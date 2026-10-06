@@ -77,6 +77,7 @@ pub struct SentMeta {
 
 /// TCP header fields and payload of one outgoing segment; the Endpoint adds the addresses and
 /// builds the IP packet with `wire::packet::build`.
+#[derive(Debug)]
 pub struct SegmentWriter {
     pub seq: SeqNum,
     pub ack: SeqNum,
@@ -119,6 +120,7 @@ impl SegmentWriter {
     }
 }
 
+#[derive(Debug)]
 pub struct Tcb {
     cfg: ConnectConfig,
     v6: bool,
@@ -297,6 +299,8 @@ impl Tcb {
         self.rcv_nxt = seg.seq.wrapping_add(1);
         self.snd_una = seg.ack;
         self.snd_wnd = u32::from(seg.wnd);
+        // A SYN retransmission made due by an RTO that fired just before is now moot.
+        self.syn_due = false;
         self.rto_at = None;
         self.ack_due = true;
         self.state = TcpState::Established;
@@ -659,6 +663,30 @@ mod tests {
         );
         assert_eq!(f.tcb.state(), TcpState::SynSent);
         assert_eq!(f.send(t(0)), None);
+    }
+
+    #[test]
+    fn synack_after_rto_fired_sends_only_ack() {
+        let mut f = Fixture::new(ConnectConfig::default(), v4());
+        f.send(t(0)).unwrap();
+        // The SYN RTO fires, then the SYN/ACK arrives before the retransmission is polled.
+        assert_eq!(f.timeout(t(1)), Reaction::None);
+        assert_eq!(
+            f.recv(
+                TcpFlags::SYN | TcpFlags::ACK,
+                ISN.wrapping_add(1),
+                5000,
+                &opts(Some(1460), Some(7))
+            ),
+            Reaction::Established
+        );
+        let meta = f.send(t(1)).unwrap();
+        assert_eq!(meta.flags, TcpFlags::ACK);
+        assert_eq!(f.out.seq, ISN.wrapping_add(1));
+        assert_eq!(f.send(t(1)), None);
+        assert_eq!(f.tcb.snd_nxt, ISN.wrapping_add(1));
+        assert_eq!(f.tcb.rto_at, None);
+        assert_eq!(f.tcb.poll_send_at(), None);
     }
 
     #[test]
