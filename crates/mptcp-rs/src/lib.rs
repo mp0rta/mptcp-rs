@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod crypto;
 mod seq;
 mod time;
 pub mod wire;
