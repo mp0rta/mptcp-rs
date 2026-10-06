@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use rangemap::RangeSet;
 
-use super::cc::{CongestionControl, CongestionEvent, Unbounded};
+use super::cc::{CongestionControl, CongestionEvent, RecoveryAck, Reno};
 use super::hooks::Hooks;
+use super::recovery::{DupAck, NewAck, NewReno};
 use super::rtt::{INITIAL_RTO, RttEstimator};
 use crate::seq::SeqNum;
 use crate::time::Instant;
@@ -141,7 +142,11 @@ pub struct Tcb {
     // Send sequence space (RFC 9293 §3.3.1).
     iss: SeqNum,
     snd_una: SeqNum,
+    /// Next sequence number to send; pulled back to SND.UNA by an RTO (go-back).
     snd_nxt: SeqNum,
+    /// One past the highest sequence number sent (SND.MAX). ACKs up to it are acceptable and
+    /// SND.MAX − SND.UNA is what is outstanding (FlightSize).
+    snd_max: SeqNum,
     /// Peer's window in octets, already scaled.
     snd_wnd: u32,
     /// Shift applied to the peer's window fields (RFC 7323 Snd.Wind.Shift).
@@ -173,6 +178,7 @@ pub struct Tcb {
     rcv_unacked: u8,
 
     cc: Box<dyn CongestionControl>,
+    recovery: NewReno,
 
     // Timers.
     rtt: RttEstimator,
@@ -199,7 +205,7 @@ pub struct Tcb {
     ack_due: bool,
     /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`.
     rst_due: Option<SeqNum>,
-    /// RTO expired: resend one segment at SND.UNA.
+    /// Resend one segment at SND.UNA (RTO, fast retransmit, partial ACK).
     retransmit_due: bool,
     probe_due: bool,
     /// SWS override timer expired: send what the window allows.
@@ -214,7 +220,7 @@ impl Tcb {
         isn: SeqNum,
         now: Instant,
     ) -> Tcb {
-        Self::with_cc(cfg, local, remote, isn, now, Box::new(Unbounded))
+        Self::with_cc(cfg, local, remote, isn, now, Box::new(Reno::new()))
     }
 
     pub(crate) fn with_cc(
@@ -234,6 +240,7 @@ impl Tcb {
             snd_una: isn,
             // Becomes ISS + 1 when the SYN is sent; until then no ACK is acceptable.
             snd_nxt: isn,
+            snd_max: isn,
             snd_wnd: 0,
             snd_shift: 0,
             snd_wl1: SeqNum(0),
@@ -248,6 +255,7 @@ impl Tcb {
             rcv_ooo: RangeSet::new(),
             rcv_unacked: 0,
             cc,
+            recovery: NewReno::new(isn),
             rtt: RttEstimator::new(),
             rto_at: None,
             rtt_timed: None,
@@ -270,7 +278,7 @@ impl Tcb {
     }
 
     /// ESTABLISHED as if our SYN had been answered by a SYN/ACK carrying `peer_mss` and
-    /// `peer_ws` (window 65535) at `now`; the handshake ACK is due. `cc::Unbounded`.
+    /// `peer_ws` (window 65535) at `now`; the handshake ACK is due. `cc::Reno`.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_established(
@@ -283,9 +291,10 @@ impl Tcb {
         peer_ws: Option<u8>,
         now: Instant,
     ) -> Tcb {
-        let mut tcb = Self::with_cc(cfg, local, remote, isn, now, Box::new(Unbounded));
+        let mut tcb = Self::with_cc(cfg, local, remote, isn, now, Box::new(Reno::new()));
         tcb.syn_due = false;
         tcb.snd_nxt = isn.wrapping_add(1);
+        tcb.snd_max = tcb.snd_nxt;
         let mut opts = [0u8; 8];
         let mut n = 0;
         if let Some(m) = peer_mss {
@@ -351,6 +360,7 @@ impl Tcb {
             self.first_syn_at.get_or_insert(now);
             self.rto_at = Some(now + self.rtt.rto());
             self.snd_nxt = self.iss.wrapping_add(1);
+            self.snd_max = self.snd_nxt;
             // RFC 7323 §2.2: the window field of a SYN is never scaled.
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
             let meta = out.start(self.iss, SeqNum(0), TcpFlags::SYN, wnd);
@@ -372,7 +382,9 @@ impl Tcb {
         if self.ack_due {
             self.ack_sent();
             let wnd = self.wnd_field(h);
-            return Some(out.start(self.snd_nxt, self.rcv_nxt, TcpFlags::ACK, wnd));
+            // SND.MAX, not a pulled-back SND.NXT: a SEQ below the peer's RCV.NXT would make
+            // the ACK unacceptable to it (RFC 9293 Table 6).
+            return Some(out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd));
         }
         None
     }
@@ -442,11 +454,13 @@ impl Tcb {
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;
         self.snd_wl2 = seg.ack;
+        self.recovery.last_wnd = self.snd_wnd;
         // RFC 6298 §5.7: the timer expired awaiting the SYN's ACK (only then is RTO above 1 s).
-        if self.rtt.rto() > INITIAL_RTO {
+        let syn_lost = self.rtt.rto() > INITIAL_RTO;
+        if syn_lost {
             self.rtt.reinit_after_syn_retransmission();
         }
-        self.cc.init(u32::from(self.eff_mss));
+        self.cc.init(u32::from(self.eff_mss), syn_lost);
         // A SYN retransmission made due by an RTO that fired just before is now moot.
         self.syn_due = false;
         self.rto_at = None;
@@ -575,20 +589,43 @@ impl Tcb {
         }
     }
 
-    /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, CC and SND.WND.
-    /// `Break` means drop the segment and return.
+    /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, loss recovery,
+    /// CC and SND.WND. `Break` means drop the segment and return.
     fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> ControlFlow<Reaction> {
         if seg.ack.lt(self.snd_una) {
             // An old duplicate ACK: ignored, the segment is processed further.
             return ControlFlow::Continue(());
         }
-        if seg.ack.gt(self.snd_nxt) {
+        if seg.ack.gt(self.snd_max) {
             self.ack_due = true;
             return ControlFlow::Break(Reaction::None);
+        }
+        // Duplicate ACK (RFC 5681 §2), judged before this segment updates SND.WND.
+        let wnd = u32::from(seg.wnd) << self.snd_shift;
+        let abcd = self.in_flight() > 0
+            && seg.payload.is_empty()
+            && !seg.flags.contains(TcpFlags::SYN)
+            && !seg.flags.contains(TcpFlags::FIN)
+            && seg.ack == self.snd_una;
+        if self.recovery.is_duplicate(abcd, wnd) {
+            match self.recovery.on_dup_ack(seg.ack, self.snd_max) {
+                DupAck::Ignore => {}
+                DupAck::FastRetransmit => {
+                    let flight = self.in_flight();
+                    self.cc
+                        .on_congestion(CongestionEvent::FastRetransmit, flight, now);
+                    self.retransmit_due = true;
+                }
+                DupAck::Inflate => self.cc.on_recovery_ack(RecoveryAck::Duplicate),
+            }
         }
         if seg.ack.gt(self.snd_una) {
             let acked = self.snd_una.distance(seg.ack) as u32;
             self.snd_una = seg.ack;
+            // An ACK past a pulled-back SND.NXT: those octets need no resend.
+            if self.snd_nxt.lt(self.snd_una) {
+                self.snd_nxt = self.snd_una;
+            }
             h.mark_acked(self.rel(seg.ack));
             let rtt = match self.rtt_timed {
                 Some((end, sent)) if end.le(seg.ack) => {
@@ -599,14 +636,26 @@ impl Tcb {
                 _ => None,
             };
             let in_flight = self.in_flight();
-            self.cc.on_ack(acked, rtt, in_flight, now);
-            // RFC 6298 §5.2 / §5.3; R2 restarts with SND.UNA (ruling R8).
+            // RFC 6298 §5.2 / §5.3, except that only the first partial ACK of a fast recovery
+            // restarts the timer (RFC 6582 §3.2 step 3); R2 restarts with SND.UNA (ruling R8).
+            let mut restart_rto = true;
+            match self.recovery.on_new_ack(seg.ack) {
+                NewAck::Normal => self.cc.on_ack(acked, rtt, in_flight, now),
+                NewAck::Partial { first } => {
+                    self.cc.on_recovery_ack(RecoveryAck::Partial { acked });
+                    self.retransmit_due = true;
+                    restart_rto = first;
+                }
+                NewAck::Full => self.cc.on_recovery_ack(RecoveryAck::Full { in_flight }),
+            }
             let restart = (in_flight > 0).then_some(now);
-            self.rto_at = restart.map(|t| t + self.rtt.rto());
+            if restart_rto {
+                self.rto_at = restart.map(|t| t + self.rtt.rto());
+            }
             self.r2_since = restart;
         }
         if self.snd_wl1.lt(seg.seq) || (self.snd_wl1 == seg.seq && self.snd_wl2.le(seg.ack)) {
-            self.snd_wnd = u32::from(seg.wnd) << self.snd_shift;
+            self.snd_wnd = wnd;
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = seg.ack;
@@ -630,9 +679,13 @@ impl Tcb {
             self.rtt.backoff();
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
-            self.retransmit_due = true;
             self.cc
                 .on_congestion(CongestionEvent::Rto, self.in_flight(), now);
+            self.recovery.on_rto(self.snd_max);
+            // Go back (RFC 5681 §3.1, RFC 6298 §5.4): SND.UNA's segment now, the rest of the
+            // window under slow start as ACKs return.
+            self.snd_nxt = self.snd_una;
+            self.retransmit_due = true;
         }
         if self.persist_at.is_some_and(|t| now >= t) {
             self.probe_due = true;
@@ -660,9 +713,17 @@ impl Tcb {
     ) -> Option<SentMeta> {
         let in_flight = self.in_flight();
         if std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
-            // Sent even into a zero window: it is the probe then (spec §3).
+            // The segment at SND.UNA (RTO, fast retransmit, partial ACK): sent regardless of
+            // cwnd, Nagle and SWS, even into a zero window, where it is the probe (spec §3).
+            // Karn: no RTT sample from anything now in flight.
+            self.rtt_timed = None;
             let len = in_flight.min(u32::from(self.eff_mss));
-            return self.write_data(self.snd_una, len, now, h, out);
+            let meta = self.write_data(self.snd_una, len, now, h, out)?;
+            let end = self.snd_una.wrapping_add(meta.len);
+            if end.gt(self.snd_nxt) {
+                self.snd_nxt = end;
+            }
+            return Some(meta);
         }
         let queued = h.assigned_end().wrapping_sub(self.rel(self.snd_nxt));
         let idle = in_flight == 0;
@@ -688,8 +749,22 @@ impl Tcb {
         self.persist_at = None;
         self.probe_due = false;
 
+        // RFC 5681 §2: nothing beyond SND.UNA + min(cwnd, rwnd); after a go-back the octets
+        // between SND.NXT and SND.MAX count as lost.
+        let sent = self.snd_una.distance(self.snd_nxt) as u32;
+        let usable = self.snd_wnd.min(self.cc.cwnd()).saturating_sub(sent);
+        let resend = self.snd_nxt.distance(self.snd_max) as u32;
+        if resend > 0 {
+            // Go-back: resends stop at SND.MAX and skip Nagle and SWS; they are not timed.
+            let len = resend.min(usable).min(u32::from(self.eff_mss));
+            if len == 0 {
+                return None;
+            }
+            let meta = self.write_data(self.snd_nxt, len, now, h, out)?;
+            self.snd_nxt = self.snd_nxt.wrapping_add(meta.len);
+            return Some(meta);
+        }
         let sws_override = std::mem::take(&mut self.sws_override);
-        let usable = self.snd_wnd.min(self.cc.cwnd()).saturating_sub(in_flight);
         let len = queued.min(usable).min(u32::from(self.eff_mss));
         if len == 0 {
             self.sws_at = None;
@@ -714,6 +789,8 @@ impl Tcb {
         self.sws_at = None;
         let meta = self.write_data(self.snd_nxt, len, now, h, out)?;
         self.snd_nxt = self.snd_nxt.wrapping_add(meta.len);
+        self.snd_max = self.snd_nxt;
+        // New data only (SEQ = SND.MAX): resends never get here (Karn).
         self.rtt_timed.get_or_insert((self.snd_nxt, now));
         Some(meta)
     }
@@ -756,8 +833,9 @@ impl Tcb {
         Some(meta)
     }
 
+    /// Octets outstanding: SND.MAX − SND.UNA (FlightSize).
     fn in_flight(&self) -> u32 {
-        self.snd_una.distance(self.snd_nxt) as u32
+        self.snd_una.distance(self.snd_max) as u32
     }
 
     /// Relative SSN of `seq`: ISS + 1 is SSN 1 (spec §5.3).

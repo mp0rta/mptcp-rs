@@ -2,6 +2,7 @@
 
 pub mod cc;
 mod hooks;
+mod recovery;
 pub(crate) mod rtt;
 mod tcb;
 

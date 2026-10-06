@@ -1,5 +1,5 @@
 use super::*;
-use crate::tcp::cc::CongestionEvent;
+use crate::tcp::cc::{CongestionEvent, RecoveryAck, Unbounded};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -731,7 +731,7 @@ struct CcLog {
 struct Recording(Rc<RefCell<CcLog>>);
 
 impl CongestionControl for Recording {
-    fn init(&mut self, smss: u32) {
+    fn init(&mut self, smss: u32, _: bool) {
         self.0.borrow_mut().init = Some(smss);
     }
     fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
@@ -740,6 +740,7 @@ impl CongestionControl for Recording {
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
         self.0.borrow_mut().events.push((ev, in_flight));
     }
+    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
     fn cwnd(&self) -> u32 {
         2 * u32::from(MSS)
     }
@@ -769,9 +770,9 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
     assert_eq!(f.timeout(tm(1100)), Reaction::None);
     // FlightSize at the RTO: data(1000)..data(3000).
     assert_eq!(log.borrow().events, vec![(CongestionEvent::Rto, 2000)]);
+    // Go-back from SND.UNA within this CC's fixed 2-segment window.
     let segs = f.drain(tm(1100));
-    assert_eq!(segs.len(), 1);
-    assert_eq!((segs[0].0.seq, segs[0].0.len), (data(1000), 1000));
+    assert_eq!(seq_lens(&segs), [(data(1000), 1000), (data(2000), 1000)]);
 }
 
 /// A send buffer whose runs are at most 7 octets, as at many internal buffer boundaries.
@@ -906,7 +907,7 @@ impl<H: Hooks> Fixture<H> {
         let mut v = Vec::new();
         while let Some(m) = self.send(now) {
             assert_eq!((m.flags, m.len), (TcpFlags::ACK, 0));
-            assert_eq!(m.seq, self.tcb.snd_nxt);
+            assert_eq!(m.seq, self.tcb.snd_max);
             v.push((self.out.ack, self.out.wnd));
             assert!(v.len() < 10, "poll_send does not stop");
         }
@@ -1467,4 +1468,253 @@ fn sws_edge_never_moves_left() {
     assert!(f.acks(t(0)).is_empty());
     f.data_in(t(0), 0, &p[..10]);
     assert_eq!(f.acks(t(0)), vec![(pdata(fill), 2)]);
+}
+
+// ---- Congestion control and loss recovery (Task 9) ----
+
+fn seq_lens(segs: &[(SentMeta, Vec<u8>)]) -> Vec<(SeqNum, u32)> {
+    segs.iter().map(|(m, _)| (m.seq, m.len)).collect()
+}
+
+/// Peer window in the Reno tests (shift 0).
+const BIG: u16 = 65535;
+
+impl Fixture {
+    /// ESTABLISHED at t(0) with `Reno` (SMSS = MSS = 1000, so IW = 4 segments), peer window
+    /// `BIG`, `bytes` written; then segments 0–2 are ACKed one by one at 10, 20 and 30 ms,
+    /// each ACK opening two more. Leaves segments 3–9 outstanding (SND.UNA = data(3000),
+    /// SND.MAX = data(10000)), cwnd 7 segments, RTO due at 1.03 s.
+    fn reno_ramp(bytes: &[u8]) -> Self {
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
+        f.establish(BIG);
+        f.write(bytes);
+        assert_eq!(f.drain(t(0)).len(), 4, "IW");
+        for k in 1..=3 {
+            assert_eq!(
+                f.ack(tm(10 * k), data(k as u32 * 1000), BIG),
+                Reaction::None
+            );
+            assert_eq!(f.drain(tm(10 * k)).len(), 2, "slow start");
+        }
+        assert_eq!((f.tcb.snd_una, f.tcb.snd_max), (data(3000), data(10_000)));
+        assert_eq!(f.tcb.cc.cwnd(), 7000);
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(1030)));
+        f
+    }
+    /// `n` duplicate ACKs of `ack` at `now`; each must draw nothing.
+    fn dup_acks_quiet(&mut self, now: Instant, ack: SeqNum, n: usize) {
+        for i in 0..n {
+            assert_eq!(self.ack(now, ack, BIG), Reaction::None);
+            assert!(
+                self.drain(now).is_empty(),
+                "duplicate ACK {i}: nothing sent"
+            );
+        }
+    }
+}
+
+#[test]
+fn initial_window_is_rfc5681() {
+    // new_active uses Reno: IW = 3 segments for SMSS 1460, 4 for 1000, 2 for 2200.
+    for (mtu, mss, segs) in [(1500, 1460, 3), (1500, 1000, 4), (9000, 2200, 2)] {
+        let cfg = ConnectConfig {
+            mtu,
+            ..ConnectConfig::default()
+        };
+        let mut f = Fixture::new(cfg, v4());
+        f.synack(BIG, &opts(Some(mss), Some(0)));
+        f.write(&pattern(10 * mss as usize));
+        let sent = f.drain(t(0));
+        assert_eq!(
+            seq_lens(&sent),
+            (0..segs)
+                .map(|i| (data(i * u32::from(mss)), u32::from(mss)))
+                .collect::<Vec<_>>(),
+            "SMSS {mss}"
+        );
+    }
+    // The SYN was retransmitted: one segment (RFC 5681 §3.1).
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.send(t(0)).unwrap();
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    f.send(t(1)).unwrap();
+    f.recv(
+        TcpFlags::SYN | TcpFlags::ACK,
+        ISN.wrapping_add(1),
+        BIG,
+        &opts(Some(1460), Some(0)),
+    );
+    f.write(&pattern(10 * 1460));
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), 1460)]);
+}
+
+#[test]
+fn three_dupacks_fast_retransmit() {
+    let bytes = pattern(20 * MSS as usize);
+    let mut f = Fixture::reno_ramp(&bytes);
+    // Segment 3 is lost; 4–9 arrive and each draws a duplicate ACK.
+    f.dup_acks_quiet(tm(40), data(3000), 2);
+    assert_eq!(f.ack(tm(41), data(3000), BIG), Reaction::None);
+    let segs = f.drain(tm(41));
+    assert_eq!(seq_lens(&segs), [(data(3000), 1000)], "fast retransmit");
+    assert_eq!(segs[0].1, bytes[3000..4000]);
+    // ssthresh = FlightSize / 2 = 3500, cwnd = ssthresh + 3·SMSS; no RTT sample from it.
+    assert_eq!(f.tcb.cc.cwnd(), 6500);
+    assert_eq!(f.tcb.rtt_timed, None);
+    // Before the RTO, which keeps its deadline.
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1030)));
+    // Each further duplicate ACK inflates cwnd by SMSS; new data goes out once it fits.
+    f.dup_acks_quiet(tm(42), data(3000), 1);
+    assert_eq!(f.tcb.cc.cwnd(), 7500);
+    f.ack(tm(43), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(43))), [(data(10_000), 1000)]);
+    f.ack(tm(44), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(44))), [(data(11_000), 1000)]);
+    // The retransmission fills the hole: a full ACK (>= recover) ends recovery with
+    // cwnd = min(ssthresh, FlightSize + SMSS) = min(3500, 2000 + 1000).
+    assert_eq!(f.ack(tm(60), data(10_000), BIG), Reaction::None);
+    assert_eq!(f.tcb.cc.cwnd(), 3000);
+    assert_eq!(seq_lens(&f.drain(tm(60))), [(data(12_000), 1000)]);
+    // Out of recovery: duplicate ACKs count from zero again.
+    f.dup_acks_quiet(tm(70), data(10_000), 2);
+}
+
+#[test]
+fn newreno_partial_ack_retransmits_next_hole() {
+    let bytes = pattern(20 * MSS as usize);
+    let mut f = Fixture::reno_ramp(&bytes);
+    // Segments 3, 6 and 8 are lost: 4, 5, 7 and 9 draw four duplicate ACKs.
+    f.dup_acks_quiet(tm(40), data(3000), 2);
+    f.ack(tm(41), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(41))), [(data(3000), 1000)]);
+    f.dup_acks_quiet(tm(42), data(3000), 1);
+    assert_eq!(f.tcb.cc.cwnd(), 7500);
+    // The retransmitted 3 arrives: partial ACK up to the next hole, which is retransmitted at
+    // once. cwnd = 7500 − 3000 + SMSS = 5500 also lets one new segment go.
+    assert_eq!(f.ack(tm(100), data(6000), BIG), Reaction::None);
+    let segs = f.drain(tm(100));
+    assert_eq!(seq_lens(&segs), [(data(6000), 1000), (data(10_000), 1000)]);
+    assert_eq!(segs[0].1, bytes[6000..7000]);
+    assert_eq!(f.tcb.cc.cwnd(), 5500);
+    // The first partial ACK restarts the retransmission timer.
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
+    // Second partial ACK: the third hole; cwnd = 5500 − 2000 + SMSS. The timer is not restarted.
+    assert_eq!(f.ack(tm(200), data(8000), BIG), Reaction::None);
+    let segs = f.drain(tm(200));
+    assert_eq!(seq_lens(&segs), [(data(8000), 1000), (data(11_000), 1000)]);
+    assert_eq!(segs[0].1, bytes[8000..9000]);
+    assert_eq!(f.tcb.cc.cwnd(), 4500);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
+    // Everything arrives: full ACK, nothing outstanding, cwnd = min(3500, SMSS + SMSS).
+    assert_eq!(f.ack(tm(300), data(12_000), BIG), Reaction::None);
+    assert_eq!(f.tcb.cc.cwnd(), 2000);
+    assert_eq!(
+        seq_lens(&f.drain(tm(300))),
+        [(data(12_000), 1000), (data(13_000), 1000)]
+    );
+}
+
+#[test]
+fn rto_go_back_resends_window_without_rto_each() {
+    let bytes = pattern(20 * MSS as usize);
+    let mut f = Fixture::reno_ramp(&bytes);
+    // 3–5 arrived and 6–9 were lost, and every ACK since 30 ms was lost too.
+    assert_eq!(f.timeout(tm(1030)), Reaction::None);
+    // Loss window: one segment, SND.UNA's.
+    let segs = f.drain(tm(1030));
+    assert_eq!(seq_lens(&segs), [(data(3000), 1000)]);
+    assert_eq!(segs[0].1, bytes[3000..4000]);
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(f.tcb.snd_nxt, data(4000));
+    // A pure ACK sent meanwhile carries SEQ = SND.MAX, not the pulled-back SND.NXT.
+    f.seg_ack(tm(1050), 500, data(3000), TcpFlags::ACK, &[1; 10]);
+    let acks = f.drain(tm(1050));
+    assert_eq!(
+        seq_lens(&acks),
+        [(data(10_000), 0)],
+        "out-of-order data: immediate ACK"
+    );
+    // The ACK covers data beyond SND.NXT (but within SND.MAX): acceptable, SND.NXT follows.
+    assert_eq!(f.ack(tm(1100), data(6000), BIG), Reaction::None);
+    assert_eq!(f.tcb.snd_una, data(6000));
+    // Slow start resends the rest of the window, ACK-clocked, without another RTO.
+    let segs = f.drain(tm(1100));
+    assert_eq!(seq_lens(&segs), [(data(6000), 1000), (data(7000), 1000)]);
+    assert_eq!(f.ack(tm(1200), data(7000), BIG), Reaction::None);
+    let segs = f.drain(tm(1200));
+    assert_eq!(seq_lens(&segs), [(data(8000), 1000), (data(9000), 1000)]);
+    let resent: Vec<u8> = segs.into_iter().flat_map(|(_, p)| p).collect();
+    assert_eq!(resent, bytes[8000..10_000]);
+    // Resent segments are never timed (Karn).
+    assert_eq!(f.tcb.rtt_timed, None);
+    // Past SND.MAX: new data, timed again.
+    assert_eq!(f.ack(tm(1300), data(8000), BIG), Reaction::None);
+    assert_eq!(f.tcb.cc.cwnd(), 4000);
+    let segs = f.drain(tm(1300));
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(10_000), 1000), (data(11_000), 1000)]
+    );
+    assert_eq!(f.tcb.snd_max, data(12_000));
+    assert_eq!(f.tcb.rtt_timed, Some((data(11_000), tm(1300))));
+    assert!(
+        f.tcb.poll_send_at().unwrap() > tm(3000),
+        "no RTO pending soon"
+    );
+}
+
+#[test]
+fn dupacks_below_recover_after_rto_do_not_fast_retransmit() {
+    let mut f = Fixture::reno_ramp(&pattern(20 * MSS as usize));
+    assert_eq!(f.timeout(tm(1030)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(tm(1030))), [(data(3000), 1000)]);
+    assert_eq!(f.ack(tm(1100), data(4000), BIG), Reaction::None);
+    assert_eq!(
+        seq_lens(&f.drain(tm(1100))),
+        [(data(4000), 1000), (data(5000), 1000)]
+    );
+    // Three duplicate ACKs that do not cover more than recover (SND.MAX − 1 at the RTO):
+    // no fast retransmit, no window change (RFC 6582 §4); the RTO stays the backup.
+    f.dup_acks_quiet(tm(1150), data(4000), 4);
+    assert_eq!(f.tcb.cc.cwnd(), 2000);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(3100)));
+}
+
+#[test]
+fn data_or_window_change_is_not_dupack() {
+    let mut f = Fixture::reno_ramp(&pattern(20 * MSS as usize));
+    let peer = PEER_ISN.wrapping_add(1);
+    f.dup_acks_quiet(tm(40), data(3000), 1);
+    // A segment carrying data (b) is not a duplicate ACK.
+    let seg = Segment {
+        src: f.addrs.1,
+        dst: f.addrs.0,
+        seq: peer,
+        ack: data(3000),
+        flags: TcpFlags::ACK,
+        wnd: BIG,
+        options: &[],
+        payload: &[9; 100],
+    };
+    assert_eq!(f.tcb.on_segment(&seg, tm(41), &mut f.h), Reaction::None);
+    assert!(f.drain(tm(41)).is_empty(), "delayed ACK only");
+    // Nor is one whose window differs from the last ACK's (e); the next with that same window
+    // is.
+    let peer = peer.wrapping_add(100);
+    for (at, wnd) in [(42, 60_000), (43, 60_000)] {
+        assert_eq!(f.ack_seq(tm(at), peer, data(3000), wnd), Reaction::None);
+        assert!(f.drain(tm(at)).iter().all(|(m, _)| m.len == 0));
+    }
+    assert_eq!(f.tcb.snd_wnd, 60_000);
+    // Only two duplicates so far: the third triggers the fast retransmit.
+    assert_eq!(f.ack_seq(tm(44), peer, data(3000), 60_000), Reaction::None);
+    let segs = f.drain(tm(44));
+    assert_eq!(
+        segs.iter()
+            .find(|(m, _)| m.len > 0)
+            .map(|(m, _)| (m.seq, m.len)),
+        Some((data(3000), 1000))
+    );
 }
