@@ -3,17 +3,21 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use super::cc::{CongestionControl, CongestionEvent, Unbounded};
 use super::hooks::Hooks;
+use super::rtt::{INITIAL_RTO, RttEstimator};
 use crate::seq::SeqNum;
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::tcp_options::{self, TcpOpt};
 
-const INITIAL_RTO: Duration = Duration::from_secs(1);
-const MAX_RTO: Duration = Duration::from_secs(60);
 /// RFC 9293 MUST-23: R2 for a SYN is at least 3 minutes.
 const MIN_R2_SYN: Duration = Duration::from_secs(180);
 const MAX_WS_SHIFT: u8 = 14;
+/// Persist interval cap (RFC 9293 SHLD-30 leaves it open; same as the RTO cap).
+const MAX_PERSIST: Duration = Duration::from_secs(60);
+/// Sender SWS override timeout (RFC 9293 §3.8.6.2.1 rule 4).
+const SWS_OVERRIDE: Duration = Duration::from_millis(500);
 
 /// Per-connection settings (spec §3; R2 is settable per connection, RFC 9293 MUST-21).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +139,11 @@ pub struct Tcb {
     snd_wnd: u32,
     /// Shift applied to the peer's window fields (RFC 7323 Snd.Wind.Shift).
     snd_shift: u8,
+    /// SEG.SEQ / SEG.ACK of the segment that last updated `snd_wnd`.
+    snd_wl1: SeqNum,
+    snd_wl2: SeqNum,
+    /// Max(SND.WND), the sender SWS estimate of the peer's buffer (RFC 9293 §3.8.6.2.1).
+    max_snd_wnd: u32,
     /// Effective send MSS (spec §3); final once ESTABLISHED.
     eff_mss: u16,
 
@@ -144,9 +153,22 @@ pub struct Tcb {
     /// SYN/ACK; 0 if the peer did not offer.
     rcv_shift: u8,
 
+    cc: Box<dyn CongestionControl>,
+
     // Timers.
-    rto: Duration,
+    rtt: RttEstimator,
+    /// Retransmission timer (SYN, then data at SND.UNA).
     rto_at: Option<Instant>,
+    /// The one timed segment (Karn): its end and send time; cleared by any RTO.
+    rtt_timed: Option<(SeqNum, Instant)>,
+    /// R2 base for data: first transmission of the segment at SND.UNA, restarted when SND.UNA
+    /// advances; or the first unanswered zero-window probe. `None` when nothing is pending.
+    r2_since: Option<Instant>,
+    /// Persist timer and its current interval (first = RTO, ×2 per probe, cap 60 s).
+    persist_at: Option<Instant>,
+    persist_ivl: Duration,
+    /// Sender SWS override timer (RFC 9293 §3.8.6.2.1 rule 4).
+    sws_at: Option<Instant>,
     /// First SYN transmission; R2 for the SYN counts from here.
     first_syn_at: Option<Instant>,
     closed_at: Option<Instant>,
@@ -156,15 +178,31 @@ pub struct Tcb {
     ack_due: bool,
     /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`.
     rst_due: Option<SeqNum>,
+    /// RTO expired: resend one segment at SND.UNA.
+    retransmit_due: bool,
+    probe_due: bool,
+    /// SWS override timer expired: send what the window allows.
+    sws_override: bool,
 }
 
 impl Tcb {
     pub fn new_active(
         cfg: &ConnectConfig,
+        local: SocketAddr,
+        remote: SocketAddr,
+        isn: SeqNum,
+        now: Instant,
+    ) -> Tcb {
+        Self::with_cc(cfg, local, remote, isn, now, Box::new(Unbounded))
+    }
+
+    pub(crate) fn with_cc(
+        cfg: &ConnectConfig,
         _local: SocketAddr,
         remote: SocketAddr,
         isn: SeqNum,
         _now: Instant,
+        cc: Box<dyn CongestionControl>,
     ) -> Tcb {
         let mut tcb = Tcb {
             cfg: cfg.clone(),
@@ -177,16 +215,28 @@ impl Tcb {
             snd_nxt: isn,
             snd_wnd: 0,
             snd_shift: 0,
+            snd_wl1: SeqNum(0),
+            snd_wl2: SeqNum(0),
+            max_snd_wnd: 0,
             eff_mss: 0,
             rcv_nxt: SeqNum(0),
             rcv_shift: ws_shift(cfg.recv_buffer),
-            rto: INITIAL_RTO,
+            cc,
+            rtt: RttEstimator::new(),
             rto_at: None,
+            rtt_timed: None,
+            r2_since: None,
+            persist_at: None,
+            persist_ivl: Duration::ZERO,
+            sws_at: None,
             first_syn_at: None,
             closed_at: None,
             syn_due: true,
             ack_due: false,
             rst_due: None,
+            retransmit_due: false,
+            probe_due: false,
+            sws_override: false,
         };
         tcb.eff_mss = tcb.eff_mss_for(None);
         tcb
@@ -201,9 +251,10 @@ impl Tcb {
         self.nodelay = nodelay;
     }
 
-    pub fn on_segment(&mut self, seg: &Segment, now: Instant, _h: &mut impl Hooks) -> Reaction {
+    pub fn on_segment(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::SynSent => self.on_segment_syn_sent(seg, now),
+            TcpState::Established => self.on_ack(seg, now, h),
             _ => Reaction::None,
         }
     }
@@ -212,6 +263,7 @@ impl Tcb {
     pub fn on_timeout(&mut self, now: Instant, _h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::SynSent => self.on_timeout_syn_sent(now),
+            TcpState::Established => self.on_timeout_data(now),
             _ => Reaction::None,
         }
     }
@@ -231,7 +283,7 @@ impl Tcb {
         if self.syn_due {
             self.syn_due = false;
             self.first_syn_at.get_or_insert(now);
-            self.rto_at = Some(now + self.rto);
+            self.rto_at = Some(now + self.rtt.rto());
             self.snd_nxt = self.iss.wrapping_add(1);
             // RFC 7323 §2.2: the window field of a SYN is never scaled.
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
@@ -240,9 +292,16 @@ impl Tcb {
             out.options_len = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
             return Some(meta);
         }
+        if self.state == TcpState::Established {
+            if let Some(meta) = self.poll_data(now, h, out) {
+                // Every data segment and probe carries the current ACK.
+                self.ack_due = false;
+                return Some(meta);
+            }
+        }
         if self.ack_due {
             self.ack_due = false;
-            let wnd = (h.recv_window() >> self.rcv_shift).min(65535) as u16;
+            let wnd = self.wnd_field(h);
             return Some(out.start(self.snd_nxt, self.rcv_nxt, TcpFlags::ACK, wnd));
         }
         None
@@ -256,6 +315,13 @@ impl Tcb {
             TcpState::SynSent => {
                 let r2 = self.first_syn_at.map(|t| t + self.r2_syn());
                 [self.rto_at, r2].into_iter().flatten().min()
+            }
+            TcpState::Established => {
+                let r2 = self.r2_since.map(|t| t + self.cfg.r2_data);
+                [self.rto_at, r2, self.persist_at, self.sws_at]
+                    .into_iter()
+                    .flatten()
+                    .min()
             }
             _ => None,
         }
@@ -299,6 +365,14 @@ impl Tcb {
         self.rcv_nxt = seg.seq.wrapping_add(1);
         self.snd_una = seg.ack;
         self.snd_wnd = u32::from(seg.wnd);
+        self.max_snd_wnd = self.snd_wnd;
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
+        // RFC 6298 §5.7: the timer expired awaiting the SYN's ACK (only then is RTO above 1 s).
+        if self.rtt.rto() > INITIAL_RTO {
+            self.rtt.reinit_after_syn_retransmission();
+        }
+        self.cc.init(u32::from(self.eff_mss));
         // A SYN retransmission made due by an RTO that fired just before is now moot.
         self.syn_due = false;
         self.rto_at = None;
@@ -313,10 +387,194 @@ impl Tcb {
         }
         if self.rto_at.is_some_and(|t| now >= t) {
             self.rto_at = None;
-            self.rto = (self.rto * 2).min(MAX_RTO);
+            self.rtt.backoff();
             self.syn_due = true;
         }
         Reaction::None
+    }
+
+    /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, CC and SND.WND.
+    /// Segment acceptability, RST/SYN checks and payload are not handled here.
+    fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
+        if !seg.flags.contains(TcpFlags::ACK) || seg.ack.lt(self.snd_una) {
+            return Reaction::None;
+        }
+        if seg.ack.gt(self.snd_nxt) {
+            self.ack_due = true;
+            return Reaction::None;
+        }
+        if seg.ack.gt(self.snd_una) {
+            let acked = self.snd_una.distance(seg.ack) as u32;
+            self.snd_una = seg.ack;
+            h.mark_acked(self.rel(seg.ack));
+            let rtt = match self.rtt_timed {
+                Some((end, sent)) if end.le(seg.ack) => {
+                    self.rtt_timed = None;
+                    self.rtt.sample(now - sent);
+                    Some(now - sent)
+                }
+                _ => None,
+            };
+            let in_flight = self.in_flight();
+            self.cc.on_ack(acked, rtt, in_flight, now);
+            // RFC 6298 §5.2 / §5.3; R2 restarts with SND.UNA (ruling R8).
+            let restart = (in_flight > 0).then_some(now);
+            self.rto_at = restart.map(|t| t + self.rtt.rto());
+            self.r2_since = restart;
+        }
+        if self.snd_wl1.lt(seg.seq) || (self.snd_wl1 == seg.seq && self.snd_wl2.le(seg.ack)) {
+            self.snd_wnd = u32::from(seg.wnd) << self.snd_shift;
+            self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
+            self.snd_wl1 = seg.seq;
+            self.snd_wl2 = seg.ack;
+        }
+        // Nothing outstanding: this ACK answered any zero-window probe (MUST-37).
+        if self.in_flight() == 0 {
+            self.r2_since = None;
+        }
+        Reaction::None
+    }
+
+    fn on_timeout_data(&mut self, now: Instant) -> Reaction {
+        if self.r2_since.is_some_and(|t| now >= t + self.cfg.r2_data) {
+            return self.close(CloseReason::Timeout, now);
+        }
+        if self.rto_at.is_some_and(|t| now >= t) {
+            // RFC 6298 §5.4–5.6: the retransmission restarts the timer when it is sent.
+            self.rto_at = None;
+            self.rtt.backoff();
+            // Karn: nothing in flight now is timed.
+            self.rtt_timed = None;
+            self.retransmit_due = true;
+            self.cc.on_congestion(CongestionEvent::Rto, now);
+        }
+        if self.persist_at.is_some_and(|t| now >= t) {
+            self.probe_due = true;
+            self.persist_ivl = (self.persist_ivl * 2).min(MAX_PERSIST);
+            self.persist_at = Some(now + self.persist_ivl);
+        }
+        if self.sws_at.is_some_and(|t| now >= t) {
+            self.sws_at = None;
+            self.sws_override = true;
+        }
+        Reaction::None
+    }
+
+    /// The retransmission, zero-window probe or new data segment due now, if any; also arms
+    /// and disarms the persist and SWS override timers.
+    fn poll_data(
+        &mut self,
+        now: Instant,
+        h: &mut impl Hooks,
+        out: &mut SegmentWriter,
+    ) -> Option<SentMeta> {
+        let in_flight = self.in_flight();
+        if std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
+            // Sent even into a zero window: it is the probe then (spec §3).
+            let len = in_flight.min(u32::from(self.eff_mss));
+            return self.write_data(self.snd_una, len, now, h, out);
+        }
+        let queued = h.assigned_end().wrapping_sub(self.rel(self.snd_nxt));
+        let idle = in_flight == 0;
+
+        // RFC 9293 §3.8.6.1; never armed while data is unacknowledged.
+        if idle && queued > 0 && self.snd_wnd == 0 {
+            if self.persist_at.is_none() {
+                self.persist_ivl = self.rtt.rto();
+                self.persist_at = Some(now + self.persist_ivl);
+            }
+            if !std::mem::take(&mut self.probe_due) {
+                return None;
+            }
+            // Zero-length at SND.UNA − 1 (spec §3, I3). Unanswered probes count toward R2.
+            self.r2_since.get_or_insert(now);
+            let wnd = self.wnd_field(h);
+            let seq = self.snd_una.wrapping_add(u32::MAX);
+            return Some(out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd));
+        }
+        self.persist_at = None;
+        self.probe_due = false;
+
+        let sws_override = std::mem::take(&mut self.sws_override);
+        let usable = self.snd_wnd.min(self.cc.cwnd()).saturating_sub(in_flight);
+        let len = queued.min(usable).min(u32::from(self.eff_mss));
+        if len == 0 {
+            self.sws_at = None;
+            return None;
+        }
+        // RFC 9293 §3.8.6.2.1 rules (1)–(4), Fs = 1/2; the bracketed SND.NXT = SND.UNA is
+        // Nagle's (§3.7.4) and dropped by `set_nodelay(true)`. Every write counts as pushed.
+        let nagle_ok = idle || self.nodelay;
+        let send = len == u32::from(self.eff_mss)
+            || (nagle_ok && queued <= usable)
+            || (nagle_ok && len >= self.max_snd_wnd / 2)
+            || sws_override;
+        if !send {
+            // Only an idle sender can stall here; otherwise the next ACK re-evaluates.
+            if idle {
+                self.sws_at.get_or_insert(now + SWS_OVERRIDE);
+            } else {
+                self.sws_at = None;
+            }
+            return None;
+        }
+        self.sws_at = None;
+        let meta = self.write_data(self.snd_nxt, len, now, h, out)?;
+        self.snd_nxt = self.snd_nxt.wrapping_add(meta.len);
+        self.rtt_timed.get_or_insert((self.snd_nxt, now));
+        Some(meta)
+    }
+
+    /// Writes up to `len` octets from SEQ `seq` (PSH if it ends at `assigned_end`) and starts
+    /// the RTO and R2 clocks if they are not running (RFC 6298 §5.1).
+    fn write_data(
+        &mut self,
+        seq: SeqNum,
+        len: u32,
+        now: Instant,
+        h: &mut impl Hooks,
+        out: &mut SegmentWriter,
+    ) -> Option<SentMeta> {
+        let wnd = self.wnd_field(h);
+        let mut meta = out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd);
+        let start = self.rel(seq);
+        let mut got = 0u32;
+        // A run may end early at a buffer boundary; an empty run is not progress.
+        while got < len {
+            let run = h.peek_with(start.wrapping_add(got), (len - got) as usize, |d| {
+                out.payload.extend_from_slice(d);
+                d.len() as u32
+            });
+            match run {
+                Some(n) if n > 0 => got += n,
+                _ => break,
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        if start.wrapping_add(got) == h.assigned_end() {
+            out.flags = TcpFlags::PSH | TcpFlags::ACK;
+        }
+        meta.flags = out.flags;
+        meta.len = got;
+        self.rto_at.get_or_insert(now + self.rtt.rto());
+        self.r2_since.get_or_insert(now);
+        Some(meta)
+    }
+
+    fn in_flight(&self) -> u32 {
+        self.snd_una.distance(self.snd_nxt) as u32
+    }
+
+    /// Relative SSN of `seq`: ISS + 1 is SSN 1 (spec §5.3).
+    fn rel(&self, seq: SeqNum) -> u32 {
+        seq.0.wrapping_sub(self.iss.0)
+    }
+
+    /// Window field of a non-SYN segment.
+    fn wnd_field(&self, h: &impl Hooks) -> u16 {
+        (h.recv_window() >> self.rcv_shift).min(65535) as u16
     }
 
     fn close(&mut self, reason: CloseReason, now: Instant) -> Reaction {
@@ -353,10 +611,15 @@ fn ws_shift(buffer: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tcp::PlainHooks;
+    use crate::tcp::cc::CongestionEvent;
+    use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const ISN: SeqNum = SeqNum(0x1000);
     const PEER_ISN: SeqNum = SeqNum(0xFFFF_FFF0);
+    /// Peer MSS in the send-path tests.
+    const MSS: u16 = 1000;
 
     fn v4() -> (SocketAddr, SocketAddr) {
         (
@@ -373,10 +636,20 @@ mod tests {
     fn t(secs: u64) -> Instant {
         Instant::from_nanos(1_000_000_000) + Duration::from_secs(secs)
     }
+    fn tm(ms: u64) -> Instant {
+        t(0) + Duration::from_millis(ms)
+    }
+    /// Sequence number of data octet `n` (0-based).
+    fn data(n: u32) -> SeqNum {
+        ISN.wrapping_add(1 + n)
+    }
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
 
-    struct Fixture {
+    struct Fixture<H = PlainHooks> {
         tcb: Tcb,
-        h: PlainHooks,
+        h: H,
         out: SegmentWriter,
         addrs: (SocketAddr, SocketAddr),
     }
@@ -388,6 +661,83 @@ mod tests {
                 h: PlainHooks::new(&cfg),
                 out: SegmentWriter::default(),
                 addrs,
+            }
+        }
+        /// IPv4, `cc::Unbounded` passed explicitly (send-path tests must not depend on the
+        /// default CC).
+        fn unbounded(cfg: ConnectConfig) -> Self {
+            let h = PlainHooks::new(&cfg);
+            Fixture::with(cfg, Box::new(Unbounded), h)
+        }
+        /// ESTABLISHED at t(0): eff_mss = MSS, peer shift 0, peer window `wnd`, handshake ACK
+        /// already sent.
+        fn established(cfg: ConnectConfig, wnd: u16) -> Self {
+            let mut f = Fixture::unbounded(cfg);
+            f.establish(wnd);
+            f
+        }
+        fn write(&mut self, data: &[u8]) {
+            assert_eq!(self.h.write(data), data.len());
+        }
+    }
+
+    impl<H: Hooks> Fixture<H> {
+        fn with(cfg: ConnectConfig, cc: Box<dyn CongestionControl>, h: H) -> Self {
+            let addrs = v4();
+            Self {
+                tcb: Tcb::with_cc(&cfg, addrs.0, addrs.1, ISN, t(0), cc),
+                h,
+                out: SegmentWriter::default(),
+                addrs,
+            }
+        }
+        fn establish(&mut self, wnd: u16) {
+            assert_eq!(
+                self.synack(wnd, &opts(Some(MSS), Some(0))),
+                Reaction::Established
+            );
+            assert_eq!(self.send(t(0)).unwrap().flags, TcpFlags::ACK);
+            assert_eq!(self.send(t(0)), None);
+        }
+        /// An ACK-only segment from the peer.
+        fn ack_seq(&mut self, now: Instant, seq: SeqNum, ack: SeqNum, wnd: u16) -> Reaction {
+            let seg = Segment {
+                src: self.addrs.1,
+                dst: self.addrs.0,
+                seq,
+                ack,
+                flags: TcpFlags::ACK,
+                wnd,
+                options: &[],
+                payload: &[],
+            };
+            self.tcb.on_segment(&seg, now, &mut self.h)
+        }
+        fn ack(&mut self, now: Instant, ack: SeqNum, wnd: u16) -> Reaction {
+            self.ack_seq(now, PEER_ISN.wrapping_add(1), ack, wnd)
+        }
+        /// Every segment `poll_send` emits at `now`, with its payload.
+        fn drain(&mut self, now: Instant) -> Vec<(SentMeta, Vec<u8>)> {
+            let mut v = Vec::new();
+            while let Some(m) = self.send(now) {
+                v.push((m, self.out.payload.clone()));
+                assert!(v.len() < 1000, "poll_send does not stop");
+            }
+            v
+        }
+        /// Fires every deadline until `Closed`; returns the send times and the close time.
+        fn run_until_closed(&mut self) -> (Vec<Instant>, Instant) {
+            let mut sends = Vec::new();
+            loop {
+                let at = self.tcb.poll_send_at().expect("a deadline");
+                match self.timeout(at) {
+                    Reaction::None => {}
+                    Reaction::Closed(CloseReason::Timeout) => return (sends, at),
+                    r => panic!("unexpected {r:?}"),
+                }
+                let segs = self.drain(at);
+                assert_eq!(segs.len(), 1, "one segment per expiry at {at:?}");
+                sends.push(at);
             }
         }
         fn send(&mut self, now: Instant) -> Option<SentMeta> {
@@ -703,5 +1053,375 @@ mod tests {
             // 4 MiB free, unscaled: capped at 65535.
             assert_eq!(f.out.wnd, 65535);
         }
+    }
+
+    // ---- Send path (Task 7) ----
+
+    const PSH_ACK: TcpFlags = TcpFlags(TcpFlags::PSH.0 | TcpFlags::ACK.0);
+
+    #[test]
+    fn sends_full_segments_up_to_window() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        let bytes = pattern(25 * MSS as usize);
+        f.write(&bytes);
+        let segs = f.drain(t(0));
+        assert_eq!(segs.len(), 10);
+        for (i, (meta, payload)) in segs.iter().enumerate() {
+            let off = i * MSS as usize;
+            assert_eq!(meta.seq, data(off as u32));
+            assert_eq!(meta.len, u32::from(MSS));
+            assert_eq!(meta.flags, TcpFlags::ACK, "segment {i}: no PSH");
+            assert_eq!(payload[..], bytes[off..off + MSS as usize]);
+        }
+        assert_eq!(f.out.ack, PEER_ISN.wrapping_add(1));
+        // Window full, data in flight: only the RTO is pending.
+        assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+    }
+
+    #[test]
+    fn psh_on_last_segment_of_written_data() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.tcb.set_nodelay(true);
+        f.write(&pattern(3 * MSS as usize / 2));
+        let segs = f.drain(t(0));
+        let got: Vec<_> = segs.iter().map(|(m, _)| (m.seq, m.len, m.flags)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (data(0), u32::from(MSS), TcpFlags::ACK),
+                (data(u32::from(MSS)), u32::from(MSS) / 2, PSH_ACK),
+            ]
+        );
+    }
+
+    #[test]
+    fn nagle_holds_small_segment_while_unacked() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&[1; 100]);
+        let segs = f.drain(t(0));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 100));
+        assert_eq!(segs[0].0.flags, PSH_ACK);
+        f.write(&[2; 100]);
+        assert!(
+            f.drain(tm(10)).is_empty(),
+            "held while 100 B unacknowledged"
+        );
+        // No SWS override while data is in flight: only the RTO is pending.
+        assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+        assert_eq!(f.ack(tm(50), data(100), 10 * MSS), Reaction::None);
+        let segs = f.drain(tm(50));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(100), 100));
+        assert_eq!(segs[0].1, vec![2; 100]);
+    }
+
+    #[test]
+    fn rto_retransmits_with_backoff_and_karn() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        let bytes = pattern(500);
+        f.write(&bytes);
+        assert_eq!(f.drain(t(0)).len(), 1);
+        assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+        assert_eq!(f.timeout(tm(999)), Reaction::None);
+        assert!(f.drain(tm(999)).is_empty());
+        for (at, next) in [(1, 3), (3, 7)] {
+            assert_eq!(f.timeout(t(at)), Reaction::None);
+            let segs = f.drain(t(at));
+            assert_eq!(segs.len(), 1, "retransmission at {at} s");
+            assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
+            assert_eq!(segs[0].1, bytes);
+            assert_eq!(f.tcb.poll_send_at(), Some(t(next)));
+        }
+        // The ACK covers a retransmitted segment: no RTT sample, RTO stays backed off.
+        assert_eq!(f.ack(tm(3100), data(500), 10 * MSS), Reaction::None);
+        assert_eq!(f.tcb.rtt.srtt(), None);
+        assert_eq!(f.tcb.rtt.rto(), Duration::from_secs(4));
+        assert_eq!(f.tcb.poll_send_at(), None);
+        // A fresh segment is timed and its ACK yields a sample, collapsing the RTO.
+        f.write(&[7; 100]);
+        assert_eq!(f.drain(tm(3200)).len(), 1);
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(7200)));
+        assert_eq!(f.ack(tm(3400), data(600), 10 * MSS), Reaction::None);
+        assert_eq!(f.tcb.rtt.srtt(), Some(Duration::from_millis(200)));
+        assert_eq!(f.tcb.rtt.rto(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rto_reinit_3s_after_syn_retransmission() {
+        let mut f = Fixture::unbounded(ConnectConfig::default());
+        f.send(t(0)).unwrap();
+        assert_eq!(f.timeout(t(1)), Reaction::None);
+        assert_eq!(f.send(t(1)).unwrap().flags, TcpFlags::SYN);
+        assert_eq!(
+            f.recv(
+                TcpFlags::SYN | TcpFlags::ACK,
+                ISN.wrapping_add(1),
+                10 * MSS,
+                &opts(Some(MSS), Some(0))
+            ),
+            Reaction::Established
+        );
+        f.write(&[1; 100]);
+        let segs = f.drain(t(1));
+        assert_eq!(segs.len(), 1, "data carries the handshake ACK");
+        assert_eq!(segs[0].0.len, 100);
+        assert_eq!(f.tcb.poll_send_at(), Some(t(4)));
+    }
+
+    #[test]
+    fn r2_data_closes() {
+        let cfg = ConnectConfig {
+            r2_data: Duration::from_secs(100),
+            ..ConnectConfig::default()
+        };
+        let mut f = Fixture::established(cfg, 10 * MSS);
+        f.write(&[1; 500]);
+        assert_eq!(f.drain(t(0)).len(), 1);
+        let (sends, closed) = f.run_until_closed();
+        assert_eq!(sends, [1, 3, 7, 15, 31, 63].map(t));
+        assert_eq!(closed, t(100));
+        assert_eq!(f.tcb.state(), TcpState::Closed);
+        assert_eq!(f.tcb.poll_send_at(), Some(t(100)));
+        // Exactly once.
+        assert_eq!(f.timeout(t(500)), Reaction::None);
+        assert_eq!(f.send(t(500)), None);
+    }
+
+    #[test]
+    fn r2_restarts_when_snd_una_advances() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&[1; 2000]);
+        assert_eq!(f.drain(t(0)).len(), 2);
+        // The first segment is acknowledged at 0.1 s; R2 now counts from there.
+        assert_eq!(f.ack(tm(100), data(1000), 10 * MSS), Reaction::None);
+        let (sends, closed) = f.run_until_closed();
+        assert_eq!(sends[0], tm(1100));
+        assert_eq!(closed, tm(100_100));
+    }
+
+    #[test]
+    fn sender_sws_override_after_500ms() {
+        let mut f = Fixture::unbounded(ConnectConfig::default());
+        assert_eq!(
+            f.synack(8192, &opts(Some(1460), Some(0))),
+            Reaction::Established
+        );
+        assert_eq!(f.drain(t(0)).len(), 1); // handshake ACK
+        assert_eq!(f.ack(t(0), ISN.wrapping_add(1), 300), Reaction::None);
+        assert_eq!(f.tcb.snd_wnd, 300);
+        f.write(&pattern(1000));
+        // (1) 300 < 1460, (2) D = 1000 > U = 300, (3) 300 < 8192 / 2: nothing sent.
+        assert!(f.drain(t(0)).is_empty());
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(500)));
+        assert_eq!(f.timeout(tm(499)), Reaction::None);
+        assert!(f.drain(tm(499)).is_empty());
+        assert_eq!(f.timeout(tm(500)), Reaction::None);
+        let segs = f.drain(tm(500));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 300));
+        assert_eq!(segs[0].0.flags, TcpFlags::ACK);
+        assert_eq!(segs[0].1, pattern(300));
+    }
+
+    #[test]
+    fn zero_window_probe_is_zero_length_at_una_minus_1() {
+        let mut f = Fixture::established(ConnectConfig::default(), 0);
+        f.write(&pattern(500));
+        assert!(f.drain(t(0)).is_empty());
+        assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+        for (at, next) in [(1, 3), (3, 7)] {
+            assert_eq!(f.timeout(t(at)), Reaction::None);
+            let segs = f.drain(t(at));
+            assert_eq!(segs.len(), 1, "probe at {at} s");
+            let (meta, payload) = &segs[0];
+            assert_eq!(meta.seq, ISN); // SND.UNA − 1
+            assert_eq!((meta.len, meta.flags), (0, TcpFlags::ACK));
+            assert!(payload.is_empty());
+            assert_eq!(f.out.ack, PEER_ISN.wrapping_add(1));
+            assert_eq!(f.tcb.poll_send_at(), Some(t(next)));
+        }
+        // The window opens: data flows and persist stops.
+        assert_eq!(f.ack(t(4), data(0), 10 * MSS), Reaction::None);
+        let segs = f.drain(t(4));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
+        assert_eq!(f.tcb.persist_at, None);
+        assert_eq!(f.tcb.poll_send_at(), Some(t(5)));
+    }
+
+    #[test]
+    fn persist_not_armed_while_unacked() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&pattern(500));
+        assert_eq!(f.drain(t(0)).len(), 1);
+        // Window closes with the data still unacknowledged.
+        assert_eq!(f.ack(tm(100), data(0), 0), Reaction::None);
+        assert_eq!(f.tcb.snd_wnd, 0);
+        assert!(f.drain(tm(100)).is_empty());
+        assert_eq!(f.tcb.persist_at, None);
+        assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+        assert_eq!(f.timeout(t(1)), Reaction::None);
+        let segs = f.drain(t(1));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
+        assert_eq!(f.tcb.persist_at, None);
+    }
+
+    #[test]
+    fn answered_probes_do_not_hit_r2() {
+        let mut f = Fixture::established(ConnectConfig::default(), 0);
+        f.write(&pattern(500));
+        assert!(f.drain(t(0)).is_empty());
+        let mut probes = Vec::new();
+        loop {
+            let at = f.tcb.poll_send_at().unwrap();
+            if at > t(300) {
+                break;
+            }
+            assert_eq!(f.timeout(at), Reaction::None);
+            let segs = f.drain(at);
+            assert_eq!(segs.len(), 1);
+            assert_eq!((segs[0].0.seq, segs[0].0.len), (ISN, 0));
+            probes.push(at);
+            assert_eq!(f.ack(at, data(0), 0), Reaction::None);
+        }
+        // ×2 per probe, capped at 60 s.
+        assert_eq!(probes, [1, 3, 7, 15, 31, 63, 123, 183, 243].map(t));
+        assert_eq!(f.tcb.state(), TcpState::Established);
+    }
+
+    #[test]
+    fn unanswered_probes_close_at_r2() {
+        let mut f = Fixture::established(ConnectConfig::default(), 0);
+        f.write(&pattern(500));
+        assert!(f.drain(t(0)).is_empty());
+        let (probes, closed) = f.run_until_closed();
+        assert_eq!(probes, [1, 3, 7, 15, 31, 63].map(t));
+        // R2 (100 s) counts from the first unanswered probe.
+        assert_eq!(closed, t(101));
+    }
+
+    #[test]
+    fn ack_processing_rules() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(t(0)).len(), 1);
+        // ACK of data not yet sent: answered with an ACK, otherwise ignored.
+        assert_eq!(f.ack(tm(10), data(5000), 20000), Reaction::None);
+        let segs = f.drain(tm(10));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(1000), 0));
+        assert_eq!(segs[0].0.flags, TcpFlags::ACK);
+        assert_eq!((f.tcb.snd_una, f.tcb.snd_wnd), (data(0), 10000));
+        // Window update from a later segment, then an older one (SEG.SEQ < SND.WL1) is ignored.
+        let peer = PEER_ISN.wrapping_add(1);
+        assert_eq!(
+            f.ack_seq(tm(20), peer.wrapping_add(4), data(1000), 20000),
+            Reaction::None
+        );
+        assert_eq!((f.tcb.snd_una, f.tcb.snd_wnd), (data(1000), 20000));
+        assert_eq!(f.ack_seq(tm(30), peer, data(1000), 0), Reaction::None);
+        assert_eq!(f.tcb.snd_wnd, 20000);
+        // A peer window field is scaled by the shift from its SYN/ACK.
+        let mut f = Fixture::unbounded(ConnectConfig::default());
+        f.synack(100, &opts(Some(MSS), Some(3)));
+        assert_eq!(f.tcb.snd_wnd, 100, "SYN/ACK window unscaled");
+        assert_eq!(f.ack(t(0), ISN.wrapping_add(1), 100), Reaction::None);
+        assert_eq!(f.tcb.snd_wnd, 800);
+        assert_eq!(f.tcb.max_snd_wnd, 800);
+    }
+
+    #[derive(Default)]
+    struct CcLog {
+        init: Option<u32>,
+        acks: Vec<(u32, Option<Duration>, u32)>,
+        events: Vec<CongestionEvent>,
+    }
+
+    /// Fixed 2-segment window that records what the `Tcb` reports.
+    struct Recording(Rc<RefCell<CcLog>>);
+
+    impl CongestionControl for Recording {
+        fn init(&mut self, smss: u32) {
+            self.0.borrow_mut().init = Some(smss);
+        }
+        fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
+            self.0.borrow_mut().acks.push((acked, rtt, in_flight));
+        }
+        fn on_congestion(&mut self, ev: CongestionEvent, _: Instant) {
+            self.0.borrow_mut().events.push(ev);
+        }
+        fn cwnd(&self) -> u32 {
+            2 * u32::from(MSS)
+        }
+    }
+
+    #[test]
+    fn cc_gates_sending_and_sees_acks_and_rto() {
+        let log = Rc::new(RefCell::new(CcLog::default()));
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(Recording(log.clone())), h);
+        f.establish(10 * MSS);
+        assert_eq!(log.borrow().init, Some(u32::from(MSS)));
+        f.write(&pattern(5000));
+        let segs = f.drain(t(0));
+        assert_eq!(segs.len(), 2, "cwnd = 2 segments");
+        assert_eq!(f.ack(tm(100), data(1000), 10 * MSS), Reaction::None);
+        assert_eq!(
+            log.borrow().acks,
+            vec![(1000, Some(Duration::from_millis(100)), 1000)]
+        );
+        let segs = f.drain(tm(100));
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0.seq, data(2000));
+        // RTO restarted by the ACK at 0.1 s.
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
+        assert_eq!(f.timeout(tm(1100)), Reaction::None);
+        assert_eq!(log.borrow().events, vec![CongestionEvent::Rto]);
+        let segs = f.drain(tm(1100));
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.seq, segs[0].0.len), (data(1000), 1000));
+    }
+
+    /// A send buffer whose runs are at most 7 octets, as at many internal buffer boundaries.
+    struct ShortRuns(PlainHooks);
+
+    impl SendBuf for ShortRuns {
+        fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+            self.0.peek_with(rel_ssn, max.min(7), f)
+        }
+        fn assigned_end(&self) -> u32 {
+            self.0.assigned_end()
+        }
+        fn mark_acked(&mut self, rel_ssn_una: u32) {
+            self.0.mark_acked(rel_ssn_una)
+        }
+    }
+
+    impl SegmentHooks for ShortRuns {
+        fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
+            self.0.accept_payload(rel_ssn, data)
+        }
+        fn recv_window(&self) -> u32 {
+            self.0.recv_window()
+        }
+    }
+
+    #[test]
+    fn segment_filled_across_short_runs() {
+        let cfg = ConnectConfig::default();
+        let h = ShortRuns(PlainHooks::new(&cfg));
+        let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
+        f.establish(10 * MSS);
+        f.tcb.set_nodelay(true);
+        let bytes = pattern(2500);
+        assert_eq!(f.h.0.write(&bytes), 2500);
+        let segs = f.drain(t(0));
+        let lens: Vec<_> = segs.iter().map(|(m, _)| m.len).collect();
+        assert_eq!(lens, [1000, 1000, 500]);
+        let sent: Vec<u8> = segs.into_iter().flat_map(|(_, p)| p).collect();
+        assert_eq!(sent, bytes);
     }
 }
