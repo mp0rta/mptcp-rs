@@ -52,6 +52,10 @@ impl Connection {
     }
 
     /// Half-closes: the FIN follows the queued data. Reading stays possible.
+    ///
+    /// In SYN-SENT this instead deletes the connection: queued writes are discarded and
+    /// `Closed { Normal }` is reported. Wait for `Event::Connected` before `close` if the
+    /// queued data must be delivered.
     pub fn close(&mut self) {
         self.closed_by_app = true;
         self.tcb.close();

@@ -11,8 +11,8 @@ struct Outcome {
     closed: Vec<CloseReason>,
 }
 
-/// Client writes `up` bytes then closes; the peer sends `down` bytes then closes after the
-/// client's FIN. Virtual clock jumps to the next timer or packet arrival.
+/// Client writes `up` bytes then closes; the peer sends `down` bytes and FINs right after them
+/// (`peer.close()` is called up front). Virtual clock jumps to the next timer or packet arrival.
 fn run(v6: bool, len: usize, seed: u64, loss: u32, reorder: u32) -> Outcome {
     let (up, down) = (pattern(len, 0), pattern(len, 13));
     let mut ep = endpoint(seed);

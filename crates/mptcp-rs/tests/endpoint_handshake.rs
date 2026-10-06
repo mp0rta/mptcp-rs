@@ -1,7 +1,7 @@
 mod support;
 
 use mptcp_rs::wire::packet::TcpFlags;
-use mptcp_rs::{CloseReason, ConnectConfig, ConnectError, Event, ReadError, SeqNum};
+use mptcp_rs::{CloseReason, ConnectConfig, ConnectError, Event, ReadError};
 use support::*;
 
 #[test]
@@ -74,6 +74,10 @@ fn reset_delivers_event_and_read_err() {
                 reason: CloseReason::Reset
             }
         ))
+    );
+    assert_eq!(
+        ep.connection(h).unwrap().write(b"x"),
+        Err(mptcp_rs::WriteError::Closed)
     );
     assert_eq!(
         ep.connection(h).unwrap().read(&mut [0u8; 8]),
@@ -220,5 +224,4 @@ fn ports_exhausted_gives_no_port() {
         ep.connect(t(1), local_ip(false), other, ConnectConfig::default())
             .is_ok()
     );
-    let _ = SeqNum(0);
 }

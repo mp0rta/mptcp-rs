@@ -1,7 +1,7 @@
 //! The sans-I/O entry point: owns every connection, demultiplexes packets and builds output
 //! (spec §1, §3.1).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
 use rand_core::CryptoRng;
@@ -10,7 +10,7 @@ use crate::Instant;
 use crate::SeqNum;
 use crate::connection::Connection;
 use crate::crypto::IsnGenerator;
-use crate::tcp::{CloseReason, ConnectConfig, PlainHooks, Reaction, SegmentWriter, Tcb};
+use crate::tcp::{CloseReason, ConnectConfig, PlainHooks, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
 
 /// Queued RSTs for segments without a TCB; beyond this they are dropped.
@@ -50,8 +50,8 @@ pub struct Endpoint<R: CryptoRng> {
     rng: R,
     isn: IsnGenerator,
     conns: BTreeMap<ConnectionHandle, Connection>,
-    /// (local, remote) → handle. Closed and TIME-WAIT TCBs stay until `handle_timeout`.
-    demux: HashMap<(SocketAddr, SocketAddr), ConnectionHandle>,
+    /// (local, remote) → handle (a BTreeMap: no OS-seeded hasher in the core). Closed and TIME-WAIT TCBs stay until `handle_timeout`.
+    demux: BTreeMap<(SocketAddr, SocketAddr), ConnectionHandle>,
     next_handle: u64,
     /// Round-robin cursor for `poll_transmit`.
     cursor: u64,
@@ -69,7 +69,7 @@ impl<R: CryptoRng> Endpoint<R> {
             rng,
             isn: IsnGenerator::new(secret),
             conns: BTreeMap::new(),
-            demux: HashMap::new(),
+            demux: BTreeMap::new(),
             next_handle: 0,
             cursor: 0,
             ip_id: 0,
@@ -207,31 +207,32 @@ impl<R: CryptoRng> Endpoint<R> {
                 return Some(n);
             }
         }
-        let handles: Vec<ConnectionHandle> = self
-            .conns
-            .range(ConnectionHandle(self.cursor)..)
-            .chain(self.conns.range(..ConnectionHandle(self.cursor)))
-            .map(|(h, _)| *h)
-            .collect();
-        for h in handles {
-            let c = self.conns.get_mut(&h)?;
-            let Some(_) = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch) else {
-                continue;
-            };
-            self.cursor = h.0 + 1;
-            let w = &self.scratch;
-            let seg = Segment {
-                src: c.local,
-                dst: c.remote,
-                seq: w.seq,
-                ack: w.ack,
-                flags: w.flags,
-                wnd: w.wnd,
-                options: w.options(),
-                payload: &w.payload,
-            };
-            if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                return Some(n);
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let cursor = ConnectionHandle(self.cursor);
+        // Round robin from the cursor, then wrap around; no allocation.
+        for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
+            for (h, c) in self.conns.range_mut(bounds) {
+                if c.tcb
+                    .poll_send(now, &mut c.hooks, &mut self.scratch)
+                    .is_none()
+                {
+                    continue;
+                }
+                self.cursor = h.0 + 1;
+                let w = &self.scratch;
+                let seg = Segment {
+                    src: c.local,
+                    dst: c.remote,
+                    seq: w.seq,
+                    ack: w.ack,
+                    flags: w.flags,
+                    wnd: w.wnd,
+                    options: w.options(),
+                    payload: &w.payload,
+                };
+                if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
+                    return Some(n);
+                }
             }
         }
         None
@@ -262,7 +263,7 @@ impl<R: CryptoRng> Endpoint<R> {
         }
         let demux = &mut self.demux;
         self.conns.retain(|_, c| {
-            let keep = c.tcb.state() != crate::tcp::TcpState::Closed;
+            let keep = c.tcb.state() != TcpState::Closed;
             if !keep {
                 demux.remove(&(c.local, c.remote));
             }
