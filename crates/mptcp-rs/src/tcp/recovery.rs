@@ -29,8 +29,9 @@ pub(crate) enum NewAck {
 #[derive(Debug)]
 pub(crate) struct NewReno {
     /// RFC 6582 "recover": the highest sequence number sent when fast retransmit was last
-    /// entered or the retransmission timer last expired.
-    recover: SeqNum,
+    /// entered or the retransmission timer last expired. `None` once SND.UNA has moved past it
+    /// (no constraint); this keeps the modular comparison from going stale after 2^31 octets.
+    recover: Option<SeqNum>,
     /// Duplicate ACKs since SND.UNA last moved.
     dupacks: u32,
     /// In fast recovery, and whether a partial ACK has arrived in it.
@@ -41,10 +42,10 @@ pub(crate) struct NewReno {
 }
 
 impl NewReno {
-    /// RFC 6582 §3.2 step 1: recover = ISS.
-    pub(crate) fn new(iss: SeqNum) -> Self {
+    /// RFC 6582 §3.2 step 1: recover = ISS, which no ACK can be below: no constraint.
+    pub(crate) fn new(_iss: SeqNum) -> Self {
         Self {
-            recover: iss,
+            recover: None,
             dupacks: 0,
             in_recovery: false,
             partial_seen: false,
@@ -68,21 +69,29 @@ impl NewReno {
         self.dupacks += 1;
         // RFC 6582 §3.2 step 2: only if the ACK covers more than recover (ack − 1 > recover);
         // otherwise neither fast retransmit nor an ssthresh change.
-        if self.dupacks != 3 || !ack.wrapping_add(u32::MAX).gt(self.recover) {
+        if self.dupacks != 3 || !self.passes_recover(ack.wrapping_add(u32::MAX)) {
             return DupAck::Ignore;
         }
-        self.recover = snd_max.wrapping_add(u32::MAX);
+        self.recover = Some(snd_max.wrapping_add(u32::MAX));
         self.in_recovery = true;
         self.partial_seen = false;
         DupAck::FastRetransmit
     }
 
+    fn passes_recover(&self, seq: SeqNum) -> bool {
+        self.recover.is_none_or(|r| seq.gt(r))
+    }
+
     /// An ACK that moved SND.UNA to `ack` (RFC 6582 §3.2 step 3).
     pub(crate) fn on_new_ack(&mut self, ack: SeqNum) -> NewAck {
         self.dupacks = 0;
+        let full = self.passes_recover(ack);
+        if self.passes_recover(ack.wrapping_add(u32::MAX)) {
+            self.recover = None;
+        }
         if !self.in_recovery {
             NewAck::Normal
-        } else if ack.gt(self.recover) {
+        } else if full {
             self.in_recovery = false;
             NewAck::Full
         } else {
@@ -94,8 +103,30 @@ impl NewReno {
 
     /// RFC 6582 §3.2 step 4 / §4: the retransmission timer expired.
     pub(crate) fn on_rto(&mut self, snd_max: SeqNum) {
-        self.recover = snd_max.wrapping_add(u32::MAX);
+        self.recover = Some(snd_max.wrapping_add(u32::MAX));
         self.in_recovery = false;
         self.dupacks = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "recover" must not go stale: after more than 2^31 octets without loss, three duplicate
+    /// ACKs still trigger fast retransmit.
+    #[test]
+    fn recover_does_not_go_stale_after_2_pow_31() {
+        let mut r = NewReno::new(SeqNum(0));
+        r.on_rto(SeqNum(1000)); // recover = 999
+        let mut ack = SeqNum(1000);
+        for _ in 0..3 {
+            ack = ack.wrapping_add(1 << 30);
+            assert_eq!(r.on_new_ack(ack), NewAck::Normal);
+        }
+        let snd_max = ack.wrapping_add(5000);
+        assert_eq!(r.on_dup_ack(ack, snd_max), DupAck::Ignore);
+        assert_eq!(r.on_dup_ack(ack, snd_max), DupAck::Ignore);
+        assert_eq!(r.on_dup_ack(ack, snd_max), DupAck::FastRetransmit);
     }
 }
