@@ -88,6 +88,9 @@ impl<R: CryptoRng> Endpoint<R> {
         remote: SocketAddr,
         cfg: ConnectConfig,
     ) -> Result<ConnectionHandle, ConnectError> {
+        // The wire carries only IP and port: drop IPv6 flow info and scope so demux keys match
+        // what `packet::parse` builds.
+        let remote = SocketAddr::new(remote.ip(), remote.port());
         let min_mtu = match (local, remote.ip()) {
             (IpAddr::V4(_), IpAddr::V4(_)) => 68,
             (IpAddr::V6(_), IpAddr::V6(_)) => 1280,

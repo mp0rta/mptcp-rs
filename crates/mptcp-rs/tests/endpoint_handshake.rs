@@ -290,3 +290,32 @@ fn passive_close_keeps_unread_data_readable() {
     assert!(ep.connection(h).is_none());
     assert_eq!(ep.poll_timeout(), None);
 }
+
+#[test]
+fn scoped_ipv6_remote_is_normalized_to_wire_form() {
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+    let mut ep = endpoint(9);
+    let remote = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2),
+        80,
+        7,
+        3,
+    ));
+    let h = ep
+        .connect(
+            t(1),
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            remote,
+            ConnectConfig::default(),
+        )
+        .unwrap();
+    let syn = expect_syn(&drain(&mut ep, t(1)));
+    send_synack(&mut ep, t(1), &syn, 5000);
+    assert_eq!(
+        ep.poll_event(),
+        Some((h, Event::Connected { mptcp: false }))
+    );
+    for p in drain(&mut ep, t(1)) {
+        assert!(!parse_owned(&p).flags.contains(TcpFlags::RST));
+    }
+}
