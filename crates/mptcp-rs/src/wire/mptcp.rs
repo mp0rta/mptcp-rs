@@ -1,4 +1,4 @@
-//! MPTCP option codec (RFC 8684 §3.1, §3.2, §3.5, §7.2). DSS is added by a later task.
+//! MPTCP option codec (RFC 8684 §3.1, §3.2, §3.3, §3.5, §7.2).
 
 pub const KIND_MPTCP: u8 = 30;
 pub const CAP_A: u8 = 0x80;
@@ -6,8 +6,15 @@ pub const CAP_B: u8 = 0x40;
 pub const CAP_C: u8 = 0x20;
 pub const CAP_H: u8 = 0x01;
 
+const DSS_F: u8 = 0x10;
+const DSS_M64: u8 = 0x08;
+const DSS_M: u8 = 0x04;
+const DSS_A64: u8 = 0x02;
+const DSS_A: u8 = 0x01;
+
 const ST_CAPABLE: u8 = 0x0;
 const ST_JOIN: u8 = 0x1;
+const ST_DSS: u8 = 0x2;
 const ST_FASTCLOSE: u8 = 0x7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +57,38 @@ pub enum MpJoin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataAck {
+    Ack32(u32),
+    Ack64(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dsn {
+    Dsn32(u32),
+    Dsn64(u64),
+}
+
+/// Data Sequence Mapping. `data_len == 0` is an infinite mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mapping {
+    pub dsn: Dsn,
+    pub ssn: u32,
+    pub data_len: u16,
+    /// Present on the wire only if checksums were negotiated.
+    pub checksum: Option<u16>,
+}
+
+/// DSS option. The M/m/A/a/F wire flags are derived from these fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dss {
+    pub data_fin: bool,
+    pub data_ack: Option<DataAck>,
+    pub mapping: Option<Mapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MptcpOption {
+    Dss(Dss),
     Capable(MpCapable),
     Join(MpJoin),
     FastClose { receiver_key: u64 },
@@ -68,6 +106,56 @@ fn u32_at(b: &[u8], i: usize) -> Result<u32, MptcpError> {
 fn u16_at(b: &[u8], i: usize) -> Result<u16, MptcpError> {
     let s = b.get(i..i + 2).ok_or(MptcpError::BadLength)?;
     Ok(u16::from_be_bytes(s.try_into().unwrap()))
+}
+
+fn parse_dss(opt: &[u8]) -> Result<Dss, MptcpError> {
+    let f = opt[3];
+    let ack_len = match (f & DSS_A != 0, f & DSS_A64 != 0) {
+        (false, _) => 0,
+        (true, false) => 4,
+        (true, true) => 8,
+    };
+    let dsn_len = if f & DSS_M64 != 0 { 8 } else { 4 };
+    let base = 4 + ack_len;
+    // Reserved bits are ignored; `a`/`m` are ignored without A/M.
+    let has_map = f & DSS_M != 0;
+    let has_ck = match (has_map, opt.len()) {
+        (false, l) if l == base => false,
+        (true, l) if l == base + dsn_len + 6 => false,
+        (true, l) if l == base + dsn_len + 8 => true,
+        _ => return Err(MptcpError::BadLength),
+    };
+    let data_ack = match ack_len {
+        4 => Some(DataAck::Ack32(u32_at(opt, 4)?)),
+        8 => Some(DataAck::Ack64(u64_at(opt, 4)?)),
+        _ => None,
+    };
+    let mapping = if has_map {
+        let o = base;
+        let dsn = if dsn_len == 8 {
+            Dsn::Dsn64(u64_at(opt, o)?)
+        } else {
+            Dsn::Dsn32(u32_at(opt, o)?)
+        };
+        let o = o + dsn_len;
+        Some(Mapping {
+            dsn,
+            ssn: u32_at(opt, o)?,
+            data_len: u16_at(opt, o + 4)?,
+            checksum: if has_ck {
+                Some(u16_at(opt, o + 6)?)
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+    Ok(Dss {
+        data_fin: f & DSS_F != 0,
+        data_ack,
+        mapping,
+    })
 }
 
 pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
@@ -129,6 +217,7 @@ pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
                 _ => return Err(MptcpError::BadLength),
             }))
         }
+        ST_DSS => parse_dss(opt).map(MptcpOption::Dss),
         ST_FASTCLOSE => {
             if len != 12 {
                 return Err(MptcpError::BadLength);
@@ -142,7 +231,7 @@ pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
 }
 
 pub fn encode(o: &MptcpOption, out: &mut [u8]) -> Result<usize, MptcpError> {
-    let mut buf = [0u8; 24];
+    let mut buf = [0u8; 28];
     let len = match o {
         MptcpOption::Capable(c) => {
             if c.version > 0x0f {
@@ -200,6 +289,51 @@ pub fn encode(o: &MptcpOption, out: &mut [u8]) -> Result<usize, MptcpError> {
             buf[2] = ST_JOIN << 4;
             buf[4..24].copy_from_slice(hmac160);
             24
+        }
+        MptcpOption::Dss(d) => {
+            // RFC 8684 §3.3.3: DATA_FIN always rides on a mapping.
+            if d.data_fin && d.mapping.is_none() {
+                return Err(MptcpError::InvalidFields);
+            }
+            let mut f = if d.data_fin { DSS_F } else { 0 };
+            let mut n = 4;
+            match d.data_ack {
+                Some(DataAck::Ack32(a)) => {
+                    f |= DSS_A;
+                    buf[n..n + 4].copy_from_slice(&a.to_be_bytes());
+                    n += 4;
+                }
+                Some(DataAck::Ack64(a)) => {
+                    f |= DSS_A | DSS_A64;
+                    buf[n..n + 8].copy_from_slice(&a.to_be_bytes());
+                    n += 8;
+                }
+                None => {}
+            }
+            if let Some(m) = &d.mapping {
+                f |= DSS_M;
+                match m.dsn {
+                    Dsn::Dsn32(v) => {
+                        buf[n..n + 4].copy_from_slice(&v.to_be_bytes());
+                        n += 4;
+                    }
+                    Dsn::Dsn64(v) => {
+                        f |= DSS_M64;
+                        buf[n..n + 8].copy_from_slice(&v.to_be_bytes());
+                        n += 8;
+                    }
+                }
+                buf[n..n + 4].copy_from_slice(&m.ssn.to_be_bytes());
+                buf[n + 4..n + 6].copy_from_slice(&m.data_len.to_be_bytes());
+                n += 6;
+                if let Some(c) = m.checksum {
+                    buf[n..n + 2].copy_from_slice(&c.to_be_bytes());
+                    n += 2;
+                }
+            }
+            buf[2] = ST_DSS << 4;
+            buf[3] = f;
+            n
         }
         MptcpOption::FastClose { receiver_key } => {
             buf[2] = ST_FASTCLOSE << 4;
@@ -342,11 +476,6 @@ mod tests {
             parse(&[30, 4, 0x50, 0]).unwrap(),
             MptcpOption::Unknown { subtype: 5 }
         );
-        // DSS is parsed by a later task; until then it is Unknown.
-        assert_eq!(
-            parse(&[30, 4, 0x20, 0]).unwrap(),
-            MptcpOption::Unknown { subtype: 2 }
-        );
     }
     #[test]
     fn bad_lengths_are_errors() {
@@ -370,5 +499,141 @@ mod tests {
             Err(MptcpError::NoSpace)
         );
         assert_eq!(encode(&fastclose(1), &mut [0u8; 12]), Ok(12));
+    }
+
+    fn dss(m: Option<Mapping>, a: Option<DataAck>, fin: bool) -> MptcpOption {
+        MptcpOption::Dss(Dss {
+            data_fin: fin,
+            data_ack: a,
+            mapping: m,
+        })
+    }
+    fn map(dsn: Dsn, ck: Option<u16>) -> Mapping {
+        Mapping {
+            dsn,
+            ssn: 0x0a0b0c0d,
+            data_len: 1400,
+            checksum: ck,
+        }
+    }
+    #[test]
+    fn dss_ack64_only_is_12() {
+        let d = dss(None, Some(DataAck::Ack64(7)), false);
+        let mut b = [0u8; 40];
+        assert_eq!(encode(&d, &mut b).unwrap(), 12);
+        assert_eq!(&b[..4], &[30, 12, 0x20, 0x03]);
+        assert_eq!(&b[4..12], &7u64.to_be_bytes());
+        assert_eq!(parse(&b[..12]).unwrap(), d);
+    }
+    #[test]
+    fn dss_ack64_map64_is_26() {
+        let d = dss(
+            Some(map(Dsn::Dsn64(KA), None)),
+            Some(DataAck::Ack64(KB)),
+            false,
+        );
+        let w = roundtrip(d);
+        assert_eq!(w.len(), 26);
+        assert_eq!(&w[..4], &[30, 26, 0x20, 0x0f]);
+        assert_eq!(&w[4..12], &KB.to_be_bytes());
+        assert_eq!(&w[12..20], &KA.to_be_bytes());
+        assert_eq!(&w[20..24], &[0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(&w[24..], &1400u16.to_be_bytes());
+    }
+    #[test]
+    fn dss_full_with_checksum_is_28() {
+        let d = dss(
+            Some(map(Dsn::Dsn64(KA), Some(0xbeef))),
+            Some(DataAck::Ack64(KB)),
+            false,
+        );
+        let w = roundtrip(d);
+        assert_eq!(w.len(), 28);
+        assert_eq!(&w[..4], &[30, 28, 0x20, 0x0f]);
+        assert_eq!(&w[26..], &[0xbe, 0xef]);
+    }
+    #[test]
+    fn dss_32bit_fields_roundtrip() {
+        let d = dss(
+            Some(map(Dsn::Dsn32(0x11223344), Some(0x1234))),
+            Some(DataAck::Ack32(0x55667788)),
+            false,
+        );
+        let w = roundtrip(d);
+        assert_eq!(w.len(), 4 + 4 + 4 + 4 + 2 + 2);
+        assert_eq!(&w[..4], &[30, 20, 0x20, 0x05]);
+        assert_eq!(&w[4..8], &[0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(&w[8..12], &[0x11, 0x22, 0x33, 0x44]);
+        // Without checksum: 4+4+4+4+2 = 18.
+        let w = roundtrip(dss(
+            Some(map(Dsn::Dsn32(1), None)),
+            Some(DataAck::Ack32(2)),
+            false,
+        ));
+        assert_eq!(w.len(), 18);
+    }
+    #[test]
+    fn dss_data_fin_flag() {
+        let d = dss(Some(map(Dsn::Dsn64(KA), None)), None, true);
+        let w = roundtrip(d);
+        assert_eq!(w[3], 0x10 | 0x08 | 0x04);
+        match parse(&w).unwrap() {
+            MptcpOption::Dss(x) => assert!(x.data_fin),
+            _ => panic!(),
+        }
+    }
+    #[test]
+    fn dss_data_fin_without_mapping_is_invalid() {
+        // RFC 8684 s3.3.3: a bare DATA_FIN still carries a mapping (len 1).
+        for a in [None, Some(DataAck::Ack32(1))] {
+            assert_eq!(
+                encode(&dss(None, a, true), &mut [0u8; 40]),
+                Err(MptcpError::InvalidFields)
+            );
+        }
+    }
+    #[test]
+    fn dss_infinite_mapping_parses() {
+        let mut m = map(Dsn::Dsn64(KA), None);
+        m.data_len = 0;
+        roundtrip(dss(Some(m), None, false));
+    }
+    #[test]
+    fn dss_length_flag_mismatch_is_error() {
+        // A|a set (needs 12) but length 8.
+        assert_eq!(
+            parse(&[30, 8, 0x20, 0x03, 0, 0, 0, 0]),
+            Err(MptcpError::BadLength)
+        );
+        // A only, 4-byte ack, but length 12.
+        assert_eq!(
+            parse(&[30, 12, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(MptcpError::BadLength)
+        );
+        // M|m needs 20 or 22; 21 is wrong.
+        let mut b = [0u8; 21];
+        b[..4].copy_from_slice(&[30, 21, 0x20, 0x0c]);
+        assert_eq!(parse(&b), Err(MptcpError::BadLength));
+        // No A, no M: only the bare 4-byte form is valid.
+        assert_eq!(parse(&[30, 4, 0x20, 0x00]).map(|_| ()), Ok(()));
+        assert_eq!(
+            parse(&[30, 8, 0x20, 0x00, 0, 0, 0, 0]),
+            Err(MptcpError::BadLength)
+        );
+    }
+    #[test]
+    fn dss_reserved_bits_ignored() {
+        let mut w = [30u8, 8, 0x20, 0xe3, 0, 0, 0, 9];
+        // 0xe3 = reserved bits + a + A; a without room is a length error, so use 12.
+        assert_eq!(parse(&w), Err(MptcpError::BadLength));
+        let mut b = [0u8; 12];
+        b[..4].copy_from_slice(&[30, 12, 0x20, 0xe3]);
+        b[11] = 7;
+        assert_eq!(
+            parse(&b).unwrap(),
+            dss(None, Some(DataAck::Ack64(7)), false)
+        );
+        w[3] = 0xe1;
+        assert_eq!(parse(&w[..4]), Err(MptcpError::BadLength));
     }
 }
