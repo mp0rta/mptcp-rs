@@ -70,6 +70,11 @@ impl PlainHooks {
         n
     }
 
+    #[cfg(test)]
+    fn ooo_pieces(&self) -> usize {
+        self.ooo.len()
+    }
+
     /// Whether received in-order bytes are waiting to be read.
     pub fn has_unread(&self) -> bool {
         !self.recv.is_empty()
@@ -120,7 +125,24 @@ impl SegmentHooks for PlainHooks {
     fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
         if rel_ssn != self.recv_end {
             self.ooo_len += data.len();
-            let old = self.ooo.insert(rel_ssn, data.to_vec());
+            // Merge into touching neighbours so the entry count follows the Tcb's receipt ranges,
+            // not the number of segments the peer sent.
+            let end = rel_ssn.wrapping_add(data.len() as u32);
+            let prev = self
+                .ooo
+                .range(..rel_ssn)
+                .next_back()
+                .filter(|(k, v)| k.wrapping_add(v.len() as u32) == rel_ssn)
+                .map(|(k, _)| *k);
+            let (key, mut piece) = match prev {
+                Some(k) => (k, self.ooo.remove(&k).unwrap_or_default()),
+                None => (rel_ssn, Vec::with_capacity(data.len())),
+            };
+            piece.extend_from_slice(data);
+            if let Some(next) = self.ooo.remove(&end) {
+                piece.extend(next);
+            }
+            let old = self.ooo.insert(key, piece);
             debug_assert!(old.is_none(), "the Tcb hands each octet over once");
             return;
         }
@@ -205,6 +227,27 @@ mod tests {
         assert_eq!(buf[0], b'e');
         assert_eq!(h.read(&mut buf), 0);
         assert_eq!(h.recv_window(), 8);
+    }
+
+    #[test]
+    fn recv_adjacent_out_of_order_pieces_coalesce() {
+        let mut h = hooks(8, 1 << 20);
+        for i in 2..5002u32 {
+            h.accept_payload(i, &[(i % 251) as u8]);
+        }
+        assert!(h.ooo_pieces() <= 64, "{} pieces", h.ooo_pieces());
+        // fill from the back and the middle too: still one run
+        h.accept_payload(5003, b"z");
+        h.accept_payload(5002, &[(5002 % 251) as u8]);
+        assert_eq!(h.ooo_pieces(), 1);
+        h.accept_payload(1, &[1]);
+        let mut buf = vec![0u8; 6000];
+        assert_eq!(h.read(&mut buf), 5003);
+        for i in 1..5003usize {
+            assert_eq!(buf[i - 1], (i % 251) as u8);
+        }
+        assert_eq!(buf[5002], b'z');
+        assert_eq!(h.recv_window(), 1 << 20);
     }
 
     #[test]
