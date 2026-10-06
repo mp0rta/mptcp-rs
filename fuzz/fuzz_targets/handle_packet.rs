@@ -67,8 +67,8 @@ fuzz_target!(|data: &[u8]| {
         ep.connection(h).unwrap().write(&[0xab; 4000]).unwrap();
         drain(&mut ep, t);
         let mut rest = rest;
-        while rest.len() >= 8 {
-            let (d, r) = rest.split_at(8);
+        while rest.len() >= 9 {
+            let (d, r) = rest.split_at(9);
             let sd = i16::from_be_bytes([d[0], d[1]]);
             let ad = i16::from_be_bytes([d[2], d[3]]);
             let olen = usize::from(d[6] % 41);
@@ -97,7 +97,7 @@ fuzz_target!(|data: &[u8]| {
             if let Some(c) = ep.connection(h) {
                 let _ = c.read(&mut [0u8; 4096]);
             }
-            t = t + Duration::from_millis(u64::from(d[5]));
+            t = t + Duration::from_millis(u64::from(d[8]));
             ep.handle_timeout(t);
             drain(&mut ep, t);
         }
