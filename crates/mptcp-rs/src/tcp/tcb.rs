@@ -428,9 +428,11 @@ impl Tcb {
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = seg.ack;
         }
-        // Nothing outstanding: this ACK answered any zero-window probe (MUST-37).
-        if self.in_flight() == 0 {
-            self.r2_since = None;
+        // An acceptable ACK with nothing outstanding or a zero window answers the probe (the
+        // zero-length one, or the retransmission that probes while data is unacknowledged):
+        // answered probes do not count toward R2 (MUST-37).
+        if self.in_flight() == 0 || self.snd_wnd == 0 {
+            self.r2_since = (self.in_flight() > 0).then_some(now);
         }
         Reaction::None
     }
@@ -446,7 +448,8 @@ impl Tcb {
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
             self.retransmit_due = true;
-            self.cc.on_congestion(CongestionEvent::Rto, now);
+            self.cc
+                .on_congestion(CongestionEvent::Rto, self.in_flight(), now);
         }
         if self.persist_at.is_some_and(|t| now >= t) {
             self.probe_due = true;
@@ -479,6 +482,9 @@ impl Tcb {
 
         // RFC 9293 §3.8.6.1; never armed while data is unacknowledged.
         if idle && queued > 0 && self.snd_wnd == 0 {
+            // Persist replaces the SWS override for this zero-window episode.
+            self.sws_at = None;
+            self.sws_override = false;
             if self.persist_at.is_none() {
                 self.persist_ivl = self.rtt.rto();
                 self.persist_at = Some(now + self.persist_ivl);
@@ -1336,7 +1342,7 @@ mod tests {
     struct CcLog {
         init: Option<u32>,
         acks: Vec<(u32, Option<Duration>, u32)>,
-        events: Vec<CongestionEvent>,
+        events: Vec<(CongestionEvent, u32)>,
     }
 
     /// Fixed 2-segment window that records what the `Tcb` reports.
@@ -1349,8 +1355,8 @@ mod tests {
         fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
             self.0.borrow_mut().acks.push((acked, rtt, in_flight));
         }
-        fn on_congestion(&mut self, ev: CongestionEvent, _: Instant) {
-            self.0.borrow_mut().events.push(ev);
+        fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
+            self.0.borrow_mut().events.push((ev, in_flight));
         }
         fn cwnd(&self) -> u32 {
             2 * u32::from(MSS)
@@ -1379,7 +1385,8 @@ mod tests {
         // RTO restarted by the ACK at 0.1 s.
         assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
         assert_eq!(f.timeout(tm(1100)), Reaction::None);
-        assert_eq!(log.borrow().events, vec![CongestionEvent::Rto]);
+        // FlightSize at the RTO: data(1000)..data(3000).
+        assert_eq!(log.borrow().events, vec![(CongestionEvent::Rto, 2000)]);
         let segs = f.drain(tm(1100));
         assert_eq!(segs.len(), 1);
         assert_eq!((segs[0].0.seq, segs[0].0.len), (data(1000), 1000));
@@ -1423,5 +1430,48 @@ mod tests {
         assert_eq!(lens, [1000, 1000, 500]);
         let sent: Vec<u8> = segs.into_iter().flat_map(|(_, p)| p).collect();
         assert_eq!(sent, bytes);
+    }
+
+    #[test]
+    fn answered_retransmission_probes_do_not_hit_r2() {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&pattern(500));
+        assert_eq!(f.drain(t(0)).len(), 1);
+        // The window closes with the data unacknowledged: each RTO retransmission is the probe.
+        assert_eq!(f.ack(tm(100), data(0), 0), Reaction::None);
+        let mut sends = Vec::new();
+        loop {
+            let at = f.tcb.poll_send_at().unwrap();
+            if at > t(300) {
+                break;
+            }
+            assert_eq!(f.timeout(at), Reaction::None);
+            let segs = f.drain(at);
+            assert_eq!(segs.len(), 1);
+            assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
+            sends.push(at);
+            assert_eq!(f.ack(at, data(0), 0), Reaction::None);
+        }
+        assert_eq!(sends, [1, 3, 7, 15, 31, 63, 123, 183, 243].map(t));
+        assert_eq!(f.tcb.state(), TcpState::Established);
+    }
+
+    #[test]
+    fn zero_window_discards_pending_sws_override() {
+        let mut f = Fixture::unbounded(ConnectConfig::default());
+        f.synack(8192, &opts(Some(1460), Some(0)));
+        f.drain(t(0));
+        f.ack(t(0), ISN.wrapping_add(1), 300);
+        f.write(&pattern(1000));
+        assert!(f.drain(t(0)).is_empty());
+        // The override fires, but the window closes before the next poll.
+        assert_eq!(f.timeout(tm(500)), Reaction::None);
+        f.ack(tm(500), ISN.wrapping_add(1), 0);
+        assert!(f.drain(tm(500)).is_empty());
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(1500)), "persist only");
+        // Reopened to a sub-SWS window: a fresh 500 ms override, not the stale one.
+        f.ack(tm(600), ISN.wrapping_add(1), 300);
+        assert!(f.drain(tm(600)).is_empty());
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
     }
 }

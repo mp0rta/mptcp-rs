@@ -14,10 +14,13 @@ pub enum CongestionEvent {
 pub trait CongestionControl {
     /// Called once when the connection reaches ESTABLISHED, with the effective send MSS.
     fn init(&mut self, _smss: u32) {}
-    /// `acked` octets newly acknowledged; `rtt` is the sample this ACK produced, if any;
-    /// `in_flight` is SND.NXT − SND.UNA after SND.UNA advanced.
+    /// Called when an ACK advances SND.UNA. `acked` is the number of octets newly
+    /// acknowledged; `rtt` is the RTT sample this ACK produced, if any; `in_flight` is
+    /// SND.NXT − SND.UNA *after* this ACK moved SND.UNA (octets still outstanding).
     fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, now: Instant);
-    fn on_congestion(&mut self, ev: CongestionEvent, now: Instant);
+    /// `in_flight` is FlightSize (RFC 5681): SND.NXT − SND.UNA at the event, before any
+    /// retransmission it triggers.
+    fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, now: Instant);
     /// Octets that may be outstanding.
     fn cwnd(&self) -> u32;
 }
@@ -35,7 +38,7 @@ pub(crate) struct Unbounded;
 
 impl CongestionControl for Unbounded {
     fn on_ack(&mut self, _: u32, _: Option<Duration>, _: u32, _: Instant) {}
-    fn on_congestion(&mut self, _: CongestionEvent, _: Instant) {}
+    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
     fn cwnd(&self) -> u32 {
         u32::MAX
     }
