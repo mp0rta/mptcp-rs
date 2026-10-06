@@ -10,3 +10,4 @@ authors.workspace = true
 sha2 = "0.11"
 hmac = "0.13"
 etherparse = "0.21"
+rangemap = "1.8"

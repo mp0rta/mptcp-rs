@@ -1,7 +1,10 @@
 //! Pure TCP state machine (RFC 9293), driven by segments, time and hooks (spec §3, §3.1).
 
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::time::Duration;
+
+use rangemap::RangeSet;
 
 use super::cc::{CongestionControl, CongestionEvent, Unbounded};
 use super::hooks::Hooks;
@@ -18,6 +21,10 @@ const MAX_WS_SHIFT: u8 = 14;
 const MAX_PERSIST: Duration = Duration::from_secs(60);
 /// Sender SWS override timeout (RFC 9293 §3.8.6.2.1 rule 4).
 const SWS_OVERRIDE: Duration = Duration::from_millis(500);
+/// Delayed ACK bound (RFC 9293 MUST-40: less than 0.5 s).
+const DELAYED_ACK: Duration = Duration::from_millis(200);
+/// Out-of-order receipt ranges kept at most; a segment that would add one more is dropped.
+const MAX_OOO_RANGES: usize = 64;
 
 /// Per-connection settings (spec §3; R2 is settable per connection, RFC 9293 MUST-21).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +156,18 @@ pub struct Tcb {
 
     // Receive sequence space.
     rcv_nxt: SeqNum,
+    /// Relative SSN of RCV.NXT, not wrapped (IRS + 1 is 1); keys `rcv_ooo`.
+    rcv_ssn: u64,
     /// Shift applied to our window fields (RFC 7323 Rcv.Wind.Shift). Holds our offer until the
     /// SYN/ACK; 0 if the peer did not offer.
     rcv_shift: u8,
+    /// Largest right window edge ever advertised (never moves left, RFC 9293 SHLD-14).
+    rcv_right_edge: SeqNum,
+    /// Out-of-order receipt ranges (headers only, spec §2 step 4), in unwrapped relative SSN.
+    /// Exactly the octets the hooks hold out of order.
+    rcv_ooo: RangeSet<u64>,
+    /// In-order data segments received since our last ACK.
+    rcv_unacked: u8,
 
     cc: Box<dyn CongestionControl>,
 
@@ -169,6 +185,8 @@ pub struct Tcb {
     persist_ivl: Duration,
     /// Sender SWS override timer (RFC 9293 §3.8.6.2.1 rule 4).
     sws_at: Option<Instant>,
+    /// Delayed-ACK deadline.
+    ack_at: Option<Instant>,
     /// First SYN transmission; R2 for the SYN counts from here.
     first_syn_at: Option<Instant>,
     closed_at: Option<Instant>,
@@ -220,7 +238,11 @@ impl Tcb {
             max_snd_wnd: 0,
             eff_mss: 0,
             rcv_nxt: SeqNum(0),
+            rcv_ssn: 0,
             rcv_shift: ws_shift(cfg.recv_buffer),
+            rcv_right_edge: SeqNum(0),
+            rcv_ooo: RangeSet::new(),
+            rcv_unacked: 0,
             cc,
             rtt: RttEstimator::new(),
             rto_at: None,
@@ -229,6 +251,7 @@ impl Tcb {
             persist_at: None,
             persist_ivl: Duration::ZERO,
             sws_at: None,
+            ack_at: None,
             first_syn_at: None,
             closed_at: None,
             syn_due: true,
@@ -239,6 +262,45 @@ impl Tcb {
             sws_override: false,
         };
         tcb.eff_mss = tcb.eff_mss_for(None);
+        tcb
+    }
+
+    /// ESTABLISHED as if our SYN had been answered by a SYN/ACK carrying `peer_mss` and
+    /// `peer_ws` (window 65535) at `now`; the handshake ACK is due. `cc::Unbounded`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_established(
+        cfg: &ConnectConfig,
+        local: SocketAddr,
+        remote: SocketAddr,
+        isn: SeqNum,
+        peer_isn: SeqNum,
+        peer_mss: Option<u16>,
+        peer_ws: Option<u8>,
+        now: Instant,
+    ) -> Tcb {
+        let mut tcb = Self::with_cc(cfg, local, remote, isn, now, Box::new(Unbounded));
+        tcb.syn_due = false;
+        tcb.snd_nxt = isn.wrapping_add(1);
+        let mut opts = [0u8; 8];
+        let mut n = 0;
+        if let Some(m) = peer_mss {
+            n += tcp_options::write_mss(&mut opts[n..], m);
+        }
+        if let Some(s) = peer_ws {
+            n += tcp_options::write_ws(&mut opts[n..], s);
+        }
+        let synack = Segment {
+            src: remote,
+            dst: local,
+            seq: peer_isn,
+            ack: tcb.snd_nxt,
+            flags: TcpFlags::SYN | TcpFlags::ACK,
+            wnd: 65535,
+            options: &opts[..n],
+            payload: &[],
+        };
+        assert_eq!(tcb.on_segment_syn_sent(&synack, now), Reaction::Established);
         tcb
     }
 
@@ -254,7 +316,7 @@ impl Tcb {
     pub fn on_segment(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::SynSent => self.on_segment_syn_sent(seg, now),
-            TcpState::Established => self.on_ack(seg, now, h),
+            TcpState::Established => self.on_segment_sync(seg, now, h),
             _ => Reaction::None,
         }
     }
@@ -295,12 +357,16 @@ impl Tcb {
         if self.state == TcpState::Established {
             if let Some(meta) = self.poll_data(now, h, out) {
                 // Every data segment and probe carries the current ACK.
-                self.ack_due = false;
+                self.ack_sent();
                 return Some(meta);
+            }
+            // A read that let the window edge move is announced (RFC 9293 §3.8.6.2.2).
+            if !self.ack_due && self.window_update_due(h) {
+                self.ack_due = true;
             }
         }
         if self.ack_due {
-            self.ack_due = false;
+            self.ack_sent();
             let wnd = self.wnd_field(h);
             return Some(out.start(self.snd_nxt, self.rcv_nxt, TcpFlags::ACK, wnd));
         }
@@ -318,7 +384,7 @@ impl Tcb {
             }
             TcpState::Established => {
                 let r2 = self.r2_since.map(|t| t + self.cfg.r2_data);
-                [self.rto_at, r2, self.persist_at, self.sws_at]
+                [self.rto_at, r2, self.persist_at, self.sws_at, self.ack_at]
                     .into_iter()
                     .flatten()
                     .min()
@@ -363,6 +429,9 @@ impl Tcb {
             None => self.rcv_shift = 0,
         }
         self.rcv_nxt = seg.seq.wrapping_add(1);
+        self.rcv_ssn = 1;
+        // The window field of our SYN (unscaled) is the first edge advertised.
+        self.rcv_right_edge = self.rcv_nxt.wrapping_add(self.cfg.recv_buffer.min(65535));
         self.snd_una = seg.ack;
         self.snd_wnd = u32::from(seg.wnd);
         self.max_snd_wnd = self.snd_wnd;
@@ -393,15 +462,113 @@ impl Tcb {
         Reaction::None
     }
 
-    /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, CC and SND.WND.
-    /// Segment acceptability, RST/SYN checks and payload are not handled here.
-    fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
-        if !seg.flags.contains(TcpFlags::ACK) || seg.ack.lt(self.snd_una) {
+    /// RFC 9293 §3.10.7.4 in a synchronized state (ESTABLISHED so far). RST is not acted on
+    /// yet and FIN is ignored: an acceptable RST or FIN is dropped.
+    fn on_segment_sync(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
+        let rst = seg.flags.contains(TcpFlags::RST);
+        // First: an unacceptable segment draws an ACK, unless it is a RST, and is dropped.
+        if !self.acceptable(seg) {
+            self.ack_due |= !rst;
             return Reaction::None;
+        }
+        if rst {
+            return Reaction::None;
+        }
+        // Fourth: a SYN (e.g. a retransmitted SYN/ACK) draws a challenge ACK (RFC 5961 §4).
+        if seg.flags.contains(TcpFlags::SYN) {
+            self.ack_due = true;
+            return Reaction::None;
+        }
+        // Fifth.
+        if !seg.flags.contains(TcpFlags::ACK) {
+            return Reaction::None;
+        }
+        if let ControlFlow::Break(r) = self.on_ack(seg, now, h) {
+            return r;
+        }
+        // Seventh (URG is not processed: urgent data is delivered inline, RFC 6093).
+        self.on_text(seg, now, h);
+        Reaction::None
+    }
+
+    /// RFC 9293 Table 6, against the largest window advertised (RFC 7323 §2.4 rule 1).
+    fn acceptable(&self, seg: &Segment) -> bool {
+        let wnd = i64::from(self.rcv_wnd());
+        let len = seg.payload.len() as i64
+            + i64::from(seg.flags.contains(TcpFlags::SYN))
+            + i64::from(seg.flags.contains(TcpFlags::FIN));
+        let off = i64::from(self.rcv_nxt.distance(seg.seq));
+        let in_wnd = |o: i64| 0 <= o && o < wnd;
+        match (len, wnd) {
+            (0, 0) => off == 0,
+            (0, _) => in_wnd(off),
+            (_, 0) => false,
+            _ => in_wnd(off) || in_wnd(off + len - 1),
+        }
+    }
+
+    /// Seventh step for an acceptable segment: hands the octets that are new, inside the window
+    /// and fit the memory to the hooks once each, in order of SSN, and decides when to ACK
+    /// (RFC 5681 §4.2, RFC 9293 §3.8.6.3). Octets cut off are neither recorded nor ACKed.
+    fn on_text(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) {
+        if seg.payload.is_empty() {
+            return;
+        }
+        let off = i64::from(self.rcv_nxt.distance(seg.seq));
+        let end = off + seg.payload.len() as i64;
+        // Free memory counts from RCV.NXT with the held out-of-order octets inside it, so the
+        // octets at RCV.NXT always fit.
+        let held: u64 = self.rcv_ooo.iter().map(|r| r.end - r.start).sum();
+        let room = u64::from(self.rcv_wnd()).min(u64::from(h.recv_window()) + held);
+        let (lo, hi) = (off.max(0), end.min(room as i64));
+        let was_ooo = !self.rcv_ooo.is_empty();
+        if lo < hi {
+            let (s, e) = (self.rcv_ssn + lo as u64, self.rcv_ssn + hi as u64);
+            let new_range = lo > 0 && !self.rcv_ooo.overlaps(&(s - 1..e + 1));
+            if new_range && self.rcv_ooo.len() >= MAX_OOO_RANGES {
+                return;
+            }
+            for gap in self.rcv_ooo.gaps(&(s..e)) {
+                let at = |ssn: u64| ((ssn - self.rcv_ssn) as i64 - off) as usize;
+                h.accept_payload(gap.start as u32, &seg.payload[at(gap.start)..at(gap.end)]);
+            }
+            self.rcv_ooo.insert(s..e);
+            if let Some(r) = self
+                .rcv_ooo
+                .first()
+                .cloned()
+                .filter(|r| r.start == self.rcv_ssn)
+            {
+                self.rcv_nxt = self.rcv_nxt.wrapping_add((r.end - r.start) as u32);
+                self.rcv_ssn = r.end;
+                self.rcv_ooo.remove(r);
+            }
+        }
+        // Out of order, filling a gap, or cut short by the window or the memory: ACK now.
+        if was_ooo || !self.rcv_ooo.is_empty() || hi < end {
+            self.ack_due = true;
+        } else {
+            // Every second segment, else within DELAYED_ACK (RFC 5681 §4.2: "at least every
+            // second segment, regardless of size").
+            self.rcv_unacked = self.rcv_unacked.saturating_add(1);
+            if self.rcv_unacked >= 2 {
+                self.ack_due = true;
+            } else {
+                self.ack_at.get_or_insert(now + DELAYED_ACK);
+            }
+        }
+    }
+
+    /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, CC and SND.WND.
+    /// `Break` means drop the segment and return.
+    fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> ControlFlow<Reaction> {
+        if seg.ack.lt(self.snd_una) {
+            // An old duplicate ACK: ignored, the segment is processed further.
+            return ControlFlow::Continue(());
         }
         if seg.ack.gt(self.snd_nxt) {
             self.ack_due = true;
-            return Reaction::None;
+            return ControlFlow::Break(Reaction::None);
         }
         if seg.ack.gt(self.snd_una) {
             let acked = self.snd_una.distance(seg.ack) as u32;
@@ -434,7 +601,7 @@ impl Tcb {
         if self.in_flight() == 0 || self.snd_wnd == 0 {
             self.r2_since = (self.in_flight() > 0).then_some(now);
         }
-        Reaction::None
+        ControlFlow::Continue(())
     }
 
     fn on_timeout_data(&mut self, now: Instant) -> Reaction {
@@ -459,6 +626,10 @@ impl Tcb {
         if self.sws_at.is_some_and(|t| now >= t) {
             self.sws_at = None;
             self.sws_override = true;
+        }
+        if self.ack_at.is_some_and(|t| now >= t) {
+            self.ack_at = None;
+            self.ack_due = true;
         }
         Reaction::None
     }
@@ -578,9 +749,56 @@ impl Tcb {
         seq.0.wrapping_sub(self.iss.0)
     }
 
-    /// Window field of a non-SYN segment.
-    fn wnd_field(&self, h: &impl Hooks) -> u16 {
-        (h.recv_window() >> self.rcv_shift).min(65535) as u16
+    /// Window field of a non-SYN segment; records the right edge it advertises.
+    fn wnd_field(&mut self, h: &impl Hooks) -> u16 {
+        let (field, edge) = self.window_offer(h);
+        self.rcv_right_edge = edge;
+        field
+    }
+
+    /// The window field to send now and the right edge it advertises (spec §5.4 applied to
+    /// plain TCP): the edge moves to RCV.NXT + free memory only in steps of the receiver SWS
+    /// threshold (RFC 9293 §3.8.6.2.2), otherwise the current edge is re-advertised; it never
+    /// moves left (SHLD-14), rounding up to the scale granularity only when needed.
+    fn window_offer(&self, h: &impl Hooks) -> (u16, SeqNum) {
+        let offered = self.rcv_wnd();
+        let free = h.recv_window();
+        let sws = (self.cfg.recv_buffer / 2).min(u32::from(self.eff_mss));
+        let target = if free.saturating_sub(offered) >= sws {
+            free
+        } else {
+            0
+        };
+        let mut field = (target >> self.rcv_shift).min(65535);
+        if field << self.rcv_shift < offered {
+            // At most 65535: `offered` came from a field of at most 65535.
+            field = offered.div_ceil(1 << self.rcv_shift);
+        }
+        (
+            field as u16,
+            self.rcv_nxt.wrapping_add(field << self.rcv_shift),
+        )
+    }
+
+    /// A window update is due when the edge can move by at least the window the peer still
+    /// has: a zero window reopens at once, while reads during a transfer ride on the ACKs the
+    /// data draws anyway. Neither the creep of a rounded-up edge nor a field capped at 65535
+    /// then draws an extra ACK per received segment.
+    fn window_update_due(&self, h: &impl Hooks) -> bool {
+        let grow = self.rcv_right_edge.distance(self.window_offer(h).1);
+        grow > 0 && grow as u32 >= self.rcv_wnd()
+    }
+
+    /// RCV.WND: from RCV.NXT to the largest edge advertised.
+    fn rcv_wnd(&self) -> u32 {
+        self.rcv_nxt.distance(self.rcv_right_edge).max(0) as u32
+    }
+
+    /// Our ACK is going out: the delayed ACK is done.
+    fn ack_sent(&mut self) {
+        self.ack_due = false;
+        self.ack_at = None;
+        self.rcv_unacked = 0;
     }
 
     fn close(&mut self, reason: CloseReason, now: Instant) -> Reaction {

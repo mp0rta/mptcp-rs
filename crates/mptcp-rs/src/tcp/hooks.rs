@@ -1,7 +1,7 @@
 //! Hook traits through which the `Tcb` reaches the send and receive buffers (spec §3), and
 //! `PlainHooks`, their plain-TCP implementation with real buffers.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::tcb::ConnectConfig;
 
@@ -20,6 +20,9 @@ pub trait SendBuf {
 /// Receive-side sink. The `Tcb` drops duplicates and trims every segment to what the hooks can
 /// store before calling `accept_payload`, so the call cannot fail.
 pub trait SegmentHooks {
+    /// New octets starting at `rel_ssn` (the first data octet is 1). Each octet is handed over
+    /// once, so the pieces held out of order tile the sequence space: a piece that extends the
+    /// in-order data ends where the next held piece starts, if it touches one.
     fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]);
     /// Free receive space in octets, before window scaling.
     fn recv_window(&self) -> u32;
@@ -28,7 +31,8 @@ pub trait SegmentHooks {
 pub trait Hooks: SendBuf + SegmentHooks {}
 impl<T: SendBuf + SegmentHooks> Hooks for T {}
 
-/// Plain TCP: one contiguous send buffer and one in-order receive buffer.
+/// Plain TCP: one contiguous send buffer, one in-order receive buffer and the out-of-order
+/// pieces waiting for it.
 pub struct PlainHooks {
     send: VecDeque<u8>,
     /// Relative SSN of `send[0]`.
@@ -37,6 +41,9 @@ pub struct PlainHooks {
     recv: VecDeque<u8>,
     /// Relative SSN one past the last in-order octet stored.
     recv_end: u32,
+    /// Out-of-order pieces by relative SSN, and their total length.
+    ooo: BTreeMap<u32, Vec<u8>>,
+    ooo_len: usize,
     recv_buffer: usize,
 }
 
@@ -48,6 +55,8 @@ impl PlainHooks {
             send_buffer: cfg.send_buffer as usize,
             recv: VecDeque::new(),
             recv_end: 1,
+            ooo: BTreeMap::new(),
+            ooo_len: 0,
             recv_buffer: cfg.recv_buffer as usize,
         }
     }
@@ -104,15 +113,24 @@ impl SendBuf for PlainHooks {
 
 impl SegmentHooks for PlainHooks {
     fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
-        // Out-of-order payload is not stored yet.
-        if rel_ssn == self.recv_end {
-            self.recv.extend(data);
-            self.recv_end = self.recv_end.wrapping_add(data.len() as u32);
+        if rel_ssn != self.recv_end {
+            self.ooo_len += data.len();
+            self.ooo.insert(rel_ssn, data.to_vec());
+            return;
+        }
+        self.recv.extend(data);
+        self.recv_end = self.recv_end.wrapping_add(data.len() as u32);
+        // Pieces tile the sequence space, so the next in-order one starts exactly here.
+        while let Some(next) = self.ooo.remove(&self.recv_end) {
+            self.ooo_len -= next.len();
+            self.recv_end = self.recv_end.wrapping_add(next.len() as u32);
+            self.recv.extend(next);
         }
     }
 
     fn recv_window(&self) -> u32 {
-        self.recv_buffer.saturating_sub(self.recv.len()) as u32
+        self.recv_buffer
+            .saturating_sub(self.recv.len() + self.ooo_len) as u32
     }
 }
 
@@ -180,6 +198,21 @@ mod tests {
         assert_eq!(h.read(&mut buf), 1);
         assert_eq!(buf[0], b'e');
         assert_eq!(h.read(&mut buf), 0);
+        assert_eq!(h.recv_window(), 8);
+    }
+
+    #[test]
+    fn recv_out_of_order_drained_when_contiguous() {
+        let mut h = hooks(8, 8);
+        h.accept_payload(6, b"fg");
+        h.accept_payload(4, b"de");
+        assert_eq!(h.recv_window(), 4);
+        assert_eq!(h.read(&mut [0u8; 8]), 0);
+        h.accept_payload(1, b"abc");
+        assert_eq!(h.recv_window(), 1);
+        let mut buf = [0u8; 8];
+        assert_eq!(h.read(&mut buf), 7);
+        assert_eq!(&buf[..7], b"abcdefg");
         assert_eq!(h.recv_window(), 8);
     }
 }

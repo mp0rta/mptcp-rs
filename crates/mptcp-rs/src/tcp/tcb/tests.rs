@@ -856,3 +856,390 @@ fn zero_window_discards_pending_sws_override() {
     assert!(f.drain(tm(600)).is_empty());
     assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
 }
+
+// ---- Receive path ----
+
+/// Sequence number of peer data octet `n` (0-based).
+fn pdata(n: u32) -> SeqNum {
+    PEER_ISN.wrapping_add(1 + n)
+}
+
+fn rx_cfg(recv_buffer: u32) -> ConnectConfig {
+    ConnectConfig {
+        recv_buffer,
+        ..ConnectConfig::default()
+    }
+}
+
+impl<H: Hooks> Fixture<H> {
+    /// A segment from the peer at peer data octet `off`, acknowledging everything we sent.
+    fn seg_in(&mut self, now: Instant, off: u32, flags: TcpFlags, payload: &[u8]) -> Reaction {
+        let seg = Segment {
+            src: self.addrs.1,
+            dst: self.addrs.0,
+            seq: pdata(off),
+            ack: self.tcb.snd_nxt,
+            flags,
+            wnd: 65535,
+            options: &[],
+            payload,
+        };
+        self.tcb.on_segment(&seg, now, &mut self.h)
+    }
+    fn data_in(&mut self, now: Instant, off: u32, payload: &[u8]) -> Reaction {
+        self.seg_in(now, off, TcpFlags::ACK, payload)
+    }
+    /// Drains `poll_send`; every segment must be ACK-only. Returns each one's (ACK, window).
+    fn acks(&mut self, now: Instant) -> Vec<(SeqNum, u16)> {
+        let mut v = Vec::new();
+        while let Some(m) = self.send(now) {
+            assert_eq!((m.flags, m.len), (TcpFlags::ACK, 0));
+            assert_eq!(m.seq, self.tcb.snd_nxt);
+            v.push((self.out.ack, self.out.wnd));
+            assert!(v.len() < 10, "poll_send does not stop");
+        }
+        v
+    }
+    /// `acks`, ACK numbers only.
+    fn ack_nos(&mut self, now: Instant) -> Vec<SeqNum> {
+        self.acks(now).into_iter().map(|a| a.0).collect()
+    }
+}
+
+impl Fixture {
+    fn read_all(&mut self) -> Vec<u8> {
+        read_all(&mut self.h)
+    }
+}
+
+fn read_all(h: &mut PlainHooks) -> Vec<u8> {
+    let mut v = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = h.read(&mut buf);
+        if n == 0 {
+            return v;
+        }
+        v.extend_from_slice(&buf[..n]);
+    }
+}
+
+#[test]
+fn in_order_data_delivered_and_delayed_ack() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(3000);
+    assert_eq!(f.data_in(t(0), 0, &p[..1000]), Reaction::None);
+    assert!(f.acks(t(0)).is_empty(), "one segment: the ACK is delayed");
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(200)));
+    assert_eq!(f.timeout(tm(200)), Reaction::None);
+    assert_eq!(f.ack_nos(tm(200)), vec![pdata(1000)]);
+    assert_eq!(f.tcb.poll_send_at(), None);
+    // Two full segments: the second is ACKed at once.
+    f.data_in(tm(300), 1000, &p[1000..2000]);
+    assert!(f.acks(tm(300)).is_empty());
+    f.data_in(tm(310), 2000, &p[2000..3000]);
+    assert_eq!(f.ack_nos(tm(310)), vec![pdata(3000)]);
+    assert_eq!(f.tcb.poll_send_at(), None, "delayed-ACK timer stopped");
+    assert_eq!(f.read_all(), p);
+}
+
+#[test]
+fn delayed_ack_rides_on_data() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.data_in(t(0), 0, &pattern(100));
+    f.write(&pattern(100));
+    let segs = f.drain(t(0));
+    assert_eq!(segs.len(), 1);
+    assert_eq!((segs[0].0.len, f.out.ack), (100, pdata(100)));
+    // The pending delayed ACK went out with the data: only the RTO remains.
+    assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+}
+
+#[test]
+fn out_of_order_held_and_dup_acked() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(2000);
+    f.data_in(t(0), 1000, &p[1000..]);
+    assert_eq!(
+        f.acks(t(0)),
+        vec![(pdata(0), 32768)],
+        "immediate duplicate ACK"
+    );
+    assert!(f.read_all().is_empty());
+    // The gap-filling segment is ACKed at once and both become readable.
+    f.data_in(t(0), 0, &p[..1000]);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(2000)]);
+    assert_eq!(f.read_all(), p);
+    assert_eq!(f.tcb.poll_send_at(), None);
+}
+
+#[test]
+fn overlap_straddling_rcv_nxt_trimmed() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(1400);
+    f.data_in(t(0), 0, &p[..1000]);
+    // Retransmission covering [rcv_nxt − 100, rcv_nxt + 400).
+    f.data_in(t(0), 900, &p[900..1400]);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(1400)]);
+    assert_eq!(f.read_all(), p, "the new 400 B delivered once");
+}
+
+#[test]
+fn segment_half_beyond_window_trimmed() {
+    let mut f = Fixture::established(rx_cfg(2000), 10 * MSS);
+    assert_eq!(f.tcb.rcv_shift, 0);
+    let p = pattern(2500);
+    // Out of order and straddling the right edge: [1000, 2000) is kept, the rest dropped.
+    f.data_in(t(0), 1000, &p[1000..2500]);
+    // The edge advertised before stays: the window is not shrunk to the free memory.
+    assert_eq!(f.acks(t(0)), vec![(pdata(0), 2000)]);
+    // In order and straddling it too: only the missing [0, 1000) is new.
+    f.data_in(t(0), 0, &p[..2500]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(2000), 0)]);
+    assert_eq!(f.read_all(), &p[..2000]);
+}
+
+/// A segment copied out of a `SegmentWriter`.
+struct Wire {
+    seq: SeqNum,
+    ack: SeqNum,
+    flags: TcpFlags,
+    wnd: u16,
+    payload: Vec<u8>,
+}
+
+fn emit(tcb: &mut Tcb, h: &mut PlainHooks, out: &mut SegmentWriter, now: Instant) -> Vec<Wire> {
+    let mut v = Vec::new();
+    while tcb.poll_send(now, h, out).is_some() {
+        v.push(Wire {
+            seq: out.seq,
+            ack: out.ack,
+            flags: out.flags,
+            wnd: out.wnd,
+            payload: out.payload.clone(),
+        });
+        assert!(v.len() < 1000, "poll_send does not stop");
+    }
+    v
+}
+
+fn deliver(tcb: &mut Tcb, h: &mut PlainHooks, w: &Wire, now: Instant) {
+    let (src, dst) = v4();
+    let seg = Segment {
+        src,
+        dst,
+        seq: w.seq,
+        ack: w.ack,
+        flags: w.flags,
+        wnd: w.wnd,
+        options: &[],
+        payload: &w.payload,
+    };
+    assert_eq!(tcb.on_segment(&seg, now, h), Reaction::None);
+}
+
+#[test]
+fn wraparound_transfer() {
+    const N: usize = 64 << 10;
+    let cfg = ConnectConfig::default();
+    let (la, lb) = v4();
+    let (isn_a, isn_b) = (SeqNum(0xFFFF_FF80), SeqNum(0xFFFF_FF00));
+    let mut a = Tcb::new_established(&cfg, la, lb, isn_a, isn_b, Some(1460), Some(7), t(0));
+    let mut b = Tcb::new_established(&cfg, lb, la, isn_b, isn_a, Some(1460), Some(7), t(0));
+    let (mut ha, mut hb) = (PlainHooks::new(&cfg), PlainHooks::new(&cfg));
+    let to_b = pattern(N);
+    let to_a: Vec<u8> = (0..N).map(|i| (i % 241) as u8 ^ 0x5a).collect();
+    assert_eq!(ha.write(&to_b), N);
+    assert_eq!(hb.write(&to_a), N);
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    let mut out = SegmentWriter::default();
+    let mut now = t(0);
+    let mut lost = false;
+    for _ in 0..10_000 {
+        let from_a = emit(&mut a, &mut ha, &mut out, now);
+        let from_b = emit(&mut b, &mut hb, &mut out, now);
+        let quiet = from_a.is_empty() && from_b.is_empty();
+        for w in &from_a {
+            // A's first data segment crosses the wrap of its sequence space: lose it once, so B
+            // reassembles everything after it across the wrap.
+            if !lost && !w.payload.is_empty() {
+                assert!(w.seq.0.checked_add(w.payload.len() as u32).is_none());
+                lost = true;
+                continue;
+            }
+            deliver(&mut b, &mut hb, w, now);
+        }
+        for w in &from_b {
+            deliver(&mut a, &mut ha, w, now);
+        }
+        got_a.extend(read_all(&mut ha));
+        got_b.extend(read_all(&mut hb));
+        if got_a.len() == N && got_b.len() == N && a.in_flight() == 0 && b.in_flight() == 0 {
+            break;
+        }
+        if quiet {
+            now = [a.poll_send_at(), b.poll_send_at()]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("stalled without a timer");
+            assert_eq!(a.on_timeout(now, &mut ha), Reaction::None);
+            assert_eq!(b.on_timeout(now, &mut hb), Reaction::None);
+        }
+    }
+    assert!(lost);
+    assert!(got_a == to_a && got_b == to_b, "byte-exact both ways");
+    let end = |isn: SeqNum| isn.wrapping_add(1 + N as u32);
+    assert_eq!((a.snd_una, a.rcv_nxt), (end(isn_a), end(isn_b)));
+    assert_eq!((b.snd_una, b.rcv_nxt), (end(isn_b), end(isn_a)));
+}
+
+#[test]
+fn no_memory_means_not_acked() {
+    const BUF: u32 = 4 << 20;
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    assert_eq!(f.tcb.rcv_shift, 7);
+    let p = pattern(BUF as usize + 24);
+    // The app does not read: two in-order segments leave 1000 B of free memory. The window
+    // edge advertised by the handshake (RCV.NXT + 4 MiB) is kept by rounding up to 1024.
+    let fill = BUF - 1000;
+    f.data_in(t(0), 0, &p[..2_000_000]);
+    f.data_in(t(0), 2_000_000, &p[2_000_000..fill as usize]);
+    assert_eq!(f.h.recv_window(), 1000);
+    assert_eq!(f.acks(t(0)), vec![(pdata(fill), 8)]);
+    // The peer fills the 1024 B window: 1000 B stored, the last 24 B dropped and not ACKed.
+    f.data_in(t(0), fill, &p[fill as usize..fill as usize + 1024]);
+    let acks = f.acks(t(0));
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].0, pdata(BUF));
+    let got = f.read_all();
+    assert_eq!(
+        got.len() - fill as usize,
+        1000,
+        "the app reads exactly 1000 more"
+    );
+    assert_eq!(got, p[..BUF as usize]);
+}
+
+#[test]
+fn window_right_edge_never_shrinks() {
+    let mut f = Fixture::established(rx_cfg(200_000), 10 * MSS);
+    assert_eq!(f.tcb.rcv_shift, 2);
+    let p = pattern(333);
+    let mut expect = Vec::new();
+    let (mut edge, mut next, mut probes, mut acks) = (f.tcb.rcv_right_edge, 0u32, 0, 0);
+    for i in 0..1000 {
+        let now = tm(i);
+        let len = (pdata(next).distance(edge).max(0) as usize).min(p.len());
+        // Window closed: the peer probes with one octet beyond it.
+        let len = len.max(1);
+        let stored = len.min(f.h.recv_window() as usize);
+        f.data_in(now, next, &p[..len]);
+        if stored == 0 {
+            probes += 1;
+        }
+        // What is not stored is not ACKed; the peer resends from the ACK.
+        expect.extend_from_slice(&p[..stored]);
+        next += stored as u32;
+        for (ack, wnd) in f.acks(now) {
+            let e = ack.wrapping_add(u32::from(wnd) << 2);
+            assert!(e.ge(edge), "edge moved left at segment {i}");
+            edge = e;
+            acks += 1;
+        }
+    }
+    assert!(probes > 300 && acks > 500);
+    let got = f.read_all();
+    assert_eq!(
+        got.len(),
+        200_000,
+        "the buffer is full, nothing beyond it stored"
+    );
+    assert_eq!(got, expect[..200_000]);
+}
+
+#[test]
+fn receiver_sws_holds_small_window_updates() {
+    let mut f = Fixture::established(rx_cfg(10_000), 10 * MSS);
+    let p = pattern(10_000);
+    for k in 0..10 {
+        f.data_in(t(0), k * 1000, &p[(k * 1000) as usize..][..1000]);
+    }
+    let acks = f.acks(t(0));
+    assert_eq!(acks.last(), Some(&(pdata(10_000), 0)), "window closed");
+    // Threshold min(buffer / 2, eff_mss) = 1000: no update for 100 B reads until 1000 B.
+    let mut buf = [0u8; 100];
+    for k in 1..=10 {
+        assert_eq!(f.h.read(&mut buf), 100);
+        let acks = f.acks(t(0));
+        if k < 10 {
+            assert!(acks.is_empty(), "update after {}", k * 100);
+        } else {
+            assert_eq!(acks, vec![(pdata(10_000), 1000)]);
+        }
+    }
+    assert!(f.acks(t(0)).is_empty(), "one update per edge move");
+}
+
+#[test]
+fn out_of_window_segment_gets_ack_unchanged() {
+    let mut f = Fixture::established(rx_cfg(2000), 10 * MSS);
+    let p = pattern(500);
+    // Beyond the right edge.
+    f.data_in(t(0), 2000, &[7; 100]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(0), 2000)]);
+    assert!(f.read_all().is_empty());
+    // Entirely old: a duplicate draws an ACK that also covers the delayed one.
+    f.data_in(t(0), 0, &p);
+    assert!(f.acks(t(0)).is_empty());
+    f.data_in(t(0), 0, &p);
+    assert_eq!(f.acks(t(0)), vec![(pdata(500), 1500)]);
+    // Never in response to a RST.
+    f.seg_in(t(0), 5000, TcpFlags::RST | TcpFlags::ACK, &[]);
+    assert!(f.acks(t(0)).is_empty());
+    assert_eq!(f.read_all(), p);
+}
+
+#[test]
+fn retransmitted_synack_in_established_is_acked() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    assert_eq!(
+        f.recv(
+            TcpFlags::SYN | TcpFlags::ACK,
+            ISN.wrapping_add(1),
+            1000,
+            &opts(Some(MSS), Some(0))
+        ),
+        Reaction::None
+    );
+    assert_eq!(f.acks(t(0)), vec![(pdata(0), 32768)]);
+    assert_eq!(f.tcb.state(), TcpState::Established);
+}
+
+#[test]
+fn ooo_range_cap() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(200);
+    let mut acks = Vec::new();
+    // 70 disjoint one-octet segments with holes between them.
+    for i in 0..70 {
+        let off = 2 + 2 * i;
+        f.data_in(t(0), off, &p[off as usize..][..1]);
+        acks.extend(f.acks(t(0)));
+    }
+    assert_eq!(f.tcb.rcv_ooo.len(), 64);
+    assert_eq!(
+        acks,
+        vec![(pdata(0), 32768); 64],
+        "the 6 over the cap are not ACKed"
+    );
+    // At the cap, a segment joining existing ranges is still taken.
+    f.data_in(t(0), 3, &p[3..4]);
+    assert_eq!(f.acks(t(0)).len(), 1);
+    assert_eq!(f.tcb.rcv_ooo.len(), 63);
+    // Filling every hole delivers each octet once.
+    f.data_in(t(0), 0, &p);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(200)]);
+    assert_eq!(f.read_all(), p);
+    assert!(f.tcb.rcv_ooo.is_empty());
+}
