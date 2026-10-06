@@ -163,6 +163,9 @@ pub struct Tcb {
     rcv_shift: u8,
     /// Largest right window edge ever advertised (never moves left, RFC 9293 SHLD-14).
     rcv_right_edge: SeqNum,
+    /// The edge the receiver SWS rule last set; every window is rounded up from it. It never
+    /// passes the memory's edge (RCV.NXT + free + held out of order), which only moves right.
+    rcv_sws_edge: SeqNum,
     /// Out-of-order receipt ranges (headers only, spec §2 step 4), in unwrapped relative SSN.
     /// Exactly the octets the hooks hold out of order.
     rcv_ooo: RangeSet<u64>,
@@ -241,6 +244,7 @@ impl Tcb {
             rcv_ssn: 0,
             rcv_shift: ws_shift(cfg.recv_buffer),
             rcv_right_edge: SeqNum(0),
+            rcv_sws_edge: SeqNum(0),
             rcv_ooo: RangeSet::new(),
             rcv_unacked: 0,
             cc,
@@ -432,6 +436,7 @@ impl Tcb {
         self.rcv_ssn = 1;
         // The window field of our SYN (unscaled) is the first edge advertised.
         self.rcv_right_edge = self.rcv_nxt.wrapping_add(self.cfg.recv_buffer.min(65535));
+        self.rcv_sws_edge = self.rcv_right_edge;
         self.snd_una = seg.ack;
         self.snd_wnd = u32::from(seg.wnd);
         self.max_snd_wnd = self.snd_wnd;
@@ -760,54 +765,63 @@ impl Tcb {
         seq.0.wrapping_sub(self.iss.0)
     }
 
-    /// Window field of a non-SYN segment; records the right edge it advertises if it is the
-    /// largest so far (only a zero window retracts it, and acceptability keeps the largest).
+    /// Window field of a non-SYN segment. Records the SWS edge, and the advertised edge if it
+    /// is the largest so far (acceptability keeps the largest).
     fn wnd_field(&mut self, h: &impl Hooks) -> u16 {
-        let (field, edge) = self.window_offer(h);
+        let (field, edge, sws_edge) = self.window_offer(h);
+        self.rcv_sws_edge = sws_edge;
         if edge.gt(self.rcv_right_edge) {
             self.rcv_right_edge = edge;
         }
         field
     }
 
-    /// The window field to send now and the right edge it advertises (spec §5.4 applied to
-    /// plain TCP): the edge moves to RCV.NXT + free memory only in steps of the receiver SWS
-    /// threshold (RFC 9293 §3.8.6.2.2), otherwise the current edge is re-advertised; it never
-    /// moves left (SHLD-14), rounding up to the scale granularity only when needed. With no
-    /// free memory the window is 0: the edge retracts by less than 2^scale (RFC 7323 §2.4),
-    /// rather than promising octets that could never be stored.
-    fn window_offer(&self, h: &impl Hooks) -> (u16, SeqNum) {
-        let offered = self.rcv_wnd();
+    /// The window field to send now, the edge it advertises and the SWS edge behind it
+    /// (spec §5.4 applied to plain TCP, ruling R16).
+    ///
+    /// The SWS edge moves to the scale-aligned RCV.NXT + free memory only when the receiver
+    /// SWS rule allows (RFC 9293 §3.8.6.2.2) and never moves left; the field is the SWS edge
+    /// rounded up to the scale unit, so it rounds only when the edge is re-advertised from an
+    /// older RCV.NXT.
+    ///
+    /// Invariant: the SWS edge never passes the memory's edge, so the advertised edge is less
+    /// than 2^scale beyond it, and no advertisement retracts the largest edge by 2^scale or
+    /// more (RFC 7323 §2.4). With no free memory nothing is held out of order (a hole below it
+    /// would be free), the SWS edge is at or before RCV.NXT and the field is 0 (ruling R14).
+    fn window_offer(&self, h: &impl Hooks) -> (u16, SeqNum, SeqNum) {
         let free = h.recv_window();
-        if free == 0 {
-            return (0, self.rcv_nxt);
+        let mut sws_edge = self.rcv_sws_edge;
+        if self.sws_moves(free) {
+            let aligned = (free >> self.rcv_shift).min(65535) << self.rcv_shift;
+            let edge = self.rcv_nxt.wrapping_add(aligned);
+            if edge.gt(sws_edge) {
+                sws_edge = edge;
+            }
         }
-        let target = if self.sws_moves(free) { free } else { 0 };
-        let mut field = (target >> self.rcv_shift).min(65535);
-        if field << self.rcv_shift < offered {
-            // At most 65535: `offered` came from a field of at most 65535.
-            field = offered.div_ceil(1 << self.rcv_shift);
-        }
-        (
-            field as u16,
-            self.rcv_nxt.wrapping_add(field << self.rcv_shift),
-        )
+        // At most 65535: the SWS edge was set by a field of at most 65535 from an RCV.NXT at
+        // or before the current one.
+        let wnd = self.rcv_nxt.distance(sws_edge).max(0) as u32;
+        let field = wnd.div_ceil(1 << self.rcv_shift).min(65535);
+        debug_assert!(free > 0 || field == 0, "a window without memory");
+        let edge = self.rcv_nxt.wrapping_add(field << self.rcv_shift);
+        (field as u16, edge, sws_edge)
     }
 
-    /// Receiver SWS (RFC 9293 §3.8.6.2.2): `buffer_edge − right_edge >= min(buffer/2, eff_mss)`.
+    /// Receiver SWS (RFC 9293 §3.8.6.2.2): `buffer_edge − sws_edge >= min(buffer/2, eff_mss)`.
     fn sws_moves(&self, free: u32) -> bool {
         let sws = (self.cfg.recv_buffer / 2).min(u32::from(self.eff_mss));
-        free.saturating_sub(self.rcv_wnd()) >= sws
+        let buffer_edge = self.rcv_nxt.wrapping_add(free);
+        i64::from(self.rcv_sws_edge.distance(buffer_edge)) >= i64::from(sws)
     }
 
     /// After a read, an update is sent only if the SWS rule moves the edge by at least the
     /// window the peer still has (ruling R15): a closed window reopens at once, while reads
-    /// during a transfer ride on the ACKs the data draws anyway, and neither the creep of a
-    /// rounded-up edge nor a field capped at 65535 draws an extra ACK per segment.
+    /// during a transfer ride on the ACKs the data draws anyway, and a field capped at 65535
+    /// draws no extra ACK per segment.
     fn window_update_due(&self, h: &impl Hooks) -> bool {
-        let free = h.recv_window();
-        let grow = self.rcv_right_edge.distance(self.window_offer(h).1);
-        self.sws_moves(free) && grow > 0 && grow as u32 >= self.rcv_wnd()
+        let (_, edge, sws_edge) = self.window_offer(h);
+        let grow = self.rcv_right_edge.distance(edge);
+        sws_edge != self.rcv_sws_edge && grow > 0 && grow as u32 >= self.rcv_wnd()
     }
 
     /// RCV.WND: from RCV.NXT to the largest edge advertised.

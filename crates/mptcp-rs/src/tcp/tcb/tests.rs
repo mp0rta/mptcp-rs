@@ -1133,20 +1133,24 @@ fn no_memory_means_not_acked() {
     assert_eq!(got, p[..BUF as usize]);
 }
 
-#[test]
-fn window_right_edge_never_shrinks() {
-    let mut f = Fixture::established(rx_cfg(200_000), 10 * MSS);
-    assert_eq!(f.tcb.rcv_shift, 2);
-    let p = pattern(333);
+/// The app never reads; the peer sends `seg`-octet segments inside the last advertised window
+/// (one octet when it is closed) and resends what was not ACKed. Checks every ACK (ruling R16):
+/// the advertised edge never retracts by a scale unit or more from the largest edge
+/// advertised, stays less than one unit beyond the memory, and a zero window appears only with
+/// the memory full. Returns (probes, ACKs, zero windows).
+fn stall(buffer: u32, shift: u8, seg: usize, n: u64) -> (u32, u32, u32) {
+    let mut f = Fixture::established(rx_cfg(buffer), 10 * MSS);
+    assert_eq!(f.tcb.rcv_shift, shift);
+    let unit = 1i32 << shift;
+    let mem_edge = pdata(buffer);
+    let p = pattern(seg);
     let mut expect = Vec::new();
     // `edge`: the peer's view (the last ACK); `max_edge`: the largest edge advertised.
-    let (mut edge, mut next, mut probes, mut acks) = (f.tcb.rcv_right_edge, 0u32, 0, 0);
-    let (mut max_edge, mut zero_wnds) = (edge, 0);
-    for i in 0..1000 {
+    let (mut edge, mut next) = (f.tcb.rcv_right_edge, 0u32);
+    let (mut max_edge, mut probes, mut acks, mut zero_wnds) = (edge, 0, 0, 0);
+    for i in 0..n {
         let now = tm(i);
-        let len = (pdata(next).distance(edge).max(0) as usize).min(p.len());
-        // Window closed: the peer probes with one octet beyond it.
-        let len = len.max(1);
+        let len = (pdata(next).distance(edge).max(0) as usize).min(seg).max(1);
         let stored = len.min(f.h.recv_window() as usize);
         f.data_in(now, next, &p[..len]);
         if stored == 0 {
@@ -1156,28 +1160,42 @@ fn window_right_edge_never_shrinks() {
         expect.extend_from_slice(&p[..stored]);
         next += stored as u32;
         for (ack, wnd) in f.acks(now) {
-            let e = ack.wrapping_add(u32::from(wnd) << 2);
-            if wnd == 0 && f.h.recv_window() == 0 {
-                // Memory full: a zero window retracts the edge (RFC 7323 §2.4); segments up to
-                // the largest edge stay acceptable.
-                assert_eq!(f.tcb.rcv_right_edge, max_edge);
+            let e = ack.wrapping_add(u32::from(wnd) << shift);
+            assert!(mem_edge.distance(e) < unit, "overshoot at segment {i}");
+            assert!(e.distance(max_edge) < unit, "retraction at segment {i}");
+            if wnd == 0 {
+                assert_eq!(f.h.recv_window(), 0, "zero window with free memory");
                 zero_wnds += 1;
-            } else {
-                assert!(e.ge(max_edge), "edge moved left at segment {i}");
+            }
+            if e.gt(max_edge) {
                 max_edge = e;
             }
+            assert_eq!(f.tcb.rcv_right_edge, max_edge);
             edge = e;
             acks += 1;
         }
     }
-    assert!(probes > 300 && acks > 500 && zero_wnds > 300);
     let got = f.read_all();
     assert_eq!(
         got.len(),
-        200_000,
-        "the buffer is full, nothing beyond it stored"
+        buffer as usize,
+        "the buffer is full, nothing beyond"
     );
-    assert_eq!(got, expect[..200_000]);
+    assert_eq!(got, expect);
+    (probes, acks, zero_wnds)
+}
+
+#[test]
+fn window_right_edge_never_shrinks() {
+    let (probes, acks, zero_wnds) = stall(200_000, 2, 333, 1000);
+    assert!(probes > 300 && acks > 500 && zero_wnds > 300);
+}
+
+#[test]
+fn round_up_overshoot_below_one_scale_unit() {
+    // 4 MiB at scale 7 with 1453 B segments: about 1450 re-advertisements before it fills.
+    let (probes, acks, zero_wnds) = stall(4 << 20, 7, 1453, 3000);
+    assert!(probes > 100 && acks > 1500 && zero_wnds > 100);
 }
 
 #[test]
@@ -1351,4 +1369,102 @@ fn text_processed_when_ack_is_old() {
     f.seg_ack(t(0), 0, data(0), TcpFlags::ACK, &pattern(100));
     assert_eq!(f.tcb.snd_una, data(1000));
     assert_eq!(f.read_all(), pattern(100));
+}
+
+/// Scale 7, the app reading irregular amounts slower than the peer streams 1453 B segments
+/// (so the window closes and reads must reopen it), with
+/// our eff_mss `mss` (64 puts the SWS threshold below the scale unit). Every ACK stays within
+/// one unit of the largest edge and of the memory's edge; an update made by a read moves the
+/// edge to a scale-aligned point inside the memory.
+fn reading_receiver(mss: u16) {
+    const BUF: u32 = 4 << 20;
+    let mut f = Fixture::unbounded(ConnectConfig::default());
+    f.synack(65535, &opts(Some(mss), Some(0)));
+    assert_eq!(f.acks(t(0)).len(), 1);
+    assert_eq!((f.tcb.rcv_shift, f.tcb.eff_mss), (7, mss));
+    let p = pattern(1453);
+    let (mut edge, mut max_edge) = (f.tcb.rcv_right_edge, f.tcb.rcv_right_edge);
+    let (mut next, mut read, mut updates) = (0u32, 0u32, 0);
+    let mut buf = vec![0u8; 4096];
+    for i in 0..8000u64 {
+        let now = tm(i);
+        let len = (pdata(next).distance(edge).max(0) as usize)
+            .min(p.len())
+            .max(1);
+        let before = f.tcb.rcv_nxt;
+        f.data_in(now, next, &p[..len]);
+        // The peer resends what was not ACKed.
+        next += before.distance(f.tcb.rcv_nxt) as u32;
+        let mut check = |f: &mut Fixture, after_read: bool, read: u32| {
+            let mem_edge = pdata(read + BUF);
+            for (ack, wnd) in f.acks(now) {
+                let e = ack.wrapping_add(u32::from(wnd) << 7);
+                assert!(mem_edge.distance(e) < 128, "overshoot at {i}");
+                assert!(e.distance(max_edge) < 128, "retraction at {i}");
+                if after_read {
+                    assert!(e.le(mem_edge) && ack.distance(e) % 128 == 0);
+                    updates += 1;
+                }
+                if e.gt(max_edge) {
+                    max_edge = e;
+                }
+                edge = e;
+            }
+        };
+        check(&mut f, false, read);
+        let want = if i % 4 == 0 {
+            (100 + i * 37 % 1500) as usize
+        } else {
+            0
+        };
+        read += f.h.read(&mut buf[..want]) as u32;
+        check(&mut f, true, read);
+    }
+    assert!(updates > 100, "{updates} updates");
+}
+
+#[test]
+fn reads_move_the_edge_aligned_within_one_unit() {
+    reading_receiver(1000);
+    reading_receiver(64);
+}
+
+#[test]
+fn rounding_alone_draws_no_window_update() {
+    const BUF: u32 = 4 << 20;
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(BUF as usize);
+    let fill = BUF - 1000;
+    f.data_in(t(0), 0, &p[..2_000_000]);
+    f.data_in(t(0), 2_000_000, &p[2_000_000..fill as usize]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(fill), 8)]);
+    // 990 B in order: rounding the SWS edge up from the new RCV.NXT would move the advertised
+    // edge past the largest one, but that is no window update; the ACK stays delayed.
+    f.data_in(t(0), fill, &p[fill as usize..][..990]);
+    assert!(f.acks(t(0)).is_empty());
+    assert_eq!(f.timeout(tm(200)), Reaction::None);
+    assert_eq!(f.acks(tm(200)), vec![(pdata(fill + 990), 1)]);
+}
+
+#[test]
+fn sws_edge_never_moves_left() {
+    // eff_mss 64 puts the SWS threshold (64) below the scale unit (128).
+    const BUF: u32 = 4 << 20;
+    let mut f = Fixture::unbounded(ConnectConfig::default());
+    f.synack(65535, &opts(Some(64), Some(0)));
+    assert_eq!(f.acks(t(0)).len(), 1);
+    let p = pattern(BUF as usize);
+    // 129 B of memory left: the SWS edge (RCV.NXT + 4 MiB) is re-advertised rounded up to
+    // 256, so the largest edge is 127 B beyond it.
+    let fill = BUF - 129;
+    f.data_in(t(0), 0, &p[..2_000_000]);
+    f.data_in(t(0), 2_000_000, &p[2_000_000..fill as usize]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(fill), 2)]);
+    // A 64 B read meets the threshold, but the aligned point (RCV.NXT + 128) is 1 B before
+    // the SWS edge: the edge stays, and so does the advertisement (128 back would retract the
+    // largest edge by a whole unit).
+    assert_eq!(f.h.read(&mut [0u8; 64]), 64);
+    assert!(f.acks(t(0)).is_empty());
+    f.data_in(t(0), 0, &p[..10]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(fill), 2)]);
 }
