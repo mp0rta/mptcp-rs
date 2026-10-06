@@ -122,6 +122,12 @@ dependencies = [
 [[package]]
 name = "mptcp-rs-tun"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "mptcp-rs",
+ "rand_chacha",
+ "rand_core",
+]
 
 [[package]]
 name = "ppv-lite86"

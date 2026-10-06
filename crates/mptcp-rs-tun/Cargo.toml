@@ -5,3 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+
+[dependencies]
+mptcp-rs = { path = "../mptcp-rs" }
+libc = "0.2"
+rand_core = "0.10"
+rand_chacha = "0.10"
