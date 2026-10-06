@@ -1,0 +1,30 @@
+[package]
+name = "mptcp-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mptcp-rs = { path = "../crates/mptcp-rs" }
+rand_chacha = "0.10"
+rand_core = "0.10"
+
+[workspace]
+
+[[bin]]
+name = "mptcp_option"
+path = "fuzz_targets/mptcp_option.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handle_packet"
+path = "fuzz_targets/handle_packet.rs"
+test = false
+doc = false
+bench = false
