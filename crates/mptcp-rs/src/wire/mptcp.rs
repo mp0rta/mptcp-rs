@@ -125,6 +125,10 @@ fn parse_dss(opt: &[u8]) -> Result<Dss, MptcpError> {
         (true, l) if l == base + dsn_len + 8 => true,
         _ => return Err(MptcpError::BadLength),
     };
+    // RFC 8684 §3.3/§3.3.3: F has no meaning without a mapping (matches encode).
+    if f & DSS_F != 0 && !has_map {
+        return Err(MptcpError::InvalidFields);
+    }
     let data_ack = match ack_len {
         4 => Some(DataAck::Ack32(u32_at(opt, 4)?)),
         8 => Some(DataAck::Ack64(u64_at(opt, 4)?)),
@@ -623,9 +627,6 @@ mod tests {
     }
     #[test]
     fn dss_reserved_bits_ignored() {
-        let mut w = [30u8, 8, 0x20, 0xe3, 0, 0, 0, 9];
-        // 0xe3 = reserved bits + a + A; a without room is a length error, so use 12.
-        assert_eq!(parse(&w), Err(MptcpError::BadLength));
         let mut b = [0u8; 12];
         b[..4].copy_from_slice(&[30, 12, 0x20, 0xe3]);
         b[11] = 7;
@@ -633,7 +634,19 @@ mod tests {
             parse(&b).unwrap(),
             dss(None, Some(DataAck::Ack64(7)), false)
         );
-        w[3] = 0xe1;
-        assert_eq!(parse(&w[..4]), Err(MptcpError::BadLength));
+        // Reserved bits with M|m set parse like 0x0C.
+        let mut m = [0u8; 18];
+        m[..4].copy_from_slice(&[30, 18, 0x20, 0x0c]);
+        let plain = parse(&m).unwrap();
+        m[3] = 0xec;
+        assert_eq!(parse(&m).unwrap(), plain);
+    }
+    #[test]
+    fn dss_data_fin_without_mapping_rejected_on_parse() {
+        assert_eq!(parse(&[30, 4, 0x20, 0x10]), Err(MptcpError::InvalidFields));
+        assert_eq!(
+            parse(&[30, 8, 0x20, 0x11, 0, 0, 0, 0]),
+            Err(MptcpError::InvalidFields)
+        );
     }
 }
