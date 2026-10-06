@@ -38,6 +38,9 @@ pub trait CongestionControl: Send {
     /// the full ACK (or an RTO) that ends fast recovery: the window inflation and deflation of
     /// RFC 5681 §3.2 / RFC 6582 §3.2 belong to the controller.
     fn on_recovery_ack(&mut self, ack: RecoveryAck);
+    /// Called before new data goes out after the sender sat idle for more than one RTO with
+    /// nothing outstanding (RFC 5681 §4.1): cwnd is set to no more than the restart window.
+    fn on_idle_restart(&mut self) {}
     /// Octets that may be outstanding.
     fn cwnd(&self) -> u32;
 }
@@ -69,6 +72,8 @@ impl CongestionControl for Unbounded {
 #[derive(Debug)]
 pub(crate) struct Reno {
     smss: u32,
+    /// The initial window, from `init`; the restart window of RFC 5681 §4.1 is min(iw, cwnd).
+    iw: u32,
     cwnd: u32,
     ssthresh: u32,
     /// Octets acknowledged in congestion avoidance since cwnd last grew (byte counting).
@@ -79,6 +84,7 @@ impl Reno {
     pub(crate) fn new() -> Self {
         Self {
             smss: 0,
+            iw: 0,
             cwnd: 0,
             // RFC 5681 §3.1: "arbitrarily high".
             ssthresh: u32::MAX,
@@ -103,7 +109,13 @@ impl CongestionControl for Reno {
             1096..=2190 => 3,
             _ => 2,
         };
-        self.cwnd = segs * smss;
+        self.iw = segs * smss;
+        self.cwnd = self.iw;
+    }
+
+    /// RW = min(IW, cwnd); ssthresh is kept (RFC 5681 §4.1).
+    fn on_idle_restart(&mut self) {
+        self.cwnd = self.cwnd.min(self.iw);
     }
 
     /// Slow start below ssthresh (eq. 2); congestion avoidance by byte counting otherwise,
@@ -163,6 +175,24 @@ mod tests {
         let mut r = Reno::new();
         r.init(SMSS, false);
         r
+    }
+
+    #[test]
+    fn reno_idle_restart_window_is_min_iw_cwnd() {
+        let mut r = reno();
+        r.on_idle_restart();
+        assert_eq!(r.cwnd(), 4 * SMSS, "cwnd at IW stays");
+        for _ in 0..10 {
+            r.on_ack(SMSS, None, 0, T0);
+        }
+        assert_eq!(r.cwnd(), 14 * SMSS);
+        r.on_idle_restart();
+        assert_eq!(r.cwnd(), 4 * SMSS);
+        // A cwnd below IW (after an RTO) is not raised; ssthresh is kept.
+        r.on_congestion(CongestionEvent::Rto, 8 * SMSS, T0);
+        r.on_idle_restart();
+        assert_eq!(r.cwnd(), SMSS);
+        assert_eq!(r.ssthresh, 4 * SMSS);
     }
 
     #[test]

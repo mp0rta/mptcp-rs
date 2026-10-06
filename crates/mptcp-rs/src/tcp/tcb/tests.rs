@@ -2313,3 +2313,45 @@ fn synack_fin_closes_receive_side() {
         );
     }
 }
+
+/// Reno grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s.
+fn grown_idle_fixture() -> Fixture {
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    assert_eq!(
+        f.synack(65535, &opts(Some(MSS), Some(0))),
+        Reaction::Established
+    );
+    f.send(t(0)).unwrap();
+    f.write(&pattern(60_000));
+    let mut now = t(0);
+    while f.tcb.snd_una != ISN.wrapping_add(60_001) {
+        assert!(!f.drain(now).is_empty());
+        now = now + Duration::from_millis(10);
+        let ack = f.tcb.snd_max;
+        f.ack(now, ack, 65535);
+    }
+    assert!(f.tcb.cc.cwnd() > 8 * u32::from(MSS), "cwnd grew");
+    f
+}
+
+#[test]
+fn idle_longer_than_rto_restarts_with_iw() {
+    // RFC 5681 §4.1: no data sent for more than the RTO, nothing outstanding.
+    let mut f = grown_idle_fixture();
+    let later = t(0) + Duration::from_secs(30);
+    f.write(&pattern(20_000));
+    let sent: u32 = f.drain(later).iter().map(|(m, _)| m.len).sum();
+    assert_eq!(sent, 4 * u32::from(MSS), "RW = IW");
+}
+
+#[test]
+fn idle_shorter_than_rto_keeps_cwnd() {
+    let mut f = grown_idle_fixture();
+    let cwnd = f.tcb.cc.cwnd();
+    let later = t(0) + Duration::from_millis(300);
+    assert!(later < t(0) + f.tcb.rtt.rto());
+    f.write(&pattern(20_000));
+    let sent: u32 = f.drain(later).iter().map(|(m, _)| m.len).sum();
+    assert_eq!(sent, 20_000.min(cwnd / u32::from(MSS) * u32::from(MSS)));
+    assert!(sent > 4 * u32::from(MSS));
+}

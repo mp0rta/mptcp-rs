@@ -194,6 +194,8 @@ pub struct Tcb {
     rto_at: Option<Instant>,
     /// The one timed segment (Karn): its end and send time; cleared by any RTO.
     rtt_timed: Option<(SeqNum, Instant)>,
+    /// When data octets last went out (RFC 5681 §4.1 idle detection).
+    last_data_sent: Option<Instant>,
     /// R2 base for data: first transmission of the segment at SND.UNA, restarted when SND.UNA
     /// advances; or the first unanswered zero-window probe. `None` when nothing is pending.
     r2_since: Option<Instant>,
@@ -272,6 +274,7 @@ impl Tcb {
             rtt: RttEstimator::new(),
             rto_at: None,
             rtt_timed: None,
+            last_data_sent: None,
             r2_since: None,
             persist_at: None,
             persist_ivl: Duration::ZERO,
@@ -912,6 +915,19 @@ impl Tcb {
         self.persist_at = None;
         self.probe_due = false;
 
+        // RFC 5681 §4.1: "a TCP SHOULD set cwnd to no more than RW before beginning
+        // transmission if the TCP has not sent data in an interval exceeding the
+        // retransmission timeout" (the SHOULD, not the receive-side wording of the prose
+        // above it). Idempotent, so a send held back by Nagle may repeat it.
+        if idle
+            && queued > 0
+            && self
+                .last_data_sent
+                .is_some_and(|t| now > t + self.rtt.rto())
+        {
+            self.cc.on_idle_restart();
+        }
+
         // RFC 5681 §2: nothing beyond SND.UNA + min(cwnd, rwnd); after a go-back the octets
         // between SND.NXT and SND.MAX count as lost.
         let sent = self.snd_una.distance(self.snd_nxt) as u32;
@@ -1004,6 +1020,9 @@ impl Tcb {
         }
         meta.flags = out.flags;
         meta.len = got;
+        if got > 0 {
+            self.last_data_sent = Some(now);
+        }
         self.rto_at.get_or_insert(now + self.rtt.rto());
         self.r2_since.get_or_insert(now);
         Some(meta)
