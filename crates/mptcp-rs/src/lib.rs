@@ -2,6 +2,7 @@
 
 pub mod crypto;
 mod seq;
+pub mod tcp;
 mod time;
 pub mod wire;
 

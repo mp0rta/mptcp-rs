@@ -1,0 +1,185 @@
+//! Hook traits through which the `Tcb` reaches the send and receive buffers (spec §3), and
+//! `PlainHooks`, their plain-TCP implementation with real buffers.
+
+use std::collections::VecDeque;
+
+use super::tcb::ConnectConfig;
+
+/// Send-side data source. Relative SSN: the first data octet is 1 (spec §5.3).
+pub trait SendBuf {
+    /// Calls `f` with the contiguous run of buffered bytes starting at `rel_ssn`, at most `max`
+    /// long. The run may be shorter than `max` and than what is buffered (it ends at an internal
+    /// buffer boundary). `None` if no byte at `rel_ssn` is buffered.
+    fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
+    /// Relative SSN one past the last assigned octet.
+    fn assigned_end(&self) -> u32;
+    /// Releases every octet below `rel_ssn_una`.
+    fn mark_acked(&mut self, rel_ssn_una: u32);
+}
+
+/// Receive-side sink. The `Tcb` drops duplicates and trims every segment to what the hooks can
+/// store before calling `accept_payload`, so the call cannot fail.
+pub trait SegmentHooks {
+    fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]);
+    /// Free receive space in octets, before window scaling.
+    fn recv_window(&self) -> u32;
+}
+
+pub trait Hooks: SendBuf + SegmentHooks {}
+impl<T: SendBuf + SegmentHooks> Hooks for T {}
+
+/// Plain TCP: one contiguous send buffer and one in-order receive buffer.
+pub struct PlainHooks {
+    send: VecDeque<u8>,
+    /// Relative SSN of `send[0]`.
+    send_una: u32,
+    send_buffer: usize,
+    recv: VecDeque<u8>,
+    /// Relative SSN one past the last in-order octet stored.
+    recv_end: u32,
+    recv_buffer: usize,
+}
+
+impl PlainHooks {
+    pub fn new(cfg: &ConnectConfig) -> Self {
+        Self {
+            send: VecDeque::new(),
+            send_una: 1,
+            send_buffer: cfg.send_buffer as usize,
+            recv: VecDeque::new(),
+            recv_end: 1,
+            recv_buffer: cfg.recv_buffer as usize,
+        }
+    }
+
+    /// Queues as much of `data` as the send buffer has room for; returns the count queued.
+    pub fn write(&mut self, data: &[u8]) -> usize {
+        let n = data
+            .len()
+            .min(self.send_buffer.saturating_sub(self.send.len()));
+        self.send.extend(&data[..n]);
+        n
+    }
+
+    /// Moves received in-order bytes into `buf`; returns the count moved.
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.recv.len());
+        for (dst, src) in buf.iter_mut().zip(self.recv.drain(..n)) {
+            *dst = src;
+        }
+        n
+    }
+}
+
+impl SendBuf for PlainHooks {
+    fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        // Below `send_una` wraps to a huge offset and is rejected too.
+        let off = rel_ssn.wrapping_sub(self.send_una) as usize;
+        if off >= self.send.len() {
+            return None;
+        }
+        let (a, b) = self.send.as_slices();
+        let run = if off < a.len() {
+            &a[off..]
+        } else {
+            &b[off - a.len()..]
+        };
+        Some(f(&run[..run.len().min(max)]))
+    }
+
+    fn assigned_end(&self) -> u32 {
+        self.send_una.wrapping_add(self.send.len() as u32)
+    }
+
+    fn mark_acked(&mut self, rel_ssn_una: u32) {
+        let d = rel_ssn_una.wrapping_sub(self.send_una) as i32;
+        if d <= 0 {
+            return;
+        }
+        let n = (d as usize).min(self.send.len());
+        self.send.drain(..n);
+        self.send_una = self.send_una.wrapping_add(n as u32);
+    }
+}
+
+impl SegmentHooks for PlainHooks {
+    fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
+        // Out-of-order payload is not stored yet.
+        if rel_ssn == self.recv_end {
+            self.recv.extend(data);
+            self.recv_end = self.recv_end.wrapping_add(data.len() as u32);
+        }
+    }
+
+    fn recv_window(&self) -> u32 {
+        self.recv_buffer.saturating_sub(self.recv.len()) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hooks(send: u32, recv: u32) -> PlainHooks {
+        PlainHooks::new(&ConnectConfig {
+            send_buffer: send,
+            recv_buffer: recv,
+            ..ConnectConfig::default()
+        })
+    }
+
+    #[test]
+    fn send_buffer_bounded_peek_and_ack() {
+        let mut h = hooks(8, 8);
+        assert_eq!(h.assigned_end(), 1);
+        assert_eq!(h.write(b"abcdef"), 6);
+        assert_eq!(h.write(b"ghij"), 2);
+        assert_eq!(h.write(b"k"), 0);
+        assert_eq!(h.assigned_end(), 9);
+        assert_eq!(h.peek_with(1, 3, |d| d.to_vec()), Some(b"abc".to_vec()));
+        assert_eq!(h.peek_with(7, 100, |d| d.to_vec()), Some(b"gh".to_vec()));
+        assert_eq!(h.peek_with(9, 1, |d| d.len()), None);
+        h.mark_acked(5);
+        assert_eq!(h.peek_with(4, 1, |d| d.len()), None);
+        assert_eq!(h.peek_with(5, 2, |d| d.to_vec()), Some(b"ef".to_vec()));
+        h.mark_acked(3); // stale: no effect
+        assert_eq!(h.peek_with(5, 1, |d| d.to_vec()), Some(b"e".to_vec()));
+        assert_eq!(h.write(b"klmnop"), 4);
+        assert_eq!(h.assigned_end(), 13);
+    }
+
+    #[test]
+    fn peek_run_ends_at_buffer_wrap() {
+        let mut h = hooks(8, 8);
+        // Fill, ack, refill so the deque wraps; peeks must still return the right bytes in order.
+        let mut out = Vec::new();
+        let mut next = 1u32;
+        for chunk in [b"abcdefgh".as_slice(), b"ijkl", b"mnop"] {
+            h.write(chunk);
+            while let Some(run) = h.peek_with(next, 100, |d| d.to_vec()) {
+                assert!(!run.is_empty());
+                next += run.len() as u32;
+                out.extend(run);
+            }
+            h.mark_acked(next);
+        }
+        assert_eq!(out, b"abcdefghijklmnop");
+    }
+
+    #[test]
+    fn recv_in_order_read_and_window() {
+        let mut h = hooks(8, 8);
+        assert_eq!(h.recv_window(), 8);
+        h.accept_payload(1, b"ab");
+        h.accept_payload(3, b"cde");
+        assert_eq!(h.recv_window(), 3);
+        let mut buf = [0u8; 4];
+        assert_eq!(h.read(&mut buf), 4);
+        assert_eq!(&buf, b"abcd");
+        assert_eq!(h.read(&mut []), 0);
+        assert_eq!(h.read(&mut buf), 1);
+        assert_eq!(buf[0], b'e');
+        assert_eq!(h.read(&mut buf), 0);
+        assert_eq!(h.recv_window(), 8);
+    }
+}
