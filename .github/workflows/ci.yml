@@ -1,0 +1,40 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "fuzz" }
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - run: cargo fuzz run mptcp_option -- -max_total_time=60
+      - run: cargo fuzz run handle_packet -- -max_total_time=60
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
