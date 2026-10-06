@@ -366,7 +366,20 @@ impl Tcb {
     pub fn on_segment(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::Closed => Reaction::None,
-            TcpState::SynSent => self.on_segment_syn_sent(seg, now),
+            TcpState::SynSent => {
+                let r = self.on_segment_syn_sent(seg, now);
+                if r == Reaction::Established {
+                    // §3.10.7.3: text and FIN on the SYN/ACK are processed once ESTABLISHED,
+                    // from the sequence number after the SYN. The FIN's CLOSE-WAIT move
+                    // emits no `Closed`, so the reaction stays `Established`.
+                    let text = Segment {
+                        seq: seg.seq.wrapping_add(1),
+                        ..seg.clone()
+                    };
+                    self.on_text_and_fin(&text, now, h);
+                }
+                r
+            }
             _ => self.on_segment_sync(seg, now, h),
         }
     }
@@ -595,13 +608,18 @@ impl Tcb {
         if let ControlFlow::Break(r) = self.on_ack(seg, now, h) {
             return r;
         }
-        // Seventh, until the peer's FIN (URG is not processed: urgent data is delivered
-        // inline, RFC 6093). Text after the FIN is ignored.
+        self.on_text_and_fin(seg, now, h)
+    }
+
+    /// Seventh and eighth steps. Seventh, until the peer's FIN (URG is not processed: urgent
+    /// data is delivered inline, RFC 6093); text after the FIN is ignored. Eighth: a FIN right
+    /// after all the text before it.
+    fn on_text_and_fin(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         if !self.fin_received {
             self.on_text(seg, now, h);
         }
-        // Eighth: a FIN right after all the text before it.
-        if fin && seg_end == self.rcv_nxt {
+        let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
+        if seg.flags.contains(TcpFlags::FIN) && seg_end == self.rcv_nxt {
             return self.on_fin(now);
         }
         Reaction::None

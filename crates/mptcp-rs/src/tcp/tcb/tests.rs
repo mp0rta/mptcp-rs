@@ -2260,3 +2260,56 @@ fn close_in_syn_sent_deletes_tcb() {
     assert_eq!(f.send(t(0)), None);
     assert_eq!(f.timeout(t(0)), NORMAL);
 }
+
+/// RFC 9293 §3.10.7.3: text and FIN carried by the SYN/ACK are processed once ESTABLISHED.
+fn synack_with(payload: &[u8], fin: bool) -> Fixture {
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.send(t(0)).unwrap();
+    let mut flags = TcpFlags::SYN | TcpFlags::ACK;
+    if fin {
+        flags = flags | TcpFlags::FIN;
+    }
+    let o = opts(Some(1400), Some(7));
+    let seg = Segment {
+        src: f.addrs.1,
+        dst: f.addrs.0,
+        seq: PEER_ISN,
+        ack: ISN.wrapping_add(1),
+        flags,
+        wnd: 5000,
+        options: &o,
+        payload,
+    };
+    assert_eq!(
+        f.tcb.on_segment(&seg, t(0), &mut f.h),
+        Reaction::Established
+    );
+    f
+}
+
+#[test]
+fn synack_payload_is_delivered() {
+    let mut f = synack_with(&[7; 100], false);
+    assert_eq!(f.tcb.state(), TcpState::Established);
+    let mut buf = [0u8; 200];
+    assert_eq!(f.h.read(&mut buf), 100);
+    assert_eq!(buf[..100], [7; 100]);
+    f.send(t(0)).unwrap();
+    assert_eq!(f.out.ack, PEER_ISN.wrapping_add(101));
+}
+
+#[test]
+fn synack_fin_closes_receive_side() {
+    for payload in [&[][..], &[5u8; 40][..]] {
+        let mut f = synack_with(payload, true);
+        assert_eq!(f.tcb.state(), TcpState::CloseWait);
+        assert!(f.tcb.fin_received());
+        assert_eq!(f.h.read(&mut [0u8; 64]), payload.len());
+        f.send(t(0)).unwrap();
+        assert_eq!(
+            f.out.ack,
+            PEER_ISN.wrapping_add(2 + payload.len() as u32),
+            "ACK covers SYN, data and FIN"
+        );
+    }
+}
