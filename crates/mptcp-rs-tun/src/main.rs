@@ -102,7 +102,7 @@ fn run(a: Args) -> Result<String, String> {
         st.events(&mut ep, &a)?;
 
         // After a normal close the connection is gone unless data is still unread.
-        if st.connected && !st.eof && (!st.done || ep.connection(h).is_some()) {
+        if st.drives(ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
             while !st.closing && st.sent < a.send {
                 let n = (a.send - st.sent).min(65536) as usize;
@@ -172,6 +172,12 @@ struct State {
 }
 
 impl State {
+    /// Whether this iteration writes, reads and closes. After a normal close the connection is
+    /// gone unless data is still unread. EOF only stops the read loop, never the writes.
+    fn drives(&self, conn_present: bool) -> bool {
+        self.connected && (!self.done || conn_present)
+    }
+
     fn events(&mut self, ep: &mut Endpoint<ChaCha20Rng>, a: &Args) -> Result<(), String> {
         while let Some((_, ev)) = ep.poll_event() {
             match ev {
@@ -238,5 +244,18 @@ mod tests {
         assert!(parse_args(v(ok)).is_some());
         assert!(parse_args(v("--tun t0")).is_none());
         assert!(parse_args(v("--bogus 1")).is_none());
+    }
+
+    #[test]
+    fn peer_eof_does_not_stop_writes_and_close() {
+        let st = State {
+            connected: true,
+            eof: true,
+            ..State::default()
+        };
+        assert!(st.drives(true));
+        let st = State { done: true, ..st };
+        assert!(!st.drives(false));
+        assert!(!State::default().drives(true), "not connected yet");
     }
 }
