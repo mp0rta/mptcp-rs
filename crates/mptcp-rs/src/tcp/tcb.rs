@@ -469,6 +469,17 @@ impl Tcb {
         // First: an unacceptable segment draws an ACK, unless it is a RST, and is dropped.
         if !self.acceptable(seg) {
             self.ack_due |= !rst;
+            // "If the RCV.WND is zero, ... special allowance should be made to accept valid
+            // ACKs, URGs, and RSTs": with our window closed, the ACK field of a segment at or
+            // beyond RCV.NXT is still processed; its text is not. (An RST allowance would go
+            // here too; RST is not acted on yet.)
+            let ack_only =
+                seg.flags.contains(TcpFlags::ACK) && !rst && !seg.flags.contains(TcpFlags::SYN);
+            if ack_only && self.rcv_nxt.le(seg.seq) && self.window_offer(h).0 == 0 {
+                if let ControlFlow::Break(r) = self.on_ack(seg, now, h) {
+                    return r;
+                }
+            }
             return Reaction::None;
         }
         if rst {
@@ -749,26 +760,29 @@ impl Tcb {
         seq.0.wrapping_sub(self.iss.0)
     }
 
-    /// Window field of a non-SYN segment; records the right edge it advertises.
+    /// Window field of a non-SYN segment; records the right edge it advertises if it is the
+    /// largest so far (only a zero window retracts it, and acceptability keeps the largest).
     fn wnd_field(&mut self, h: &impl Hooks) -> u16 {
         let (field, edge) = self.window_offer(h);
-        self.rcv_right_edge = edge;
+        if edge.gt(self.rcv_right_edge) {
+            self.rcv_right_edge = edge;
+        }
         field
     }
 
     /// The window field to send now and the right edge it advertises (spec §5.4 applied to
     /// plain TCP): the edge moves to RCV.NXT + free memory only in steps of the receiver SWS
     /// threshold (RFC 9293 §3.8.6.2.2), otherwise the current edge is re-advertised; it never
-    /// moves left (SHLD-14), rounding up to the scale granularity only when needed.
+    /// moves left (SHLD-14), rounding up to the scale granularity only when needed. With no
+    /// free memory the window is 0: the edge retracts by less than 2^scale (RFC 7323 §2.4),
+    /// rather than promising octets that could never be stored.
     fn window_offer(&self, h: &impl Hooks) -> (u16, SeqNum) {
         let offered = self.rcv_wnd();
         let free = h.recv_window();
-        let sws = (self.cfg.recv_buffer / 2).min(u32::from(self.eff_mss));
-        let target = if free.saturating_sub(offered) >= sws {
-            free
-        } else {
-            0
-        };
+        if free == 0 {
+            return (0, self.rcv_nxt);
+        }
+        let target = if self.sws_moves(free) { free } else { 0 };
         let mut field = (target >> self.rcv_shift).min(65535);
         if field << self.rcv_shift < offered {
             // At most 65535: `offered` came from a field of at most 65535.
@@ -780,13 +794,20 @@ impl Tcb {
         )
     }
 
-    /// A window update is due when the edge can move by at least the window the peer still
-    /// has: a zero window reopens at once, while reads during a transfer ride on the ACKs the
-    /// data draws anyway. Neither the creep of a rounded-up edge nor a field capped at 65535
-    /// then draws an extra ACK per received segment.
+    /// Receiver SWS (RFC 9293 §3.8.6.2.2): `buffer_edge − right_edge >= min(buffer/2, eff_mss)`.
+    fn sws_moves(&self, free: u32) -> bool {
+        let sws = (self.cfg.recv_buffer / 2).min(u32::from(self.eff_mss));
+        free.saturating_sub(self.rcv_wnd()) >= sws
+    }
+
+    /// After a read, an update is sent only if the SWS rule moves the edge by at least the
+    /// window the peer still has (ruling R15): a closed window reopens at once, while reads
+    /// during a transfer ride on the ACKs the data draws anyway, and neither the creep of a
+    /// rounded-up edge nor a field capped at 65535 draws an extra ACK per segment.
     fn window_update_due(&self, h: &impl Hooks) -> bool {
+        let free = h.recv_window();
         let grow = self.rcv_right_edge.distance(self.window_offer(h).1);
-        grow > 0 && grow as u32 >= self.rcv_wnd()
+        self.sws_moves(free) && grow > 0 && grow as u32 >= self.rcv_wnd()
     }
 
     /// RCV.WND: from RCV.NXT to the largest edge advertised.

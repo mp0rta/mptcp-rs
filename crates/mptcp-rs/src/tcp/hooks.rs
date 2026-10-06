@@ -115,7 +115,8 @@ impl SegmentHooks for PlainHooks {
     fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
         if rel_ssn != self.recv_end {
             self.ooo_len += data.len();
-            self.ooo.insert(rel_ssn, data.to_vec());
+            let old = self.ooo.insert(rel_ssn, data.to_vec());
+            debug_assert!(old.is_none(), "the Tcb hands each octet over once");
             return;
         }
         self.recv.extend(data);

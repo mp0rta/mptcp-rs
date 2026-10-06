@@ -874,11 +874,23 @@ fn rx_cfg(recv_buffer: u32) -> ConnectConfig {
 impl<H: Hooks> Fixture<H> {
     /// A segment from the peer at peer data octet `off`, acknowledging everything we sent.
     fn seg_in(&mut self, now: Instant, off: u32, flags: TcpFlags, payload: &[u8]) -> Reaction {
+        let ack = self.tcb.snd_nxt;
+        self.seg_ack(now, off, ack, flags, payload)
+    }
+    /// As `seg_in`, with an explicit ACK number.
+    fn seg_ack(
+        &mut self,
+        now: Instant,
+        off: u32,
+        ack: SeqNum,
+        flags: TcpFlags,
+        payload: &[u8],
+    ) -> Reaction {
         let seg = Segment {
             src: self.addrs.1,
             dst: self.addrs.0,
             seq: pdata(off),
-            ack: self.tcb.snd_nxt,
+            ack,
             flags,
             wnd: 65535,
             options: &[],
@@ -1127,7 +1139,9 @@ fn window_right_edge_never_shrinks() {
     assert_eq!(f.tcb.rcv_shift, 2);
     let p = pattern(333);
     let mut expect = Vec::new();
+    // `edge`: the peer's view (the last ACK); `max_edge`: the largest edge advertised.
     let (mut edge, mut next, mut probes, mut acks) = (f.tcb.rcv_right_edge, 0u32, 0, 0);
+    let (mut max_edge, mut zero_wnds) = (edge, 0);
     for i in 0..1000 {
         let now = tm(i);
         let len = (pdata(next).distance(edge).max(0) as usize).min(p.len());
@@ -1143,12 +1157,20 @@ fn window_right_edge_never_shrinks() {
         next += stored as u32;
         for (ack, wnd) in f.acks(now) {
             let e = ack.wrapping_add(u32::from(wnd) << 2);
-            assert!(e.ge(edge), "edge moved left at segment {i}");
+            if wnd == 0 && f.h.recv_window() == 0 {
+                // Memory full: a zero window retracts the edge (RFC 7323 §2.4); segments up to
+                // the largest edge stay acceptable.
+                assert_eq!(f.tcb.rcv_right_edge, max_edge);
+                zero_wnds += 1;
+            } else {
+                assert!(e.ge(max_edge), "edge moved left at segment {i}");
+                max_edge = e;
+            }
             edge = e;
             acks += 1;
         }
     }
-    assert!(probes > 300 && acks > 500);
+    assert!(probes > 300 && acks > 500 && zero_wnds > 300);
     let got = f.read_all();
     assert_eq!(
         got.len(),
@@ -1242,4 +1264,91 @@ fn ooo_range_cap() {
     assert_eq!(f.ack_nos(t(0)), vec![pdata(200)]);
     assert_eq!(f.read_all(), p);
     assert!(f.tcb.rcv_ooo.is_empty());
+}
+
+#[test]
+fn full_memory_advertises_zero_window_and_reopens() {
+    const BUF: u32 = 4 << 20;
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(BUF as usize + 2000);
+    let fill = BUF - 1000;
+    f.data_in(t(0), 0, &p[..2_000_000]);
+    f.data_in(t(0), 2_000_000, &p[2_000_000..fill as usize]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(fill), 8)]);
+    // 1000 of the 1024 B stored: memory is full, so the window is 0 (the edge retracts by
+    // less than 2^7, RFC 7323 §2.4) instead of a rounded-up 128 B nobody can store.
+    f.data_in(t(0), fill, &p[fill as usize..][..1024]);
+    assert_eq!(f.acks(t(0)), vec![(pdata(BUF), 0)]);
+    f.data_in(t(0), BUF, &p[BUF as usize..][..1]);
+    assert_eq!(
+        f.acks(t(0)),
+        vec![(pdata(BUF), 0)],
+        "probe answered, still closed"
+    );
+    // Our data in flight; the peer's pure ACK at its SND.NXT (beyond our zero window, where
+    // its dropped 24 B ended) still acknowledges it.
+    f.write(&pattern(500));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.seg_ack(t(0), BUF + 24, data(500), TcpFlags::ACK, &[]);
+    assert_eq!(f.tcb.snd_una, data(500));
+    assert_eq!(f.acks(t(0)), vec![(pdata(BUF), 0)]);
+    // A small read stays below the SWS threshold: no update.
+    let mut buf = vec![0u8; 65536];
+    assert_eq!(f.h.read(&mut buf[..500]), 500);
+    assert!(f.acks(t(0)).is_empty());
+    // A read past it reopens the window, and the transfer continues.
+    assert_eq!(f.h.read(&mut buf[500..]), 65036);
+    assert_eq!(f.acks(t(0)), vec![(pdata(BUF), 512)]);
+    f.data_in(t(1), BUF, &p[BUF as usize..]);
+    assert_eq!(f.ack_nos(t(1)), Vec::<SeqNum>::new());
+    assert_eq!(f.timeout(tm(1200)), Reaction::None);
+    assert_eq!(f.ack_nos(tm(1200)), vec![pdata(BUF + 2000)]);
+    let mut got = buf;
+    got.extend(f.read_all());
+    assert_eq!(got, p);
+}
+
+#[test]
+fn zero_window_still_takes_acks() {
+    let mut f = Fixture::established(rx_cfg(10_000), 10 * MSS);
+    let p = pattern(10_000);
+    for k in 0..10 {
+        f.seg_ack(
+            t(0),
+            k * 1000,
+            data(0),
+            TcpFlags::ACK,
+            &p[(k * 1000) as usize..][..1000],
+        );
+    }
+    assert_eq!(f.acks(t(0)).last(), Some(&(pdata(10_000), 0)));
+    assert_eq!(f.tcb.rcv_wnd(), 0);
+    f.write(&pattern(300));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    // A one-octet probe at RCV.NXT: its text is refused, its ACK field is taken.
+    f.seg_ack(t(0), 10_000, data(100), TcpFlags::ACK, &[9]);
+    assert_eq!((f.tcb.snd_una, f.h.recv_window()), (data(100), 0));
+    assert_eq!(f.acks(t(0)), vec![(pdata(10_000), 0)]);
+    // A pure ACK at RCV.NXT + 1 (after the dropped probe octet).
+    f.seg_ack(t(0), 10_001, data(300), TcpFlags::ACK, &[]);
+    assert_eq!(f.tcb.snd_una, data(300));
+    assert_eq!(f.acks(t(0)), vec![(pdata(10_000), 0)]);
+    // An ACK of data not yet sent changes nothing.
+    f.seg_ack(t(0), 10_001, data(900), TcpFlags::ACK, &[]);
+    assert_eq!(f.tcb.snd_una, data(300));
+    assert_eq!(f.acks(t(0)).len(), 1);
+    assert_eq!(f.read_all(), p);
+}
+
+#[test]
+fn text_processed_when_ack_is_old() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.write(&pattern(1000));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(t(0), data(1000), 10_000);
+    assert_eq!(f.tcb.snd_una, data(1000));
+    // SEG.ACK < SND.UNA: the ACK is ignored, the text is not.
+    f.seg_ack(t(0), 0, data(0), TcpFlags::ACK, &pattern(100));
+    assert_eq!(f.tcb.snd_una, data(1000));
+    assert_eq!(f.read_all(), pattern(100));
 }
