@@ -992,7 +992,7 @@ impl Tcb {
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
     ) -> Option<SentMeta> {
-        let wnd = self.wnd_field(h);
+        let (wnd, edge, sws_edge) = self.window_offer(h);
         let mut meta = out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd);
         let start = self.rel(seq);
         let mut got = 0u32;
@@ -1020,6 +1020,7 @@ impl Tcb {
         }
         meta.flags = out.flags;
         meta.len = got;
+        self.record_offer(edge, sws_edge);
         if got > 0 {
             self.last_data_sent = Some(now);
         }
@@ -1057,11 +1058,16 @@ impl Tcb {
     /// is the largest so far (acceptability keeps the largest).
     fn wnd_field(&mut self, h: &impl Hooks) -> u16 {
         let (field, edge, sws_edge) = self.window_offer(h);
+        self.record_offer(edge, sws_edge);
+        field
+    }
+
+    /// Records an advertised window. Only for a segment that is really going out.
+    fn record_offer(&mut self, edge: SeqNum, sws_edge: SeqNum) {
         self.rcv_sws_edge = sws_edge;
         if edge.gt(self.rcv_right_edge) {
             self.rcv_right_edge = edge;
         }
-        field
     }
 
     /// The window field to send now, the edge it advertises and the SWS edge behind it

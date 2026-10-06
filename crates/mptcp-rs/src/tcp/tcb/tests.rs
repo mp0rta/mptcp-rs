@@ -2355,3 +2355,48 @@ fn idle_shorter_than_rto_keeps_cwnd() {
     assert_eq!(sent, 20_000.min(cwnd / u32::from(MSS) * u32::from(MSS)));
     assert!(sent > 4 * u32::from(MSS));
 }
+
+#[test]
+fn window_update_survives_a_go_back_that_sends_nothing() {
+    // After an RTO the go-back path runs with cwnd exhausted and sends nothing; it must not
+    // record a window the read just reopened as already advertised.
+    let cfg = ConnectConfig {
+        recv_buffer: 2000,
+        ..ConnectConfig::default()
+    };
+    let mut f = Fixture::new(cfg, v4());
+    assert_eq!(
+        f.synack(65535, &opts(Some(MSS), Some(0))),
+        Reaction::Established
+    );
+    f.send(t(0)).unwrap();
+    f.write(&pattern(3000));
+    assert_eq!(f.drain(t(0)).len(), 3);
+    // The peer fills our receive buffer.
+    let payload = pattern(2000);
+    let seg = Segment {
+        src: f.addrs.1,
+        dst: f.addrs.0,
+        seq: PEER_ISN.wrapping_add(1),
+        ack: ISN.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        wnd: 65535,
+        options: &[],
+        payload: &payload,
+    };
+    f.tcb.on_segment(&seg, t(0), &mut f.h);
+    f.timeout(tm(250)); // the delayed ACK
+    let acks = f.drain(tm(250));
+    assert_eq!(acks.last().unwrap().0.flags, TcpFlags::ACK);
+    assert_eq!(f.out.wnd, 0, "buffer full");
+    // RTO: one retransmission uses up the 1-MSS cwnd.
+    let at = f.tcb.poll_send_at().unwrap();
+    f.timeout(at);
+    assert_eq!(f.send(at).unwrap().len, u32::from(MSS));
+    // The go-back pass finds no room; the app then reads everything.
+    assert_eq!(f.send(at), None);
+    assert_eq!(f.h.read(&mut [0u8; 2000]), 2000);
+    let m = f.send(at).expect("window update ACK");
+    assert_eq!(m.len, 0);
+    assert!(f.out.wnd > 0);
+}
