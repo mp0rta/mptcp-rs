@@ -70,6 +70,11 @@ impl PlainHooks {
         n
     }
 
+    /// Whether received in-order bytes are waiting to be read.
+    pub fn has_unread(&self) -> bool {
+        !self.recv.is_empty()
+    }
+
     /// Moves received in-order bytes into `buf`; returns the count moved.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.recv.len());

@@ -113,12 +113,14 @@ impl<R: CryptoRng> Endpoint<R> {
                 remote,
                 closed_by_app: false,
                 reset: false,
+                detached: false,
             },
         );
         Ok(h)
     }
 
-    /// `None` once the TCB is freed.
+    /// `None` once the connection is freed. A closed (not reset) connection with unread data
+    /// stays reachable, without its port, until the data is read and `handle_timeout` runs.
     pub fn connection(&mut self, h: ConnectionHandle) -> Option<&mut Connection> {
         self.conns.get_mut(&h)
     }
@@ -244,10 +246,12 @@ impl<R: CryptoRng> Endpoint<R> {
         packet::build(seg, id, buf).ok()
     }
 
-    /// Earliest `poll_send_at` over all connections.
+    /// Earliest `poll_send_at` over all connections. Driver contract: after any `read`,
+    /// `write` or `close` call `poll_transmit` (they can make a packet due), then re-read this.
     pub fn poll_timeout(&self) -> Option<Instant> {
         self.conns
             .values()
+            .filter(|c| !c.detached)
             .filter_map(|c| c.tcb.poll_send_at())
             .min()
     }
@@ -255,19 +259,24 @@ impl<R: CryptoRng> Endpoint<R> {
     /// Runs `Tcb::on_timeout` on every due TCB (Closed ones included: a SYN-SENT close reports
     /// its `Closed(Normal)` there), then frees the TCBs that are `Closed`.
     pub fn handle_timeout(&mut self, now: Instant) {
-        for (&h, c) in self.conns.iter_mut() {
+        for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
             if c.tcb.poll_send_at().is_some_and(|t| t <= now) {
                 let r = c.tcb.on_timeout(now, &mut c.hooks);
                 Self::push_event(&mut self.events, c, h, r);
             }
         }
         let demux = &mut self.demux;
-        self.conns.retain(|_, c| {
-            let keep = c.tcb.state() != TcpState::Closed;
-            if !keep {
-                demux.remove(&(c.local, c.remote));
+        self.conns.retain(|&h, c| {
+            if c.tcb.state() != TcpState::Closed {
+                return true;
             }
-            keep
+            let key = (c.local, c.remote);
+            if demux.get(&key) == Some(&h) {
+                demux.remove(&key);
+            }
+            // A reset connection's data is not readable; otherwise keep it until drained.
+            c.detached = !c.reset && c.hooks.has_unread();
+            c.detached
         });
     }
 }

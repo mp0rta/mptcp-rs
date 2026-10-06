@@ -225,3 +225,50 @@ fn ports_exhausted_gives_no_port() {
             .is_ok()
     );
 }
+
+/// R23: a passive close must not lose received data the application has not read yet.
+#[test]
+fn passive_close_keeps_unread_data_readable() {
+    let mut ep = endpoint(9);
+    let (h, syn, iss) = established(&mut ep, t(1), false);
+    let isn = syn.seq.0;
+    send_seg(
+        &mut ep,
+        t(2),
+        &syn,
+        iss + 1,
+        isn + 1,
+        TcpFlags::ACK | TcpFlags::FIN,
+        b"hello",
+    );
+    expect_ack(&drain(&mut ep, t(2)), iss + 7);
+    ep.connection(h).unwrap().close(); // before reading
+    let fin = parse_owned(&drain(&mut ep, t(2))[0]);
+    assert!(fin.flags.contains(TcpFlags::FIN));
+    send_seg(&mut ep, t(3), &syn, iss + 7, isn + 2, TcpFlags::ACK, &[]);
+    ep.handle_timeout(t(3));
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            h,
+            Event::Closed {
+                reason: CloseReason::Normal
+            }
+        ))
+    );
+    // The port is released: a segment for the 4-tuple is now answered with RST.
+    send_seg(&mut ep, t(3), &syn, iss + 7, isn + 2, TcpFlags::ACK, &[]);
+    let rst = parse_owned(&drain(&mut ep, t(3))[0]);
+    assert!(rst.flags.contains(TcpFlags::RST));
+    // No timer spin while only the drained-pending connection exists.
+    assert_eq!(ep.poll_timeout(), None);
+    ep.handle_timeout(t(4));
+    let mut buf = [0u8; 16];
+    let c = ep.connection(h).expect("kept until drained");
+    assert_eq!(c.read(&mut buf), Ok(5));
+    assert_eq!(&buf[..5], b"hello");
+    assert_eq!(c.read(&mut buf), Ok(0), "EOF");
+    ep.handle_timeout(t(5));
+    assert!(ep.connection(h).is_none());
+    assert_eq!(ep.poll_timeout(), None);
+}

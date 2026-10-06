@@ -25,6 +25,9 @@ pub struct Connection {
     pub(crate) remote: SocketAddr,
     pub(crate) closed_by_app: bool,
     pub(crate) reset: bool,
+    /// Closed and out of the demux table, kept only until the application has read the
+    /// remaining data (no timers, no packets).
+    pub(crate) detached: bool,
 }
 
 impl Connection {
@@ -51,7 +54,9 @@ impl Connection {
         }
     }
 
-    /// Half-closes: the FIN follows the queued data. Reading stays possible.
+    /// Half-closes: the FIN follows the queued data. Reading stays possible, also after the
+    /// connection has fully closed: unread data stays readable through `Endpoint::connection`
+    /// until `read` returns `Ok(0)`; the next `Endpoint::handle_timeout` then frees it.
     ///
     /// In SYN-SENT this instead deletes the connection: queued writes are discarded and
     /// `Closed { Normal }` is reported. Wait for `Event::Connected` before `close` if the
