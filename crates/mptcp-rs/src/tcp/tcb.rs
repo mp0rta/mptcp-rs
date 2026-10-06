@@ -180,6 +180,12 @@ pub struct Tcb {
     /// Out-of-order receipt ranges (headers only, spec §2 step 4), in unwrapped relative SSN.
     /// Exactly the octets the hooks hold out of order.
     rcv_ooo: RangeSet<u64>,
+    /// Peer offered SACK-Permitted in its SYN; our sender still uses NewReno.
+    sack_permitted: bool,
+    /// Points in the most recently received out-of-order blocks, newest first.
+    sack_recent: Vec<u64>,
+    /// Duplicate data from the latest input, reported once (RFC 2883).
+    dsack: Option<(SeqNum, SeqNum)>,
     /// In-order data segments received since our last ACK.
     rcv_unacked: u8,
     /// The peer's FIN is received (RCV.NXT is past it).
@@ -192,6 +198,9 @@ pub struct Tcb {
     rtt: RttEstimator,
     /// Retransmission timer (SYN, then data at SND.UNA).
     rto_at: Option<Instant>,
+    /// End of the last retransmission at SND.UNA and its earliest permitted RTO expiry
+    /// (RFC 6298 §5). Cleared once all of that segment, including any FIN, is acknowledged.
+    rto_not_before: Option<(SeqNum, Instant)>,
     /// The one timed segment (Karn): its end and send time; cleared by any RTO.
     rtt_timed: Option<(SeqNum, Instant)>,
     /// When data octets last went out (RFC 5681 §4.1 idle detection).
@@ -267,12 +276,16 @@ impl Tcb {
             rcv_right_edge: SeqNum(0),
             rcv_sws_edge: SeqNum(0),
             rcv_ooo: RangeSet::new(),
+            sack_permitted: false,
+            sack_recent: Vec::new(),
+            dsack: None,
             rcv_unacked: 0,
             fin_received: false,
             cc,
             recovery: NewReno::new(isn),
             rtt: RttEstimator::new(),
             rto_at: None,
+            rto_not_before: None,
             rtt_timed: None,
             last_data_sent: None,
             r2_since: None,
@@ -430,7 +443,8 @@ impl Tcb {
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
             let meta = out.start(self.iss, SeqNum(0), TcpFlags::SYN, wnd);
             let n = tcp_options::write_mss(&mut out.options, self.mss_option());
-            out.options_len = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
+            let n = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
+            out.options_len = n + tcp_options::write_sack_permitted(&mut out.options[n..]);
             return Some(meta);
         }
         if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
@@ -441,7 +455,12 @@ impl Tcb {
             if fin_unsent && self.fin_rel.is_none() {
                 self.fin_rel = Some(h.assigned_end());
             }
-            if let Some(meta) = self.poll_data(now, h, out) {
+            let mut options = [0u8; 40];
+            let limit = usize::from(self.eff_mss.saturating_sub(1)).min(options.len());
+            let n = self.write_sacks(&mut options[..limit]);
+            if let Some(meta) = self.poll_data(now, h, out, n as u16) {
+                out.options[..n].copy_from_slice(&options[..n]);
+                out.options_len = n;
                 // Every data segment, FIN and probe carries the current ACK.
                 self.ack_sent();
                 return Some(meta);
@@ -453,11 +472,14 @@ impl Tcb {
             }
         }
         if self.ack_due {
-            self.ack_sent();
             let wnd = self.wnd_field(h);
             // SND.MAX, not a pulled-back SND.NXT: a SEQ below the peer's RCV.NXT would make
             // the ACK unacceptable to it (RFC 9293 Table 6).
-            return Some(out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd));
+            let meta = out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd);
+            let limit = usize::from(self.mss_option()).min(out.options.len());
+            out.options_len = self.write_sacks(&mut out.options[..limit]);
+            self.ack_sent();
+            return Some(meta);
         }
         None
     }
@@ -475,12 +497,27 @@ impl Tcb {
             TcpState::TimeWait => self.time_wait_at,
             _ => {
                 let r2 = self.r2_since.map(|t| t + self.cfg.r2_data);
-                [self.rto_at, r2, self.persist_at, self.sws_at, self.ack_at]
-                    .into_iter()
-                    .flatten()
-                    .min()
+                [
+                    self.rto_deadline(),
+                    r2,
+                    self.persist_at,
+                    self.sws_at,
+                    self.ack_at,
+                ]
+                .into_iter()
+                .flatten()
+                .min()
             }
         }
+    }
+
+    /// Preserve NewReno's nominal timer (only the first partial ACK restarts it), while
+    /// preventing a timer-based retry less than one RTO after the last retransmission.
+    fn rto_deadline(&self) -> Option<Instant> {
+        self.rto_at.map(|at| {
+            self.rto_not_before
+                .map_or(at, |(_, earliest)| at.max(earliest))
+        })
     }
 
     /// RFC 9293 §3.10.7.3. A segment without ACK is dropped: a RST without ACK by the RFC's
@@ -509,6 +546,7 @@ impl Tcb {
             match opt {
                 TcpOpt::Mss(m) => mss = Some(m),
                 TcpOpt::WindowScale(s) => ws = Some(s),
+                TcpOpt::SackPermitted => self.sack_permitted = true,
                 _ => {}
             }
         }
@@ -582,6 +620,12 @@ impl Tcb {
         // First: an unacceptable segment draws an ACK and is dropped.
         if !self.acceptable(seg) {
             self.ack_due = true;
+            if seg.flags.contains(TcpFlags::ACK)
+                && !seg.flags.contains(TcpFlags::SYN)
+                && !seg.ack.gt(self.snd_max)
+            {
+                self.record_dsack(seg);
+            }
             // "If the RCV.WND is zero, ... special allowance should be made to accept valid
             // ACKs": with our window closed, the ACK field of a segment from RCV.NXT up to one
             // past the largest edge is still processed; its text is not. One past: a one-octet
@@ -622,8 +666,14 @@ impl Tcb {
             self.on_text(seg, now, h);
         }
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
-        if seg.flags.contains(TcpFlags::FIN) && seg_end == self.rcv_nxt {
-            return self.on_fin(now);
+        // Trim sequence-space controls to the receive window too (RFC 9293 §3.10.7.4).
+        // Text may consume the whole window, leaving the following FIN outside it.
+        if seg.flags.contains(TcpFlags::FIN) {
+            if !seg_end.lt(self.rcv_right_edge) {
+                self.ack_due = true;
+            } else if seg_end == self.rcv_nxt {
+                return self.on_fin(now);
+            }
         }
         Reaction::None
     }
@@ -652,6 +702,7 @@ impl Tcb {
         self.state = TcpState::TimeWait;
         self.time_wait_at = Some(now + 2 * MSL);
         self.rto_at = None;
+        self.rto_not_before = None;
         self.r2_since = None;
         self.persist_at = None;
         self.sws_at = None;
@@ -692,6 +743,7 @@ impl Tcb {
         if seg.payload.is_empty() {
             return;
         }
+        self.record_dsack(seg);
         let off = i64::from(self.rcv_nxt.distance(seg.seq));
         let end = off + seg.payload.len() as i64;
         // Free memory counts from RCV.NXT with the held out-of-order octets inside it, so the
@@ -711,6 +763,16 @@ impl Tcb {
                 h.accept_payload(gap.start as u32, &seg.payload[at(gap.start)..at(gap.end)]);
             }
             self.rcv_ooo.insert(s..e);
+            if self.sack_permitted && lo > 0 {
+                // Retain only points in other held blocks; insertion may have coalesced them.
+                self.sack_recent.retain(|point| {
+                    self.rcv_ooo
+                        .get(point)
+                        .is_some_and(|r| !r.contains(&(e - 1)))
+                });
+                self.sack_recent.insert(0, e - 1);
+                self.sack_recent.truncate(4);
+            }
             if let Some(r) = self
                 .rcv_ooo
                 .first()
@@ -770,6 +832,9 @@ impl Tcb {
         if seg.ack.gt(self.snd_una) {
             let acked = self.snd_una.distance(seg.ack) as u32;
             self.snd_una = seg.ack;
+            if self.rto_not_before.is_some_and(|(end, _)| end.le(seg.ack)) {
+                self.rto_not_before = None;
+            }
             // An ACK past a pulled-back SND.NXT: those octets need no resend.
             if self.snd_nxt.lt(self.snd_una) {
                 self.snd_nxt = self.snd_una;
@@ -834,9 +899,10 @@ impl Tcb {
         if self.r2_since.is_some_and(|t| now >= t + self.cfg.r2_data) {
             return self.terminate(CloseReason::Timeout, now);
         }
-        if self.rto_at.is_some_and(|t| now >= t) {
+        if self.rto_deadline().is_some_and(|t| now >= t) {
             // RFC 6298 §5.4–5.6: the retransmission restarts the timer when it is sent.
             self.rto_at = None;
+            self.rto_not_before = None;
             self.rtt.backoff();
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
@@ -871,19 +937,20 @@ impl Tcb {
         now: Instant,
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
+        options_len: u16,
     ) -> Option<SentMeta> {
+        let mss = u32::from(self.eff_mss - options_len);
         let in_flight = self.in_flight();
         if std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
             // The segment at SND.UNA (RTO, fast retransmit, partial ACK): sent regardless of
             // cwnd, Nagle and SWS, even into a zero window, where it is the probe (spec §3).
             // Karn: no RTT sample from anything now in flight.
             self.rtt_timed = None;
-            let len = self
-                .data_len(self.snd_una, self.snd_max)
-                .min(u32::from(self.eff_mss));
+            let len = self.data_len(self.snd_una, self.snd_max).min(mss);
             let fin = self.fin_sent();
             let meta = self.write_data(self.snd_una, len, fin, now, h, out)?;
             let end = self.snd_una.wrapping_add(seq_len(&meta));
+            self.rto_not_before = Some((end, now + self.rtt.rto()));
             if end.gt(self.snd_nxt) {
                 self.snd_nxt = end;
             }
@@ -939,14 +1006,14 @@ impl Tcb {
             let len = self
                 .data_len(self.snd_nxt, self.snd_max)
                 .min(usable)
-                .min(u32::from(self.eff_mss));
+                .min(mss);
             let fin = self.fin_sent() && usable > len;
             let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
             self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
             return Some(meta);
         }
         let sws_override = std::mem::take(&mut self.sws_override);
-        let len = queued.min(usable).min(u32::from(self.eff_mss));
+        let len = queued.min(usable).min(mss);
         // The FIN takes one sequence number of the window, behind the last data octet.
         let fin = fin_pending && usable > len;
         if len == 0 && !fin {
@@ -958,7 +1025,7 @@ impl Tcb {
         // A FIN alone is sent at once.
         let nagle_ok = idle || self.nodelay;
         let send = len == 0
-            || len == u32::from(self.eff_mss)
+            || len == mss
             || (nagle_ok && queued <= usable)
             || (nagle_ok && len >= self.max_snd_wnd / 2)
             || sws_override;
@@ -1128,6 +1195,76 @@ impl Tcb {
         self.ack_due = false;
         self.ack_at = None;
         self.rcv_unacked = 0;
+        self.dsack = None;
+    }
+
+    /// Reports only bytes actually received, including a prefix below the cumulative ACK.
+    fn record_dsack(&mut self, seg: &Segment) {
+        self.dsack = None;
+        if !self.sack_permitted || seg.payload.is_empty() {
+            return;
+        }
+        let next = self
+            .rcv_nxt
+            .wrapping_add(0u32.wrapping_sub(u32::from(self.fin_received)));
+        let off = i64::from(next.distance(seg.seq));
+        let end = off + seg.payload.len() as i64;
+        let lo = off.max(1 - self.rcv_ssn as i64);
+        let hi = end.min(0);
+        if lo < hi {
+            self.dsack = Some((next.wrapping_add(lo as u32), next.wrapping_add(hi as u32)));
+        } else if end > 0 {
+            let start = self.rcv_ssn + off.max(0) as u64;
+            let end = self.rcv_ssn + end as u64;
+            if let Some(r) = self.rcv_ooo.iter().find(|r| r.start < end && r.end > start) {
+                let left = r.start.max(start);
+                let right = r.end.min(end);
+                self.dsack = Some((
+                    next.wrapping_add((left - self.rcv_ssn) as u32),
+                    next.wrapping_add((right - self.rcv_ssn) as u32),
+                ));
+            }
+        }
+    }
+
+    /// DSACK first, its containing block second, then held blocks in reception order.
+    fn write_sacks(&self, out: &mut [u8]) -> usize {
+        if !self.sack_permitted {
+            return 0;
+        }
+        let mut blocks = [(0, 0); 4];
+        let mut count = 0;
+        let duplicate = self
+            .dsack
+            .filter(|(left, _)| !left.lt(self.rcv_nxt))
+            .map(|(left, _)| self.rcv_ssn + self.rcv_nxt.distance(left) as u64);
+        // A DSACK above ACK requires its containing block too (RFC 2883 §4).
+        let dsack = self
+            .dsack
+            .filter(|_| duplicate.is_none() || out.len() >= 20);
+        if let Some((left, right)) = dsack {
+            blocks[0] = (left.0, right.0);
+            count = 1;
+        }
+        for point in duplicate
+            .into_iter()
+            .chain(self.sack_recent.iter().copied())
+            .chain(self.rcv_ooo.iter().rev().map(|r| r.end - 1))
+        {
+            if let Some(r) = self.rcv_ooo.get(&point) {
+                let block = (
+                    self.rcv_nxt.wrapping_add((r.start - self.rcv_ssn) as u32).0,
+                    self.rcv_nxt.wrapping_add((r.end - self.rcv_ssn) as u32).0,
+                );
+                // A full duplicate above ACK needs the same block again to identify DSACK.
+                let first = usize::from(dsack.is_some());
+                if count < blocks.len() && !blocks[first..count].contains(&block) {
+                    blocks[count] = block;
+                    count += 1;
+                }
+            }
+        }
+        tcp_options::write_sack(out, &blocks[..count])
     }
 
     fn terminate(&mut self, reason: CloseReason, now: Instant) -> Reaction {
@@ -1145,8 +1282,8 @@ impl Tcb {
         self.cfg.mtu.saturating_sub(if self.v6 { 60 } else { 40 })
     }
 
-    /// Spec §3: min(peer's MSS option, or 536 / 1220 when absent; our MTU-derived MSS). No TCP
-    /// options are in use on data segments in M0.
+    /// Spec §3: min(peer's MSS option, or 536 / 1220 when absent; our MTU-derived MSS). TCP
+    /// option bytes are subtracted by `poll_data` when SACK accompanies data.
     fn eff_mss_for(&self, peer: Option<u16>) -> u16 {
         let peer = peer.unwrap_or(if self.v6 { 1220 } else { 536 });
         // ponytail: a peer MSS of 0 would stall the send path; used as 1.

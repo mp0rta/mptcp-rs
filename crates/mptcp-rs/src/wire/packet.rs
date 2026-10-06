@@ -77,6 +77,13 @@ pub struct Segment<'a> {
     pub payload: &'a [u8],
 }
 
+// RFC 1071 / RFC 1624 section 5: verification includes the received checksum
+// in the one's-complement sum. A zero computed checksum also admits 0xffff.
+fn valid_checksum(computed: u16, received: u16) -> bool {
+    let sum = u32::from(!computed) + u32::from(received);
+    (sum & 0xffff) + (sum >> 16) == u32::from(u16::MAX)
+}
+
 /// Parse an IPv4 or IPv6 packet carrying TCP. Verifies the IPv4 header and TCP checksums.
 pub fn parse(pkt: &[u8]) -> Result<Segment<'_>, PacketError> {
     let (src_ip, dst_ip, l4) = match pkt.first().map(|b| b >> 4) {
@@ -87,7 +94,7 @@ pub fn parse(pkt: &[u8]) -> Result<Segment<'_>, PacketError> {
             if total < hl || total > pkt.len() {
                 return Err(PacketError::Malformed);
             }
-            if h.header_checksum() != h.to_header().calc_header_checksum() {
+            if !valid_checksum(h.to_header().calc_header_checksum(), h.header_checksum()) {
                 return Err(PacketError::IpChecksum);
             }
             if h.is_fragmenting_payload() {
@@ -127,7 +134,7 @@ pub fn parse(pkt: &[u8]) -> Result<Segment<'_>, PacketError> {
         _ => unreachable!("families come from one IP header"),
     }
     .map_err(|_| PacketError::Malformed)?;
-    if sum != t.checksum() {
+    if !valid_checksum(sum, t.checksum()) {
         return Err(PacketError::Checksum);
     }
     let bit = |set: bool, f: TcpFlags| if set { f } else { TcpFlags(0) };

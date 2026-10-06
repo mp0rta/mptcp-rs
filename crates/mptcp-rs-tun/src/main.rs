@@ -4,6 +4,9 @@
 #[allow(unsafe_code)]
 mod tun;
 
+#[cfg(test)]
+mod ack_tests;
+
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
@@ -89,7 +92,11 @@ fn run(a: Args) -> Result<String, String> {
         tun.wait_readable(Some(wait)).map_err(io_err("poll"))?;
         loop {
             match tun.read(&mut pkt) {
-                Ok(n) => ep.handle_packet(now(start), &pkt[..n]),
+                Ok(n) => {
+                    if let Some(n) = receive_and_poll(&mut ep, now(start), &mut pkt, n) {
+                        write_packet(&tun, &pkt[..n])?;
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(format!("tun read: {e}")),
             }
@@ -143,14 +150,7 @@ fn run(a: Args) -> Result<String, String> {
 
         // Drain before returning: the final ACK of the active close must go out.
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
-            match tun.write(&pkt[..n]) {
-                Ok(_) => {}
-                // Link not up yet (EIO) or queue full: a dropped packet, TCP recovers.
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || matches!(e.raw_os_error(), Some(libc::EIO | libc::ENOBUFS)) => {}
-                Err(e) => return Err(format!("tun write: {e}")),
-            }
+            write_packet(&tun, &pkt[..n])?;
         }
         if st.done {
             return Ok(format!(
@@ -158,6 +158,32 @@ fn run(a: Args) -> Result<String, String> {
                 st.sent, st.verified
             ));
         }
+    }
+}
+
+/// Service the single connection's current ACK before another input can coalesce it.
+/// One output can carry the ACK on data; remaining data is drained after application reads.
+fn receive_and_poll(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    t: Instant,
+    pkt: &mut [u8],
+    n: usize,
+) -> Option<usize> {
+    ep.handle_packet(t, &pkt[..n]);
+    ep.poll_transmit(t, pkt)
+}
+
+fn write_packet(tun: &Tun, pkt: &[u8]) -> Result<(), String> {
+    match tun.write(pkt) {
+        Ok(_) => Ok(()),
+        // Link not up yet (EIO) or queue full: a dropped packet, TCP recovers.
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock
+                || matches!(e.raw_os_error(), Some(libc::EIO | libc::ENOBUFS)) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(format!("tun write: {e}")),
     }
 }
 

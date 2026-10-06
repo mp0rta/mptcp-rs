@@ -42,7 +42,7 @@ pub struct PlainHooks {
     /// Relative SSN one past the last in-order octet stored.
     recv_end: u32,
     /// Out-of-order pieces by relative SSN, and their total length.
-    ooo: BTreeMap<u32, Vec<u8>>,
+    ooo: BTreeMap<u32, VecDeque<u8>>,
     ooo_len: usize,
     recv_buffer: usize,
 }
@@ -126,22 +126,46 @@ impl SegmentHooks for PlainHooks {
         if rel_ssn != self.recv_end {
             self.ooo_len += data.len();
             // Merge into touching neighbours so the entry count follows the Tcb's receipt ranges,
-            // not the number of segments the peer sent.
+            // not the number of segments the peer sent. The smaller of the two neighbours is
+            // copied into the larger (a deque takes pieces at both ends), so every octet is
+            // copied O(log n) times, not once per later segment.
             let end = rel_ssn.wrapping_add(data.len() as u32);
             let prev = self
                 .ooo
                 .range(..rel_ssn)
                 .next_back()
                 .filter(|(k, v)| k.wrapping_add(v.len() as u32) == rel_ssn)
-                .map(|(k, _)| *k);
-            let (key, mut piece) = match prev {
-                Some(k) => (k, self.ooo.remove(&k).unwrap_or_default()),
-                None => (rel_ssn, Vec::with_capacity(data.len())),
+                .map(|(k, _)| *k)
+                .and_then(|k| self.ooo.remove(&k).map(|v| (k, v)));
+            let next = self.ooo.remove(&end);
+            let (key, piece) = match (prev, next) {
+                (None, None) => (rel_ssn, VecDeque::from(data.to_vec())),
+                (Some((k, mut p)), None) => {
+                    p.extend(data);
+                    (k, p)
+                }
+                (None, Some(mut n)) => {
+                    for &b in data.iter().rev() {
+                        n.push_front(b);
+                    }
+                    (rel_ssn, n)
+                }
+                (Some((k, mut p)), Some(mut n)) => {
+                    if p.len() >= n.len() {
+                        p.extend(data);
+                        p.append(&mut n);
+                        (k, p)
+                    } else {
+                        for &b in data.iter().rev() {
+                            n.push_front(b);
+                        }
+                        while let Some(b) = p.pop_back() {
+                            n.push_front(b);
+                        }
+                        (k, n)
+                    }
+                }
             };
-            piece.extend_from_slice(data);
-            if let Some(next) = self.ooo.remove(&end) {
-                piece.extend(next);
-            }
             let old = self.ooo.insert(key, piece);
             debug_assert!(old.is_none(), "the Tcb hands each octet over once");
             return;
@@ -149,10 +173,10 @@ impl SegmentHooks for PlainHooks {
         self.recv.extend(data);
         self.recv_end = self.recv_end.wrapping_add(data.len() as u32);
         // Pieces tile the sequence space, so the next in-order one starts exactly here.
-        while let Some(next) = self.ooo.remove(&self.recv_end) {
+        while let Some(mut next) = self.ooo.remove(&self.recv_end) {
             self.ooo_len -= next.len();
             self.recv_end = self.recv_end.wrapping_add(next.len() as u32);
-            self.recv.extend(next);
+            self.recv.append(&mut next);
         }
     }
 
@@ -248,6 +272,28 @@ mod tests {
         }
         assert_eq!(buf[5002], b'z');
         assert_eq!(h.recv_window(), 1 << 20);
+    }
+
+    #[test]
+    fn recv_descending_adjacent_pieces_stay_cheap() {
+        // Descending one-byte segments: copying the whole accumulated piece each time would be
+        // quadratic (~1 TB moved at this size), far beyond any test runtime.
+        const N: u32 = 1 << 21;
+        let mut h = hooks(8, N + 8);
+        for i in (2..=N).rev() {
+            h.accept_payload(i, &[(i % 251) as u8]);
+        }
+        assert_eq!(h.ooo_pieces(), 1);
+        h.accept_payload(1, &[1]);
+        let mut buf = vec![0u8; N as usize + 1];
+        assert_eq!(h.read(&mut buf), N as usize);
+        assert!((1..=N as usize).all(|i| buf[i - 1] == (i % 251) as u8));
+        // Interleaved arrival also merges into one piece.
+        let mut h = hooks(8, N + 8);
+        for i in (2..=4096u32).step_by(2).chain((3..=4096).step_by(2)) {
+            h.accept_payload(i, &[(i % 251) as u8]);
+        }
+        assert_eq!(h.ooo_pieces(), 1);
     }
 
     #[test]

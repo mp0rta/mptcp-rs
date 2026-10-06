@@ -192,10 +192,14 @@ fn syn_carries_mss_and_ws() {
         assert_eq!(f.out.flags, TcpFlags::SYN);
         assert_eq!(f.out.wnd, 65535);
         assert!(f.out.payload.is_empty());
-        // Only MSS and WS: no SACK-permitted, no timestamps.
+        // Receive-side SACK is offered; timestamps remain unused.
         assert_eq!(
             parsed(f.out.options()),
-            vec![TcpOpt::Mss(mss), TcpOpt::WindowScale(7)]
+            vec![
+                TcpOpt::Mss(mss),
+                TcpOpt::WindowScale(7),
+                TcpOpt::SackPermitted
+            ]
         );
         assert_eq!(f.send(t(0)), None);
     }
@@ -212,7 +216,11 @@ fn syn_window_is_buffer_when_small() {
     assert_eq!(f.out.wnd, 1000);
     assert_eq!(
         parsed(f.out.options()),
-        vec![TcpOpt::Mss(1460), TcpOpt::WindowScale(0)]
+        vec![
+            TcpOpt::Mss(1460),
+            TcpOpt::WindowScale(0),
+            TcpOpt::SackPermitted
+        ]
     );
 }
 
@@ -988,6 +996,189 @@ fn out_of_order_held_and_dup_acked() {
     assert_eq!(f.tcb.poll_send_at(), None);
 }
 
+fn sack_receiver(cfg: ConnectConfig) -> Fixture {
+    let mut f = Fixture::new(cfg, v4());
+    let mut options = opts(Some(MSS), Some(0));
+    options.extend_from_slice(&[4, 2]);
+    assert_eq!(f.synack(65535, &options), Reaction::Established);
+    f.send(t(0)).unwrap();
+    assert!(f.tcb.sack_permitted);
+    f
+}
+
+fn sack_blocks(out: &SegmentWriter) -> Vec<(SeqNum, SeqNum)> {
+    parsed(out.options())
+        .into_iter()
+        .filter_map(|opt| match opt {
+            TcpOpt::Sack(raw) => Some(
+                raw.chunks_exact(8)
+                    .map(|block| {
+                        (
+                            SeqNum(u32::from_be_bytes(block[..4].try_into().unwrap())),
+                            SeqNum(u32::from_be_bytes(block[4..].try_into().unwrap())),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[test]
+fn sack_requires_peer_permission_and_orders_coalesced_blocks() {
+    let mut plain = Fixture::established(ConnectConfig::default(), 65535);
+    plain.data_in(t(0), 100, &[1; 100]);
+    plain.send(t(0)).unwrap();
+    assert!(plain.out.options().is_empty());
+
+    let mut f = sack_receiver(ConnectConfig::default());
+    for off in [100, 300, 500, 700, 900] {
+        f.data_in(t(0), off, &[1; 100]);
+        f.send(t(0)).unwrap();
+        assert_eq!(sack_blocks(&f.out)[0], (pdata(off), pdata(off + 100)));
+        assert!(f.out.options_len <= 40);
+    }
+    assert_eq!(
+        sack_blocks(&f.out),
+        vec![
+            (pdata(900), pdata(1000)),
+            (pdata(700), pdata(800)),
+            (pdata(500), pdata(600)),
+            (pdata(300), pdata(400)),
+        ]
+    );
+    f.data_in(t(0), 200, &[1; 100]);
+    f.send(t(0)).unwrap();
+    assert_eq!(sack_blocks(&f.out)[0], (pdata(100), pdata(400)));
+    f.data_in(t(0), 0, &[1; 100]);
+    f.send(t(0)).unwrap();
+    assert_eq!(f.out.ack, pdata(400));
+    assert!(
+        !sack_blocks(&f.out)
+            .iter()
+            .any(|&(left, _)| left.lt(f.out.ack))
+    );
+}
+
+#[test]
+fn sack_reports_only_bytes_held_within_the_window() {
+    let mut f = sack_receiver(rx_cfg(200));
+    f.data_in(t(0), 100, &[1; 200]);
+    f.send(t(0)).unwrap();
+    assert_eq!(sack_blocks(&f.out), vec![(pdata(100), pdata(200))]);
+    f.data_in(t(0), 0, &[1; 100]);
+    f.send(t(0)).unwrap();
+    assert_eq!(f.out.ack, pdata(200));
+    assert!(sack_blocks(&f.out).is_empty());
+    assert_eq!(f.read_all(), vec![1; 200]);
+}
+
+#[test]
+fn dsack_reports_old_and_partial_duplicates_once_across_wrap() {
+    let mut f = sack_receiver(ConnectConfig::default());
+    let p = pattern(250);
+    f.data_in(t(0), 0, &p[..200]);
+    f.timeout(tm(200));
+    f.send(tm(200)).unwrap();
+    // Below RCV.NXT: rejected by TCP's window check, but still reported as DSACK.
+    f.data_in(tm(210), 0, &p[..100]);
+    f.send(tm(210)).unwrap();
+    assert_eq!(sack_blocks(&f.out), vec![(pdata(0), pdata(100))]);
+    assert_eq!(f.out.ack, pdata(200));
+    assert!(f.tcb.dsack.is_none());
+    f.data_in(tm(220), 150, &p[150..250]);
+    // DSACK changes ACK contents, not the existing delayed-ACK policy (RFC 2883 §2).
+    assert_eq!(f.send(tm(220)), None);
+    f.timeout(tm(420));
+    f.send(tm(420)).unwrap();
+    assert_eq!(sack_blocks(&f.out), vec![(pdata(150), pdata(200))]);
+    assert_eq!(f.out.ack, pdata(250));
+    f.tcb.ack_due = true;
+    f.send(tm(420)).unwrap();
+    assert!(sack_blocks(&f.out).is_empty());
+    assert_eq!(f.read_all(), p);
+    // Data before IRS + 1 was never received and must not be reported.
+    f.seg_ack(
+        tm(430),
+        u32::MAX - 99,
+        f.tcb.snd_una,
+        TcpFlags::ACK,
+        &[1; 50],
+    );
+    f.send(tm(430)).unwrap();
+    assert!(sack_blocks(&f.out).is_empty());
+    f.seg_in(tm(440), 250, TcpFlags::ACK | TcpFlags::FIN, &[]);
+    f.send(tm(440)).unwrap();
+    f.data_in(tm(450), 200, &p[200..]);
+    f.send(tm(450)).unwrap();
+    assert_eq!(sack_blocks(&f.out), vec![(pdata(200), pdata(250))]);
+    assert_eq!(f.out.ack, pdata(251));
+}
+
+#[test]
+fn dsack_above_ack_includes_the_containing_block_second() {
+    let mut f = sack_receiver(ConnectConfig::default());
+    f.data_in(t(0), 100, &[1; 200]);
+    f.send(t(0)).unwrap();
+    for (off, len) in [(150, 50), (100, 200)] {
+        f.data_in(t(0), off, &vec![1; len]);
+        f.send(t(0)).unwrap();
+        assert_eq!(
+            sack_blocks(&f.out),
+            vec![
+                (pdata(off), pdata(off + len as u32)),
+                (pdata(100), pdata(300)),
+            ]
+        );
+    }
+    // Partly duplicate, partly new: report the duplicate bytes and merged held block.
+    f.data_in(t(0), 250, &[1; 150]);
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        sack_blocks(&f.out),
+        vec![(pdata(250), pdata(300)), (pdata(100), pdata(400)),]
+    );
+    f.data_in(t(0), 150, &[1; 50]);
+    let mut short = [0; 12];
+    assert_eq!(f.tcb.write_sacks(&mut short), 12);
+    assert_eq!(&short[2..6], &pdata(100).0.to_be_bytes());
+    assert_eq!(&short[6..10], &pdata(400).0.to_be_bytes());
+    // No output: the pending DSACK must survive until an ACK is emitted.
+    f.tcb.ack_due = false;
+    assert_eq!(f.send(t(0)), None);
+    assert!(f.tcb.dsack.is_some());
+    f.data_in(t(0), 0, &[1; 100]);
+    f.send(t(0)).unwrap();
+    assert_eq!(f.read_all(), vec![1; 400]);
+}
+
+#[test]
+fn sack_and_dsack_piggyback_on_data_without_exceeding_mtu() {
+    for mtu in [68, 1500] {
+        let mut f = sack_receiver(ConnectConfig {
+            mtu,
+            ..ConnectConfig::default()
+        });
+        f.data_in(t(0), 100, &[1; 100]);
+        f.send(t(0)).unwrap();
+        f.data_in(t(0), 150, &[1; 50]);
+        f.write(&pattern(2000));
+        f.send(t(0)).unwrap();
+        assert!(!f.out.payload.is_empty());
+        assert_eq!(
+            sack_blocks(&f.out),
+            vec![(pdata(150), pdata(200)), (pdata(100), pdata(200)),]
+        );
+        assert!(40 + f.out.options_len + f.out.payload.len() <= usize::from(mtu));
+        assert!(f.tcb.dsack.is_none());
+        f.send(t(0)).unwrap();
+        assert_eq!(sack_blocks(&f.out), vec![(pdata(100), pdata(200))]);
+        assert!(40 + f.out.options_len + f.out.payload.len() <= usize::from(mtu));
+    }
+}
+
 #[test]
 fn overlap_straddling_rcv_nxt_trimmed() {
     let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
@@ -1569,8 +1760,10 @@ fn three_dupacks_fast_retransmit() {
     // ssthresh = FlightSize / 2 = 3500, cwnd = ssthresh + 3·SMSS; no RTT sample from it.
     assert_eq!(f.tcb.cc.cwnd(), 6500);
     assert_eq!(f.tcb.rtt_timed, None);
-    // Before the RTO, which keeps its deadline.
-    assert_eq!(f.tcb.poll_send_at(), Some(tm(1030)));
+    // The nominal timer stays put, but this segment cannot time out until one RTO after
+    // its fast retransmission.
+    assert_eq!(f.tcb.rto_at, Some(tm(1030)));
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1041)));
     // Each further duplicate ACK inflates cwnd by SMSS; new data goes out once it fits.
     f.dup_acks_quiet(tm(42), data(3000), 1);
     assert_eq!(f.tcb.cc.cwnd(), 7500);
@@ -1585,6 +1778,97 @@ fn three_dupacks_fast_retransmit() {
     assert_eq!(seq_lens(&f.drain(tm(60))), [(data(12_000), 1000)]);
     // Out of recovery: duplicate ACKs count from zero again.
     f.dup_acks_quiet(tm(70), data(10_000), 2);
+}
+
+#[test]
+fn rto_waits_for_fast_retransmission() {
+    let mut f = Fixture::reno_ramp(&pattern(20 * MSS as usize));
+    f.dup_acks_quiet(tm(990), data(3000), 2);
+    f.ack(tm(1000), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(1000))), [(data(3000), 1000)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2000)));
+
+    // The old deadline must neither retransmit nor back off RTO or cwnd.
+    assert_eq!(f.timeout(tm(1030)), Reaction::None);
+    assert!(f.drain(tm(1030)).is_empty());
+    assert_eq!(f.tcb.rtt.rto(), INITIAL_RTO);
+    assert_eq!(f.tcb.cc.cwnd(), 6500);
+
+    // Other timers still run while the retransmitted segment is awaiting its RTO.
+    f.seg_ack(tm(1100), 0, data(3000), TcpFlags::ACK, &[9; 10]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1300)));
+    assert_eq!(f.timeout(tm(1300)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(tm(1300))), [(data(10_000), 0)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2000)));
+
+    assert_eq!(f.timeout(tm(2000)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(tm(2000))), [(data(3000), 1000)]);
+    assert_eq!(f.tcb.rtt.rto(), 2 * INITIAL_RTO);
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(4000)));
+}
+
+#[test]
+fn partial_ack_retransmission_has_its_own_rto_deadline() {
+    let mut f = Fixture::reno_ramp(&pattern(20 * MSS as usize));
+    f.dup_acks_quiet(tm(40), data(3000), 2);
+    f.ack(tm(41), data(3000), BIG);
+    f.drain(tm(41));
+    f.dup_acks_quiet(tm(42), data(3000), 1);
+
+    f.ack(tm(100), data(6000), BIG);
+    f.drain(tm(100));
+    f.ack(tm(1000), data(8000), BIG);
+    assert_eq!(
+        seq_lens(&f.drain(tm(1000))),
+        [(data(8000), 1000), (data(11_000), 1000)]
+    );
+    // NewReno restarts the nominal timer on the first partial ACK only.
+    assert_eq!(f.tcb.rto_at, Some(tm(1100)));
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2000)));
+    assert_eq!(f.timeout(tm(1100)), Reaction::None);
+    assert!(f.drain(tm(1100)).is_empty());
+    assert_eq!(f.tcb.cc.cwnd(), 4500);
+    assert_eq!(f.tcb.rtt.rto(), INITIAL_RTO);
+    assert_eq!(f.timeout(tm(2000)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(tm(2000))), [(data(8000), 1000)]);
+}
+
+#[test]
+fn acknowledged_retransmission_does_not_delay_later_data_across_wrap() {
+    let cfg = ConnectConfig::default();
+    let isn = SeqNum(u32::MAX - 500);
+    let start = isn.wrapping_add(1);
+    let mut f = Fixture::unbounded(cfg.clone());
+    f.tcb = Tcb::with_cc(&cfg, f.addrs.0, f.addrs.1, isn, t(0), Box::new(Unbounded));
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        f.recv(
+            TcpFlags::SYN | TcpFlags::ACK,
+            start,
+            BIG,
+            &opts(Some(MSS), Some(0))
+        ),
+        Reaction::Established
+    );
+    f.drain(t(0));
+    f.write(&pattern(2000));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.dup_acks_quiet(tm(990), start, 2);
+    f.ack(tm(1000), start, BIG);
+    assert_eq!(seq_lens(&f.drain(tm(1000))), [(start, 1000)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2000)));
+
+    // ACKing the retransmission releases its deadline even though its end wrapped.
+    f.ack(tm(1010), start.wrapping_add(2000), BIG);
+    assert_eq!(f.tcb.rto_not_before, None);
+    assert_eq!(f.tcb.poll_send_at(), None);
+    f.write(&pattern(500));
+    assert_eq!(
+        seq_lens(&f.drain(tm(1010))),
+        [(start.wrapping_add(2000), 500)]
+    );
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2010)));
 }
 
 #[test]
@@ -1606,13 +1890,15 @@ fn newreno_partial_ack_retransmits_next_hole() {
     assert_eq!(f.tcb.cc.cwnd(), 5500);
     // The first partial ACK restarts the retransmission timer.
     assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
-    // Second partial ACK: the third hole; cwnd = 5500 − 2000 + SMSS. The timer is not restarted.
+    // Second partial ACK: the third hole; cwnd = 5500 − 2000 + SMSS. The nominal timer is
+    // not restarted, but a timeout cannot retry this segment before its own RTO elapses.
     assert_eq!(f.ack(tm(200), data(8000), BIG), Reaction::None);
     let segs = f.drain(tm(200));
     assert_eq!(seq_lens(&segs), [(data(8000), 1000), (data(11_000), 1000)]);
     assert_eq!(segs[0].1, bytes[8000..9000]);
     assert_eq!(f.tcb.cc.cwnd(), 4500);
-    assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
+    assert_eq!(f.tcb.rto_at, Some(tm(1100)));
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1200)));
     // Everything arrives: full ACK, nothing outstanding, cwnd = min(3500, SMSS + SMSS).
     assert_eq!(f.ack(tm(300), data(12_000), BIG), Reaction::None);
     assert_eq!(f.tcb.cc.cwnd(), 2000);
@@ -1738,6 +2024,48 @@ fn flagged(segs: &[(SentMeta, Vec<u8>)]) -> Vec<(SeqNum, u32, TcpFlags)> {
 
 fn payloads(segs: &[(SentMeta, Vec<u8>)]) -> Vec<u8> {
     segs.iter().flat_map(|(_, p)| p.clone()).collect()
+}
+
+#[test]
+fn fin_outside_window_is_trimmed() {
+    for len in [1000, 1001] {
+        let cfg = ConnectConfig {
+            recv_buffer: 1000,
+            ..ConnectConfig::default()
+        };
+        let mut f = Fixture::established(cfg, 10 * MSS);
+        let bytes = vec![3; len];
+        f.seg_ack(t(0), 0, data(0), FIN_ACK, &bytes);
+        assert!(
+            !f.tcb.fin_received(),
+            "FIN lies outside the advertised window"
+        );
+        assert_eq!(f.tcb.state(), TcpState::Established);
+        assert_eq!(f.acks(t(0)), [(pdata(1000), 0)]);
+        assert_eq!(f.read_all(), bytes[..1000]);
+
+        // Once a read reopens the window, the trimmed suffix and FIN are retransmitted.
+        assert_eq!(f.acks(t(1)), [(pdata(1000), 1000)]);
+        f.seg_ack(t(1), 1000, data(0), FIN_ACK, &bytes[1000..]);
+        assert!(f.tcb.fin_received());
+        assert_eq!(f.tcb.state(), TcpState::CloseWait);
+        assert_eq!(f.read_all(), bytes[1000..]);
+        assert_eq!(f.ack_nos(t(1)), [pdata(len as u32 + 1)]);
+    }
+}
+
+#[test]
+fn fin_at_last_sequence_number_in_window_is_accepted() {
+    let cfg = ConnectConfig {
+        recv_buffer: 1000,
+        ..ConnectConfig::default()
+    };
+    let mut f = Fixture::established(cfg, 10 * MSS);
+    f.seg_ack(t(0), 0, data(0), FIN_ACK, &[3; 999]);
+    assert!(f.tcb.fin_received());
+    assert_eq!(f.tcb.state(), TcpState::CloseWait);
+    assert_eq!(f.ack_nos(t(0)), [pdata(1000)]);
+    assert_eq!(f.read_all(), [3; 999]);
 }
 
 impl Fixture {
