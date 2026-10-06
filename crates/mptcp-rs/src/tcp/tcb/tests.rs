@@ -1037,6 +1037,10 @@ fn emit(tcb: &mut Tcb, h: &mut PlainHooks, out: &mut SegmentWriter, now: Instant
 }
 
 fn deliver(tcb: &mut Tcb, h: &mut PlainHooks, w: &Wire, now: Instant) {
+    assert_eq!(feed(tcb, h, w, now), Reaction::None);
+}
+
+fn feed(tcb: &mut Tcb, h: &mut PlainHooks, w: &Wire, now: Instant) -> Reaction {
     let (src, dst) = v4();
     let seg = Segment {
         src,
@@ -1048,7 +1052,7 @@ fn deliver(tcb: &mut Tcb, h: &mut PlainHooks, w: &Wire, now: Instant) {
         options: &[],
         payload: &w.payload,
     };
-    assert_eq!(tcb.on_segment(&seg, now, h), Reaction::None);
+    tcb.on_segment(&seg, now, h)
 }
 
 #[test]
@@ -1717,4 +1721,540 @@ fn data_or_window_change_is_not_dupack() {
             .map(|(m, _)| (m.seq, m.len)),
         Some((data(3000), 1000))
     );
+}
+
+// ---- Close and reset (Task 10) ----
+
+const FIN_ACK: TcpFlags = TcpFlags(TcpFlags::FIN.0 | TcpFlags::ACK.0);
+const PSH_FIN_ACK: TcpFlags = TcpFlags(TcpFlags::PSH.0 | TcpFlags::FIN.0 | TcpFlags::ACK.0);
+const NORMAL: Reaction = Reaction::Closed(CloseReason::Normal);
+const RESET: Reaction = Reaction::Closed(CloseReason::Reset);
+
+fn flagged(segs: &[(SentMeta, Vec<u8>)]) -> Vec<(SeqNum, u32, TcpFlags)> {
+    segs.iter().map(|(m, _)| (m.seq, m.len, m.flags)).collect()
+}
+
+fn payloads(segs: &[(SentMeta, Vec<u8>)]) -> Vec<u8> {
+    segs.iter().flat_map(|(_, p)| p.clone()).collect()
+}
+
+impl Fixture {
+    /// ESTABLISHED, `close()` with nothing queued, the FIN sent at t(0) and ACKed at 10 ms.
+    fn fin_wait_2() -> Self {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.tcb.close();
+        assert_eq!(flagged(&f.drain(t(0))), [(data(0), 0, FIN_ACK)]);
+        assert_eq!(f.ack(tm(10), data(1), 10 * MSS), Reaction::None);
+        assert_eq!(f.tcb.state(), TcpState::FinWait2);
+        f
+    }
+}
+
+#[test]
+fn active_close_fin_after_data() {
+    let bytes = pattern(3 * MSS as usize);
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.write(&bytes);
+    f.tcb.close();
+    assert_eq!(f.tcb.state(), TcpState::FinWait1);
+    // The FIN rides on the last data segment when the window has room for it.
+    let sent = f.drain(t(0));
+    assert_eq!(
+        flagged(&sent),
+        [
+            (data(0), 1000, TcpFlags::ACK),
+            (data(1000), 1000, TcpFlags::ACK),
+            (data(2000), 1000, PSH_FIN_ACK)
+        ]
+    );
+    assert_eq!(payloads(&sent), bytes);
+    assert_eq!(f.tcb.snd_max, data(3001));
+    // A second close does nothing: no second FIN.
+    f.tcb.close();
+    assert_eq!(f.tcb.state(), TcpState::FinWait1);
+    assert!(f.drain(t(0)).is_empty());
+
+    // The data fills the window exactly: the FIN follows alone once the window moves.
+    let mut f = Fixture::established(ConnectConfig::default(), 3 * MSS);
+    f.write(&bytes);
+    f.tcb.close();
+    assert_eq!(
+        flagged(&f.drain(t(0))),
+        [
+            (data(0), 1000, TcpFlags::ACK),
+            (data(1000), 1000, TcpFlags::ACK),
+            (data(2000), 1000, PSH_ACK)
+        ]
+    );
+    assert_eq!(f.ack(tm(100), data(3000), 3 * MSS), Reaction::None);
+    assert_eq!(flagged(&f.drain(tm(100))), [(data(3000), 0, FIN_ACK)]);
+    assert_eq!(f.tcb.state(), TcpState::FinWait1);
+}
+
+#[test]
+fn fin_resent_by_rto_go_back_and_alone() {
+    let bytes = pattern(2500);
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.tcb.set_nodelay(true);
+    f.write(&bytes);
+    f.tcb.close();
+    let first = f.drain(t(0));
+    assert_eq!(
+        flagged(&first),
+        [
+            (data(0), 1000, TcpFlags::ACK),
+            (data(1000), 1000, TcpFlags::ACK),
+            (data(2000), 500, PSH_FIN_ACK)
+        ]
+    );
+    // RTO: SND.UNA's segment, then the go-back resends the rest, the FIN on the last again.
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    let resent = f.drain(t(1));
+    assert_eq!(flagged(&resent), flagged(&first));
+    assert_eq!(payloads(&resent), bytes);
+    // The segment at SND.UNA carries the FIN.
+    assert_eq!(f.ack(tm(1100), data(2000), 10 * MSS), Reaction::None);
+    let at = f.tcb.poll_send_at().unwrap();
+    assert_eq!(f.timeout(at), Reaction::None);
+    assert_eq!(flagged(&f.drain(at)), [(data(2000), 500, PSH_FIN_ACK)]);
+    // Only the FIN is outstanding: it is resent alone.
+    assert_eq!(f.ack(at, data(2500), 10 * MSS), Reaction::None);
+    let at = f.tcb.poll_send_at().unwrap();
+    assert_eq!(f.timeout(at), Reaction::None);
+    assert_eq!(flagged(&f.drain(at)), [(data(2500), 0, FIN_ACK)]);
+    // Its ACK: FIN-WAIT-2, nothing outstanding, no timer.
+    assert_eq!(f.ack(at, data(2501), 10 * MSS), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::FinWait2);
+    assert_eq!(f.tcb.in_flight(), 0);
+    assert_eq!(f.tcb.poll_send_at(), None);
+}
+
+#[test]
+fn fin_resent_by_partial_ack() {
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
+    f.establish(BIG);
+    f.write(&pattern(8 * MSS as usize));
+    f.tcb.close();
+    assert_eq!(f.drain(t(0)).len(), 4, "IW");
+    f.ack(tm(10), data(1000), BIG);
+    assert_eq!(f.drain(tm(10)).len(), 2);
+    // Segment 7 fills the usable window exactly: no room for the FIN on it.
+    f.ack(tm(20), data(2000), BIG);
+    assert_eq!(
+        flagged(&f.drain(tm(20))),
+        [
+            (data(6000), 1000, TcpFlags::ACK),
+            (data(7000), 1000, PSH_ACK)
+        ]
+    );
+    f.ack(tm(30), data(3000), BIG);
+    assert_eq!(flagged(&f.drain(tm(30))), [(data(8000), 0, FIN_ACK)]);
+    // Segment 3 and the FIN are lost; 4–7 draw duplicate ACKs.
+    f.dup_acks_quiet(tm(40), data(3000), 2);
+    f.ack(tm(41), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(41))), [(data(3000), 1000)]);
+    f.dup_acks_quiet(tm(42), data(3000), 1);
+    // The partial ACK (below recover = the FIN) resends the FIN alone.
+    assert_eq!(f.ack(tm(100), data(8000), BIG), Reaction::None);
+    assert_eq!(flagged(&f.drain(tm(100))), [(data(8000), 0, FIN_ACK)]);
+    assert_eq!(f.ack(tm(200), data(8001), BIG), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::FinWait2);
+}
+
+#[test]
+fn peer_fin_is_not_a_duplicate_ack() {
+    let mut f = Fixture::reno_ramp(&pattern(20 * MSS as usize));
+    let peer = PEER_ISN.wrapping_add(1);
+    f.dup_acks_quiet(tm(40), data(3000), 2);
+    // A FIN with SEG.ACK = SND.UNA and the same window (RFC 5681 §2 (c)): only its ACK goes out.
+    let fin = Segment {
+        src: f.addrs.1,
+        dst: f.addrs.0,
+        seq: peer,
+        ack: data(3000),
+        flags: FIN_ACK,
+        wnd: BIG,
+        options: &[],
+        payload: &[],
+    };
+    assert_eq!(f.tcb.on_segment(&fin, tm(41), &mut f.h), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::CloseWait);
+    assert_eq!(seq_lens(&f.drain(tm(41))), [(data(10_000), 0)]);
+    // The next duplicate is the third.
+    f.ack_seq(tm(42), peer.wrapping_add(1), data(3000), BIG);
+    assert_eq!(seq_lens(&f.drain(tm(42))), [(data(3000), 1000)]);
+}
+
+#[test]
+fn active_close_reaches_time_wait_then_frees() {
+    let mut f = Fixture::fin_wait_2();
+    assert_eq!(f.tcb.poll_send_at(), None);
+    // Half-closed: the peer's data is still received.
+    f.data_in(tm(200), 0, &pattern(100));
+    assert_eq!(f.read_all(), pattern(100));
+    assert!(!f.tcb.fin_received());
+    // The peer's FIN: TIME-WAIT, reported once, ACKed at once.
+    assert_eq!(f.seg_in(t(1), 100, FIN_ACK, &[]), NORMAL);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    assert!(f.tcb.fin_received());
+    assert_eq!(f.ack_nos(t(1)), vec![pdata(101)]);
+    // 2·MSL = 120 s.
+    assert_eq!(f.tcb.poll_send_at(), Some(t(121)));
+    assert_eq!(f.timeout(t(120)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    assert_eq!(f.timeout(t(121)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(121)));
+    // Nothing more is reported or sent.
+    assert_eq!(f.seg_in(t(122), 100, FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.timeout(t(500)), Reaction::None);
+    assert_eq!(f.send(t(500)), None);
+}
+
+#[test]
+fn fin_ack_in_one_segment_from_fin_wait_1() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.write(&pattern(500));
+    f.tcb.close();
+    assert_eq!(flagged(&f.drain(t(0))), [(data(0), 500, PSH_FIN_ACK)]);
+    // What Linux sends when its close() follows our EOF: its data and FIN, ACKing our FIN.
+    let p = pattern(300);
+    assert_eq!(f.seg_ack(tm(50), 0, data(501), FIN_ACK, &p), NORMAL);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    assert_eq!(f.read_all(), p);
+    assert!(f.tcb.fin_received());
+    assert_eq!(f.ack_nos(tm(50)), vec![pdata(301)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(120_050)));
+    // Its retransmission is ACKed; nothing is reported or delivered again.
+    assert_eq!(f.seg_ack(tm(60), 0, data(501), FIN_ACK, &p), Reaction::None);
+    assert_eq!(f.ack_nos(tm(60)), vec![pdata(301)]);
+    assert!(f.read_all().is_empty());
+}
+
+#[test]
+fn time_wait_acks_retransmitted_fin_and_restarts() {
+    let mut f = Fixture::fin_wait_2();
+    assert_eq!(f.seg_in(t(1), 0, FIN_ACK, &[]), NORMAL);
+    assert_eq!(f.ack_nos(t(1)), vec![pdata(1)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(121)));
+    // The FIN again at +60 s: ACKed, 2·MSL restarts.
+    assert_eq!(f.seg_in(t(61), 0, FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.ack_nos(t(61)), vec![pdata(1)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(181)));
+    assert_eq!(f.timeout(t(121)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    // Other segments: data after the FIN is not delivered and draws nothing; a SYN draws a
+    // challenge ACK; an unacceptable segment draws an ACK. None restarts the timer.
+    f.data_in(t(130), 1, &[1; 10]);
+    assert!(f.acks(t(130)).is_empty());
+    assert!(f.read_all().is_empty());
+    f.seg_in(t(131), 1, TcpFlags::SYN | TcpFlags::ACK, &[]);
+    assert_eq!(f.ack_nos(t(131)), vec![pdata(1)]);
+    f.data_in(t(132), 8 << 20, &[1; 10]);
+    assert_eq!(f.ack_nos(t(132)), vec![pdata(1)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(181)));
+    assert_eq!(f.timeout(t(180)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    assert_eq!(f.timeout(t(181)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+}
+
+#[test]
+fn closing_emits_closed_once() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.tcb.close();
+    assert_eq!(flagged(&f.drain(t(0))), [(data(0), 0, FIN_ACK)]);
+    // The peer's FIN crosses ours (it does not ACK ours): CLOSING, ACKed at once.
+    assert_eq!(f.seg_ack(tm(10), 0, data(0), FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::Closing);
+    assert_eq!(f.ack_nos(tm(10)), vec![pdata(1)]);
+    // The ACK of our FIN: TIME-WAIT, reported once.
+    assert_eq!(f.seg_ack(tm(20), 1, data(1), TcpFlags::ACK, &[]), NORMAL);
+    assert_eq!(f.tcb.state(), TcpState::TimeWait);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(120_020)));
+    assert_eq!(
+        f.seg_ack(tm(30), 1, data(1), TcpFlags::ACK, &[]),
+        Reaction::None
+    );
+    assert!(f.acks(tm(30)).is_empty());
+    // The peer's FIN arrives after close() but before our FIN went out: CLOSING, and our FIN
+    // still goes (with the ACK of theirs).
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.tcb.close();
+    assert_eq!(f.seg_ack(tm(10), 0, data(0), FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::Closing);
+    assert_eq!(flagged(&f.drain(tm(10))), [(data(0), 0, FIN_ACK)]);
+    assert_eq!(f.out.ack, pdata(1));
+    assert_eq!(f.seg_ack(tm(20), 1, data(1), TcpFlags::ACK, &[]), NORMAL);
+}
+
+#[test]
+fn passive_close_close_wait_last_ack() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let p = pattern(500);
+    f.data_in(t(0), 0, &p);
+    assert!(!f.tcb.fin_received());
+    // The peer's FIN: CLOSE-WAIT, ACKed at once.
+    assert_eq!(f.seg_in(tm(10), 500, FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::CloseWait);
+    assert!(f.tcb.fin_received());
+    assert_eq!(f.ack_nos(tm(10)), vec![pdata(501)]);
+    // A second FIN where the first ended is only ACKed: RCV.NXT stays.
+    assert_eq!(f.seg_in(tm(15), 501, FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.ack_nos(tm(15)), vec![pdata(501)]);
+    // The data, then EOF: nothing to read and the FIN received.
+    assert_eq!(f.read_all(), p);
+    assert_eq!(f.h.read(&mut [0; 16]), 0);
+    // Data after the peer's FIN is not delivered.
+    f.data_in(tm(20), 501, &[1; 10]);
+    assert!(f.acks(tm(20)).is_empty());
+    assert!(f.read_all().is_empty());
+    // We still send; close: LAST-ACK, the FIN after the queued data.
+    f.write(&pattern(300));
+    f.tcb.close();
+    assert_eq!(f.tcb.state(), TcpState::LastAck);
+    assert_eq!(flagged(&f.drain(tm(30))), [(data(0), 300, PSH_FIN_ACK)]);
+    assert_eq!(
+        f.seg_ack(tm(40), 501, data(300), TcpFlags::ACK, &[]),
+        Reaction::None
+    );
+    assert_eq!(f.tcb.state(), TcpState::LastAck);
+    assert_eq!(
+        f.seg_ack(tm(50), 501, data(301), TcpFlags::ACK, &[]),
+        NORMAL
+    );
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(50)));
+    assert_eq!(
+        f.seg_ack(tm(60), 501, data(301), TcpFlags::ACK, &[]),
+        Reaction::None
+    );
+    assert_eq!(f.timeout(t(500)), Reaction::None);
+    assert_eq!(f.send(t(500)), None);
+}
+
+#[test]
+fn simultaneous_close_closing() {
+    let cfg = ConnectConfig::default();
+    let (la, lb) = v4();
+    let (isn_a, isn_b) = (SeqNum(0x1000), SeqNum(0x9000));
+    let mut a = Tcb::new_established(&cfg, la, lb, isn_a, isn_b, Some(1460), Some(7), t(0));
+    let mut b = Tcb::new_established(&cfg, lb, la, isn_b, isn_a, Some(1460), Some(7), t(0));
+    let (mut ha, mut hb) = (PlainHooks::new(&cfg), PlainHooks::new(&cfg));
+    let mut out = SegmentWriter::default();
+    for w in emit(&mut a, &mut ha, &mut out, t(0)) {
+        deliver(&mut b, &mut hb, &w, t(0));
+    }
+    for w in emit(&mut b, &mut hb, &mut out, t(0)) {
+        deliver(&mut a, &mut ha, &w, t(0));
+    }
+    a.close();
+    b.close();
+    let (fa, fb) = (
+        emit(&mut a, &mut ha, &mut out, t(0)),
+        emit(&mut b, &mut hb, &mut out, t(0)),
+    );
+    assert_eq!((fa.len(), fa[0].flags), (1, FIN_ACK));
+    assert_eq!((fb.len(), fb[0].flags), (1, FIN_ACK));
+    // The FINs cross: both CLOSING.
+    assert_eq!(feed(&mut a, &mut ha, &fb[0], tm(10)), Reaction::None);
+    assert_eq!(feed(&mut b, &mut hb, &fa[0], tm(10)), Reaction::None);
+    assert_eq!(
+        (a.state(), b.state()),
+        (TcpState::Closing, TcpState::Closing)
+    );
+    // Each ACKs the other's FIN: both TIME-WAIT, each reported once.
+    let (aa, ab) = (
+        emit(&mut a, &mut ha, &mut out, tm(10)),
+        emit(&mut b, &mut hb, &mut out, tm(10)),
+    );
+    assert_eq!((aa.len(), aa[0].flags), (1, TcpFlags::ACK));
+    assert_eq!((ab.len(), ab[0].flags), (1, TcpFlags::ACK));
+    assert_eq!(feed(&mut a, &mut ha, &ab[0], tm(20)), NORMAL);
+    assert_eq!(feed(&mut b, &mut hb, &aa[0], tm(20)), NORMAL);
+    assert_eq!(
+        (a.state(), b.state()),
+        (TcpState::TimeWait, TcpState::TimeWait)
+    );
+    assert!(emit(&mut a, &mut ha, &mut out, tm(20)).is_empty());
+    assert!(emit(&mut b, &mut hb, &mut out, tm(20)).is_empty());
+    assert_eq!(a.poll_send_at(), Some(tm(120_020)));
+}
+
+#[test]
+fn rst_exact_seq_resets() {
+    // ESTABLISHED, FIN-WAIT-1 (data and FIN outstanding), CLOSE-WAIT and LAST-ACK.
+    for (closed_by_us, fin_from_peer) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+        f.write(&pattern(500));
+        let mut off = 0;
+        if fin_from_peer {
+            f.seg_in(t(0), 0, FIN_ACK, &[]);
+            off = 1;
+        }
+        if closed_by_us {
+            f.tcb.close();
+        }
+        f.drain(t(0));
+        let before = f.tcb.state();
+        assert_eq!(
+            f.seg_in(tm(10), off, TcpFlags::RST, &[]),
+            RESET,
+            "{before:?}"
+        );
+        assert_eq!(f.tcb.state(), TcpState::Closed);
+        assert_eq!(f.tcb.poll_send_at(), Some(tm(10)));
+        assert_eq!(f.send(tm(10)), None);
+        // Exactly once.
+        assert_eq!(f.seg_in(tm(20), off, TcpFlags::RST, &[]), Reaction::None);
+        assert_eq!(f.timeout(t(500)), Reaction::None);
+    }
+}
+
+#[test]
+fn rst_in_window_not_exact_gets_challenge_ack() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    assert_eq!(
+        f.seg_in(t(0), 10, TcpFlags::RST | TcpFlags::ACK, &[]),
+        Reaction::None
+    );
+    // <SEQ=SND.MAX><ACK=RCV.NXT><CTL=ACK>, never more than one.
+    assert_eq!(f.acks(t(0)), vec![(pdata(0), 32768)]);
+    assert_eq!(f.tcb.state(), TcpState::Established);
+    // The exact one still resets.
+    assert_eq!(f.seg_in(t(0), 0, TcpFlags::RST, &[]), RESET);
+}
+
+#[test]
+fn rst_out_of_window_dropped() {
+    let mut f = Fixture::established(rx_cfg(2000), 10 * MSS);
+    // At the right edge (RCV.NXT + RCV.WND) and below RCV.NXT: no reaction, no output.
+    assert_eq!(f.seg_in(t(0), 2000, TcpFlags::RST, &[]), Reaction::None);
+    assert_eq!(
+        f.recv(TcpFlags::RST | TcpFlags::ACK, data(0), 0, &[]),
+        Reaction::None
+    );
+    assert_eq!(f.send(t(0)), None);
+    assert_eq!(f.tcb.state(), TcpState::Established);
+}
+
+#[test]
+fn rst_in_time_wait_frees_without_second_report() {
+    let mut f = Fixture::fin_wait_2();
+    assert_eq!(f.seg_in(t(1), 0, FIN_ACK, &[]), NORMAL);
+    f.drain(t(1));
+    assert_eq!(f.seg_in(t(2), 1, TcpFlags::RST, &[]), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(2)));
+    assert_eq!(f.timeout(t(121)), Reaction::None);
+}
+
+#[test]
+fn zero_window_allowance_bounded_and_takes_rst() {
+    let mut f = Fixture::established(rx_cfg(10_000), 10 * MSS);
+    let p = pattern(10_000);
+    for k in 0..10 {
+        f.data_in(t(0), k * 1000, &p[(k * 1000) as usize..][..1000]);
+    }
+    assert_eq!(f.acks(t(0)).last(), Some(&(pdata(10_000), 0)));
+    assert_eq!(f.tcb.rcv_wnd(), 0);
+    f.write(&pattern(300));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    // Beyond the edge and the one octet a probe may have taken: the ACK field is not taken.
+    f.seg_ack(t(0), 10_002, data(300), TcpFlags::ACK, &[]);
+    assert_eq!(f.tcb.snd_una, data(0));
+    assert_eq!(f.acks(t(0)), vec![(pdata(10_000), 0)]);
+    // The window is empty: a RST off RCV.NXT is dropped silently; at RCV.NXT, even with text,
+    // it resets.
+    assert_eq!(f.seg_in(t(0), 10_001, TcpFlags::RST, &[]), Reaction::None);
+    assert!(f.acks(t(0)).is_empty());
+    assert_eq!(f.seg_in(t(0), 10_000, TcpFlags::RST, &[1, 2, 3]), RESET);
+}
+
+#[test]
+fn unacked_fin_hits_r2() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.tcb.close();
+    assert_eq!(flagged(&f.drain(t(0))), [(data(0), 0, FIN_ACK)]);
+    let (sends, closed) = f.run_until_closed();
+    assert_eq!(sends, [1, 3, 7, 15, 31, 63].map(t));
+    assert_eq!(closed, t(100));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+}
+
+#[test]
+fn data_written_after_close_is_not_sent() {
+    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    f.write(&pattern(100));
+    f.tcb.close();
+    assert_eq!(flagged(&f.drain(t(0))), [(data(0), 100, PSH_FIN_ACK)]);
+    f.write(&pattern(100));
+    assert!(f.drain(t(0)).is_empty());
+    assert_eq!(f.ack(tm(10), data(101), 10 * MSS), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::FinWait2);
+    assert!(f.drain(tm(10)).is_empty());
+    assert_eq!(f.tcb.poll_send_at(), None);
+    // The FIN's ACK released no data octet from the send buffer.
+    assert!(f.h.peek_with(101, 1, |_| ()).is_some());
+}
+
+#[test]
+fn fin_waits_for_a_closed_window_with_probes() {
+    let mut f = Fixture::established(ConnectConfig::default(), 0);
+    f.tcb.close();
+    assert!(f.drain(t(0)).is_empty());
+    assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!(flagged(&f.drain(t(1))), [(ISN, 0, TcpFlags::ACK)]);
+    // The window opens: the FIN goes.
+    assert_eq!(f.ack(t(2), data(0), 10 * MSS), Reaction::None);
+    assert_eq!(flagged(&f.drain(t(2))), [(data(0), 0, FIN_ACK)]);
+}
+
+#[test]
+fn no_window_update_after_peer_fin() {
+    let mut f = Fixture::established(rx_cfg(10_000), 10 * MSS);
+    let p = pattern(9000);
+    for k in 0..9 {
+        f.data_in(t(0), k * 1000, &p[(k * 1000) as usize..][..1000]);
+    }
+    assert_eq!(f.acks(t(0)).last(), Some(&(pdata(9000), 1000)));
+    assert_eq!(f.seg_in(t(0), 9000, FIN_ACK, &[]), Reaction::None);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(9001)]);
+    // Reading frees 9000 B, but nothing more can arrive: no window update.
+    assert_eq!(f.read_all(), p);
+    assert!(f.acks(t(0)).is_empty());
+}
+
+#[test]
+fn close_in_syn_sent_deletes_tcb() {
+    let synack = TcpFlags::SYN | TcpFlags::ACK;
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.send(t(0)).unwrap();
+    f.tcb.close();
+    // Gone at once: nothing more is sent or accepted, and the TCB is due now.
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    assert_eq!(f.send(t(0)), None);
+    assert!(f.tcb.poll_send_at().unwrap() <= t(0));
+    assert_eq!(
+        f.recv(synack, ISN.wrapping_add(1), 5000, &[]),
+        Reaction::None
+    );
+    assert_eq!(f.send(t(0)), None);
+    // The next timeout reports it, once.
+    assert_eq!(f.timeout(tm(5)), NORMAL);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(5)));
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    f.tcb.close();
+    assert_eq!(f.timeout(t(2)), Reaction::None);
+
+    // Closed before the SYN was ever polled: no SYN goes out.
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.tcb.close();
+    assert_eq!(f.send(t(0)), None);
+    assert_eq!(f.timeout(t(0)), NORMAL);
 }

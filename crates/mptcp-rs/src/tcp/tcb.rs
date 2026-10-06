@@ -26,6 +26,9 @@ const SWS_OVERRIDE: Duration = Duration::from_millis(500);
 const DELAYED_ACK: Duration = Duration::from_millis(200);
 /// Out-of-order receipt ranges kept at most; a segment that would add one more is dropped.
 const MAX_OOO_RANGES: usize = 64;
+/// Maximum segment lifetime: 60 s, below RFC 9293's "arbitrarily 2 minutes" as common stacks
+/// do; TIME-WAIT lasts 2·MSL (MUST-13).
+const MSL: Duration = Duration::from_secs(60);
 
 /// Per-connection settings (spec §3; R2 is settable per connection, RFC 9293 MUST-21).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +161,9 @@ pub struct Tcb {
     max_snd_wnd: u32,
     /// Effective send MSS (spec §3); final once ESTABLISHED.
     eff_mss: u16,
+    /// Relative SSN of our FIN: the end of the data queued at the first `poll_send` after
+    /// `close`. Nothing queued later is sent.
+    fin_rel: Option<u32>,
 
     // Receive sequence space.
     rcv_nxt: SeqNum,
@@ -176,6 +182,8 @@ pub struct Tcb {
     rcv_ooo: RangeSet<u64>,
     /// In-order data segments received since our last ACK.
     rcv_unacked: u8,
+    /// The peer's FIN is received (RCV.NXT is past it).
+    fin_received: bool,
 
     cc: Box<dyn CongestionControl>,
     recovery: NewReno,
@@ -198,6 +206,9 @@ pub struct Tcb {
     ack_at: Option<Instant>,
     /// First SYN transmission; R2 for the SYN counts from here.
     first_syn_at: Option<Instant>,
+    /// End of TIME-WAIT.
+    time_wait_at: Option<Instant>,
+    /// `None` in `Closed` only after a `close` in SYN-SENT that `on_timeout` has not reported.
     closed_at: Option<Instant>,
 
     // Segments due at the next `poll_send`.
@@ -247,6 +258,7 @@ impl Tcb {
             snd_wl2: SeqNum(0),
             max_snd_wnd: 0,
             eff_mss: 0,
+            fin_rel: None,
             rcv_nxt: SeqNum(0),
             rcv_ssn: 0,
             rcv_shift: ws_shift(cfg.recv_buffer),
@@ -254,6 +266,7 @@ impl Tcb {
             rcv_sws_edge: SeqNum(0),
             rcv_ooo: RangeSet::new(),
             rcv_unacked: 0,
+            fin_received: false,
             cc,
             recovery: NewReno::new(isn),
             rtt: RttEstimator::new(),
@@ -265,6 +278,7 @@ impl Tcb {
             sws_at: None,
             ack_at: None,
             first_syn_at: None,
+            time_wait_at: None,
             closed_at: None,
             syn_due: true,
             ack_due: false,
@@ -321,6 +335,29 @@ impl Tcb {
         self.state
     }
 
+    /// RFC 9293 §3.10.4 CLOSE; idempotent. ESTABLISHED → FIN-WAIT-1 and CLOSE-WAIT →
+    /// LAST-ACK at once; the FIN follows the data queued at the next `poll_send`, and nothing
+    /// queued after that is sent (the Connection rejects writes after `close` before they
+    /// reach the hooks).
+    ///
+    /// SYN-SENT: the TCB is deleted. `state()` is `Closed` at once and nothing more is sent or
+    /// accepted; `poll_send_at` reports a deadline that is already due, and the next
+    /// `on_timeout` returns `Closed(Normal)`, once, and sets `closed_at`.
+    pub fn close(&mut self) {
+        self.state = match self.state {
+            TcpState::SynSent => TcpState::Closed,
+            TcpState::Established => TcpState::FinWait1,
+            TcpState::CloseWait => TcpState::LastAck,
+            s => s,
+        };
+    }
+
+    /// The peer's FIN has been received. Every data octet before it was handed to the hooks
+    /// first, so once they hold no more data the application's read is at EOF.
+    pub fn fin_received(&self) -> bool {
+        self.fin_received
+    }
+
     /// Switches Nagle off (`true`) or on (`false`, the default).
     pub fn set_nodelay(&mut self, nodelay: bool) {
         self.nodelay = nodelay;
@@ -328,9 +365,9 @@ impl Tcb {
 
     pub fn on_segment(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
+            TcpState::Closed => Reaction::None,
             TcpState::SynSent => self.on_segment_syn_sent(seg, now),
-            TcpState::Established => self.on_segment_sync(seg, now, h),
-            _ => Reaction::None,
+            _ => self.on_segment_sync(seg, now, h),
         }
     }
 
@@ -338,8 +375,20 @@ impl Tcb {
     pub fn on_timeout(&mut self, now: Instant, _h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::SynSent => self.on_timeout_syn_sent(now),
-            TcpState::Established => self.on_timeout_data(now),
-            _ => Reaction::None,
+            // A `close` in SYN-SENT, reported once.
+            TcpState::Closed if self.closed_at.is_none() => {
+                self.closed_at = Some(now);
+                Reaction::Closed(CloseReason::Normal)
+            }
+            TcpState::Closed => Reaction::None,
+            TcpState::TimeWait => {
+                if self.time_wait_at.is_some_and(|t| now >= t) {
+                    // `Closed(Normal)` was returned on entering TIME-WAIT.
+                    self.terminate(CloseReason::Normal, now);
+                }
+                Reaction::None
+            }
+            _ => self.on_timeout_data(now),
         }
     }
 
@@ -368,14 +417,22 @@ impl Tcb {
             out.options_len = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
             return Some(meta);
         }
-        if self.state == TcpState::Established {
+        if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
+            let fin_unsent = matches!(
+                self.state,
+                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+            );
+            if fin_unsent && self.fin_rel.is_none() {
+                self.fin_rel = Some(h.assigned_end());
+            }
             if let Some(meta) = self.poll_data(now, h, out) {
-                // Every data segment and probe carries the current ACK.
+                // Every data segment, FIN and probe carries the current ACK.
                 self.ack_sent();
                 return Some(meta);
             }
-            // A read that let the window edge move is announced (RFC 9293 §3.8.6.2.2).
-            if !self.ack_due && self.window_update_due(h) {
+            // A read that let the window edge move is announced (RFC 9293 §3.8.6.2.2), while
+            // data can still arrive.
+            if !self.ack_due && !self.fin_received && self.window_update_due(h) {
                 self.ack_due = true;
             }
         }
@@ -393,19 +450,20 @@ impl Tcb {
     /// not reported here: the driver calls `poll_send` after every input.
     pub fn poll_send_at(&self) -> Option<Instant> {
         match self.state {
-            TcpState::Closed => self.closed_at,
+            // Due at once after a `close` in SYN-SENT.
+            TcpState::Closed => Some(self.closed_at.unwrap_or(Instant::from_nanos(0))),
             TcpState::SynSent => {
                 let r2 = self.first_syn_at.map(|t| t + self.r2_syn());
                 [self.rto_at, r2].into_iter().flatten().min()
             }
-            TcpState::Established => {
+            TcpState::TimeWait => self.time_wait_at,
+            _ => {
                 let r2 = self.r2_since.map(|t| t + self.cfg.r2_data);
                 [self.rto_at, r2, self.persist_at, self.sws_at, self.ack_at]
                     .into_iter()
                     .flatten()
                     .min()
             }
-            _ => None,
         }
     }
 
@@ -424,7 +482,7 @@ impl Tcb {
             return Reaction::None;
         }
         if rst {
-            return self.close(CloseReason::Reset, now);
+            return self.terminate(CloseReason::Reset, now);
         }
         if !seg.flags.contains(TcpFlags::SYN) {
             return Reaction::None;
@@ -471,7 +529,7 @@ impl Tcb {
 
     fn on_timeout_syn_sent(&mut self, now: Instant) -> Reaction {
         if self.first_syn_at.is_some_and(|t| now >= t + self.r2_syn()) {
-            return self.close(CloseReason::Timeout, now);
+            return self.terminate(CloseReason::Timeout, now);
         }
         if self.rto_at.is_some_and(|t| now >= t) {
             self.rto_at = None;
@@ -481,27 +539,48 @@ impl Tcb {
         Reaction::None
     }
 
-    /// RFC 9293 §3.10.7.4 in a synchronized state (ESTABLISHED so far). RST is not acted on
-    /// yet and FIN is ignored: an acceptable RST or FIN is dropped.
+    /// RFC 9293 §3.10.7.4 in the synchronized states.
     fn on_segment_sync(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
-        let rst = seg.flags.contains(TcpFlags::RST);
-        // First: an unacceptable segment draws an ACK, unless it is a RST, and is dropped.
+        let fin = seg.flags.contains(TcpFlags::FIN);
+        // Second step, on SEG.SEQ alone (RFC 5961 §3 as RFC 9293 gives it): RCV.NXT exactly
+        // resets, elsewhere in the window draws a challenge ACK, outside it the RST is dropped
+        // silently. This also covers the first step for RSTs and, with the window empty, the
+        // "special allowance" for them (a RST with text at RCV.NXT still resets). No RFC 5961
+        // challenge-ACK rate limit.
+        if seg.flags.contains(TcpFlags::RST) {
+            let off = self.rcv_nxt.distance(seg.seq);
+            if off == 0 {
+                return self.on_reset(now);
+            }
+            self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();
+            return Reaction::None;
+        }
+        // TIME-WAIT: a retransmitted FIN ends at RCV.NXT, below the window, so it is ACKed and
+        // restarts 2·MSL here rather than in the fifth and eighth steps it cannot reach.
+        let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
+        if self.state == TcpState::TimeWait && fin && seg_end.wrapping_add(1) == self.rcv_nxt {
+            self.time_wait_at = Some(now + 2 * MSL);
+            self.ack_due = true;
+            return Reaction::None;
+        }
+        // First: an unacceptable segment draws an ACK and is dropped.
         if !self.acceptable(seg) {
-            self.ack_due |= !rst;
+            self.ack_due = true;
             // "If the RCV.WND is zero, ... special allowance should be made to accept valid
-            // ACKs, URGs, and RSTs": with our window closed, the ACK field of a segment at or
-            // beyond RCV.NXT is still processed; its text is not. (An RST allowance would go
-            // here too; RST is not acted on yet.)
-            let ack_only =
-                seg.flags.contains(TcpFlags::ACK) && !rst && !seg.flags.contains(TcpFlags::SYN);
-            if ack_only && self.rcv_nxt.le(seg.seq) && self.window_offer(h).0 == 0 {
+            // ACKs": with our window closed, the ACK field of a segment from RCV.NXT up to one
+            // past the largest edge is still processed; its text is not. One past: a one-octet
+            // probe into the closed window (RFC 9293 §3.8.6.1) moves the peer's SND.NXT there.
+            let ack_only = seg.flags.contains(TcpFlags::ACK) && !seg.flags.contains(TcpFlags::SYN);
+            let edge = self.rcv_right_edge.wrapping_add(1);
+            if ack_only
+                && self.rcv_nxt.le(seg.seq)
+                && seg.seq.le(edge)
+                && self.window_offer(h).0 == 0
+            {
                 if let ControlFlow::Break(r) = self.on_ack(seg, now, h) {
                     return r;
                 }
             }
-            return Reaction::None;
-        }
-        if rst {
             return Reaction::None;
         }
         // Fourth: a SYN (e.g. a retransmitted SYN/ACK) draws a challenge ACK (RFC 5961 §4).
@@ -516,9 +595,57 @@ impl Tcb {
         if let ControlFlow::Break(r) = self.on_ack(seg, now, h) {
             return r;
         }
-        // Seventh (URG is not processed: urgent data is delivered inline, RFC 6093).
-        self.on_text(seg, now, h);
+        // Seventh, until the peer's FIN (URG is not processed: urgent data is delivered
+        // inline, RFC 6093). Text after the FIN is ignored.
+        if !self.fin_received {
+            self.on_text(seg, now, h);
+        }
+        // Eighth: a FIN right after all the text before it.
+        if fin && seg_end == self.rcv_nxt {
+            return self.on_fin(now);
+        }
         Reaction::None
+    }
+
+    /// Eighth step for a FIN at RCV.NXT: ACK it at once, CLOSE-WAIT / CLOSING / TIME-WAIT.
+    fn on_fin(&mut self, now: Instant) -> Reaction {
+        self.ack_due = true;
+        if self.fin_received {
+            // A second FIN where the first one ended: only ACKed.
+            return Reaction::None;
+        }
+        self.fin_received = true;
+        self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        match self.state {
+            TcpState::Established => self.state = TcpState::CloseWait,
+            // Our FIN is not ACKed yet: `on_ack` moves FIN-WAIT-1 to FIN-WAIT-2 when it is.
+            TcpState::FinWait1 => self.state = TcpState::Closing,
+            TcpState::FinWait2 => return self.enter_time_wait(now),
+            _ => {}
+        }
+        Reaction::None
+    }
+
+    /// The only entry into TIME-WAIT: start 2·MSL, stop the other timers, `Closed(Normal)`.
+    fn enter_time_wait(&mut self, now: Instant) -> Reaction {
+        self.state = TcpState::TimeWait;
+        self.time_wait_at = Some(now + 2 * MSL);
+        self.rto_at = None;
+        self.r2_since = None;
+        self.persist_at = None;
+        self.sws_at = None;
+        self.ack_at = None;
+        Reaction::Closed(CloseReason::Normal)
+    }
+
+    /// An acceptable RST (second step): CLOSED. In TIME-WAIT, `Closed(Normal)` was already
+    /// returned, so nothing more is.
+    fn on_reset(&mut self, now: Instant) -> Reaction {
+        if self.state == TcpState::TimeWait {
+            self.terminate(CloseReason::Normal, now);
+            return Reaction::None;
+        }
+        self.terminate(CloseReason::Reset, now)
     }
 
     /// RFC 9293 Table 6, against the largest window advertised (RFC 7323 §2.4 rule 1).
@@ -626,7 +753,9 @@ impl Tcb {
             if self.snd_nxt.lt(self.snd_una) {
                 self.snd_nxt = self.snd_una;
             }
-            h.mark_acked(self.rel(seg.ack));
+            // The FIN is not in the send buffer.
+            let data_una = self.fin_seq().filter(|f| f.lt(seg.ack)).unwrap_or(seg.ack);
+            h.mark_acked(self.rel(data_una));
             let rtt = match self.rtt_timed {
                 Some((end, sent)) if end.le(seg.ack) => {
                     self.rtt_timed = None;
@@ -666,12 +795,23 @@ impl Tcb {
         if self.in_flight() == 0 || self.snd_wnd == 0 {
             self.r2_since = (self.in_flight() > 0).then_some(now);
         }
+        if self.fin_seq().is_some_and(|f| f.lt(self.snd_una)) {
+            // Our FIN is acknowledged.
+            match self.state {
+                TcpState::FinWait1 => self.state = TcpState::FinWait2,
+                TcpState::Closing => return ControlFlow::Break(self.enter_time_wait(now)),
+                TcpState::LastAck => {
+                    return ControlFlow::Break(self.terminate(CloseReason::Normal, now));
+                }
+                _ => {}
+            }
+        }
         ControlFlow::Continue(())
     }
 
     fn on_timeout_data(&mut self, now: Instant) -> Reaction {
         if self.r2_since.is_some_and(|t| now >= t + self.cfg.r2_data) {
-            return self.close(CloseReason::Timeout, now);
+            return self.terminate(CloseReason::Timeout, now);
         }
         if self.rto_at.is_some_and(|t| now >= t) {
             // RFC 6298 §5.4–5.6: the retransmission restarts the timer when it is sent.
@@ -717,19 +857,24 @@ impl Tcb {
             // cwnd, Nagle and SWS, even into a zero window, where it is the probe (spec §3).
             // Karn: no RTT sample from anything now in flight.
             self.rtt_timed = None;
-            let len = in_flight.min(u32::from(self.eff_mss));
-            let meta = self.write_data(self.snd_una, len, now, h, out)?;
-            let end = self.snd_una.wrapping_add(meta.len);
+            let len = self
+                .data_len(self.snd_una, self.snd_max)
+                .min(u32::from(self.eff_mss));
+            let fin = self.fin_sent();
+            let meta = self.write_data(self.snd_una, len, fin, now, h, out)?;
+            let end = self.snd_una.wrapping_add(seq_len(&meta));
             if end.gt(self.snd_nxt) {
                 self.snd_nxt = end;
             }
             return Some(meta);
         }
-        let queued = h.assigned_end().wrapping_sub(self.rel(self.snd_nxt));
+        let queued = self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end()));
+        let fin_pending = self.fin_rel.is_some() && !self.fin_sent();
         let idle = in_flight == 0;
 
-        // RFC 9293 §3.8.6.1; never armed while data is unacknowledged.
-        if idle && queued > 0 && self.snd_wnd == 0 {
+        // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is
+        // unacknowledged.
+        if idle && (queued > 0 || fin_pending) && self.snd_wnd == 0 {
             // Persist replaces the SWS override for this zero-window episode.
             self.sws_at = None;
             self.sws_override = false;
@@ -755,25 +900,31 @@ impl Tcb {
         let usable = self.snd_wnd.min(self.cc.cwnd()).saturating_sub(sent);
         let resend = self.snd_nxt.distance(self.snd_max) as u32;
         if resend > 0 {
-            // Go-back: resends stop at SND.MAX and skip Nagle and SWS; they are not timed.
-            let len = resend.min(usable).min(u32::from(self.eff_mss));
-            if len == 0 {
-                return None;
-            }
-            let meta = self.write_data(self.snd_nxt, len, now, h, out)?;
-            self.snd_nxt = self.snd_nxt.wrapping_add(meta.len);
+            // Go-back: resends stop at SND.MAX and skip Nagle and SWS; they are not timed. The
+            // FIN goes again if the window has room behind the data.
+            let len = self
+                .data_len(self.snd_nxt, self.snd_max)
+                .min(usable)
+                .min(u32::from(self.eff_mss));
+            let fin = self.fin_sent() && usable > len;
+            let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
+            self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
             return Some(meta);
         }
         let sws_override = std::mem::take(&mut self.sws_override);
         let len = queued.min(usable).min(u32::from(self.eff_mss));
-        if len == 0 {
+        // The FIN takes one sequence number of the window, behind the last data octet.
+        let fin = fin_pending && usable > len;
+        if len == 0 && !fin {
             self.sws_at = None;
             return None;
         }
         // RFC 9293 §3.8.6.2.1 rules (1)–(4), Fs = 1/2; the bracketed SND.NXT = SND.UNA is
         // Nagle's (§3.7.4) and dropped by `set_nodelay(true)`. Every write counts as pushed.
+        // A FIN alone is sent at once.
         let nagle_ok = idle || self.nodelay;
-        let send = len == u32::from(self.eff_mss)
+        let send = len == 0
+            || len == u32::from(self.eff_mss)
             || (nagle_ok && queued <= usable)
             || (nagle_ok && len >= self.max_snd_wnd / 2)
             || sws_override;
@@ -787,20 +938,22 @@ impl Tcb {
             return None;
         }
         self.sws_at = None;
-        let meta = self.write_data(self.snd_nxt, len, now, h, out)?;
-        self.snd_nxt = self.snd_nxt.wrapping_add(meta.len);
+        let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
+        self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
         self.snd_max = self.snd_nxt;
         // New data only (SEQ = SND.MAX): resends never get here (Karn).
         self.rtt_timed.get_or_insert((self.snd_nxt, now));
         Some(meta)
     }
 
-    /// Writes up to `len` octets from SEQ `seq` (PSH if it ends at `assigned_end`) and starts
-    /// the RTO and R2 clocks if they are not running (RFC 6298 §5.1).
+    /// Writes up to `len` data octets from SEQ `seq`, PSH if they end at the last queued octet,
+    /// and the FIN if `fin` and they end where it sits; `None` if neither data nor FIN goes.
+    /// Starts the RTO and R2 clocks if they are not running (RFC 6298 §5.1).
     fn write_data(
         &mut self,
         seq: SeqNum,
         len: u32,
+        fin: bool,
         now: Instant,
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
@@ -820,11 +973,16 @@ impl Tcb {
                 _ => break,
             }
         }
-        if got == 0 {
+        let end = start.wrapping_add(got);
+        let fin = fin && self.fin_rel == Some(end);
+        if got == 0 && !fin {
             return None;
         }
-        if start.wrapping_add(got) == h.assigned_end() {
-            out.flags = TcpFlags::PSH | TcpFlags::ACK;
+        if got > 0 && end == self.fin_rel.unwrap_or(h.assigned_end()) {
+            out.flags = out.flags | TcpFlags::PSH;
+        }
+        if fin {
+            out.flags = out.flags | TcpFlags::FIN;
         }
         meta.flags = out.flags;
         meta.len = got;
@@ -836,6 +994,21 @@ impl Tcb {
     /// Octets outstanding: SND.MAX − SND.UNA (FlightSize).
     fn in_flight(&self) -> u32 {
         self.snd_una.distance(self.snd_max) as u32
+    }
+
+    /// SEQ of our FIN, once fixed.
+    fn fin_seq(&self) -> Option<SeqNum> {
+        self.fin_rel.map(|r| self.iss.wrapping_add(r))
+    }
+
+    fn fin_sent(&self) -> bool {
+        self.fin_seq().is_some_and(|f| f.lt(self.snd_max))
+    }
+
+    /// Data octets from `seq` to `end`, stopping at the FIN; 0 if `seq` is past either.
+    fn data_len(&self, seq: SeqNum, end: SeqNum) -> u32 {
+        let end = self.fin_seq().filter(|f| f.lt(end)).unwrap_or(end);
+        seq.distance(end).max(0) as u32
     }
 
     /// Relative SSN of `seq`: ISS + 1 is SSN 1 (spec §5.3).
@@ -914,7 +1087,7 @@ impl Tcb {
         self.rcv_unacked = 0;
     }
 
-    fn close(&mut self, reason: CloseReason, now: Instant) -> Reaction {
+    fn terminate(&mut self, reason: CloseReason, now: Instant) -> Reaction {
         self.state = TcpState::Closed;
         self.closed_at = Some(now);
         Reaction::Closed(reason)
@@ -936,6 +1109,11 @@ impl Tcb {
         // ponytail: a peer MSS of 0 would stall the send path; used as 1.
         peer.min(self.mss_option()).max(1)
     }
+}
+
+/// Sequence numbers a segment we sent occupies: its data and the FIN.
+fn seq_len(m: &SentMeta) -> u32 {
+    m.len + u32::from(m.flags.contains(TcpFlags::FIN))
 }
 
 /// Smallest shift `s` with `buffer >> s <= 65535`, at most 14 (RFC 7323 §2.3).
