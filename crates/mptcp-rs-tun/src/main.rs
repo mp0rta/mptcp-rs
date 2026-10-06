@@ -77,9 +77,10 @@ fn run(a: Args) -> Result<String, String> {
         .map_err(|e| format!("connect: {e:?}"))?;
 
     let mut pkt = vec![0u8; 65535];
-    let mut chunk = vec![0u8; 65536];
-    let (mut sent, mut verified) = (0u64, 0u64);
-    let (mut connected, mut closing, mut eof) = (false, false, false);
+    let mut rbuf = vec![0u8; 65536];
+    // One period of the pattern repeats every 251 bytes: slice at `sent % 251`.
+    let pat: Vec<u8> = (0..65536 + 251u64).map(pattern_byte).collect();
+    let mut st = State::default();
     loop {
         let t = now(start);
         let wait = ep.poll_timeout().map_or(CAP, |d| {
@@ -97,65 +98,97 @@ fn run(a: Args) -> Result<String, String> {
         if ep.poll_timeout().is_some_and(|d| d <= t) {
             ep.handle_timeout(t);
         }
+        // Events first: a reset or R2 timeout frees the TCB in the same iteration.
+        st.events(&mut ep, &a)?;
 
-        if connected && !closing {
+        if st.connected && !st.done {
             let conn = ep.connection(h).ok_or("connection gone")?;
-            while sent < a.send {
-                let n = ((a.send - sent).min(chunk.len() as u64)) as usize;
-                for (b, i) in chunk[..n].iter_mut().zip(sent..) {
-                    *b = pattern_byte(i);
-                }
-                match conn.write(&chunk[..n]) {
+            while !st.closing && st.sent < a.send {
+                let n = (a.send - st.sent).min(65536) as usize;
+                match conn.write(&pat[(st.sent % 251) as usize..][..n]) {
                     Ok(0) => break,
-                    Ok(w) => sent += w as u64,
+                    Ok(w) => st.sent += w as u64,
                     Err(e) => return Err(format!("write: {e:?}")),
                 }
             }
-            while !eof {
-                match conn.read(&mut chunk) {
-                    Ok(0) => eof = true,
+            // Keep verifying after close(): extra bytes from the peer are a mismatch.
+            while !st.eof {
+                match conn.read(&mut rbuf) {
+                    Ok(0) => st.eof = true,
                     Ok(n) => {
-                        if verified + n as u64 > a.expect || !verify_pattern(verified, &chunk[..n])
+                        if st.verified + n as u64 > a.expect
+                            || !verify_pattern(st.verified, &rbuf[..n])
                         {
-                            return Err(format!("verification mismatch at byte {verified}"));
+                            return Err(format!("verification mismatch at byte {}", st.verified));
                         }
-                        verified += n as u64;
+                        st.verified += n as u64;
                     }
                     Err(ReadError::WouldBlock) => break,
                     Err(ReadError::Reset) => return Err("connection reset by peer".into()),
                 }
             }
-            if eof && verified < a.expect {
+            if st.eof && st.verified < a.expect {
                 return Err(format!(
-                    "premature EOF after {verified} of {} bytes",
-                    a.expect
+                    "premature EOF after {} of {} bytes",
+                    st.verified, a.expect
                 ));
             }
-            if sent == a.send && verified == a.expect {
+            if !st.closing && st.sent == a.send && st.verified == a.expect {
                 conn.close();
-                closing = true;
+                st.closing = true;
             }
         }
+        st.events(&mut ep, &a)?;
 
+        // Drain before returning: the final ACK of the active close must go out.
+        while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
+            match tun.write(&pkt[..n]) {
+                Ok(_) => {}
+                // Link not up yet (EIO) or queue full: a dropped packet, TCP recovers.
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || matches!(e.raw_os_error(), Some(libc::EIO | libc::ENOBUFS)) => {}
+                Err(e) => return Err(format!("tun write: {e}")),
+            }
+        }
+        if st.done {
+            return Ok(format!(
+                "ok: sent {} bytes, verified {} bytes",
+                st.sent, st.verified
+            ));
+        }
+    }
+}
+
+#[derive(Default)]
+struct State {
+    sent: u64,
+    verified: u64,
+    connected: bool,
+    closing: bool,
+    eof: bool,
+    done: bool,
+}
+
+impl State {
+    fn events(&mut self, ep: &mut Endpoint<ChaCha20Rng>, a: &Args) -> Result<(), String> {
         while let Some((_, ev)) = ep.poll_event() {
             match ev {
-                Event::Connected { .. } => connected = true,
+                Event::Connected { .. } => self.connected = true,
                 Event::Closed {
                     reason: CloseReason::Normal,
-                } if closing && sent == a.send && verified == a.expect => {
-                    return Ok(format!("ok: sent {sent} bytes, verified {verified} bytes"));
+                } if self.closing && self.sent == a.send && self.verified == a.expect => {
+                    self.done = true;
                 }
                 Event::Closed { reason } => {
                     return Err(format!(
-                        "connection closed: {reason:?} (sent {sent}, verified {verified})"
+                        "connection closed: {reason:?} (sent {}, verified {})",
+                        self.sent, self.verified
                     ));
                 }
             }
         }
-
-        while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
-            tun.write(&pkt[..n]).map_err(io_err("tun write"))?;
-        }
+        Ok(())
     }
 }
 
