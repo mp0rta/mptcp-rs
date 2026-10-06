@@ -101,7 +101,8 @@ fn run(a: Args) -> Result<String, String> {
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
         st.events(&mut ep, &a)?;
 
-        if st.connected && !st.done {
+        // After a normal close the connection is gone unless data is still unread.
+        if st.connected && !st.eof && (!st.done || ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
             while !st.closing && st.sent < a.send {
                 let n = (a.send - st.sent).min(65536) as usize;

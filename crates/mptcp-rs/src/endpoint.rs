@@ -34,6 +34,8 @@ pub enum ConnectError {
     NoPort,
     /// IPv4 needs an MTU of at least 68, IPv6 at least 1280.
     InvalidMtu,
+    /// `send_buffer` and `recv_buffer` must be within 1 and 2^30.
+    InvalidBuffer,
     /// `local` and `remote` are of different IP families.
     FamilyMismatch,
 }
@@ -93,6 +95,12 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         if cfg.mtu < min_mtu {
             return Err(ConnectError::InvalidMtu);
+        }
+        if [cfg.send_buffer, cfg.recv_buffer]
+            .iter()
+            .any(|b| !(1..=1 << 30).contains(b))
+        {
+            return Err(ConnectError::InvalidBuffer);
         }
         let start = self.rng.next_u32() % EPHEMERAL_COUNT;
         let local = (0..EPHEMERAL_COUNT)
@@ -192,7 +200,9 @@ impl<R: CryptoRng> Endpoint<R> {
 
     /// Writes one complete IP packet into `buf` and returns its length, or `None` if nothing is
     /// to be sent. `buf` must hold at least the connection MTU: a packet that does not fit is
-    /// dropped (TCP retransmission recovers it).
+    /// dropped (TCP retransmission recovers it). Driver contract: call this after every `read`,
+    /// `write`, `close` and `handle_packet` until it returns `None`: those calls can make a
+    /// packet (window update, data, FIN) due without any timer being armed.
     pub fn poll_transmit(&mut self, now: Instant, buf: &mut [u8]) -> Option<usize> {
         while let Some(r) = self.pending_rst.pop_front() {
             let seg = Segment {

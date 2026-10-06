@@ -21,13 +21,13 @@ if [ "${1:-}" = "--inner" ]; then
   ip netns exec cli sysctl -qw net.ipv4.ip_forward=1
   ip -n srv route add 10.0.9.0/24 via 10.0.1.1
 
-  rm -f m0.pcap
+  rm -f m0.pcap srv.log cli.log
   ip netns exec srv tcpdump -i a1 -U -s 128 -w m0.pcap >/dev/null 2>&1 &
   tdpid=$!
   ip netns exec srv timeout 130 python3 tests/interop/server.py --mode tcp --port 5201 --bytes $N \
     >srv.log 2>&1 &
   srvpid=$!
-  for _ in $(seq 50); do grep -q listening srv.log && break; sleep 0.1; done
+  for _ in $(seq 50); do grep -qs listening srv.log && break; sleep 0.1; done
   sleep 1  # tcpdump is up
 
   start=$(date +%s.%N)

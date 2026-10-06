@@ -768,7 +768,10 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
     assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
     assert_eq!(f.timeout(tm(1100)), Reaction::None);
     // FlightSize at the RTO: data(1000)..data(3000).
-    assert_eq!(log.lock().unwrap().events, vec![(CongestionEvent::Rto, 2000)]);
+    assert_eq!(
+        log.lock().unwrap().events,
+        vec![(CongestionEvent::Rto, 2000)]
+    );
     // Go-back from SND.UNA within this CC's fixed 2-segment window.
     let segs = f.drain(tm(1100));
     assert_eq!(seq_lens(&segs), [(data(1000), 1000), (data(2000), 1000)]);
@@ -2000,8 +2003,8 @@ fn passive_close_close_wait_last_ack() {
     assert_eq!(f.tcb.state(), TcpState::CloseWait);
     assert!(f.tcb.fin_received());
     assert_eq!(f.ack_nos(tm(10)), vec![pdata(501)]);
-    // A second FIN where the first ended is only ACKed: RCV.NXT stays.
-    assert_eq!(f.seg_in(tm(15), 501, FIN_ACK, &[]), Reaction::None);
+    // A retransmitted FIN (it starts at 500) is only ACKed: RCV.NXT stays.
+    assert_eq!(f.seg_in(tm(15), 500, FIN_ACK, &[]), Reaction::None);
     assert_eq!(f.ack_nos(tm(15)), vec![pdata(501)]);
     // The data, then EOF: nothing to read and the FIN received.
     assert_eq!(f.read_all(), p);

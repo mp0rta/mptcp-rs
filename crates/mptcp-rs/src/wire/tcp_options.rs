@@ -63,7 +63,7 @@ impl<'a> Iterator for TcpOptions<'a> {
                     val: u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
                     ecr: u32::from_be_bytes([d[4], d[5], d[6], d[7]]),
                 },
-                (30, _) => TcpOpt::Mptcp(opt),
+                (super::mptcp::KIND_MPTCP, _) => TcpOpt::Mptcp(opt),
                 _ => TcpOpt::Unknown { kind, data: d },
             }));
         }

@@ -179,6 +179,24 @@ fn connect_validates_arguments() {
     assert!(c(&mut ep, false, 68).is_ok());
     assert_eq!(c(&mut ep, true, 1279).err(), Some(ConnectError::InvalidMtu));
     assert!(c(&mut ep, true, 1280).is_ok());
+    for (send_buffer, recv_buffer) in [(0, 1), (1, 0), ((1 << 30) + 1, 1), (1, (1 << 30) + 1)] {
+        let cfg = ConnectConfig {
+            send_buffer,
+            recv_buffer,
+            ..ConnectConfig::default()
+        };
+        let r = ep.connect(t(1), local_ip(false), peer_addr(false), cfg);
+        assert_eq!(r.err(), Some(ConnectError::InvalidBuffer));
+    }
+    let max = ConnectConfig {
+        send_buffer: 1 << 30,
+        recv_buffer: 1 << 30,
+        ..ConnectConfig::default()
+    };
+    assert!(
+        ep.connect(t(1), local_ip(false), peer_addr(false), max)
+            .is_ok()
+    );
     assert_eq!(
         ep.connect(
             t(1),
