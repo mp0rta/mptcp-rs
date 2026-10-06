@@ -1,8 +1,7 @@
 use super::*;
 use crate::tcp::cc::{CongestionEvent, RecoveryAck, Unbounded};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 const ISN: SeqNum = SeqNum(0x1000);
 const PEER_ISN: SeqNum = SeqNum(0xFFFF_FFF0);
@@ -728,17 +727,17 @@ struct CcLog {
 }
 
 /// Fixed 2-segment window that records what the `Tcb` reports.
-struct Recording(Rc<RefCell<CcLog>>);
+struct Recording(Arc<Mutex<CcLog>>);
 
 impl CongestionControl for Recording {
     fn init(&mut self, smss: u32, _: bool) {
-        self.0.borrow_mut().init = Some(smss);
+        self.0.lock().unwrap().init = Some(smss);
     }
     fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
-        self.0.borrow_mut().acks.push((acked, rtt, in_flight));
+        self.0.lock().unwrap().acks.push((acked, rtt, in_flight));
     }
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
-        self.0.borrow_mut().events.push((ev, in_flight));
+        self.0.lock().unwrap().events.push((ev, in_flight));
     }
     fn on_recovery_ack(&mut self, _: RecoveryAck) {}
     fn cwnd(&self) -> u32 {
@@ -748,18 +747,18 @@ impl CongestionControl for Recording {
 
 #[test]
 fn cc_gates_sending_and_sees_acks_and_rto() {
-    let log = Rc::new(RefCell::new(CcLog::default()));
+    let log = Arc::new(Mutex::new(CcLog::default()));
     let cfg = ConnectConfig::default();
     let h = PlainHooks::new(&cfg);
     let mut f = Fixture::with(cfg, Box::new(Recording(log.clone())), h);
     f.establish(10 * MSS);
-    assert_eq!(log.borrow().init, Some(u32::from(MSS)));
+    assert_eq!(log.lock().unwrap().init, Some(u32::from(MSS)));
     f.write(&pattern(5000));
     let segs = f.drain(t(0));
     assert_eq!(segs.len(), 2, "cwnd = 2 segments");
     assert_eq!(f.ack(tm(100), data(1000), 10 * MSS), Reaction::None);
     assert_eq!(
-        log.borrow().acks,
+        log.lock().unwrap().acks,
         vec![(1000, Some(Duration::from_millis(100)), 1000)]
     );
     let segs = f.drain(tm(100));
@@ -769,7 +768,7 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
     assert_eq!(f.tcb.poll_send_at(), Some(tm(1100)));
     assert_eq!(f.timeout(tm(1100)), Reaction::None);
     // FlightSize at the RTO: data(1000)..data(3000).
-    assert_eq!(log.borrow().events, vec![(CongestionEvent::Rto, 2000)]);
+    assert_eq!(log.lock().unwrap().events, vec![(CongestionEvent::Rto, 2000)]);
     // Go-back from SND.UNA within this CC's fixed 2-segment window.
     let segs = f.drain(tm(1100));
     assert_eq!(seq_lens(&segs), [(data(1000), 1000), (data(2000), 1000)]);

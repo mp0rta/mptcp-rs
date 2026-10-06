@@ -204,3 +204,10 @@ fn segment_after_time_wait_expired_gets_rst() {
     let r = parse_owned(&drain(&mut ep, t(221))[0]);
     assert_eq!((r.flags, r.seq), (TcpFlags::RST, SeqNum(isn + 2)));
 }
+
+#[test]
+fn endpoint_and_connection_are_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<mptcp_rs::Endpoint<rand_chacha::ChaCha20Rng>>();
+    assert_send::<mptcp_rs::Connection>();
+}

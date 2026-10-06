@@ -22,7 +22,7 @@ pub enum RecoveryAck {
     Full { in_flight: u32 },
 }
 
-pub trait CongestionControl {
+pub trait CongestionControl: Send {
     /// Called once when the connection reaches ESTABLISHED, with the effective send MSS;
     /// `syn_lost` is true if our SYN was retransmitted (RFC 5681 §3.1: IW is then one segment).
     fn init(&mut self, _smss: u32, _syn_lost: bool) {}
