@@ -2,7 +2,7 @@
 # M0 interop: mptcp-rs-tun (userland TCP over TUN) <-> Linux plain TCP, 64 MiB each way.
 # Usage: cargo build --release -p mptcp-rs-tun && tests/interop/run.sh m0
 # Needs docker (runs a --privileged ubuntu:24.04 container; the host-built binary must be
-# glibc-compatible with it). Writes m0.pcap in the repo root.
+# glibc-compatible with it; on another host, build inside the container). Writes m0.pcap in the repo root.
 set -euo pipefail
 
 N=67108864
@@ -24,16 +24,20 @@ if [ "${1:-}" = "--inner" ]; then
   rm -f m0.pcap
   ip netns exec srv tcpdump -i a1 -U -s 128 -w m0.pcap >/dev/null 2>&1 &
   tdpid=$!
-  ip netns exec srv python3 tests/interop/server.py --mode tcp --port 5201 --bytes $N \
+  ip netns exec srv timeout 130 python3 tests/interop/server.py --mode tcp --port 5201 --bytes $N \
     >srv.log 2>&1 &
   srvpid=$!
-  sleep 2  # tcpdump and the listener are up
+  for _ in $(seq 50); do grep -q listening srv.log && break; sleep 0.1; done
+  sleep 1  # tcpdump is up
 
   start=$(date +%s.%N)
   ip netns exec cli timeout 120 target/release/mptcp-rs-tun --tun mtun0 --local 10.0.9.2 \
     --remote 10.0.1.2:5201 --send $N --expect $N >cli.log 2>&1 &
   clipid=$!
   for _ in $(seq 50); do ip -n cli link show mtun0 >/dev/null 2>&1 && break; sleep 0.1; done
+  if ! ip -n cli link show mtun0 >/dev/null 2>&1; then
+    echo "M0 FAIL: mtun0 not created"; cat cli.log; exit 1
+  fi
   ip -n cli addr add 10.0.9.1/24 dev mtun0
   ip -n cli link set mtun0 up
 
@@ -46,7 +50,7 @@ if [ "${1:-}" = "--inner" ]; then
   fin_c2s=$(tcpdump -r m0.pcap 'src 10.0.9.2 and tcp[tcpflags] & tcp-fin != 0' 2>/dev/null | wc -l)
   fin_s2c=$(tcpdump -r m0.pcap 'src 10.0.1.2 and tcp[tcpflags] & tcp-fin != 0' 2>/dev/null | wc -l)
   echo "--- client:"; tail -3 cli.log; echo "--- server:"; tail -3 srv.log
-  printf 'duration=%.1fs\n' "$(echo "$end - $start" | bc 2>/dev/null || python3 -c "print($end-$start)")"
+  python3 -c "print('duration=%.1fs' % ($end - $start))"
   if [ $cli_rc -eq 0 ] && [ $srv_rc -eq 0 ] && [ "$rst" -eq 0 ] && [ "$fin_c2s" -ge 1 ] && [ "$fin_s2c" -ge 1 ]; then
     echo "M0 PASS bytes=$N rst=$rst fin_c2s=$fin_c2s fin_s2c=$fin_s2c"
   else
@@ -57,4 +61,5 @@ if [ "${1:-}" = "--inner" ]; then
 fi
 
 [ "${1:-}" = "m0" ] || { echo "usage: $0 m0" >&2; exit 2; }
-docker run --rm --privileged -v "$PWD":/w -w /w ubuntu:24.04 bash tests/interop/run.sh --inner
+cd "$(dirname "$0")/../.."
+docker run --rm --init --privileged -v "$PWD":/w -w /w ubuntu:24.04 bash tests/interop/run.sh --inner

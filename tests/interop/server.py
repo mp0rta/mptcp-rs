@@ -41,7 +41,14 @@ while sent < N:
     c.sendall(BUF[sent % 251 : sent % 251 + n])
     sent += n
 
-while c.recv(65536):  # read until EOF; extra bytes are ignored
-    pass
+extra = 0
+while True:  # read until EOF; any byte beyond N is a failure
+    d = c.recv(65536)
+    if not d:
+        break
+    extra += len(d)
 c.close()
+if extra:
+    print(f"FAIL {extra} extra bytes after {N}")
+    sys.exit(1)
 print(f"server ok: received {got} sent {sent} from {peer[0]}")
