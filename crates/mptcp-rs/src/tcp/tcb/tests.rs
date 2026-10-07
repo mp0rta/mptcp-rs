@@ -786,7 +786,7 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
 }
 
 /// A send buffer whose runs are at most 7 octets, as at many internal buffer boundaries.
-struct ShortRuns(PlainHooks);
+struct ShortRuns(PlainHooks, usize);
 
 impl SendBuf for ShortRuns {
     fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
@@ -801,6 +801,13 @@ impl SendBuf for ShortRuns {
 }
 
 impl SegmentHooks for ShortRuns {
+    fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
+        if flags.contains(TcpFlags::SYN) {
+            return 0;
+        }
+        out[..self.1].fill(1); // NOPs reserve protocol option space without MPTCP data semantics.
+        self.1
+    }
     fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
         self.0.accept_payload(rel_ssn, data)
     }
@@ -812,7 +819,7 @@ impl SegmentHooks for ShortRuns {
 #[test]
 fn segment_filled_across_short_runs() {
     let cfg = ConnectConfig::default();
-    let h = ShortRuns(PlainHooks::new(&cfg));
+    let h = ShortRuns(PlainHooks::new(&cfg), 0);
     let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
     f.establish(10 * MSS);
     f.tcb.set_nodelay(true);
@@ -2727,4 +2734,33 @@ fn window_update_survives_a_go_back_that_sends_nothing() {
     let m = f.send(at).expect("window update ACK");
     assert_eq!(m.len, 0);
     assert!(f.out.wnd > 0);
+}
+
+#[test]
+fn protocol_options_and_sacks_reduce_payload_budget() {
+    for mtu in [68, 1500] {
+        let cfg = ConnectConfig {
+            mtu,
+            ..ConnectConfig::default()
+        };
+        let h = ShortRuns(PlainHooks::new(&cfg), 20);
+        let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
+        f.establish(10 * MSS);
+        f.tcb.sack_permitted = true;
+        f.data_in(t(0), 100, &[1; 100]);
+        f.h.0.write(&pattern(2000));
+        f.send(t(0)).unwrap();
+        assert!(!f.out.payload.is_empty());
+        assert_eq!(&f.out.options[..20], &[1; 20]);
+        assert!(f.out.options_len <= 40);
+        assert_eq!(f.out.options_len % 4, 0);
+        assert!(40 + f.out.options_len + f.out.payload.len() <= usize::from(mtu));
+        assert!(f.out.options_len + f.out.payload.len() <= usize::from(MSS));
+        if mtu == 68 {
+            assert_eq!(f.out.payload.len(), 8);
+            assert!(sack_blocks(&f.out).is_empty());
+        } else {
+            assert_eq!(sack_blocks(&f.out), vec![(pdata(100), pdata(200))]);
+        }
+    }
 }

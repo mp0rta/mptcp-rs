@@ -3,6 +3,9 @@
 mod connection;
 pub mod crypto;
 mod endpoint;
+// M1 staging: remove this gate with the DSS data path before enabling public MPTCP.
+#[cfg(test)]
+mod mptcp;
 mod seq;
 pub mod tcp;
 mod time;

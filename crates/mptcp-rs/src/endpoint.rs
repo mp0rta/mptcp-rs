@@ -8,9 +8,9 @@ use rand_core::CryptoRng;
 
 use crate::Instant;
 use crate::SeqNum;
-use crate::connection::Connection;
+use crate::connection::{Connection, ConnectionHooks};
 use crate::crypto::IsnGenerator;
-use crate::tcp::{CloseReason, ConnectConfig, PlainHooks, Reaction, SegmentWriter, Tcb, TcpState};
+use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
 
 /// Queued RSTs for segments without a TCB; beyond this they are dropped.
@@ -119,7 +119,7 @@ impl<R: CryptoRng> Endpoint<R> {
             h,
             Connection {
                 tcb: Tcb::new_active(&cfg, local, remote, isn, now),
-                hooks: PlainHooks::new(&cfg),
+                hooks: ConnectionHooks::new(&cfg),
                 local,
                 remote,
                 closed_by_app: false,
@@ -127,6 +127,33 @@ impl<R: CryptoRng> Endpoint<R> {
                 detached: false,
             },
         );
+        Ok(h)
+    }
+
+    // M1 staging: use from the normal connect path only once the DSS data path is ready.
+    #[cfg(test)]
+    fn connect_mptcp(
+        &mut self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+        cfg: ConnectConfig,
+    ) -> Result<ConnectionHandle, ConnectError> {
+        let h = self.connect(now, local, remote, cfg)?;
+        // ponytail: scan live connections; use a token set if connect volume warrants it.
+        // Keeping the token on its connection also retains it through TIME_WAIT.
+        let negotiation = loop {
+            let candidate = crate::mptcp::Negotiation::new(self.rng.next_u64());
+            if !self.conns.values().any(|c| {
+                c.hooks
+                    .negotiation
+                    .as_ref()
+                    .is_some_and(|m| m.token == candidate.token)
+            }) {
+                break candidate;
+            }
+        };
+        self.conns.get_mut(&h).unwrap().hooks.negotiation = Some(negotiation);
         Ok(h)
     }
 
@@ -167,7 +194,13 @@ impl<R: CryptoRng> Endpoint<R> {
     ) {
         match r {
             Reaction::None => {}
-            Reaction::Established => events.push_back((h, Event::Connected { mptcp: false })),
+            Reaction::Established => {
+                #[cfg(test)]
+                if c.hooks.negotiation.is_some() {
+                    return;
+                }
+                events.push_back((h, Event::Connected { mptcp: false }));
+            }
             Reaction::Closed(reason) => {
                 c.reset |= reason == CloseReason::Reset;
                 events.push_back((h, Event::Closed { reason }));
@@ -227,6 +260,11 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
+                // A staged MPTCP third ACK must remain due until it can be emitted.
+                #[cfg(test)]
+                if c.hooks.negotiation.is_some() && buf.len() < c.tcb.mtu() {
+                    continue;
+                }
                 if c.tcb
                     .poll_send(now, &mut c.hooks, &mut self.scratch)
                     .is_none()
@@ -246,6 +284,15 @@ impl<R: CryptoRng> Endpoint<R> {
                     payload: &w.payload,
                 };
                 if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
+                    #[cfg(test)]
+                    if let Some(mptcp) = c
+                        .hooks
+                        .negotiation
+                        .as_mut()
+                        .and_then(|m| m.on_transmitted(w.flags))
+                    {
+                        self.events.push_back((*h, Event::Connected { mptcp }));
+                    }
                     return Some(n);
                 }
             }
@@ -293,3 +340,6 @@ impl<R: CryptoRng> Endpoint<R> {
         });
     }
 }
+
+#[cfg(test)]
+mod mptcp_tests;

@@ -2,7 +2,12 @@
 
 use std::net::SocketAddr;
 
-use crate::tcp::{PlainHooks, Tcb, TcpState};
+use crate::tcp::{Tcb, TcpState};
+
+#[cfg(not(test))]
+pub(crate) type ConnectionHooks = crate::tcp::PlainHooks;
+#[cfg(test)]
+pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
 /// `write` failed because the connection is closed (by `close`, a reset or a timeout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +25,7 @@ pub enum ReadError {
 
 pub struct Connection {
     pub(crate) tcb: Tcb,
-    pub(crate) hooks: PlainHooks,
+    pub(crate) hooks: ConnectionHooks,
     pub(crate) local: SocketAddr,
     pub(crate) remote: SocketAddr,
     pub(crate) closed_by_app: bool,

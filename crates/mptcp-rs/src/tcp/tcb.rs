@@ -368,6 +368,11 @@ impl Tcb {
         };
     }
 
+    #[cfg(test)]
+    pub(crate) fn mtu(&self) -> usize {
+        usize::from(self.cfg.mtu)
+    }
+
     /// The peer's FIN has been received. Every data octet before it was handed to the hooks
     /// first, so once they hold no more data the application's read is at EOF.
     pub fn fin_received(&self) -> bool {
@@ -385,6 +390,7 @@ impl Tcb {
             TcpState::SynSent => {
                 let r = self.on_segment_syn_sent(seg, now);
                 if r == Reaction::Established {
+                    h.on_valid_segment(seg);
                     // §3.10.7.3: text and FIN on the SYN/ACK are processed once ESTABLISHED,
                     // from the sequence number after the SYN. The FIN's CLOSE-WAIT move
                     // emits no `Closed`, so the reaction stays `Established`.
@@ -442,7 +448,8 @@ impl Tcb {
             // RFC 7323 §2.2: the window field of a SYN is never scaled.
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
             let meta = out.start(self.iss, SeqNum(0), TcpFlags::SYN, wnd);
-            let n = tcp_options::write_mss(&mut out.options, self.mss_option());
+            let n = h.options_for(TcpFlags::SYN, &mut out.options);
+            let n = n + tcp_options::write_mss(&mut out.options[n..], self.mss_option());
             let n = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
             out.options_len = n + tcp_options::write_sack_permitted(&mut out.options[n..]);
             return Some(meta);
@@ -457,13 +464,16 @@ impl Tcb {
             }
             let mut options = [0u8; 40];
             let limit = usize::from(self.eff_mss.saturating_sub(1)).min(options.len());
-            let n = self.write_sacks(&mut options[..limit]);
-            if let Some(meta) = self.poll_data(now, h, out, n as u16) {
-                out.options[..n].copy_from_slice(&options[..n]);
-                out.options_len = n;
-                // Every data segment, FIN and probe carries the current ACK.
-                self.ack_sent();
-                return Some(meta);
+            let n = h.options_for(TcpFlags::ACK, &mut options);
+            let n = n + self.write_sacks(&mut options[n..limit.max(n)]);
+            if n < usize::from(self.eff_mss) {
+                if let Some(meta) = self.poll_data(now, h, out, n as u16) {
+                    out.options[..n].copy_from_slice(&options[..n]);
+                    out.options_len = n;
+                    // Every data segment, FIN and probe carries the current ACK.
+                    self.ack_sent();
+                    return Some(meta);
+                }
             }
             // A read that let the window edge move is announced (RFC 9293 §3.8.6.2.2), while
             // data can still arrive.
@@ -477,7 +487,8 @@ impl Tcb {
             // the ACK unacceptable to it (RFC 9293 Table 6).
             let meta = out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd);
             let limit = usize::from(self.mss_option()).min(out.options.len());
-            out.options_len = self.write_sacks(&mut out.options[..limit]);
+            let n = h.options_for(TcpFlags::ACK, &mut out.options);
+            out.options_len = n + self.write_sacks(&mut out.options[n..limit.max(n)]);
             self.ack_sent();
             return Some(meta);
         }
@@ -604,6 +615,7 @@ impl Tcb {
         if seg.flags.contains(TcpFlags::RST) {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
+                h.on_valid_segment(seg);
                 return self.on_reset(now);
             }
             self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();
@@ -804,12 +816,14 @@ impl Tcb {
     fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> ControlFlow<Reaction> {
         if seg.ack.lt(self.snd_una) {
             // An old duplicate ACK: ignored, the segment is processed further.
+            h.on_valid_segment(seg);
             return ControlFlow::Continue(());
         }
         if seg.ack.gt(self.snd_max) {
             self.ack_due = true;
             return ControlFlow::Break(Reaction::None);
         }
+        h.on_valid_segment(seg);
         // Duplicate ACK (RFC 5681 §2), judged before this segment updates SND.WND.
         let wnd = u32::from(seg.wnd) << self.snd_shift;
         let abcd = self.in_flight() > 0

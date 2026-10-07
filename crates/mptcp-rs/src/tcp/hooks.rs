@@ -20,6 +20,15 @@ pub trait SendBuf {
 /// Receive-side sink. The `Tcb` drops duplicates and trims every segment to what the hooks can
 /// store before calling `accept_payload`, so the call cannot fail.
 pub trait SegmentHooks {
+    /// Called only after TCP accepts the segment, before handing over its payload.
+    fn on_valid_segment(&mut self, _seg: &crate::wire::packet::Segment<'_>) {}
+
+    /// Protocol options first; return a word-aligned length, using NOP padding.
+    /// The remaining option space is available for TCP SACK blocks.
+    fn options_for(&mut self, _flags: crate::wire::packet::TcpFlags, _out: &mut [u8]) -> usize {
+        0
+    }
+
     /// New octets starting at `rel_ssn` (the first data octet is 1). Each octet is handed over
     /// once, so the pieces held out of order tile the sequence space: a piece that extends the
     /// in-order data ends where the next held piece starts, if it touches one.
