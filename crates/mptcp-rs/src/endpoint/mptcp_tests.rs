@@ -482,3 +482,321 @@ fn all_synack_flags_and_option_lengths_are_checked() {
         );
     }
 }
+
+fn mapping(ssn: u32, dsn: u64, len: u16) -> Vec<u8> {
+    let mut out = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: None,
+            mapping: Some(mptcp::Mapping {
+                ssn,
+                dsn: mptcp::Dsn::Dsn64(dsn),
+                data_len: len,
+                checksum: None,
+            }),
+        }),
+        &mut out,
+    )
+    .unwrap();
+    out[..n].to_vec()
+}
+
+#[test]
+fn dsn_receive_bypasses_ssn_window_and_acks_only_dsn_window_bytes() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(17));
+    let h = open(&mut ep);
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let dsn = crate::crypto::key_token_idsn(PEER_KEY).1.wrapping_add(1);
+    // A fresh SSN outside the last subflow window carries the in-order connection head.
+    let opts = mapping(5_000_000, dsn, 3);
+    let seg = Segment {
+        src: syn.dst,
+        dst: syn.src,
+        seq: SeqNum(5_005_000),
+        ack: syn.seq.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        wnd: 1234,
+        options: &opts,
+        payload: b"abc",
+    };
+    input(&mut ep, &seg);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let ack = packet::parse(&bytes).unwrap();
+    assert_eq!(ack.ack, SeqNum(5001));
+    let MptcpOption::Dss(dss) = mptcp::parse(mpc(ack.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        dss.data_ack,
+        Some(mptcp::DataAck::Ack64(dsn.wrapping_add(3)))
+    );
+    let mut buf = [0; 3];
+    assert_eq!(ep.connection(h).unwrap().read(&mut buf), Ok(3));
+    assert_eq!(&buf, b"abc");
+    // Out-of-DSN-window data at the TCP head cannot advance TCP ACK.
+    let opts = mapping(1, dsn.wrapping_add(10_000_000), 3);
+    input(
+        &mut ep,
+        &Segment {
+            seq: SeqNum(5001),
+            options: &opts,
+            ..seg.clone()
+        },
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().ack, SeqNum(5001));
+}
+
+#[test]
+fn unmapped_data_is_tcp_acked_but_not_delivered() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(18));
+    let h = open(&mut ep);
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let seg = Segment {
+        src: syn.dst,
+        dst: syn.src,
+        seq: SeqNum(5001),
+        ack: syn.seq.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        wnd: 1234,
+        options: &[],
+        payload: b"abc",
+    };
+    input(&mut ep, &seg);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().ack, SeqNum(5004));
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut [0; 3]),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+}
+
+fn connected_with_capacity(cap: u32) -> (Endpoint<ChaCha20Rng>, ConnectionHandle, Vec<u8>, u64) {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(19));
+    let h = ep
+        .connect_mptcp(
+            Instant::from_nanos(0),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2:80".parse().unwrap(),
+            ConnectConfig {
+                recv_buffer: cap,
+                ..ConnectConfig::default()
+            },
+        )
+        .unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    ep.poll_event();
+    (
+        ep,
+        h,
+        bytes,
+        crate::crypto::key_token_idsn(PEER_KEY).1.wrapping_add(1),
+    )
+}
+fn peer_data<'a>(syn: &Segment, seq: u32, options: &'a [u8], payload: &'a [u8]) -> Segment<'a> {
+    Segment {
+        src: syn.dst,
+        dst: syn.src,
+        seq: SeqNum(seq),
+        ack: syn.seq.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        wnd: 1234,
+        options,
+        payload,
+    }
+}
+fn dack(seg: &Segment) -> u64 {
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    let Some(mptcp::DataAck::Ack64(a)) = d.data_ack else {
+        panic!()
+    };
+    a
+}
+
+#[test]
+fn discarded_full_memory_data_advances_tcp_ack_only() {
+    let (mut ep, h, bytes, dsn) = connected_with_capacity(4);
+    let syn = packet::parse(&bytes).unwrap();
+    ep.conns
+        .get_mut(&h)
+        .unwrap()
+        .hooks
+        .data
+        .as_mut()
+        .unwrap()
+        .recv
+        .right_edge = dsn.wrapping_add(6);
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &mapping(1, dsn, 4), b"abcd"),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().ack, SeqNum(5005));
+    input(
+        &mut ep,
+        &peer_data(&syn, 5005, &mapping(5, dsn.wrapping_add(4), 2), b"ef"),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let ack = packet::parse(&bytes).unwrap();
+    assert_eq!(ack.ack, SeqNum(5007));
+    assert_eq!(dack(&ack), dsn.wrapping_add(4));
+    let mut out = [0; 8];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(4));
+    assert_eq!(&out[..4], b"abcd");
+    // New SSNs recover data that was discarded but already TCP-ACKed.
+    input(
+        &mut ep,
+        &peer_data(&syn, 5007, &mapping(7, dsn.wrapping_add(4), 2), b"ef"),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(dack(&packet::parse(&bytes).unwrap()), dsn.wrapping_add(6));
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(2));
+    assert_eq!(&out[..2], b"ef");
+}
+
+#[test]
+fn conflicting_mapping_resets_only_after_tcp_validity() {
+    let (mut ep, h, bytes, dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&bytes).unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &mapping(1, dsn, 4), b"ab"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    let opts = mapping(1, dsn.wrapping_add(1), 4);
+    let mut seg = peer_data(&syn, 5003, &opts, b"cd");
+    seg.ack = syn.seq.wrapping_add(2); // ACKs unsent sequence space
+    input(&mut ep, &seg);
+    transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(ep.poll_event(), None);
+    seg.ack = syn.seq.wrapping_add(1);
+    input(&mut ep, &seg);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            h,
+            Event::Closed {
+                reason: CloseReason::Reset
+            }
+        ))
+    );
+}
+
+#[test]
+fn unmapped_byte_bound_resets_subflow() {
+    let (mut ep, h, bytes, _) = connected_with_capacity(4);
+    let syn = packet::parse(&bytes).unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &[], b"abcd"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(ep.poll_event(), None);
+    input(&mut ep, &peer_data(&syn, 5005, &[], b"e"));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            h,
+            Event::Closed {
+                reason: CloseReason::Reset
+            }
+        ))
+    );
+}
+
+#[test]
+fn initial_mpc_and_equivalent_dss_deliver_once() {
+    let (mut ep, h, bytes, dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&bytes).unwrap();
+    let local_key = {
+        reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+        let ack = transmit(&mut ep, Instant::from_nanos(2));
+        let packet = packet::parse(&ack).unwrap();
+        let MptcpOption::Capable(c) = mptcp::parse(mpc(packet.options)[0]).unwrap() else {
+            panic!()
+        };
+        c.sender_key.unwrap()
+    };
+    let mut opts = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Capable(MpCapable {
+            version: 1,
+            flags: CAP_H,
+            sender_key: Some(PEER_KEY),
+            receiver_key: Some(local_key),
+            data_len: Some(4),
+            checksum: None,
+        }),
+        &mut opts,
+    )
+    .unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &opts[..n], b"ab"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &mapping(1, dsn, 4), b"abcd"),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(dack(&packet::parse(&bytes).unwrap()), dsn.wrapping_add(4));
+    let mut out = [0; 8];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(4));
+    assert_eq!(&out[..4], b"abcd");
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut out),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+}
+
+#[test]
+fn ack32_promotion_releases_connection_store_only_with_tcp_ack() {
+    let (mut ep, h, bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&bytes).unwrap();
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    // Install a wrapped send origin before any application data.
+    d.send = crate::mptcp::data::SendStore::new(u64::MAX - 1, 4);
+    assert_eq!(d.send.write(b"abcd"), 4);
+    assert!(d.send.assign(&mut d.tx, u64::MAX - 1, 4));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().payload, b"abcd");
+    let mut opts = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack32(2)),
+            mapping: None,
+        }),
+        &mut opts,
+    )
+    .unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &opts[..n], &[]));
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    assert_eq!(d.send.una, 2);
+    assert_eq!(d.send.write(b"e"), 0);
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.ack = syn.seq.wrapping_add(5);
+    input(&mut ep, &ack);
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    assert_eq!(d.send.write(b"e"), 1);
+}
+
+#[test]
+fn queued_handshake_bytes_move_into_connection_store() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(20));
+    let h = open(&mut ep);
+    assert_eq!(ep.connection(h).unwrap().write(b"abcd"), Ok(4));
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_eq!(d.send.end.wrapping_sub(d.send.una), 4);
+}

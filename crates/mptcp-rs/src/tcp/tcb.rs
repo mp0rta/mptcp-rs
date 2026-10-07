@@ -433,11 +433,11 @@ impl Tcb {
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
     ) -> Option<SentMeta> {
-        if self.state == TcpState::Closed {
-            return None;
-        }
         if let Some(seq) = self.rst_due.take() {
             return Some(out.start(seq, SeqNum(0), TcpFlags::RST, 0));
+        }
+        if self.state == TcpState::Closed {
+            return None;
         }
         if self.syn_due {
             self.syn_due = false;
@@ -630,7 +630,9 @@ impl Tcb {
             return Reaction::None;
         }
         // First: an unacceptable segment draws an ACK and is dropped.
-        if !self.acceptable(seg) {
+        let delegated =
+            h.delegates_data() && !seg.payload.is_empty() && !seg.flags.contains(TcpFlags::SYN);
+        if !delegated && !self.acceptable(seg) {
             self.ack_due = true;
             if seg.flags.contains(TcpFlags::ACK)
                 && !seg.flags.contains(TcpFlags::SYN)
@@ -674,8 +676,12 @@ impl Tcb {
     /// data is delivered inline, RFC 6093); text after the FIN is ignored. Eighth: a FIN right
     /// after all the text before it.
     fn on_text_and_fin(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
-        if !self.fin_received {
+        if !h.reset_requested() && !self.fin_received {
             self.on_text(seg, now, h);
+        }
+        if h.reset_requested() {
+            self.rst_due = Some(self.snd_max);
+            return self.terminate(CloseReason::Reset, now);
         }
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         // Trim sequence-space controls to the receive window too (RFC 9293 §3.10.7.4).
@@ -756,6 +762,10 @@ impl Tcb {
             return;
         }
         self.record_dsack(seg);
+        if h.delegates_data() {
+            self.on_delegated_text(seg, h);
+            return;
+        }
         let off = i64::from(self.rcv_nxt.distance(seg.seq));
         let end = off + seg.payload.len() as i64;
         // Free memory counts from RCV.NXT with the held out-of-order octets inside it, so the
@@ -809,6 +819,48 @@ impl Tcb {
                 self.ack_at.get_or_insert(now + DELAYED_ACK);
             }
         }
+    }
+
+    /// MPTCP receipts are headers only, independent of DSN retention and eviction.
+    fn on_delegated_text(&mut self, seg: &Segment, h: &mut impl Hooks) {
+        let off = i64::from(self.rcv_nxt.distance(seg.seq));
+        let ssn = (self.rcv_ssn as u32).wrapping_add_signed(off as i32);
+        for range in h.receive_data(ssn, self.rcv_ssn as u32, seg.payload) {
+            let lo = (off + range.start as i64).max(0);
+            let hi = off + range.end as i64;
+            if lo >= hi {
+                continue;
+            }
+            let (s, e) = (self.rcv_ssn + lo as u64, self.rcv_ssn + hi as u64);
+            if lo > 0
+                && !self.rcv_ooo.overlaps(&(s - 1..e + 1))
+                && self.rcv_ooo.len() >= MAX_OOO_RANGES
+            {
+                continue;
+            }
+            self.rcv_ooo.insert(s..e);
+            if self.sack_permitted && lo > 0 {
+                self.sack_recent.retain(|point| {
+                    self.rcv_ooo
+                        .get(point)
+                        .is_some_and(|r| !r.contains(&(e - 1)))
+                });
+                self.sack_recent.insert(0, e - 1);
+                self.sack_recent.truncate(4);
+            }
+        }
+        if let Some(r) = self
+            .rcv_ooo
+            .first()
+            .cloned()
+            .filter(|r| r.start == self.rcv_ssn)
+        {
+            self.rcv_nxt = self.rcv_nxt.wrapping_add((r.end - r.start) as u32);
+            self.rcv_ssn = r.end;
+            self.rcv_ooo.remove(r);
+        }
+        h.receipt_advanced(self.rcv_ssn as u32);
+        self.ack_due = true;
     }
 
     /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, loss recovery,

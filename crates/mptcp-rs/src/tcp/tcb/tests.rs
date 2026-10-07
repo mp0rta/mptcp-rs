@@ -2764,3 +2764,77 @@ fn protocol_options_and_sacks_reduce_payload_budget() {
         }
     }
 }
+
+#[test]
+fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
+    use crate::mptcp::{ConnectionHooks, Negotiation};
+    use crate::wire::mptcp::{self, CAP_H, Dsn, Dss, Mapping, MpCapable, MptcpOption};
+    let cfg = ConnectConfig {
+        recv_buffer: 16,
+        ..ConnectConfig::default()
+    };
+    let mut h = ConnectionHooks::new(&cfg);
+    h.negotiation = Some(Negotiation::new(1));
+    let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
+    let mut options = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Capable(MpCapable {
+            version: 1,
+            flags: CAP_H,
+            sender_key: Some(2),
+            receiver_key: None,
+            data_len: None,
+            checksum: None,
+        }),
+        &mut options,
+    )
+    .unwrap();
+    assert_eq!(f.synack(100, &options[..n]), Reaction::Established);
+    f.send(t(0));
+    f.h.negotiation
+        .as_mut()
+        .unwrap()
+        .on_transmitted(TcpFlags::ACK);
+    f.tcb.rcv_ssn = u64::from(u32::MAX) - 1;
+    f.tcb.rcv_nxt = PEER_ISN.wrapping_add(u32::MAX - 1);
+    let recv = &mut f.h.data.as_mut().unwrap().recv;
+    recv.next = u64::MAX - 1;
+    recv.right_edge = 8;
+    for (ssn, dsn, data) in [
+        (0, 0, b"cd".as_slice()),
+        (u32::MAX - 1, u32::MAX - 1, b"ab"),
+    ] {
+        let n = mptcp::encode(
+            &MptcpOption::Dss(Dss {
+                data_fin: false,
+                data_ack: None,
+                mapping: Some(Mapping {
+                    ssn,
+                    dsn: Dsn::Dsn32(dsn),
+                    data_len: 2,
+                    checksum: None,
+                }),
+            }),
+            &mut options,
+        )
+        .unwrap();
+        let seg = Segment {
+            src: f.addrs.1,
+            dst: f.addrs.0,
+            seq: PEER_ISN.wrapping_add(ssn),
+            ack: ISN.wrapping_add(1),
+            flags: TcpFlags::ACK,
+            wnd: 100,
+            options: &options[..n],
+            payload: data,
+        };
+        f.tcb.on_segment(&seg, t(0), &mut f.h);
+        f.send(t(0));
+    }
+    assert_eq!(f.tcb.rcv_ssn, u64::from(u32::MAX) + 3);
+    assert_eq!(f.tcb.rcv_nxt, PEER_ISN.wrapping_add(2));
+    assert_eq!(f.h.data.as_ref().unwrap().recv.next, 2);
+    let mut out = [0; 4];
+    assert_eq!(f.h.read(&mut out), 4);
+    assert_eq!(&out, b"abcd");
+}

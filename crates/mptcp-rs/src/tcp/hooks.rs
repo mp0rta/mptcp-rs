@@ -17,11 +17,29 @@ pub trait SendBuf {
     fn mark_acked(&mut self, rel_ssn_una: u32);
 }
 
-/// Receive-side sink. The `Tcb` drops duplicates and trims every segment to what the hooks can
-/// store before calling `accept_payload`, so the call cannot fail.
+/// Receive-side sink. Plain TCP drops duplicates and trims to available memory before
+/// `accept_payload`. MPTCP uses `receive_data` and tracks TCP receipts separately.
 pub trait SegmentHooks {
     /// Called only after TCP accepts the segment, before handing over its payload.
     fn on_valid_segment(&mut self, _seg: &crate::wire::packet::Segment<'_>) {}
+
+    /// MPTCP delegates payload acceptance to its connection-level DSN window.
+    fn delegates_data(&self) -> bool {
+        false
+    }
+    /// Accepted byte ranges in this payload, independently of retained payload memory.
+    fn receive_data(
+        &mut self,
+        _ssn: u32,
+        _tcp_ack: u32,
+        _data: &[u8],
+    ) -> Vec<std::ops::Range<usize>> {
+        Vec::new()
+    }
+    fn receipt_advanced(&mut self, _ssn: u32) {}
+    fn reset_requested(&self) -> bool {
+        false
+    }
 
     /// Protocol options first; return a word-aligned length, using NOP padding.
     /// The remaining option space is available for TCP SACK blocks.
