@@ -1,4 +1,5 @@
 use super::*;
+use crate::tcp::SendBuf;
 use crate::wire::tcp_options::{TcpOpt, walk};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -1288,4 +1289,341 @@ fn connection_probe_demand_does_not_block_already_credited_mapping() {
         ep.conns[&h].hooks.data.as_ref().unwrap().send.next,
         origin.wrapping_add(1234)
     );
+}
+
+#[test]
+fn tcp_acked_without_data_ack_reinjects_with_new_ssn_and_backoff() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"lost").unwrap();
+    let first = transmit(&mut ep, Instant::from_nanos(2));
+    let first = packet::parse(&first).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let options = data_ack(head); // TCP received it, DSN assembler discarded it.
+    let mut ack = peer_data(&syn, 5001, &options, &[]);
+    ack.ack = first.seq.wrapping_add(4);
+    input(&mut ep, &ack);
+    let deadline = ep.poll_timeout().expect("connection recovery timer");
+    ep.handle_timeout(deadline);
+    let retry = transmit(&mut ep, deadline);
+    let retry = packet::parse(&retry).unwrap();
+    assert_eq!(retry.seq, first.seq.wrapping_add(4));
+    assert_eq!(retry.payload, b"lost");
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(retry.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.mapping.unwrap().dsn, mptcp::Dsn::Dsn64(head));
+    assert!(ep.poll_transmit(deadline, &mut [0; 1500]).is_none());
+    ack.ack = retry.seq.wrapping_add(4);
+    let mut bytes = [0; 1500];
+    let n = packet::build(&ack, 0, &mut bytes).unwrap();
+    ep.handle_packet(deadline, &bytes[..n]);
+    let second = ep.poll_timeout().unwrap();
+    assert!(second - deadline >= std::time::Duration::from_secs(2));
+    ep.handle_timeout(second);
+    let retry = transmit(&mut ep, second);
+    assert_eq!(packet::parse(&retry).unwrap().payload, b"lost");
+}
+
+#[test]
+fn lost_data_ack_falls_back_once_preserving_both_streams() {
+    let (mut ep, h, syn, peer_dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    let opts = mapping(1, peer_dsn, 3);
+    input(&mut ep, &peer_data(&syn, 5001, &opts, b"old"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    ep.connection(h).unwrap().write(b"first").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(3));
+    let sent = packet::parse(&sent).unwrap();
+    ep.connection(h).unwrap().write(b"queued").unwrap();
+    let mut ack = peer_data(&syn, 5004, &[], b"new");
+    ack.ack = sent.seq.wrapping_add(5);
+    input(&mut ep, &ack);
+    assert_eq!(
+        ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+        crate::mptcp::State::FellBack
+    );
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(4), &mut [0; 20])
+            .is_none()
+    );
+    let final_dss = transmit(&mut ep, Instant::from_nanos(4));
+    let final_dss = packet::parse(&final_dss).unwrap();
+    let MptcpOption::Dss(dss) = mptcp::parse(mpc(final_dss.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(dss.mapping.unwrap().data_len, 0);
+    assert_eq!(dss.data_ack, None);
+    let queued = transmit(&mut ep, Instant::from_nanos(4));
+    let queued = packet::parse(&queued).unwrap();
+    assert_eq!(queued.seq, sent.seq.wrapping_add(5));
+    assert_eq!(queued.payload, b"queued");
+    assert!(mpc(queued.options).is_empty());
+    let mut out = [0; 20];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(6));
+    assert_eq!(&out[..6], b"oldnew");
+}
+
+#[test]
+fn data_mapping_confirmation_is_distinct_from_receiving_peer_dss() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"first").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let options = data_ack(head + 5);
+    let mut ack = peer_data(&syn, 5001, &options, &[]);
+    ack.ack = sent.seq.wrapping_add(5);
+    input(&mut ep, &ack);
+    ep.connection(h).unwrap().write(b"second").unwrap();
+    let second = transmit(&mut ep, Instant::from_nanos(3));
+    ack.ack = packet::parse(&second).unwrap().seq.wrapping_add(6);
+    ack.options = &[];
+    input(&mut ep, &ack);
+    assert_ne!(
+        ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+        crate::mptcp::State::FellBack
+    );
+}
+
+#[test]
+fn fallback_plain_tcp_does_not_ack_discarded_receive_bytes() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(4);
+    let syn = packet::parse(&syn).unwrap();
+    let inf = mapping(1, dsn, 0);
+    input(&mut ep, &peer_data(&syn, 5001, &inf, b"ab"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    // Earlier rounding can advertise more than the remaining memory.
+    ep.conns
+        .get_mut(&h)
+        .unwrap()
+        .hooks
+        .data
+        .as_mut()
+        .unwrap()
+        .recv
+        .right_edge = dsn + 8;
+    input(&mut ep, &peer_data(&syn, 5003, &[], b"cdef"));
+    let ack = transmit(&mut ep, Instant::from_nanos(3));
+    assert_eq!(packet::parse(&ack).unwrap().ack, SeqNum(5005));
+    let mut out = [0; 4];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(4));
+    assert_eq!(&out, b"abcd");
+    input(&mut ep, &peer_data(&syn, 5005, &[], b"ef"));
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(2));
+    assert_eq!(&out[..2], b"ef");
+}
+
+#[test]
+fn fallback_close_drains_unassigned_bytes_before_fin() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    let inf = mapping(1, dsn, 0);
+    input(&mut ep, &peer_data(&syn, 5001, &inf, &[]));
+    transmit(&mut ep, Instant::from_nanos(2));
+    ep.connection(h).unwrap().write(b"last").unwrap();
+    ep.connection(h).unwrap().close();
+    let data = transmit(&mut ep, Instant::from_nanos(3));
+    let data = packet::parse(&data).unwrap();
+    assert_eq!(data.payload, b"last");
+    let fin = if data.flags.contains(TcpFlags::FIN) {
+        data.seq.wrapping_add(4)
+    } else {
+        let fin = transmit(&mut ep, Instant::from_nanos(3));
+        let fin = packet::parse(&fin).unwrap();
+        assert!(fin.flags.contains(TcpFlags::FIN));
+        fin.seq
+    };
+    assert_eq!(fin, syn.seq.wrapping_add(5));
+}
+
+#[test]
+fn malformed_and_stale_acks_cannot_trigger_or_confirm_fallback() {
+    for options in [vec![99, 1], [data_ack(u64::MAX), vec![99, 1]].concat()] {
+        let (mut ep, h, syn, _) = connected_with_capacity(64);
+        let syn = packet::parse(&syn).unwrap();
+        ep.connection(h).unwrap().write(b"abc").unwrap();
+        let sent = transmit(&mut ep, Instant::from_nanos(2));
+        let sent = packet::parse(&sent).unwrap();
+        let mut ack = peer_data(&syn, 5001, &[], &[]);
+        ack.ack = sent.seq.wrapping_add(4); // unsent byte
+        input(&mut ep, &ack);
+        assert_ne!(
+            ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+            crate::mptcp::State::FellBack
+        );
+        ack.ack = sent.seq.wrapping_add(1);
+        ack.options = &options;
+        input(&mut ep, &ack); // TCP advances, malformed MPTCP cannot mutate state
+        assert_ne!(
+            ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+            crate::mptcp::State::FellBack
+        );
+        ack.ack = sent.seq;
+        ack.options = &[];
+        input(&mut ep, &ack);
+        assert_ne!(
+            ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+            crate::mptcp::State::FellBack
+        );
+        ack.ack = sent.seq.wrapping_add(3);
+        input(&mut ep, &ack);
+        assert_eq!(ep.poll_event(), Some((h, Event::FellBack)));
+        let final_dss = transmit(&mut ep, Instant::from_nanos(3));
+        assert_eq!(mpc(packet::parse(&final_dss).unwrap().options).len(), 1);
+        input(&mut ep, &ack);
+        assert_eq!(ep.poll_event(), None);
+    }
+}
+
+#[test]
+fn received_infinite_mapping_is_permanent_and_keeps_inflight_send() {
+    let (mut ep, h, syn, peer_dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"outstanding").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let inf = mapping(1, peer_dsn, 0);
+    input(&mut ep, &peer_data(&syn, 5001, &inf, b"reply"));
+    assert_eq!(ep.poll_event(), Some((h, Event::FellBack)));
+    let out = transmit(&mut ep, Instant::from_nanos(3));
+    assert_eq!(mpc(packet::parse(&out).unwrap().options).len(), 1);
+    input(&mut ep, &peer_data(&syn, 5001, &inf, b"reply"));
+    let out = transmit(&mut ep, Instant::from_nanos(3));
+    assert!(mpc(packet::parse(&out).unwrap().options).is_empty());
+    assert_eq!(ep.poll_event(), None);
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    let retrans = transmit(&mut ep, at);
+    let retrans = packet::parse(&retrans).unwrap();
+    assert_eq!(retrans.seq, sent.seq);
+    assert_eq!(retrans.payload, b"outstanding");
+    assert!(mpc(retrans.options).is_empty());
+    let mut ack = peer_data(&syn, 5006, &[], &[]);
+    ack.ack = sent.seq.wrapping_add(11);
+    input(&mut ep, &ack);
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().send.una,
+        ep.conns[&h].hooks.data.as_ref().unwrap().send.next
+    );
+    assert_eq!(ep.poll_timeout(), None);
+    let mut out = [0; 5];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(5));
+    assert_eq!(&out, b"reply");
+}
+
+#[test]
+fn invalid_data_ack_does_not_confirm_mapping() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"abc").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let opts = data_ack(head + 100);
+    let mut ack = peer_data(&syn, 5001, &opts, &[]);
+    ack.ack = sent.seq.wrapping_add(1);
+    input(&mut ep, &ack);
+    ack.options = &[];
+    ack.ack = sent.seq.wrapping_add(3);
+    input(&mut ep, &ack);
+    assert_eq!(ep.poll_event(), Some((h, Event::FellBack)));
+}
+
+#[test]
+fn recovery_reevaluates_head_and_cancels_after_data_ack() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"abcd").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let opts = data_ack(head);
+    let mut ack = peer_data(&syn, 5001, &opts, &[]);
+    ack.ack = sent.seq.wrapping_add(4);
+    input(&mut ep, &ack);
+    let old = ep.poll_timeout().unwrap();
+    let opts = data_ack(head + 2);
+    ack.options = &opts;
+    let now = Instant::from_nanos(500_000_000);
+    let mut bytes = [0; 1500];
+    let n = packet::build(&ack, 0, &mut bytes).unwrap();
+    ep.handle_packet(now, &bytes[..n]);
+    let new = ep.poll_timeout().unwrap();
+    assert!(new > old);
+    ep.handle_timeout(old);
+    assert!(ep.poll_transmit(old, &mut bytes).is_none());
+    ep.handle_timeout(new);
+    let retry = transmit(&mut ep, new);
+    let retry = packet::parse(&retry).unwrap();
+    assert_eq!(retry.payload, b"cd");
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(retry.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.mapping.unwrap().dsn, mptcp::Dsn::Dsn64(head + 2));
+    let opts = data_ack(head + 4);
+    ack.options = &opts;
+    ack.ack = retry.seq.wrapping_add(2);
+    let n = packet::build(&ack, 0, &mut bytes).unwrap();
+    ep.handle_packet(new, &bytes[..n]);
+    assert_eq!(ep.poll_timeout(), None);
+}
+
+#[test]
+fn reinjection_respects_zero_tcp_window_and_deduplicates_live_copy() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"data").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let opts = data_ack(head);
+    let mut ack = peer_data(&syn, 5001, &opts, &[]);
+    ack.ack = sent.seq.wrapping_add(4);
+    ack.wnd = 0;
+    input(&mut ep, &ack);
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    assert!(ep.poll_transmit(at, &mut [0; 1500]).is_none());
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().tx.assigned_end(),
+        5
+    );
+    ack.wnd = 1234;
+    let mut bytes = [0; 1500];
+    let n = packet::build(&ack, 0, &mut bytes).unwrap();
+    ep.handle_packet(at, &bytes[..n]);
+    let retry = transmit(&mut ep, at);
+    let retry = packet::parse(&retry).unwrap();
+    assert_eq!(retry.seq, sent.seq.wrapping_add(4));
+    // Live copy remains the only copy; its own TCP RTO reuses the same SSN.
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    let retrans = transmit(&mut ep, at);
+    assert_eq!(packet::parse(&retrans).unwrap().seq, retry.seq);
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().tx.assigned_end(),
+        9
+    );
+}
+
+#[test]
+fn infinite_receive_mapping_tracks_ssn_wrap() {
+    use crate::tcp::SegmentHooks;
+    let (mut ep, h, syn, dsn) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &mapping(1, dsn, 0), &[]));
+    let hooks = &mut ep.conns.get_mut(&h).unwrap().hooks;
+    // Skip stored payload while simulating bounded successive TCP receipt advances.
+    for offset in [0x7000_0000u64, 0xe000_0000, 0x1_5000_0000] {
+        let next = dsn.wrapping_add(offset);
+        let recv = &mut hooks.data.as_mut().unwrap().recv;
+        recv.next = next;
+        recv.right_edge = next.wrapping_add(64);
+        hooks.receipt_advanced((offset as u32).wrapping_add(1));
+        let ssn = (offset as u32).wrapping_add(1);
+        assert_eq!(hooks.receive_data(ssn, ssn, b"x"), vec![0..1]);
+        assert_eq!(hooks.read(&mut [0; 1]), 1);
+    }
 }

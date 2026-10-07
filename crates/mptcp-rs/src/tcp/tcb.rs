@@ -527,6 +527,14 @@ impl Tcb {
     pub fn set_probe_demand(&mut self, demand: bool) {
         self.probe_demand = demand;
     }
+    #[cfg(test)]
+    pub(crate) fn request_ack(&mut self) {
+        self.ack_due = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn retransmission_timeout(&self) -> Duration {
+        self.rtt.rto()
+    }
     pub fn peer_window_closed(&self) -> bool {
         self.snd_wnd == 0
     }

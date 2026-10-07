@@ -14,6 +14,7 @@ use crate::wire::{
     mptcp::{self, CAP_C, CAP_H, MpCapable, MptcpOption},
     tcp_options::{TcpOpt, walk},
 };
+use std::time::Duration;
 
 pub(crate) struct ConnectionHooks {
     plain: PlainHooks,
@@ -21,6 +22,10 @@ pub(crate) struct ConnectionHooks {
     pub data: Option<DataState>,
     recv_cap: usize,
     send_cap: usize,
+    // None: malformed/invalid; Some(false): valid options without DATA_ACK.
+    // Consumed only by mark_acked, after TCP proves advancement over our data.
+    valid_data_ack: Option<bool>,
+    pub fallback_event: bool,
 }
 
 pub(crate) struct DataState {
@@ -31,6 +36,15 @@ pub(crate) struct DataState {
     unmapped: usize,
     reset: bool,
     pub sanity_failures: u64,
+    recovery_head: Option<u64>,
+    recovery_at: Option<Instant>,
+    recovery_interval: Duration,
+    reinject: bool,
+    dss_confirmed: bool,
+    fallback: bool,
+    final_mapping: Option<mptcp::Mapping>,
+    rx_infinite: Option<(u32, u64)>,
+    tcp_acked_dsn: u64,
 }
 
 impl ConnectionHooks {
@@ -41,15 +55,64 @@ impl ConnectionHooks {
             data: None,
             recv_cap: cfg.recv_buffer as usize,
             send_cap: cfg.send_buffer as usize,
+            valid_data_ack: None,
+            fallback_event: false,
         }
     }
-    pub fn prepare_send(&self, tcb: &mut Tcb, now: Instant) {
+    pub fn pending_data(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.send.next != d.send.end || d.reinject)
+    }
+    // Option generation is speculative inside Tcb; consume the final mapping only
+    // after Endpoint has successfully built the packet into the caller's buffer.
+    pub fn on_transmitted(&mut self) {
+        if let Some(d) = &mut self.data {
+            d.final_mapping = None;
+        }
+    }
+    pub fn recovery_deadline(&self) -> Option<Instant> {
+        self.data.as_ref().and_then(|d| d.recovery_at)
+    }
+    pub fn update_recovery(&mut self, tcb: &Tcb, now: Instant) {
+        let Some(d) = &mut self.data else {
+            return;
+        };
+        let head = (!d.fallback && d.send.una != d.send.next).then_some(d.send.una);
+        if d.recovery_head != head {
+            d.recovery_head = head;
+            d.recovery_at = None;
+            d.recovery_interval = tcb.retransmission_timeout();
+            d.reinject = false;
+        }
+        if head.is_none() || d.tx.uncovered_len(d.send.una, 1) == 0 {
+            d.recovery_at = None;
+            d.reinject = false;
+        } else if !d.reinject {
+            let at = d.recovery_at.get_or_insert(now + d.recovery_interval);
+            if now >= *at {
+                d.reinject = true;
+                d.recovery_at = None;
+                d.recovery_interval = (d.recovery_interval * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+    pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant) {
+        self.update_recovery(tcb, now);
+        if self
+            .data
+            .as_ref()
+            .is_some_and(|d| d.final_mapping.is_some())
+        {
+            tcb.request_ack();
+        }
         let demand = match (&self.negotiation, &self.data) {
             (Some(m), Some(d)) => {
-                d.send.next != d.send.end
+                (d.send.next != d.send.end || d.reinject)
                     && (tcb.peer_window_closed()
-                        || m.send_right_edge
-                            .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0))
+                        || (!d.fallback
+                            && m.send_right_edge
+                                .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0)))
             }
             _ => false,
         };
@@ -63,13 +126,31 @@ impl ConnectionHooks {
         );
     }
     pub fn assign(&mut self, tcb: &Tcb, now: Instant) -> bool {
+        if let Some(d) = &self.data {
+            if d.reinject {
+                let head = d.send.una;
+                let len =
+                    d.tx.uncovered_len(head, d.send.run_len(head))
+                        .min(d.send.next.wrapping_sub(head) as usize)
+                        .min(u16::MAX as usize);
+                let len = tcb
+                    .send_budget(now, len, len, true, self.data_option_len(), self)
+                    .bytes();
+                let d = self.data.as_mut().unwrap();
+                if d.send.assign(&mut d.tx, head, len) {
+                    d.reinject = false;
+                    return true;
+                }
+                return false;
+            }
+        }
         let len = tcb
             .send_budget(
                 now,
                 self.unassigned_len(),
                 self.candidate_len(),
                 false,
-                28,
+                self.data_option_len(),
                 self,
             )
             .bytes();
@@ -110,8 +191,13 @@ impl ConnectionHooks {
 impl SendBuf for ConnectionHooks {
     fn unassigned_len(&self) -> usize {
         match (&self.data, &self.negotiation) {
-            (Some(d), Some(m)) => (d.send.end.wrapping_sub(d.send.next) as usize)
-                .min((m.send_right_edge.unwrap().wrapping_sub(d.send.next) as i64).max(0) as usize),
+            (Some(d), Some(m)) => {
+                (d.send.end.wrapping_sub(d.send.next) as usize).min(if d.fallback {
+                    usize::MAX
+                } else {
+                    (m.send_right_edge.unwrap().wrapping_sub(d.send.next) as i64).max(0) as usize
+                })
+            }
             _ => 0,
         }
     }
@@ -137,19 +223,44 @@ impl SendBuf for ConnectionHooks {
     }
     fn mark_acked(&mut self, ssn: u32) {
         match &mut self.data {
-            Some(d) => d.tx.mark_acked(ssn),
+            Some(d) => {
+                if let Some(dsn) = d.tx.acked_dsn(ssn) {
+                    d.tcp_acked_dsn = dsn;
+                    if !d.fallback && !d.dss_confirmed {
+                        match self.valid_data_ack {
+                            Some(true) => d.dss_confirmed = true,
+                            Some(false) => {
+                                d.fall_back(self.negotiation.as_mut().unwrap());
+                                self.fallback_event = true;
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                d.tx.mark_acked(ssn);
+                if d.fallback {
+                    d.send.ack(d.tcp_acked_dsn);
+                }
+            }
             None => self.plain.mark_acked(ssn),
         }
     }
 }
 impl SegmentHooks for ConnectionHooks {
     fn data_option_len(&self) -> usize {
-        if self.data.is_some() { 28 } else { 0 }
+        if self.data.as_ref().is_some_and(|d| !d.fallback) {
+            28
+        } else {
+            0
+        }
     }
     fn data_options_for(&mut self, ssn: u32, out: &mut [u8]) -> usize {
         let (Some(m), Some(d)) = (&self.negotiation, &self.data) else {
             return self.options_for(TcpFlags::ACK, out);
         };
+        if d.fallback {
+            return self.options_for(TcpFlags::ACK, out);
+        }
         let mapping = d.tx.mapping(ssn).expect("payload has mapping");
         let option = if m.state == State::PreConfirmed && mapping.ssn == 1 {
             MptcpOption::Capable(MpCapable {
@@ -190,7 +301,24 @@ impl SegmentHooks for ConnectionHooks {
     }
 
     fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
-        if let (Some(m), Some(d)) = (&self.negotiation, &self.data) {
+        if let (Some(m), Some(d)) = (&self.negotiation, &mut self.data) {
+            if let Some(mapping) = d.final_mapping {
+                let n = mptcp::encode(
+                    &MptcpOption::Dss(mptcp::Dss {
+                        data_fin: false,
+                        data_ack: None,
+                        mapping: Some(mapping),
+                    }),
+                    out,
+                )
+                .expect("infinite mapping fits");
+                let padded = n.next_multiple_of(4);
+                out[n..padded].fill(1);
+                return padded;
+            }
+            if d.fallback {
+                return 0;
+            }
             if m.state == State::Confirmed && flags.contains(TcpFlags::ACK) {
                 return mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
@@ -208,6 +336,26 @@ impl SegmentHooks for ConnectionHooks {
             .map_or(0, |m| m.options_for(flags, out))
     }
     fn on_valid_segment(&mut self, seg: &Segment<'_>) {
+        self.valid_data_ack = None;
+        // Validate the whole option list before mutating mapping or DATA_ACK state.
+        let (mut dss, mut capable) = (None, None);
+        for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
+            match opt {
+                Err(_) => return,
+                Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
+                    Ok(MptcpOption::Dss(v)) if dss.is_none() => dss = Some(v),
+                    Ok(MptcpOption::Capable(v)) if capable.is_none() => capable = Some(v),
+                    Ok(MptcpOption::Dss(_) | MptcpOption::Capable(_)) | Err(_) => return,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        self.valid_data_ack = if dss.is_some_and(|v| v.data_ack.is_some()) {
+            None
+        } else {
+            Some(false)
+        };
         let Some(m) = &mut self.negotiation else {
             return;
         };
@@ -232,6 +380,15 @@ impl SegmentHooks for ConnectionHooks {
                 unmapped: 0,
                 reset: false,
                 sanity_failures: 0,
+                recovery_head: None,
+                recovery_at: None,
+                recovery_interval: Duration::from_secs(1),
+                reinject: false,
+                dss_confirmed: false,
+                fallback: false,
+                final_mapping: None,
+                rx_infinite: None,
+                tcp_acked_dsn: m.local_idsn.wrapping_add(1),
             });
         }
         if seg.flags.contains(TcpFlags::SYN) {
@@ -245,19 +402,8 @@ impl SegmentHooks for ConnectionHooks {
         let Some(d) = &mut self.data else {
             return;
         };
-        // Validate the whole option list before mutating mapping or DATA_ACK state.
-        let (mut dss, mut capable) = (None, None);
-        for opt in walk(seg.options) {
-            match opt {
-                Err(_) => return,
-                Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
-                    Ok(MptcpOption::Dss(v)) if dss.is_none() => dss = Some(v),
-                    Ok(MptcpOption::Capable(v)) if capable.is_none() => capable = Some(v),
-                    Ok(MptcpOption::Dss(_) | MptcpOption::Capable(_)) | Err(_) => return,
-                    _ => {}
-                },
-                _ => {}
-            }
+        if d.fallback {
+            return;
         }
         if let Some(c) = capable {
             if let Some(len) = c.data_len {
@@ -279,7 +425,13 @@ impl SegmentHooks for ConnectionHooks {
                     mptcp::Dsn::Dsn32(x) => promote32(x, d.recv.next),
                     mptcp::Dsn::Dsn64(x) => x,
                 };
-                // Infinite mappings and DATA_FIN lifecycle are integrated by Steps 4/5.
+                if mapping.data_len == 0 {
+                    d.fall_back(m);
+                    d.rx_infinite = Some((mapping.ssn, dsn));
+                    d.send.ack(d.tcp_acked_dsn);
+                    self.fallback_event = true;
+                    return;
+                }
                 let len = u32::from(mapping.data_len).saturating_sub(u32::from(v.data_fin));
                 if len > 0 && !d.rx.install(mapping.ssn, dsn, len) {
                     d.reset = true;
@@ -293,6 +445,7 @@ impl SegmentHooks for ConnectionHooks {
                     mptcp::DataAck::Ack64(x) => x,
                 };
                 if d.send.ack(ack) {
+                    self.valid_data_ack = Some(true);
                     let edge = ack.wrapping_add(u64::from(seg.wnd) << m.peer_scale);
                     if m.send_right_edge
                         .is_none_or(|old| edge.wrapping_sub(old) as i64 > 0)
@@ -312,6 +465,10 @@ impl SegmentHooks for ConnectionHooks {
     }
     fn receipt_advanced(&mut self, ssn: u32) {
         if let Some(d) = &mut self.data {
+            if let Some((base, dsn)) = &mut d.rx_infinite {
+                *dsn = dsn.wrapping_add_signed(ssn.wrapping_sub(*base) as i32 as i64);
+                *base = ssn;
+            }
             d.rx.ack(ssn);
         }
     }
@@ -326,7 +483,17 @@ impl SegmentHooks for ConnectionHooks {
         let mut at = 0;
         while at < bytes.len() {
             let pos = ssn.wrapping_add(at as u32);
-            if let Some((dsn, len)) = d.rx.translate(pos) {
+            let translated = if d.fallback {
+                d.rx_infinite.map(|(ssn, dsn)| {
+                    (
+                        dsn.wrapping_add_signed(pos.wrapping_sub(ssn) as i32 as i64),
+                        bytes.len() - at,
+                    )
+                })
+            } else {
+                d.rx.translate(pos)
+            };
+            if let Some((dsn, len)) = translated {
                 let len = len.min(bytes.len() - at);
                 let dsn_offset = dsn.wrapping_sub(d.recv.next) as i64;
                 if at == 0
@@ -335,7 +502,11 @@ impl SegmentHooks for ConnectionHooks {
                 {
                     d.sanity_failures = d.sanity_failures.saturating_add(1);
                 }
-                let (_, n) = d.recv.accept(dsn, &bytes[at..at + len]);
+                let n = if d.fallback {
+                    d.recv.accept_tcp(dsn, &bytes[at..at + len])
+                } else {
+                    d.recv.accept(dsn, &bytes[at..at + len]).1
+                };
                 if n > 0 {
                     accepted.push(at..at + n);
                 }
@@ -362,6 +533,22 @@ impl SegmentHooks for ConnectionHooks {
         self.data
             .as_ref()
             .map_or_else(|| self.plain.recv_window(), |d| d.recv.free() as u32)
+    }
+}
+
+impl DataState {
+    fn fall_back(&mut self, m: &mut Negotiation) {
+        self.fallback = true;
+        m.state = State::FellBack;
+        self.recovery_at = None;
+        self.reinject = false;
+        self.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
+        self.final_mapping = Some(mptcp::Mapping {
+            dsn: mptcp::Dsn::Dsn64(m.local_idsn.wrapping_add(1)),
+            ssn: 1,
+            data_len: 0,
+            checksum: None,
+        });
     }
 }
 

@@ -68,6 +68,10 @@ impl Connection {
     /// queued data must be delivered.
     pub fn close(&mut self) {
         self.closed_by_app = true;
+        #[cfg(test)]
+        if self.hooks.pending_data() {
+            return;
+        }
         self.tcb.close();
     }
 

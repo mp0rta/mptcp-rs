@@ -221,6 +221,33 @@ pub(crate) struct TxMaps {
     cap: usize,
 }
 impl TxMaps {
+    pub fn acked_dsn(&self, ack: u32) -> Option<u64> {
+        self.maps
+            .iter()
+            .filter_map(|m| {
+                let n = ack.wrapping_sub(m.ssn) as i32;
+                (n > 0).then(|| {
+                    m.chunk
+                        .dsn
+                        .wrapping_add((n as usize).min(m.chunk.len()) as u64)
+                })
+            })
+            .next_back()
+    }
+    /// Prefix without a live TCP copy, clipped at the next active mapping.
+    pub fn uncovered_len(&self, dsn: u64, max: usize) -> usize {
+        self.maps.iter().fold(max, |len, m| {
+            let off = m.chunk.dsn.wrapping_sub(dsn) as i64;
+            if off <= 0 && off + m.chunk.len() as i64 > 0 {
+                0
+            } else if off > 0 {
+                len.min(off as usize)
+            } else {
+                len
+            }
+        })
+    }
+
     pub fn mapping(&self, ssn: u32) -> Option<crate::wire::mptcp::Mapping> {
         self.maps
             .iter()
@@ -345,6 +372,19 @@ impl RecvAssembler {
     }
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
+        self.accept_inner(dsn, data, false)
+    }
+    pub fn accept_tcp(&mut self, dsn: u64, data: &[u8]) -> usize {
+        let before = self.next;
+        let off = dsn.wrapping_sub(before) as i64;
+        let (outcome, n) = self.accept_inner(dsn, data, true);
+        match outcome {
+            Outcome::Discarded => (-off).max(0).min(data.len() as i64) as usize,
+            Outcome::Stored if off <= 0 => self.next.wrapping_sub(dsn).min(n as u64) as usize,
+            _ => n,
+        }
+    }
+    fn accept_inner(&mut self, dsn: u64, data: &[u8], tcp: bool) -> (Outcome, usize) {
         let off = dsn.wrapping_sub(self.next) as i64;
         // Peer-controlled offsets may sit at i64::MAX. Only comparisons and window
         // clipping use this end, so saturation preserves the out-of-window result.
@@ -365,7 +405,11 @@ impl RecvAssembler {
         // The in-order prefix always makes progress unless unread bytes fill the cap.
         // Any in-window suffix discarded here is still TCP-acknowledged.
         let hi = if lo == 0 {
-            hi.min((self.cap - self.ready.len()) as i64)
+            hi.min(if tcp {
+                self.free()
+            } else {
+                self.cap - self.ready.len()
+            } as i64)
         } else {
             hi
         };
@@ -418,7 +462,7 @@ impl RecvAssembler {
             if needed <= self.free() && count <= self.range_cap {
                 break gaps;
             }
-            if lo != 0 || self.pieces.pop().is_none() {
+            if tcp || lo != 0 || self.pieces.pop().is_none() {
                 return (Outcome::Discarded, acknowledged);
             }
         };
