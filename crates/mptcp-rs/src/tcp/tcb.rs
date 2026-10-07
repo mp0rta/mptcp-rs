@@ -1165,7 +1165,11 @@ impl Tcb {
 
         // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is
         // unacknowledged.
-        if idle && (((queued > 0 || fin_pending) && self.snd_wnd == 0) || self.probe_demand) {
+        // Assigned bytes already own connection credit. Drain them (or a pending FIN)
+        // through an open subflow before probing for credit for unassigned data.
+        let connection_probe =
+            self.probe_demand && (self.snd_wnd == 0 || (queued == 0 && !fin_pending));
+        if idle && (((queued > 0 || fin_pending) && self.snd_wnd == 0) || connection_probe) {
             // Persist replaces the SWS override for this zero-window episode.
             self.sws_at = None;
             self.sws_override = false;

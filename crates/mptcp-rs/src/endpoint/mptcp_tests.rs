@@ -1239,3 +1239,53 @@ fn short_chunk_cannot_use_a_larger_sws_partial_budget() {
         "nothing assigned before it can send"
     );
 }
+
+#[test]
+fn connection_probe_demand_does_not_block_already_credited_mapping() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(25));
+    let h = open(&mut ep);
+    let syn_bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&syn_bytes).unwrap();
+    let mut opts = capable(1, CAP_H);
+    let mut mss = [0; 4];
+    let n = crate::wire::tcp_options::write_mss(&mut mss, 645);
+    opts.extend_from_slice(&mss[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    ep.connection(h).unwrap().write(&[7; 2000]).unwrap();
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.next;
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().payload.len(), 617);
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().send.next,
+        origin.wrapping_add(1234)
+    );
+    // The first segment is acknowledged before the second is polled. No TCP bytes remain
+    // in flight, but the second half of this mapping already owns connection credit.
+    let mut opts = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(origin.wrapping_add(617))),
+            mapping: None,
+        }),
+        &mut opts,
+    )
+    .unwrap();
+    let mut ack = peer_data(&syn, 5001, &opts[..n], &[]);
+    ack.ack = syn.seq.wrapping_add(618);
+    ack.wnd = 617;
+    input(&mut ep, &ack);
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.seq, syn.seq.wrapping_add(618));
+    assert_eq!(seg.payload, &[7; 617]);
+    let MptcpOption::Dss(dss) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(dss.mapping.unwrap().data_len, 1234);
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().send.next,
+        origin.wrapping_add(1234)
+    );
+}
