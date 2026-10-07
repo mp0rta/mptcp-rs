@@ -23,7 +23,7 @@ pub(crate) struct ConnectionHooks {
     recv_cap: usize,
     send_cap: usize,
     // None: malformed/invalid; Some(false): valid options without DATA_ACK.
-    // Consumed only by mark_acked, after TCP proves advancement over our data.
+    // Current ACK coverage is retained after TCP releases a mapping.
     valid_data_ack: Option<bool>,
     pub fallback_event: bool,
 }
@@ -467,6 +467,17 @@ impl SegmentHooks for ConnectionHooks {
                     }
                 }
             }
+        }
+        // A current duplicate TCP ACK still covers our data even when an earlier
+        // malformed DATA_ACK let TCP release the live mapping without confirmation.
+        if !d.dss_confirmed
+            && self.valid_data_ack == Some(false)
+            && d.tcp_acked_ssn
+                .is_some_and(|ssn| seg.ack.ge(d.local_isn.wrapping_add(ssn)))
+        {
+            d.fall_back(m);
+            d.send.ack(d.tcp_acked_dsn);
+            self.fallback_event = true;
         }
     }
 

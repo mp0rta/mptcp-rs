@@ -1672,3 +1672,42 @@ fn corrected_data_ack_confirms_already_tcp_acked_mapping() {
         );
     }
 }
+
+#[test]
+fn current_tcp_ack_without_data_ack_falls_back_after_invalid_data_ack() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"abc").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let invalid = data_ack(head.wrapping_add(100));
+    let mut ack = peer_data(&syn, 5001, &invalid, &[]);
+    ack.ack = sent.seq.wrapping_add(3);
+    input(&mut ep, &ack);
+    assert_eq!(ep.poll_event(), None);
+    assert!(ep.poll_timeout().is_some());
+    ack.options = &[];
+    for stale in [sent.seq, sent.seq.wrapping_add(2)] {
+        ack.ack = stale;
+        input(&mut ep, &ack);
+        assert_eq!(ep.poll_event(), None);
+    }
+    ack.ack = sent.seq.wrapping_add(3);
+    input(&mut ep, &ack);
+    assert_eq!(ep.poll_event(), Some((h, Event::FellBack)));
+    assert_eq!(ep.poll_timeout(), None);
+    let final_dss = transmit(&mut ep, Instant::from_nanos(3));
+    let final_dss = packet::parse(&final_dss).unwrap();
+    let MptcpOption::Dss(dss) = mptcp::parse(mpc(final_dss.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(dss.mapping.unwrap().data_len, 0);
+    assert!(final_dss.payload.is_empty());
+    input(&mut ep, &ack);
+    assert_eq!(ep.poll_event(), None);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(3), &mut [0; 1500])
+            .is_none()
+    );
+}
