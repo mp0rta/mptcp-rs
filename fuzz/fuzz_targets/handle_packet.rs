@@ -22,15 +22,22 @@ fuzz_target!(|data: &[u8]| {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
     let local = IpAddr::V4(Ipv4Addr::new(10, 0, 9, 2));
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)), 5201);
-    let h = ep
-        .connect(now, local, remote, ConnectConfig::default())
-        .unwrap();
+    let mptcp = data.first().is_some_and(|b| b & 2 != 0);
+    let connect = if mptcp {
+        Endpoint::connect_mptcp
+    } else {
+        Endpoint::connect
+    };
+    let h = connect(&mut ep, now, local, remote, ConnectConfig::default()).unwrap();
 
     // Inline handshake: SYN/ACK with MSS 1200 + NOP + WS 7.
     let pkts = drain(&mut ep, now);
     assert_eq!(pkts.len(), 1);
     let syn = parse(&pkts[0]).unwrap();
-    let opts = [2, 4, 0x04, 0xb0, 1, 3, 3, 7];
+    let mut opts = vec![2, 4, 0x04, 0xb0, 1, 3, 3, 7];
+    if mptcp {
+        opts.extend_from_slice(&[30, 12, 1, 1, 1, 2, 3, 4, 5, 6, 7, 8]);
+    }
     let synack = Segment {
         src: syn.dst,
         dst: syn.src,
@@ -44,11 +51,44 @@ fuzz_target!(|data: &[u8]| {
     let mut buf = [0u8; 1500];
     let n = build(&synack, 0, &mut buf).unwrap();
     ep.handle_packet(now, &buf[..n]);
-    assert_eq!(
-        ep.poll_event(),
-        Some((h, Event::Connected { mptcp: false }))
-    );
-    drain(&mut ep, now);
+    let third = drain(&mut ep, now);
+    assert_eq!(ep.poll_event(), Some((h, Event::Connected { mptcp })));
+    if mptcp {
+        use mptcp_rs::wire::{
+            mptcp::{self, DataAck, Dss, MptcpOption},
+            tcp_options::{TcpOpt, walk},
+        };
+        let ack = parse(&third[0]).unwrap();
+        let key = walk(ack.options)
+            .find_map(|o| match o {
+                Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw).ok()? {
+                    MptcpOption::Capable(c) => c.sender_key,
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        let (_, idsn) = mptcp_rs::crypto::key_token_idsn(key);
+        let mut options = [0; 40];
+        let len = mptcp::encode(
+            &MptcpOption::Dss(Dss {
+                data_ack: Some(DataAck::Ack64(idsn.wrapping_add(1))),
+                mapping: None,
+                data_fin: false,
+            }),
+            &mut options,
+        )
+        .unwrap();
+        let confirmed = Segment {
+            seq: mptcp_rs::SeqNum(5001),
+            flags: TcpFlags::ACK,
+            options: &options[..len],
+            ..synack
+        };
+        let n = build(&confirmed, 0, &mut buf).unwrap();
+        ep.handle_packet(now, &buf[..n]);
+        drain(&mut ep, now);
+    }
 
     let Some((&mode, rest)) = data.split_first() else {
         return;
@@ -102,7 +142,13 @@ fuzz_target!(|data: &[u8]| {
             drain(&mut ep, t);
         }
     }
+    if let Some(c) = ep.connection(h) {
+        c.close();
+    }
+    drain(&mut ep, t);
     let later = t + Duration::from_secs(1);
     ep.handle_timeout(later);
     drain(&mut ep, later);
+    ep.handle_timeout(later + Duration::from_secs(180));
+    drain(&mut ep, later + Duration::from_secs(180));
 });

@@ -2,3 +2,5 @@
 m0.pcap
 cli.log
 srv.log
+
+/artifacts/

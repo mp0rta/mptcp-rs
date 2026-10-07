@@ -11,15 +11,78 @@ pub trait SendBuf {
     /// long. The run may be shorter than `max` and than what is buffered (it ends at an internal
     /// buffer boundary). `None` if no byte at `rel_ssn` is buffered.
     fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
+    /// Limit one segment to a protocol mapping; ordinary TCP may span buffer runs.
+    fn segment_limit(&self, _ssn: u32) -> usize {
+        usize::MAX
+    }
+    /// Reinjected bytes are retransmissions for Nagle/SWS purposes.
+    fn is_reinjection(&self, _ssn: u32) -> bool {
+        false
+    }
+    /// Pending connection bytes, used by sender SWS before assignment.
+    fn unassigned_len(&self) -> usize {
+        0
+    }
     /// Relative SSN one past the last assigned octet.
     fn assigned_end(&self) -> u32;
     /// Releases every octet below `rel_ssn_una`.
     fn mark_acked(&mut self, rel_ssn_una: u32);
 }
 
-/// Receive-side sink. The `Tcb` drops duplicates and trims every segment to what the hooks can
-/// store before calling `accept_payload`, so the call cannot fail.
+/// Receive-side sink. Plain TCP drops duplicates and trims to available memory before
+/// `accept_payload`. MPTCP uses `receive_data` and tracks TCP receipts separately.
 pub trait SegmentHooks {
+    /// Called only after TCP accepts the segment, before handing over its payload.
+    fn on_valid_segment(&mut self, _seg: &crate::wire::packet::Segment<'_>) {}
+
+    /// MPTCP delegates payload acceptance to its connection-level DSN window.
+    fn delegates_data(&self) -> bool {
+        false
+    }
+    /// Connection control signals must pass the TCP sequence window even when
+    /// ordinary payload acceptance is delegated to a connection sequence space.
+    fn requires_tcp_sequence_check(&self, _seg: &crate::wire::packet::Segment<'_>) -> bool {
+        false
+    }
+    /// Accepted byte ranges in this payload, independently of retained payload memory.
+    fn receive_data(
+        &mut self,
+        _ssn: u32,
+        _tcp_ack: u32,
+        _data: &[u8],
+    ) -> Vec<std::ops::Range<usize>> {
+        Vec::new()
+    }
+    fn receipt_advanced(&mut self, _ssn: u32) {}
+    fn reset_requested(&self) -> bool {
+        false
+    }
+
+    /// Protocol options first; return a word-aligned length, using NOP padding.
+    /// The remaining option space is available for TCP SACK blocks.
+    fn options_for(&mut self, _flags: crate::wire::packet::TcpFlags, _out: &mut [u8]) -> usize {
+        0
+    }
+
+    /// Reserved data layout, including padding (may exceed the initial wire layout).
+    fn data_option_len(&self) -> usize {
+        0
+    }
+    fn data_options_for(&mut self, _ssn: u32, out: &mut [u8]) -> usize {
+        self.options_for(crate::wire::packet::TcpFlags::ACK, out)
+    }
+    /// Connection receive-window override and commit, called only for transmitted segments.
+    fn window_offer(&self, _scale: u8, _mss: u16) -> Option<u16> {
+        None
+    }
+    fn window_sent(&mut self, _field: u16, _scale: u8) {}
+    fn window_update_due(&self, _scale: u8, _mss: u16) -> bool {
+        false
+    }
+    fn duplicate_ack_allowed(&self, _seg: &crate::wire::packet::Segment<'_>) -> bool {
+        true
+    }
+
     /// New octets starting at `rel_ssn` (the first data octet is 1). Each octet is handed over
     /// once, so the pieces held out of order tile the sequence space: a piece that extends the
     /// in-order data ends where the next held piece starts, if it touches one.

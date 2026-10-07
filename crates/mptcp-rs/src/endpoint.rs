@@ -8,9 +8,9 @@ use rand_core::CryptoRng;
 
 use crate::Instant;
 use crate::SeqNum;
-use crate::connection::Connection;
+use crate::connection::{Connection, ConnectionHooks};
 use crate::crypto::IsnGenerator;
-use crate::tcp::{CloseReason, ConnectConfig, PlainHooks, Reaction, SegmentWriter, Tcb, TcpState};
+use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
 
 /// Queued RSTs for segments without a TCB; beyond this they are dropped.
@@ -25,6 +25,7 @@ pub struct ConnectionHandle(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Connected { mptcp: bool },
+    FellBack,
     Closed { reason: CloseReason },
 }
 
@@ -119,7 +120,7 @@ impl<R: CryptoRng> Endpoint<R> {
             h,
             Connection {
                 tcb: Tcb::new_active(&cfg, local, remote, isn, now),
-                hooks: PlainHooks::new(&cfg),
+                hooks: ConnectionHooks::new(&cfg),
                 local,
                 remote,
                 closed_by_app: false,
@@ -127,6 +128,32 @@ impl<R: CryptoRng> Endpoint<R> {
                 detached: false,
             },
         );
+        Ok(h)
+    }
+
+    /// Opens an MPTCP v1 connection, falling back to TCP if the peer does not support it.
+    pub fn connect_mptcp(
+        &mut self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+        cfg: ConnectConfig,
+    ) -> Result<ConnectionHandle, ConnectError> {
+        let h = self.connect(now, local, remote, cfg)?;
+        // ponytail: scan live connections; use a token set if connect volume warrants it.
+        // Keeping the token on its connection also retains it through TIME_WAIT.
+        let negotiation = loop {
+            let candidate = crate::mptcp::Negotiation::new(self.rng.next_u64());
+            if !self.conns.values().any(|c| {
+                c.hooks
+                    .negotiation
+                    .as_ref()
+                    .is_some_and(|m| m.token == candidate.token)
+            }) {
+                break candidate;
+            }
+        };
+        self.conns.get_mut(&h).unwrap().hooks.negotiation = Some(negotiation);
         Ok(h)
     }
 
@@ -157,6 +184,23 @@ impl<R: CryptoRng> Endpoint<R> {
             Reaction::None => {}
             r => Self::push_event(&mut self.events, c, h, r),
         }
+        c.hooks.update_recovery(&c.tcb, now);
+        Self::update_close(&mut self.events, c, h, now);
+        if std::mem::take(&mut c.hooks.fallback_event) {
+            self.events.push_back((h, Event::FellBack));
+        }
+    }
+
+    fn update_close(
+        events: &mut VecDeque<(ConnectionHandle, Event)>,
+        c: &mut Connection,
+        h: ConnectionHandle,
+        now: Instant,
+    ) {
+        if let Some(reason) = c.hooks.update_close(&c.tcb, now) {
+            c.reset |= reason != CloseReason::Normal;
+            events.push_back((h, Event::Closed { reason }));
+        }
     }
 
     fn push_event(
@@ -167,8 +211,16 @@ impl<R: CryptoRng> Endpoint<R> {
     ) {
         match r {
             Reaction::None => {}
-            Reaction::Established => events.push_back((h, Event::Connected { mptcp: false })),
+            Reaction::Established => {
+                if c.hooks.negotiation.is_some() {
+                    return;
+                }
+                events.push_back((h, Event::Connected { mptcp: false }));
+            }
             Reaction::Closed(reason) => {
+                if c.hooks.active() {
+                    return;
+                }
                 c.reset |= reason == CloseReason::Reset;
                 events.push_back((h, Event::Closed { reason }));
             }
@@ -227,10 +279,23 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
-                if c.tcb
-                    .poll_send(now, &mut c.hooks, &mut self.scratch)
-                    .is_none()
-                {
+                // An MPTCP third ACK must remain due until it can be emitted.
+                if c.hooks.negotiation.is_some() && buf.len() < c.tcb.mtu() {
+                    continue;
+                }
+                c.hooks.prepare_send(&mut c.tcb, now);
+                if c.closed_by_app && !c.hooks.close() {
+                    c.tcb.close();
+                }
+                let sent = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch);
+                let sent = sent.or_else(|| {
+                    if c.hooks.assign(&c.tcb, now) {
+                        c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch)
+                    } else {
+                        None
+                    }
+                });
+                if sent.is_none() {
                     continue;
                 }
                 self.cursor = h.0 + 1;
@@ -246,6 +311,16 @@ impl<R: CryptoRng> Endpoint<R> {
                     payload: &w.payload,
                 };
                 if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
+                    c.hooks
+                        .on_transmitted(&seg, now, c.tcb.retransmission_timeout());
+                    if let Some(mptcp) = c
+                        .hooks
+                        .negotiation
+                        .as_mut()
+                        .and_then(|m| m.on_transmitted(w.flags))
+                    {
+                        self.events.push_back((*h, Event::Connected { mptcp }));
+                    }
                     return Some(n);
                 }
             }
@@ -265,7 +340,13 @@ impl<R: CryptoRng> Endpoint<R> {
         self.conns
             .values()
             .filter(|c| !c.detached)
-            .filter_map(|c| c.tcb.poll_send_at())
+            .filter_map(|c| {
+                let at = c.tcb.poll_send_at();
+                at.filter(|_| !c.hooks.retained() || c.tcb.state() != TcpState::Closed)
+                    .into_iter()
+                    .chain(c.hooks.recovery_deadline())
+                    .min()
+            })
             .min()
     }
 
@@ -273,13 +354,18 @@ impl<R: CryptoRng> Endpoint<R> {
     /// its `Closed(Normal)` there), then frees the TCBs that are `Closed`.
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
+            c.hooks.update_recovery(&c.tcb, now);
             if c.tcb.poll_send_at().is_some_and(|t| t <= now) {
                 let r = c.tcb.on_timeout(now, &mut c.hooks);
                 Self::push_event(&mut self.events, c, h, r);
             }
+            Self::update_close(&mut self.events, c, h, now);
         }
         let demux = &mut self.demux;
         self.conns.retain(|&h, c| {
+            if c.hooks.retained() || c.tcb.reset_pending() {
+                return true;
+            }
             if c.tcb.state() != TcpState::Closed {
                 return true;
             }
@@ -293,3 +379,6 @@ impl<R: CryptoRng> Endpoint<R> {
         });
     }
 }
+
+#[cfg(test)]
+mod mptcp_tests;

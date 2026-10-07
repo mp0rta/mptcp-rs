@@ -44,6 +44,7 @@ fn run(v6: bool, len: usize, seed: u64, loss: u32, reorder: u32) -> Outcome {
         }
         while let Some((_, e)) = ep.poll_event() {
             match e {
+                Event::FellBack => panic!("plain connection fell back"),
                 Event::Connected { .. } => connected = true,
                 Event::Closed { reason } => closed.push(reason),
             }

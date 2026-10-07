@@ -17,8 +17,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use tun::Tun;
 
-const USAGE: &str =
-    "usage: mptcp-rs-tun --tun NAME --local IP --remote IP:PORT --send BYTES --expect BYTES";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES --expect BYTES [--pause-read-ms MS]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -33,6 +32,8 @@ fn verify_pattern(offset: u64, data: &[u8]) -> bool {
 }
 
 struct Args {
+    mptcp: bool,
+    pause_read: Duration,
     tun: String,
     local: IpAddr,
     remote: SocketAddr,
@@ -42,9 +43,19 @@ struct Args {
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let (mut tun, mut local, mut remote, mut send, mut expect) = (None, None, None, None, None);
+    let mut mode = None;
+    let mut pause_read = Duration::ZERO;
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
+            "--mode" => {
+                mode = Some(match v.as_str() {
+                    "tcp" => false,
+                    "mptcp" => true,
+                    _ => return None,
+                })
+            }
+            "--pause-read-ms" => pause_read = Duration::from_millis(v.parse().ok()?),
             "--tun" => tun = Some(v),
             "--local" => local = v.parse().ok(),
             "--remote" => remote = v.parse().ok(),
@@ -54,6 +65,8 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         }
     }
     Some(Args {
+        mptcp: mode?,
+        pause_read,
         tun: tun?,
         local: local?,
         remote: remote?,
@@ -75,8 +88,20 @@ fn run(a: Args) -> Result<String, String> {
         .map_err(io_err("read /dev/urandom"))?;
     let mut ep = Endpoint::new(ChaCha20Rng::from_seed(seed));
     let start = std::time::Instant::now();
-    let h = ep
-        .connect(now(start), a.local, a.remote, ConnectConfig::default())
+    let connect = if a.mptcp {
+        Endpoint::connect_mptcp
+    } else {
+        Endpoint::connect
+    };
+    let cfg = ConnectConfig {
+        recv_buffer: if a.pause_read.is_zero() {
+            ConnectConfig::default().recv_buffer
+        } else {
+            16384
+        },
+        ..ConnectConfig::default()
+    };
+    let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
         .map_err(|e| format!("connect: {e:?}"))?;
 
     let mut pkt = vec![0u8; 65535];
@@ -84,7 +109,11 @@ fn run(a: Args) -> Result<String, String> {
     // One period of the pattern repeats every 251 bytes: slice at `sent % 251`.
     let pat: Vec<u8> = (0..65536 + 251u64).map(pattern_byte).collect();
     let mut st = State::default();
+    let mut resume_read = None;
     loop {
+        if start.elapsed() > Duration::from_secs(900) {
+            return Err("connection timed out".into());
+        }
         let t = now(start);
         let wait = ep.poll_timeout().map_or(CAP, |d| {
             Duration::from_nanos(d.as_nanos().saturating_sub(t.as_nanos())).min(CAP)
@@ -95,6 +124,10 @@ fn run(a: Args) -> Result<String, String> {
                 Ok(n) => {
                     if let Some(n) = receive_and_poll(&mut ep, now(start), &mut pkt, n) {
                         write_packet(&tun, &pkt[..n])?;
+                    }
+                    // Start the test pause before a continuously readable TUN fills the buffer.
+                    if !a.pause_read.is_zero() && st.verified == 0 {
+                        break;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -120,7 +153,7 @@ fn run(a: Args) -> Result<String, String> {
                 }
             }
             // Keep verifying after close(): extra bytes from the peer are a mismatch.
-            while !st.eof {
+            while !st.eof && resume_read.is_none_or(|deadline| start.elapsed() >= deadline) {
                 match conn.read(&mut rbuf) {
                     Ok(0) => st.eof = true,
                     Ok(n) => {
@@ -130,6 +163,11 @@ fn run(a: Args) -> Result<String, String> {
                             return Err(format!("verification mismatch at byte {}", st.verified));
                         }
                         st.verified += n as u64;
+                        if resume_read.is_none() && !a.pause_read.is_zero() {
+                            resume_read = Some(start.elapsed() + a.pause_read);
+                            eprintln!("read paused at {} bytes", st.verified);
+                            break;
+                        }
                     }
                     Err(ReadError::WouldBlock) => break,
                     Err(ReadError::Reset) => return Err("connection reset by peer".into()),
@@ -153,8 +191,11 @@ fn run(a: Args) -> Result<String, String> {
             write_packet(&tun, &pkt[..n])?;
         }
         if st.done {
+            if !st.eof {
+                return Err("closed before EOF".into());
+            }
             return Ok(format!(
-                "ok: sent {} bytes, verified {} bytes",
+                "ok: sent {} bytes, verified {} bytes, eof=true",
                 st.sent, st.verified
             ));
         }
@@ -207,10 +248,15 @@ impl State {
     fn events(&mut self, ep: &mut Endpoint<ChaCha20Rng>, a: &Args) -> Result<(), String> {
         while let Some((_, ev)) = ep.poll_event() {
             match ev {
-                Event::Connected { .. } => self.connected = true,
+                Event::FellBack => eprintln!("event: FellBack"),
+                Event::Connected { mptcp } => {
+                    eprintln!("event: Connected mptcp={mptcp}");
+                    self.connected = true;
+                }
                 Event::Closed {
                     reason: CloseReason::Normal,
                 } if self.closing && self.sent == a.send && self.verified == a.expect => {
+                    eprintln!("event: Closed Normal");
                     self.done = true;
                 }
                 Event::Closed { reason } => {
@@ -267,7 +313,10 @@ mod tests {
                 .into_iter()
         };
         let ok = "--tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 5 --expect 6";
-        assert!(parse_args(v(ok)).is_some());
+        assert!(parse_args(v(ok)).is_none());
+        assert!(parse_args(v(&format!("{ok} --mode tcp"))).is_some());
+        assert!(parse_args(v(&format!("{ok} --mode mptcp"))).is_some());
+        assert!(parse_args(v(&format!("{ok} --mode other"))).is_none());
         assert!(parse_args(v("--tun t0")).is_none());
         assert!(parse_args(v("--bogus 1")).is_none());
     }

@@ -3,6 +3,7 @@
 mod connection;
 pub mod crypto;
 mod endpoint;
+mod mptcp;
 mod seq;
 pub mod tcp;
 mod time;

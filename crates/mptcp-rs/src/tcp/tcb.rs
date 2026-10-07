@@ -82,6 +82,24 @@ pub enum Reaction {
     Closed(CloseReason),
 }
 
+/// Exact new-mapping shapes permitted by the TCP sender at this instant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SendBudget {
+    pub seg_payload: usize,
+    pub full_segments: usize,
+    pub partial: usize,
+}
+impl SendBudget {
+    /// A mapping consists of full segments, or one permitted partial segment.
+    pub fn bytes(self) -> usize {
+        if self.seg_payload == 0 {
+            return 0;
+        }
+        let full = self.full_segments * self.seg_payload;
+        if full > 0 { full } else { self.partial }
+    }
+}
+
 /// The segment `poll_send` just wrote into the `SegmentWriter`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SentMeta {
@@ -210,6 +228,7 @@ pub struct Tcb {
     r2_since: Option<Instant>,
     /// Persist timer and its current interval (first = RTO, ×2 per probe, cap 60 s).
     persist_at: Option<Instant>,
+    probe_demand: bool,
     persist_ivl: Duration,
     /// Sender SWS override timer (RFC 9293 §3.8.6.2.1 rule 4).
     sws_at: Option<Instant>,
@@ -290,6 +309,7 @@ impl Tcb {
             last_data_sent: None,
             r2_since: None,
             persist_at: None,
+            probe_demand: false,
             persist_ivl: Duration::ZERO,
             sws_at: None,
             ack_at: None,
@@ -368,6 +388,10 @@ impl Tcb {
         };
     }
 
+    pub(crate) fn mtu(&self) -> usize {
+        usize::from(self.cfg.mtu)
+    }
+
     /// The peer's FIN has been received. Every data octet before it was handed to the hooks
     /// first, so once they hold no more data the application's read is at EOF.
     pub fn fin_received(&self) -> bool {
@@ -385,6 +409,7 @@ impl Tcb {
             TcpState::SynSent => {
                 let r = self.on_segment_syn_sent(seg, now);
                 if r == Reaction::Established {
+                    h.on_valid_segment(seg);
                     // §3.10.7.3: text and FIN on the SYN/ACK are processed once ESTABLISHED,
                     // from the sequence number after the SYN. The FIN's CLOSE-WAIT move
                     // emits no `Closed`, so the reaction stays `Established`.
@@ -421,17 +446,124 @@ impl Tcb {
         }
     }
 
+    /// Additional assigned octets sendable now for a concrete candidate. `bytes` is all
+    /// pending data (after connection credit); `contiguous` bounds this mapping's stored run
+    /// and 16-bit length. Keeping both prevents a chunk boundary from bypassing sender SWS.
+    /// Reinjections bypass Nagle/SWS but still respect cwnd and the subflow window.
+    /// Calls do not mutate CC, sequence numbers, options or timers.
+    pub fn send_budget(
+        &self,
+        now: Instant,
+        bytes: usize,
+        contiguous: usize,
+        reinject: bool,
+        option_len: usize,
+        h: &impl Hooks,
+    ) -> SendBudget {
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            || self.retransmit_due
+            || self.snd_nxt != self.snd_max
+        {
+            return SendBudget::default();
+        }
+        let mss = usize::from(self.eff_mss).saturating_sub(option_len + self.sack_len(option_len));
+        if mss == 0 {
+            return SendBudget::default();
+        }
+        let cwnd = if self.in_flight() == 0
+            && self
+                .last_data_sent
+                .is_some_and(|t| now > t + self.rtt.rto())
+        {
+            self.cc.restart_cwnd()
+        } else {
+            self.cc.cwnd()
+        };
+        let assigned =
+            self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end())) as usize;
+        let usable =
+            self.snd_wnd
+                .min(cwnd)
+                .saturating_sub(self.snd_una.distance(self.snd_nxt) as u32) as usize;
+        let room = usable.saturating_sub(assigned);
+        let len = bytes.min(room).min(contiguous);
+        let partial = len.min(mss - 1);
+        let nagle_ok = (self.in_flight() == 0 && assigned == 0) || self.nodelay;
+        let override_due = self.sws_override || self.sws_at.is_some_and(|t| now >= t);
+        let partial = if reinject
+            || override_due
+            || (nagle_ok && (bytes <= room || partial >= self.max_snd_wnd as usize / 2))
+        {
+            partial
+        } else {
+            0
+        };
+        SendBudget {
+            seg_payload: mss,
+            full_segments: len / mss,
+            partial,
+        }
+    }
+
+    /// Arm sender SWS for data awaiting assignment; budget queries remain read-only.
+    pub fn pending_send(
+        &mut self,
+        now: Instant,
+        bytes: usize,
+        contiguous: usize,
+        option_len: usize,
+        h: &impl Hooks,
+    ) {
+        if bytes > 0 && self.in_flight() == 0 && self.snd_wnd > 0 && !self.probe_demand {
+            let budget = self.send_budget(now, bytes, contiguous, false, option_len, h);
+            if budget.seg_payload > 0 && budget.bytes() == 0 {
+                self.sws_at.get_or_insert(now + SWS_OVERRIDE);
+            }
+        }
+    }
+
+    /// Connection-level zero-window demand shares TCP's existing persist timer.
+    pub fn set_probe_demand(&mut self, demand: bool) {
+        self.probe_demand = demand;
+    }
+    pub(crate) fn ack_pending(&self) -> bool {
+        self.ack_due
+    }
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.rst_due.is_some()
+    }
+    pub(crate) fn request_ack(&mut self) {
+        self.ack_due = true;
+    }
+    pub(crate) fn retransmission_timeout(&self) -> Duration {
+        self.rtt.rto()
+    }
+    pub fn peer_window_closed(&self) -> bool {
+        self.snd_wnd == 0
+    }
+
+    fn sack_len(&self, protocol: usize) -> usize {
+        if protocol >= 40 {
+            return 0;
+        }
+        let mut options = [0; 40];
+        let end = usize::from(self.eff_mss.saturating_sub(1))
+            .min(40)
+            .max(protocol);
+        self.write_sacks(&mut options[protocol..end])
+    }
+
     pub fn poll_send(
         &mut self,
         now: Instant,
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
     ) -> Option<SentMeta> {
-        if self.state == TcpState::Closed {
-            return None;
-        }
         if let Some(seq) = self.rst_due.take() {
             return Some(out.start(seq, SeqNum(0), TcpFlags::RST, 0));
+        }
+        if self.state == TcpState::Closed {
+            return None;
         }
         if self.syn_due {
             self.syn_due = false;
@@ -442,7 +574,8 @@ impl Tcb {
             // RFC 7323 §2.2: the window field of a SYN is never scaled.
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
             let meta = out.start(self.iss, SeqNum(0), TcpFlags::SYN, wnd);
-            let n = tcp_options::write_mss(&mut out.options, self.mss_option());
+            let n = h.options_for(TcpFlags::SYN, &mut out.options);
+            let n = n + tcp_options::write_mss(&mut out.options[n..], self.mss_option());
             let n = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
             out.options_len = n + tcp_options::write_sack_permitted(&mut out.options[n..]);
             return Some(meta);
@@ -456,12 +589,36 @@ impl Tcb {
                 self.fin_rel = Some(h.assigned_end());
             }
             let mut options = [0u8; 40];
-            let limit = usize::from(self.eff_mss.saturating_sub(1)).min(options.len());
-            let n = self.write_sacks(&mut options[..limit]);
-            if let Some(meta) = self.poll_data(now, h, out, n as u16) {
+            let seq = if self.retransmit_due {
+                self.snd_una
+            } else {
+                self.snd_nxt
+            };
+            let ssn = self.rel(seq);
+            let has_data =
+                h.segment_limit(ssn) > 0 && h.peek_with(ssn, 1, |b| !b.is_empty()).unwrap_or(false);
+            let n = if has_data {
+                h.data_options_for(ssn, &mut options)
+            } else {
+                h.options_for(TcpFlags::ACK, &mut options)
+            };
+            let reserved = if has_data {
+                n.max(h.data_option_len())
+            } else {
+                n
+            };
+            let sack_len = self.sack_len(reserved);
+            self.write_sacks(&mut options[n..n + sack_len]);
+            if let Some(meta) = self.poll_data(now, h, out, (reserved + sack_len) as u16) {
+                // A persist probe is payload-free even when assigned data exists.
+                let n = if meta.len == 0 {
+                    let n = h.options_for(TcpFlags::ACK, &mut options);
+                    n + self.write_sacks(&mut options[n..40])
+                } else {
+                    n + sack_len
+                };
                 out.options[..n].copy_from_slice(&options[..n]);
                 out.options_len = n;
-                // Every data segment, FIN and probe carries the current ACK.
                 self.ack_sent();
                 return Some(meta);
             }
@@ -477,7 +634,8 @@ impl Tcb {
             // the ACK unacceptable to it (RFC 9293 Table 6).
             let meta = out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd);
             let limit = usize::from(self.mss_option()).min(out.options.len());
-            out.options_len = self.write_sacks(&mut out.options[..limit]);
+            let n = h.options_for(TcpFlags::ACK, &mut out.options);
+            out.options_len = n + self.write_sacks(&mut out.options[n..limit.max(n)]);
             self.ack_sent();
             return Some(meta);
         }
@@ -604,6 +762,11 @@ impl Tcb {
         if seg.flags.contains(TcpFlags::RST) {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
+                h.on_valid_segment(seg);
+                if h.reset_requested() {
+                    self.rst_due = Some(self.snd_max);
+                    return self.terminate(CloseReason::Reset, now);
+                }
                 return self.on_reset(now);
             }
             self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();
@@ -613,12 +776,23 @@ impl Tcb {
         // restarts 2·MSL here rather than in the fifth and eighth steps it cannot reach.
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         if self.state == TcpState::TimeWait && fin && seg_end.wrapping_add(1) == self.rcv_nxt {
+            if seg.flags.contains(TcpFlags::ACK) && !seg.ack.gt(self.snd_max) {
+                h.on_valid_segment(seg);
+                if h.reset_requested() {
+                    self.rst_due = Some(self.snd_max);
+                    return self.terminate(CloseReason::Reset, now);
+                }
+            }
             self.time_wait_at = Some(now + 2 * MSL);
             self.ack_due = true;
             return Reaction::None;
         }
         // First: an unacceptable segment draws an ACK and is dropped.
-        if !self.acceptable(seg) {
+        let delegated = h.delegates_data()
+            && !seg.payload.is_empty()
+            && !seg.flags.contains(TcpFlags::SYN)
+            && !h.requires_tcp_sequence_check(seg);
+        if !delegated && !self.acceptable(seg) {
             self.ack_due = true;
             if seg.flags.contains(TcpFlags::ACK)
                 && !seg.flags.contains(TcpFlags::SYN)
@@ -633,6 +807,7 @@ impl Tcb {
             let ack_only = seg.flags.contains(TcpFlags::ACK) && !seg.flags.contains(TcpFlags::SYN);
             let edge = self.rcv_right_edge.wrapping_add(1);
             if ack_only
+                && !h.requires_tcp_sequence_check(seg)
                 && self.rcv_nxt.le(seg.seq)
                 && seg.seq.le(edge)
                 && self.window_offer(h).0 == 0
@@ -662,8 +837,12 @@ impl Tcb {
     /// data is delivered inline, RFC 6093); text after the FIN is ignored. Eighth: a FIN right
     /// after all the text before it.
     fn on_text_and_fin(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
-        if !self.fin_received {
+        if !h.reset_requested() && !self.fin_received {
             self.on_text(seg, now, h);
+        }
+        if h.reset_requested() {
+            self.rst_due = Some(self.snd_max);
+            return self.terminate(CloseReason::Reset, now);
         }
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         // Trim sequence-space controls to the receive window too (RFC 9293 §3.10.7.4).
@@ -744,6 +923,10 @@ impl Tcb {
             return;
         }
         self.record_dsack(seg);
+        if h.delegates_data() {
+            self.on_delegated_text(seg, h);
+            return;
+        }
         let off = i64::from(self.rcv_nxt.distance(seg.seq));
         let end = off + seg.payload.len() as i64;
         // Free memory counts from RCV.NXT with the held out-of-order octets inside it, so the
@@ -799,16 +982,64 @@ impl Tcb {
         }
     }
 
+    /// MPTCP receipts are headers only, independent of DSN retention and eviction.
+    fn on_delegated_text(&mut self, seg: &Segment, h: &mut impl Hooks) {
+        let off = i64::from(self.rcv_nxt.distance(seg.seq));
+        let ssn = (self.rcv_ssn as u32).wrapping_add_signed(off as i32);
+        for range in h.receive_data(ssn, self.rcv_ssn as u32, seg.payload) {
+            let lo = (off + range.start as i64).max(0);
+            let hi = off + range.end as i64;
+            if lo >= hi {
+                continue;
+            }
+            let (s, e) = (self.rcv_ssn + lo as u64, self.rcv_ssn + hi as u64);
+            if lo > 0
+                && !self.rcv_ooo.overlaps(&(s - 1..e + 1))
+                && self.rcv_ooo.len() >= MAX_OOO_RANGES
+            {
+                continue;
+            }
+            self.rcv_ooo.insert(s..e);
+            if self.sack_permitted && lo > 0 {
+                self.sack_recent.retain(|point| {
+                    self.rcv_ooo
+                        .get(point)
+                        .is_some_and(|r| !r.contains(&(e - 1)))
+                });
+                self.sack_recent.insert(0, e - 1);
+                self.sack_recent.truncate(4);
+            }
+        }
+        if let Some(r) = self
+            .rcv_ooo
+            .first()
+            .cloned()
+            .filter(|r| r.start == self.rcv_ssn)
+        {
+            self.rcv_nxt = self.rcv_nxt.wrapping_add((r.end - r.start) as u32);
+            self.rcv_ssn = r.end;
+            self.rcv_ooo.remove(r);
+        }
+        h.receipt_advanced(self.rcv_ssn as u32);
+        self.ack_due = true;
+    }
+
     /// RFC 9293 §3.10.7.4 fifth step, send side: SND.UNA, the send buffer, RTT, loss recovery,
     /// CC and SND.WND. `Break` means drop the segment and return.
     fn on_ack(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> ControlFlow<Reaction> {
         if seg.ack.lt(self.snd_una) {
             // An old duplicate ACK: ignored, the segment is processed further.
+            h.on_valid_segment(seg);
             return ControlFlow::Continue(());
         }
         if seg.ack.gt(self.snd_max) {
             self.ack_due = true;
             return ControlFlow::Break(Reaction::None);
+        }
+        h.on_valid_segment(seg);
+        if h.reset_requested() {
+            self.rst_due = Some(self.snd_max);
+            return ControlFlow::Break(self.terminate(CloseReason::Reset, now));
         }
         // Duplicate ACK (RFC 5681 §2), judged before this segment updates SND.WND.
         let wnd = u32::from(seg.wnd) << self.snd_shift;
@@ -816,7 +1047,8 @@ impl Tcb {
             && seg.payload.is_empty()
             && !seg.flags.contains(TcpFlags::SYN)
             && !seg.flags.contains(TcpFlags::FIN)
-            && seg.ack == self.snd_una;
+            && seg.ack == self.snd_una
+            && h.duplicate_ack_allowed(seg);
         if self.recovery.is_duplicate(abcd, wnd) {
             match self.recovery.on_dup_ack(seg.ack, self.snd_max) {
                 DupAck::Ignore => {}
@@ -939,7 +1171,7 @@ impl Tcb {
         out: &mut SegmentWriter,
         options_len: u16,
     ) -> Option<SentMeta> {
-        let mss = u32::from(self.eff_mss - options_len);
+        let mss = u32::from(self.eff_mss.saturating_sub(options_len));
         let in_flight = self.in_flight();
         if std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
             // The segment at SND.UNA (RTO, fast retransmit, partial ACK): sent regardless of
@@ -962,7 +1194,11 @@ impl Tcb {
 
         // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is
         // unacknowledged.
-        if idle && (queued > 0 || fin_pending) && self.snd_wnd == 0 {
+        // Assigned bytes already own connection credit. Drain them (or a pending FIN)
+        // through an open subflow before probing for credit for unassigned data.
+        let connection_probe =
+            self.probe_demand && (self.snd_wnd == 0 || (queued == 0 && !fin_pending));
+        if idle && (((queued > 0 || fin_pending) && self.snd_wnd == 0) || connection_probe) {
             // Persist replaces the SWS override for this zero-window episode.
             self.sws_at = None;
             self.sws_override = false;
@@ -1012,12 +1248,11 @@ impl Tcb {
             self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
             return Some(meta);
         }
-        let sws_override = std::mem::take(&mut self.sws_override);
+        let sws_override = self.sws_override;
         let len = queued.min(usable).min(mss);
         // The FIN takes one sequence number of the window, behind the last data octet.
         let fin = fin_pending && usable > len;
         if len == 0 && !fin {
-            self.sws_at = None;
             return None;
         }
         // RFC 9293 §3.8.6.2.1 rules (1)–(4), Fs = 1/2; the bracketed SND.NXT = SND.UNA is
@@ -1026,9 +1261,10 @@ impl Tcb {
         let nagle_ok = idle || self.nodelay;
         let send = len == 0
             || len == mss
-            || (nagle_ok && queued <= usable)
+            || (nagle_ok && u64::from(queued) + h.unassigned_len() as u64 <= u64::from(usable))
             || (nagle_ok && len >= self.max_snd_wnd / 2)
-            || sws_override;
+            || sws_override
+            || h.is_reinjection(self.rel(self.snd_nxt));
         if !send {
             // Only an idle sender can stall here; otherwise the next ACK re-evaluates.
             if idle {
@@ -1038,8 +1274,9 @@ impl Tcb {
             }
             return None;
         }
-        self.sws_at = None;
         let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
+        self.sws_at = None;
+        self.sws_override = false;
         self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
         self.snd_max = self.snd_nxt;
         // New data only (SEQ = SND.MAX): resends never get here (Karn).
@@ -1062,6 +1299,7 @@ impl Tcb {
         let (wnd, edge, sws_edge) = self.window_offer(h);
         let mut meta = out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd);
         let start = self.rel(seq);
+        let len = len.min(h.segment_limit(start).min(u32::MAX as usize) as u32);
         let mut got = 0u32;
         // A run may end early at a buffer boundary; an empty run is not progress.
         while got < len {
@@ -1088,6 +1326,7 @@ impl Tcb {
         meta.flags = out.flags;
         meta.len = got;
         self.record_offer(edge, sws_edge);
+        h.window_sent(wnd, self.rcv_shift);
         if got > 0 {
             self.last_data_sent = Some(now);
         }
@@ -1123,9 +1362,10 @@ impl Tcb {
 
     /// Window field of a non-SYN segment. Records the SWS edge, and the advertised edge if it
     /// is the largest so far (acceptability keeps the largest).
-    fn wnd_field(&mut self, h: &impl Hooks) -> u16 {
+    fn wnd_field(&mut self, h: &mut impl Hooks) -> u16 {
         let (field, edge, sws_edge) = self.window_offer(h);
         self.record_offer(edge, sws_edge);
+        h.window_sent(field, self.rcv_shift);
         field
     }
 
@@ -1150,6 +1390,12 @@ impl Tcb {
     /// more (RFC 7323 §2.4). With no free memory nothing is held out of order (a hole below it
     /// would be free), the SWS edge is at or before RCV.NXT and the field is 0 (ruling R14).
     fn window_offer(&self, h: &impl Hooks) -> (u16, SeqNum, SeqNum) {
+        if let Some(field) = h.window_offer(self.rcv_shift, self.eff_mss) {
+            let edge = self
+                .rcv_nxt
+                .wrapping_add(u32::from(field) << self.rcv_shift);
+            return (field, edge, edge);
+        }
         let free = h.recv_window();
         let mut sws_edge = self.rcv_sws_edge;
         if self.sws_moves(free) {
@@ -1180,6 +1426,9 @@ impl Tcb {
     /// during a transfer ride on the ACKs the data draws anyway, and a field capped at 65535
     /// draws no extra ACK per segment.
     fn window_update_due(&self, h: &impl Hooks) -> bool {
+        if h.delegates_data() {
+            return h.window_update_due(self.rcv_shift, self.eff_mss);
+        }
         let (_, edge, sws_edge) = self.window_offer(h);
         let grow = self.rcv_right_edge.distance(edge);
         sws_edge != self.rcv_sws_edge && grow > 0 && grow as u32 >= self.rcv_wnd()
