@@ -1013,7 +1013,7 @@ fn connection_window_persists_without_assigned_bytes_and_recovers_lost_update() 
 }
 
 #[test]
-fn stored_chunk_boundary_does_not_bypass_sender_sws_and_timeout_releases_it() {
+fn write_boundary_does_not_bypass_sender_sws_and_timeout_releases_whole_window() {
     let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
     let syn = packet::parse(&syn_bytes).unwrap();
     ep.connection(h).unwrap().write(&[1; 8]).unwrap();
@@ -1031,7 +1031,11 @@ fn stored_chunk_boundary_does_not_bypass_sender_sws_and_timeout_releases_it() {
     assert!(deadline <= Instant::from_nanos(500_000_002));
     ep.handle_timeout(deadline);
     let bytes = transmit(&mut ep, deadline);
-    assert_eq!(packet::parse(&bytes).unwrap().payload, &[1; 8]);
+    // One segment fills the window across the write boundary.
+    assert_eq!(
+        packet::parse(&bytes).unwrap().payload,
+        [[1; 8].as_slice(), &[2; 92]].concat()
+    );
 }
 
 #[test]
@@ -1093,8 +1097,17 @@ fn shared_window_scaling_rounds_only_to_preserve_edge() {
     assert_eq!(recv.right_edge, 1018);
 }
 
+/// Data-Level Length of the DSS mapping or MP_CAPABLE data form a segment carries.
+fn mapped_len(seg: &Segment) -> u16 {
+    match mptcp::parse(mpc(seg.options)[0]).unwrap() {
+        MptcpOption::Dss(d) => d.mapping.unwrap().data_len,
+        MptcpOption::Capable(c) => c.data_len.unwrap(),
+        _ => panic!("no mapping"),
+    }
+}
+
 #[test]
-fn short_chunk_waits_for_sws_override_even_with_full_segment_budget() {
+fn short_write_joins_the_next_write_in_a_full_segment_at_once() {
     let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
     let syn = packet::parse(&syn_bytes).unwrap();
     ep.connection(h).unwrap().write(&[1; 8]).unwrap();
@@ -1102,14 +1115,76 @@ fn short_chunk_waits_for_sws_override_even_with_full_segment_budget() {
     let mut ack = peer_data(&syn, 5001, &[], &[]);
     ack.wnd = 1000;
     input(&mut ep, &ack);
-    assert!(
-        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
-            .is_none()
-    );
-    let deadline = ep.poll_timeout().expect("short chunk needs SWS override");
-    ep.handle_timeout(deadline);
-    let bytes = transmit(&mut ep, deadline);
-    assert_eq!(packet::parse(&bytes).unwrap().payload, &[1; 8]);
+    // A full segment is sendable (RFC 9293 §3.8.6.2.1 (1)): no SWS override wait.
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.payload, [[1; 8].as_slice(), &[2; 500]].concat());
+    assert_eq!(mapped_len(&seg), 508, "one mapping spans both writes");
+}
+
+/// Cumulative payload octets sent after each 20 ms round of a bulk transfer written in 64 KiB
+/// pieces (as the TUN client does), the peer acknowledging every segment through a 4 MiB
+/// window. `mptcp = false` answers the SYN without MP_CAPABLE: the plain-TCP path.
+fn bulk_rounds(mptcp: bool, rounds: u64) -> Vec<u64> {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(26));
+    let h = open(&mut ep);
+    let syn_bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&syn_bytes).unwrap();
+    let mut opts = if mptcp { capable(1, CAP_H) } else { Vec::new() };
+    let mut o = [0; 4];
+    let n = crate::wire::tcp_options::write_mss(&mut o, 1460);
+    opts.extend_from_slice(&o[..n]);
+    let n = crate::wire::tcp_options::write_ws(&mut o, 7);
+    opts.extend_from_slice(&o[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let data_base = ep.conns[&h].hooks.data.as_ref().map(|d| d.send.una);
+    assert_eq!(data_base.is_some(), mptcp);
+    let chunk = [5; 65536];
+    for _ in 0..6 {
+        assert_eq!(ep.connection(h).unwrap().write(&chunk), Ok(chunk.len()));
+    }
+    let (mut sent, mut cumulative) = (0, Vec::new());
+    for round in 0..rounds {
+        let now = Instant::from_nanos(1 + round * 20_000_000);
+        let mut ends = Vec::new();
+        let mut out = [0; 1500];
+        while let Some(n) = ep.poll_transmit(now, &mut out) {
+            let seg = packet::parse(&out[..n]).unwrap();
+            sent += seg.payload.len() as u64;
+            ends.push(seg.seq.wrapping_add(seg.payload.len() as u32));
+        }
+        cumulative.push(sent);
+        for end in ends {
+            let options = data_base.map_or_else(Vec::new, |base| {
+                data_ack(base.wrapping_add(u64::from(end.0.wrapping_sub(syn.seq.0) - 1)))
+            });
+            let ack = Segment {
+                ack: end,
+                wnd: 32768,
+                ..peer_data(&syn, 5001, &options, &[])
+            };
+            let mut wire = [0; 1500];
+            let n = packet::build(&ack, 0, &mut wire).unwrap();
+            ep.handle_packet(now, &wire[..n]);
+        }
+    }
+    cumulative
+}
+
+#[test]
+fn bulk_send_across_write_boundaries_keeps_pace_with_plain_tcp() {
+    // A mapping may cover several application writes: the sub-MSS tail of one 64 KiB write is
+    // not a short segment while the next write is queued behind it (RFC 9293 §3.8.6.2.1 (1)),
+    // so the sender never idles for the SWS override timer, and its window grows like TCP's.
+    let plain = bulk_rounds(false, 8);
+    let mptcp = bulk_rounds(true, 8);
+    for (round, (p, m)) in plain.iter().zip(&mptcp).enumerate() {
+        assert!(
+            m + 1460 * (round as u64 + 1) >= *p,
+            "round {round}: MPTCP {mptcp:?} vs plain {plain:?}"
+        );
+    }
 }
 
 #[test]
@@ -1255,7 +1330,7 @@ fn read_advertises_shared_edge_after_sws_threshold_even_with_open_window() {
 }
 
 #[test]
-fn short_chunk_cannot_use_a_larger_sws_partial_budget() {
+fn sws_partial_budget_covers_the_run_across_write_boundaries() {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(24));
     let h = open(&mut ep);
     let syn_bytes = transmit(&mut ep, Instant::from_nanos(0));
@@ -1270,7 +1345,7 @@ fn short_chunk_cannot_use_a_larger_sws_partial_budget() {
     ep.connection(h).unwrap().write(&[2; 2000]).unwrap();
     let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.next;
     let mut ack = peer_data(&syn, 5001, &[], &[]);
-    ack.wnd = 800;
+    ack.wnd = 500;
     input(&mut ep, &ack);
     assert!(
         ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
@@ -1281,6 +1356,13 @@ fn short_chunk_cannot_use_a_larger_sws_partial_budget() {
         origin,
         "nothing assigned before it can send"
     );
+    // Half the largest window (RFC 9293 §3.8.6.2.1 (3)) goes as one segment and one mapping.
+    ack.wnd = 800;
+    input(&mut ep, &ack);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.payload, [[1; 8].as_slice(), &[2; 792]].concat());
+    assert_eq!(mapped_len(&seg), 800);
 }
 
 #[test]

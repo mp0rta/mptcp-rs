@@ -447,8 +447,9 @@ impl Tcb {
     }
 
     /// Additional assigned octets sendable now for a concrete candidate. `bytes` is all
-    /// pending data (after connection credit); `contiguous` bounds this mapping's stored run
-    /// and 16-bit length. Keeping both prevents a chunk boundary from bypassing sender SWS.
+    /// pending data (after connection credit); `contiguous` bounds this mapping (16-bit
+    /// length, a reinjection's uncovered run). Keeping both prevents a mapping boundary from
+    /// bypassing sender SWS.
     /// Reinjections bypass Nagle/SWS but still respect cwnd and the subflow window.
     /// Calls do not mutate CC, sequence numbers, options or timers.
     pub fn send_budget(

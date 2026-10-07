@@ -137,14 +137,12 @@ impl SendStore {
         }
         n
     }
+    /// Stored octets from `dsn` to the end. Chunks are contiguous in DSN space, so a mapping
+    /// may span application writes: a write boundary is not a mapping or segment boundary.
     pub fn run_len(&self, dsn: u64) -> usize {
-        self.chunks
-            .iter()
-            .find_map(|c| {
-                let off = dsn.wrapping_sub(c.dsn) as usize;
-                (off < c.len()).then(|| c.len() - off)
-            })
-            .unwrap_or(0)
+        let off = dsn.wrapping_sub(self.una);
+        let len = self.end.wrapping_sub(self.una);
+        if off < len { (len - off) as usize } else { 0 }
     }
     /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
     pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
@@ -155,16 +153,29 @@ impl SendStore {
         if dsn != self.next && (self.next.wrapping_sub(dsn) as i64) < len as i64 {
             return false;
         }
-        let Some(c) = self
-            .chunks
-            .iter()
-            .find(|c| dsn.wrapping_sub(c.dsn) < c.len() as u64)
-        else {
+        if len > self.run_len(dsn) {
             return false;
-        };
-        let off = dsn.wrapping_sub(c.dsn) as usize;
-        if len > c.len() - off {
-            return false;
+        }
+        let end = dsn.wrapping_add(len as u64);
+        let mut pieces = VecDeque::new();
+        let mut at = dsn;
+        for c in &self.chunks {
+            let off = at.wrapping_sub(c.dsn);
+            if off >= c.len() as u64 {
+                continue;
+            }
+            let off = off as usize;
+            let n = (c.len() - off).min(end.wrapping_sub(at) as usize);
+            pieces.push_back(Chunk {
+                dsn: at,
+                bytes: c.bytes.clone(),
+                start: c.start + off,
+                end: c.start + off + n,
+            });
+            at = at.wrapping_add(n as u64);
+            if at == end {
+                break;
+            }
         }
         maps.maps.push_back(TxMap {
             ssn: maps.end,
@@ -176,12 +187,9 @@ impl SendStore {
             },
             reinjected: dsn != self.next,
             data_fin: false,
-            chunk: Chunk {
-                dsn,
-                bytes: c.bytes.clone(),
-                start: c.start + off,
-                end: c.start + off + len,
-            },
+            dsn,
+            len,
+            pieces,
         });
         maps.end = maps.end.wrapping_add(len as u32);
         if dsn == self.next {
@@ -215,7 +223,15 @@ struct TxMap {
     mapping: crate::wire::mptcp::Mapping,
     reinjected: bool,
     data_fin: bool,
-    chunk: Chunk,
+    /// First unacknowledged DSN and octet count; `pieces` hold exactly these octets.
+    dsn: u64,
+    len: usize,
+    pieces: VecDeque<Chunk>,
+}
+impl TxMap {
+    fn covers(&self, ssn: u32) -> bool {
+        (ssn.wrapping_sub(self.ssn) as usize) < self.len
+    }
 }
 pub(crate) struct TxMaps {
     maps: VecDeque<TxMap>,
@@ -228,19 +244,15 @@ impl TxMaps {
             .iter()
             .filter_map(|m| {
                 let n = ack.wrapping_sub(m.ssn) as i32;
-                (n > 0).then(|| {
-                    m.chunk
-                        .dsn
-                        .wrapping_add((n as usize).min(m.chunk.len()) as u64)
-                })
+                (n > 0).then(|| m.dsn.wrapping_add((n as usize).min(m.len) as u64))
             })
             .next_back()
     }
     /// Prefix without a live TCP copy, clipped at the next active mapping.
     pub fn uncovered_len(&self, dsn: u64, max: usize) -> usize {
         self.maps.iter().fold(max, |len, m| {
-            let off = m.chunk.dsn.wrapping_sub(dsn) as i64;
-            if off <= 0 && off + m.chunk.len() as i64 > 0 {
+            let off = m.dsn.wrapping_sub(dsn) as i64;
+            if off <= 0 && off + m.len as i64 > 0 {
                 0
             } else if off > 0 {
                 len.min(off as usize)
@@ -257,15 +269,10 @@ impl TxMaps {
         }
     }
     pub fn data_fin(&self, ssn: u32) -> bool {
-        self.maps
-            .iter()
-            .any(|m| m.data_fin && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+        self.maps.iter().any(|m| m.data_fin && m.covers(ssn))
     }
     pub fn mapping(&self, ssn: u32) -> Option<crate::wire::mptcp::Mapping> {
-        self.maps
-            .iter()
-            .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
-            .map(|m| m.mapping)
+        self.maps.iter().find(|m| m.covers(ssn)).map(|m| m.mapping)
     }
     pub fn new(end: u32, cap: usize) -> Self {
         Self {
@@ -276,23 +283,29 @@ impl TxMaps {
     }
 }
 impl SendBuf for TxMaps {
+    /// Octets from `ssn` to the end of its mapping: a segment never spans two mappings.
     fn segment_limit(&self, ssn: u32) -> usize {
-        self.peek_with(ssn, usize::MAX, |b| b.len()).unwrap_or(0)
-    }
-    fn is_reinjection(&self, ssn: u32) -> bool {
         self.maps
             .iter()
-            .any(|m| m.reinjected && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+            .find(|m| m.covers(ssn))
+            .map_or(0, |m| m.len - ssn.wrapping_sub(m.ssn) as usize)
     }
+    fn is_reinjection(&self, ssn: u32) -> bool {
+        self.maps.iter().any(|m| m.reinjected && m.covers(ssn))
+    }
+    /// The run from `ssn` to the end of its stored piece; a segment may take several runs.
     fn peek_with<R>(&self, ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        let m = self
-            .maps
-            .iter()
-            .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())?;
-        let start = m.chunk.start + ssn.wrapping_sub(m.ssn) as usize;
-        Some(f(
-            &m.chunk.bytes[start..m.chunk.end.min(start.saturating_add(max))]
-        ))
+        let m = self.maps.iter().find(|m| m.covers(ssn))?;
+        let mut off = ssn.wrapping_sub(m.ssn) as usize;
+        let c = m.pieces.iter().find(|c| {
+            let inside = off < c.len();
+            if !inside {
+                off -= c.len();
+            }
+            inside
+        })?;
+        let start = c.start + off;
+        Some(f(&c.bytes[start..c.end.min(start.saturating_add(max))]))
     }
     fn assigned_end(&self) -> u32 {
         self.end
@@ -303,12 +316,22 @@ impl SendBuf for TxMaps {
             if n <= 0 {
                 break;
             }
-            if n as usize >= m.chunk.len() {
+            if n as usize >= m.len {
                 self.maps.pop_front();
             } else {
                 m.ssn = ack;
-                m.chunk.dsn = m.chunk.dsn.wrapping_add(n as u64);
-                m.chunk.start += n as usize;
+                m.dsn = m.dsn.wrapping_add(n as u64);
+                m.len -= n as usize;
+                let mut n = n as usize;
+                while let Some(c) = m.pieces.front_mut() {
+                    if n < c.len() {
+                        c.start += n;
+                        c.dsn = c.dsn.wrapping_add(n as u64);
+                        break;
+                    }
+                    n -= c.len();
+                    m.pieces.pop_front();
+                }
                 break;
             }
         }
