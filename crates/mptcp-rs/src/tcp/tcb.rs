@@ -526,6 +526,12 @@ impl Tcb {
     pub fn set_probe_demand(&mut self, demand: bool) {
         self.probe_demand = demand;
     }
+    pub(crate) fn ack_pending(&self) -> bool {
+        self.ack_due
+    }
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.rst_due.is_some()
+    }
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }

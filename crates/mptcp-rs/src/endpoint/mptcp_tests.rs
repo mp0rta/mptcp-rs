@@ -2237,3 +2237,90 @@ fn fastclose_outside_closed_tcp_window_is_not_an_ack_only_probe() {
     assert_eq!(ep.poll_event(), None);
     assert!(ep.conns[&h].hooks.retained());
 }
+
+#[test]
+fn close_before_third_ack_preserves_keys_and_fin_progress() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(2));
+    let h = open(&mut ep);
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    ep.connection(h).unwrap().close();
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 20])
+            .is_none()
+    );
+    assert_eq!(ep.poll_event(), None);
+    // No peer DSS is needed to finish an empty stream. Repeated SYN/ACKs
+    // must still get keys, even when the DATA_FIN retry is simultaneously due.
+    for now in [Instant::from_nanos(2), Instant::from_nanos(2_000_000_000)] {
+        if now != Instant::from_nanos(2) {
+            reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+        }
+        let bytes = transmit(&mut ep, now);
+        let ack = packet::parse(&bytes).unwrap();
+        assert!(matches!(mptcp::parse(mpc(ack.options)[0]),
+            Ok(MptcpOption::Capable(c)) if c.sender_key.is_some() && c.receiver_key == Some(PEER_KEY)));
+        let bytes = transmit(&mut ep, now);
+        let fin = packet::parse(&bytes).unwrap();
+        assert!(matches!(mptcp::parse(mpc(fin.options)[0]),
+            Ok(MptcpOption::Dss(d)) if d.data_fin && d.mapping.unwrap().ssn == 0));
+        assert!(!fin.flags.contains(TcpFlags::FIN));
+        assert!(ep.poll_transmit(now, &mut [0; 1500]).is_none());
+    }
+    assert_eq!(ep.poll_event(), Some((h, Event::Connected { mptcp: true })));
+    assert_eq!(ep.poll_event(), None);
+}
+
+#[test]
+fn fastclose_reset_survives_timeout_drive() {
+    for flags in [TcpFlags::ACK, TcpFlags::RST] {
+        let (mut ep, h, syn, _) = connected_with_capacity(4096);
+        let syn = packet::parse(&syn).unwrap();
+        reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+        let keys = transmit(&mut ep, Instant::from_nanos(2));
+        let MptcpOption::Capable(keys) =
+            mptcp::parse(mpc(packet::parse(&keys).unwrap().options)[0]).unwrap()
+        else {
+            panic!()
+        };
+        let mut opts = [0; 40];
+        let n = mptcp::encode(
+            &MptcpOption::FastClose {
+                receiver_key: keys.sender_key.unwrap(),
+            },
+            &mut opts,
+        )
+        .unwrap();
+        input(
+            &mut ep,
+            &Segment {
+                flags,
+                ..peer_data(&syn, 5001, &opts[..n], &[])
+            },
+        );
+        assert_eq!(
+            ep.poll_event(),
+            Some((
+                h,
+                Event::Closed {
+                    reason: CloseReason::Reset
+                }
+            ))
+        );
+        let now = Instant::from_nanos(3);
+        ep.handle_timeout(now);
+        assert!(ep.poll_transmit(now, &mut [0; 20]).is_none());
+        ep.handle_timeout(now);
+        assert!(
+            ep.connection(h).is_some(),
+            "retain until RST actually fits the output buffer"
+        );
+        let bytes = transmit(&mut ep, now);
+        assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+        assert!(ep.poll_transmit(now, &mut [0; 1500]).is_none());
+        ep.handle_timeout(now);
+        assert!(ep.connection(h).is_none());
+        assert_eq!(ep.poll_event(), None);
+    }
+}

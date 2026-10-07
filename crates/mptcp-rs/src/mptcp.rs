@@ -25,6 +25,7 @@ pub(crate) struct ConnectionHooks {
     pub fallback_event: bool,
     fast_closed: bool,
     ack_now: bool,
+    capable_ack_due: bool,
 }
 
 pub(crate) struct DataState {
@@ -61,6 +62,7 @@ impl ConnectionHooks {
             fallback_event: false,
             fast_closed: false,
             ack_now: false,
+            capable_ack_due: false,
         }
     }
     pub fn recovery_deadline(&self) -> Option<Instant> {
@@ -109,6 +111,13 @@ impl ConnectionHooks {
     }
     pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant) {
         self.update_recovery(tcb, now);
+        // Preserve the third ACK and replies to repeated SYN/ACKs before
+        // requesting a separate DATA_FIN ACK. An idle peer need not send DSS first.
+        self.capable_ack_due = tcb.ack_pending()
+            && self
+                .negotiation
+                .as_ref()
+                .is_some_and(|m| m.state == State::PreConfirmed);
         if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
             if d.close.acked {
                 tcb.close();
@@ -380,7 +389,7 @@ impl SegmentHooks for ConnectionHooks {
             if d.fallback {
                 return 0;
             }
-            if d.close.due && flags.contains(TcpFlags::ACK) {
+            if d.close.due && !self.capable_ack_due && flags.contains(TcpFlags::ACK) {
                 let n = mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
                         data_fin: true,

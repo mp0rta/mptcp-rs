@@ -363,7 +363,7 @@ impl<R: CryptoRng> Endpoint<R> {
         }
         let demux = &mut self.demux;
         self.conns.retain(|&h, c| {
-            if c.hooks.retained() {
+            if c.hooks.retained() || c.tcb.reset_pending() {
                 return true;
             }
             if c.tcb.state() != TcpState::Closed {
