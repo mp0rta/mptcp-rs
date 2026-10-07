@@ -39,6 +39,11 @@ pub trait SegmentHooks {
     fn delegates_data(&self) -> bool {
         false
     }
+    /// Connection control signals must pass the TCP sequence window even when
+    /// ordinary payload acceptance is delegated to a connection sequence space.
+    fn requires_tcp_sequence_check(&self, _seg: &crate::wire::packet::Segment<'_>) -> bool {
+        false
+    }
     /// Accepted byte ranges in this payload, independently of retained payload memory.
     fn receive_data(
         &mut self,

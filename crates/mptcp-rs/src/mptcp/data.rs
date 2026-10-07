@@ -175,6 +175,7 @@ impl SendStore {
                 checksum: None,
             },
             reinjected: dsn != self.next,
+            data_fin: false,
             chunk: Chunk {
                 dsn,
                 bytes: c.bytes.clone(),
@@ -213,6 +214,7 @@ struct TxMap {
     ssn: u32,
     mapping: crate::wire::mptcp::Mapping,
     reinjected: bool,
+    data_fin: bool,
     chunk: Chunk,
 }
 pub(crate) struct TxMaps {
@@ -248,6 +250,17 @@ impl TxMaps {
         })
     }
 
+    pub fn attach_fin(&mut self) {
+        if let Some(m) = self.maps.back_mut() {
+            m.data_fin = true;
+            m.mapping.data_len += 1;
+        }
+    }
+    pub fn data_fin(&self, ssn: u32) -> bool {
+        self.maps
+            .iter()
+            .any(|m| m.data_fin && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+    }
     pub fn mapping(&self, ssn: u32) -> Option<crate::wire::mptcp::Mapping> {
         self.maps
             .iter()
@@ -320,6 +333,7 @@ pub(crate) struct RecvAssembler {
     pieces: Vec<Piece>,
     cap: usize,
     range_cap: usize,
+    fin: Option<u64>,
 }
 impl RecvAssembler {
     pub fn new(head: u64, cap: usize, range_cap: usize) -> Self {
@@ -330,6 +344,35 @@ impl RecvAssembler {
             pieces: Vec::new(),
             cap,
             range_cap,
+            fin: None,
+        }
+    }
+    pub fn has_fin(&self) -> bool {
+        self.fin.is_some()
+    }
+    pub fn eof(&self) -> bool {
+        self.fin.is_some_and(|fin| self.next == fin.wrapping_add(1))
+    }
+    pub fn finish(&mut self, fin: u64) -> bool {
+        if let Some(old) = self.fin {
+            return old == fin;
+        }
+        if (fin.wrapping_sub(self.next) as i64) < 0
+            || (fin.wrapping_sub(self.right_edge) as i64) >= 0
+            || self
+                .pieces
+                .iter()
+                .any(|p| p.dsn.wrapping_add(p.bytes.len() as u64).wrapping_sub(fin) as i64 > 0)
+        {
+            return false;
+        }
+        self.fin = Some(fin);
+        self.advance_fin();
+        true
+    }
+    fn advance_fin(&mut self) {
+        if self.fin == Some(self.next) {
+            self.next = self.next.wrapping_add(1);
         }
     }
     pub fn window_offer(&self, scale: u8, mss: u16) -> u16 {
@@ -372,7 +415,12 @@ impl RecvAssembler {
     }
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
-        self.accept_inner(dsn, data, false)
+        let len = self.fin.map_or(data.len(), |fin| {
+            (fin.wrapping_sub(dsn) as i64).max(0).min(data.len() as i64) as usize
+        });
+        let result = self.accept_inner(dsn, &data[..len], false);
+        self.advance_fin();
+        result
     }
     pub fn accept_tcp(&mut self, dsn: u64, data: &[u8]) -> usize {
         let before = self.next;

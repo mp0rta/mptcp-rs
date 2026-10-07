@@ -193,8 +193,23 @@ impl<R: CryptoRng> Endpoint<R> {
         #[cfg(test)]
         c.hooks.update_recovery(&c.tcb, now);
         #[cfg(test)]
+        Self::update_close(&mut self.events, c, h, now);
+        #[cfg(test)]
         if std::mem::take(&mut c.hooks.fallback_event) {
             self.events.push_back((h, Event::FellBack));
+        }
+    }
+
+    #[cfg(test)]
+    fn update_close(
+        events: &mut VecDeque<(ConnectionHandle, Event)>,
+        c: &mut Connection,
+        h: ConnectionHandle,
+        now: Instant,
+    ) {
+        if let Some(reason) = c.hooks.update_close(&c.tcb, now) {
+            c.reset |= reason != CloseReason::Normal;
+            events.push_back((h, Event::Closed { reason }));
         }
     }
 
@@ -214,6 +229,10 @@ impl<R: CryptoRng> Endpoint<R> {
                 events.push_back((h, Event::Connected { mptcp: false }));
             }
             Reaction::Closed(reason) => {
+                #[cfg(test)]
+                if c.hooks.active() {
+                    return;
+                }
                 c.reset |= reason == CloseReason::Reset;
                 events.push_back((h, Event::Closed { reason }));
             }
@@ -280,7 +299,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 #[cfg(test)]
                 c.hooks.prepare_send(&mut c.tcb, now);
                 #[cfg(test)]
-                if c.closed_by_app && !c.hooks.pending_data() {
+                if c.closed_by_app && !c.hooks.close() {
                     c.tcb.close();
                 }
                 let sent = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch);
@@ -309,7 +328,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 };
                 if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
                     #[cfg(test)]
-                    c.hooks.on_transmitted();
+                    c.hooks
+                        .on_transmitted(&seg, now, c.tcb.retransmission_timeout());
                     #[cfg(test)]
                     if let Some(mptcp) = c
                         .hooks
@@ -341,7 +361,11 @@ impl<R: CryptoRng> Endpoint<R> {
             .filter_map(|c| {
                 let at = c.tcb.poll_send_at();
                 #[cfg(test)]
-                let at = at.into_iter().chain(c.hooks.recovery_deadline()).min();
+                let at = at
+                    .filter(|_| !c.hooks.active() || c.tcb.state() != TcpState::Closed)
+                    .into_iter()
+                    .chain(c.hooks.recovery_deadline())
+                    .min();
                 at
             })
             .min()
@@ -357,9 +381,15 @@ impl<R: CryptoRng> Endpoint<R> {
                 let r = c.tcb.on_timeout(now, &mut c.hooks);
                 Self::push_event(&mut self.events, c, h, r);
             }
+            #[cfg(test)]
+            Self::update_close(&mut self.events, c, h, now);
         }
         let demux = &mut self.demux;
         self.conns.retain(|&h, c| {
+            #[cfg(test)]
+            if c.hooks.retained() {
+                return true;
+            }
             if c.tcb.state() != TcpState::Closed {
                 return true;
             }

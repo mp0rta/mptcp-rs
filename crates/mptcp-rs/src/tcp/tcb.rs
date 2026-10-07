@@ -760,6 +760,10 @@ impl Tcb {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
                 h.on_valid_segment(seg);
+                if h.reset_requested() {
+                    self.rst_due = Some(self.snd_max);
+                    return self.terminate(CloseReason::Reset, now);
+                }
                 return self.on_reset(now);
             }
             self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();
@@ -769,13 +773,22 @@ impl Tcb {
         // restarts 2·MSL here rather than in the fifth and eighth steps it cannot reach.
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         if self.state == TcpState::TimeWait && fin && seg_end.wrapping_add(1) == self.rcv_nxt {
+            if seg.flags.contains(TcpFlags::ACK) && !seg.ack.gt(self.snd_max) {
+                h.on_valid_segment(seg);
+                if h.reset_requested() {
+                    self.rst_due = Some(self.snd_max);
+                    return self.terminate(CloseReason::Reset, now);
+                }
+            }
             self.time_wait_at = Some(now + 2 * MSL);
             self.ack_due = true;
             return Reaction::None;
         }
         // First: an unacceptable segment draws an ACK and is dropped.
-        let delegated =
-            h.delegates_data() && !seg.payload.is_empty() && !seg.flags.contains(TcpFlags::SYN);
+        let delegated = h.delegates_data()
+            && !seg.payload.is_empty()
+            && !seg.flags.contains(TcpFlags::SYN)
+            && !h.requires_tcp_sequence_check(seg);
         if !delegated && !self.acceptable(seg) {
             self.ack_due = true;
             if seg.flags.contains(TcpFlags::ACK)
@@ -791,6 +804,7 @@ impl Tcb {
             let ack_only = seg.flags.contains(TcpFlags::ACK) && !seg.flags.contains(TcpFlags::SYN);
             let edge = self.rcv_right_edge.wrapping_add(1);
             if ack_only
+                && !h.requires_tcp_sequence_check(seg)
                 && self.rcv_nxt.le(seg.seq)
                 && seg.seq.le(edge)
                 && self.window_offer(h).0 == 0
@@ -1020,6 +1034,10 @@ impl Tcb {
             return ControlFlow::Break(Reaction::None);
         }
         h.on_valid_segment(seg);
+        if h.reset_requested() {
+            self.rst_due = Some(self.snd_max);
+            return ControlFlow::Break(self.terminate(CloseReason::Reset, now));
+        }
         // Duplicate ACK (RFC 5681 §2), judged before this segment updates SND.WND.
         let wnd = u32::from(seg.wnd) << self.snd_shift;
         let abcd = self.in_flight() > 0

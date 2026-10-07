@@ -3,6 +3,7 @@ use crate::tcp::SendBuf;
 use crate::wire::tcp_options::{TcpOpt, walk};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use std::time::Duration;
 
 fn open(ep: &mut Endpoint<ChaCha20Rng>) -> ConnectionHandle {
     ep.connect_mptcp(
@@ -361,25 +362,57 @@ fn token_collision_regenerates_key_and_time_wait_reserves_token() {
     let syn = packet::parse(&bytes).unwrap();
     reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
     transmit(&mut ep, Instant::from_nanos(1));
+    ep.poll_event();
+    let local_fin = ep.conns[&a].hooks.data.as_ref().unwrap().send.end;
+    let peer_fin = ep.conns[&a].hooks.data.as_ref().unwrap().recv.next;
     ep.connection(a).unwrap().close();
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert!(!packet::parse(&bytes).unwrap().flags.contains(TcpFlags::FIN));
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &data_ack(local_fin.wrapping_add(1)), &[]),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::FIN));
+    let opts = fin_option(peer_fin, 0, 1, Some(local_fin.wrapping_add(1)));
+    let seg = Segment {
+        ack: syn.seq.wrapping_add(2),
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input(&mut ep, &seg);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(
+        dack(&packet::parse(&bytes).unwrap()),
+        peer_fin.wrapping_add(1)
+    );
+    ep.handle_timeout(Instant::from_nanos(2));
+    assert_eq!(ep.conns[&a].tcb.state(), TcpState::TimeWait);
+    assert_eq!(
+        ep.poll_event(),
+        None,
+        "TCP TIME_WAIT is not connection closure"
+    );
+    // Lost final DATA_ACK: repeat the FIN below the receive window in TIME_WAIT.
+    input(&mut ep, &seg);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(
+        dack(&packet::parse(&bytes).unwrap()),
+        peer_fin.wrapping_add(1)
+    );
     input(
         &mut ep,
         &Segment {
-            src: syn.dst,
-            dst: syn.src,
-            seq: SeqNum(5001),
-            ack: syn.seq.wrapping_add(2),
-            flags: TcpFlags::ACK | TcpFlags::FIN,
-            wnd: 1234,
-            options: &[],
-            payload: &[],
+            seq: SeqNum(5002),
+            flags: TcpFlags::ACK,
+            ..seg.clone()
         },
     );
-    transmit(&mut ep, Instant::from_nanos(2));
-    ep.handle_timeout(Instant::from_nanos(2));
-    assert_eq!(ep.conns[&a].tcb.state(), TcpState::TimeWait);
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(
+        dack(&packet::parse(&bytes).unwrap()),
+        peer_fin.wrapping_add(1)
+    );
     // Rewind injected randomness: port probing then generates the exact same first key.
     ep.rng = before_open.clone();
     let b = open(&mut ep);
@@ -391,7 +424,28 @@ fn token_collision_regenerates_key_and_time_wait_reserves_token() {
     ep.handle_timeout(Instant::from_nanos(2));
     assert!(!ep.conns.contains_key(&b));
     let deadline = ep.poll_timeout().unwrap();
+    assert_eq!(deadline, Instant::from_nanos(2) + Duration::from_secs(120));
     ep.handle_timeout(deadline);
+    // The other connection was closed during SYN-SENT; drain its Normal first.
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            b,
+            Event::Closed {
+                reason: CloseReason::Normal
+            }
+        ))
+    );
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            a,
+            Event::Closed {
+                reason: CloseReason::Normal
+            }
+        ))
+    );
+    assert_eq!(ep.poll_event(), None);
     assert!(!ep.conns.contains_key(&a));
     ep.rng = before_open;
     let c = open(&mut ep);
@@ -683,15 +737,9 @@ fn conflicting_mapping_resets_only_after_tcp_validity() {
     input(&mut ep, &seg);
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(
-        ep.poll_event(),
-        Some((
-            h,
-            Event::Closed {
-                reason: CloseReason::Reset
-            }
-        ))
-    );
+    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.conns[&h].tcb.state(), TcpState::Closed);
+    assert!(ep.conns[&h].hooks.retained());
 }
 
 #[test]
@@ -704,15 +752,9 @@ fn unmapped_byte_bound_resets_subflow() {
     input(&mut ep, &peer_data(&syn, 5005, &[], b"e"));
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(
-        ep.poll_event(),
-        Some((
-            h,
-            Event::Closed {
-                reason: CloseReason::Reset
-            }
-        ))
-    );
+    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.conns[&h].tcb.state(), TcpState::Closed);
+    assert!(ep.conns[&h].hooks.retained());
 }
 
 #[test]
@@ -1710,4 +1752,488 @@ fn current_tcp_ack_without_data_ack_falls_back_after_invalid_data_ack() {
         ep.poll_transmit(Instant::from_nanos(3), &mut [0; 1500])
             .is_none()
     );
+}
+
+fn fin_option(dsn: u64, ssn: u32, len: u16, ack: Option<u64>) -> Vec<u8> {
+    let mut out = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: true,
+            data_ack: ack.map(mptcp::DataAck::Ack64),
+            mapping: Some(mptcp::Mapping {
+                dsn: mptcp::Dsn::Dsn64(dsn),
+                ssn,
+                data_len: len,
+                checksum: None,
+            }),
+        }),
+        &mut out,
+    )
+    .unwrap();
+    out[..n].to_vec()
+}
+
+#[test]
+fn standalone_data_fin_is_immediately_acked_and_half_closes_data_only() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &fin_option(dsn, 0, 1, None), &[]),
+    );
+    let packet = transmit(&mut ep, Instant::from_nanos(2));
+    let ack = packet::parse(&packet).unwrap();
+    assert_eq!(ack.ack, SeqNum(5001));
+    assert_eq!(dack(&ack), dsn.wrapping_add(1));
+    assert_eq!(ep.connection(h).unwrap().read(&mut [0; 1]), Ok(0));
+    assert_eq!(ep.connection(h).unwrap().write(b"reply"), Ok(5));
+}
+
+#[test]
+fn local_data_fin_is_standalone_and_tcp_fin_waits_for_data_ack() {
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    let fin_dsn = ep
+        .connection(h)
+        .unwrap()
+        .hooks
+        .data
+        .as_ref()
+        .unwrap()
+        .send
+        .end;
+    ep.connection(h).unwrap().close();
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    let fin = packet::parse(&bytes).unwrap();
+    assert!(!fin.flags.contains(TcpFlags::FIN));
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(fin.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    assert_eq!(d.mapping.unwrap().ssn, 0);
+    assert_eq!(d.mapping.unwrap().data_len, 1);
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &data_ack(fin_dsn.wrapping_add(1)), &[]),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(4));
+    assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::FIN));
+}
+
+#[test]
+fn fastclose_valid_key_closes_once_on_ack_or_rst_after_tcp_validation() {
+    for flags in [TcpFlags::ACK, TcpFlags::RST] {
+        for valid in [false, true] {
+            let (mut ep, h, syn, _) = connected_with_capacity(4096);
+            let syn = packet::parse(&syn).unwrap();
+            let key_packet = {
+                // PreConfirmed ACK repeats the local key.
+                reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+                transmit(&mut ep, Instant::from_nanos(2))
+            };
+            let MptcpOption::Capable(keys) =
+                mptcp::parse(mpc(packet::parse(&key_packet).unwrap().options)[0]).unwrap()
+            else {
+                panic!()
+            };
+            let mut opts = [0; 40];
+            let n = mptcp::encode(
+                &MptcpOption::FastClose {
+                    receiver_key: keys.sender_key.unwrap() ^ u64::from(!valid),
+                },
+                &mut opts,
+            )
+            .unwrap();
+            let seg = Segment {
+                flags,
+                ..peer_data(&syn, 5001, &opts[..n], &[])
+            };
+            for bad in [
+                Segment {
+                    seq: SeqNum(999_999),
+                    ..seg.clone()
+                },
+                Segment {
+                    seq: SeqNum(999_999),
+                    payload: b"x",
+                    ..seg.clone()
+                },
+            ] {
+                input(&mut ep, &bad);
+                assert_eq!(ep.poll_event(), None);
+            }
+            if flags == TcpFlags::ACK {
+                input(
+                    &mut ep,
+                    &Segment {
+                        ack: syn.seq.wrapping_add(100),
+                        ..seg.clone()
+                    },
+                );
+                assert_eq!(ep.poll_event(), None);
+            }
+            input(&mut ep, &seg);
+            if valid {
+                assert_eq!(
+                    ep.poll_event(),
+                    Some((
+                        h,
+                        Event::Closed {
+                            reason: CloseReason::Reset
+                        }
+                    ))
+                );
+                let bytes = transmit(&mut ep, Instant::from_nanos(3));
+                assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+                input(&mut ep, &seg);
+                assert_eq!(ep.poll_event(), None);
+            } else {
+                assert_eq!(ep.poll_event(), None);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_rst_keeps_data_until_no_subflow_timeout() {
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"retained").unwrap();
+    transmit(&mut ep, Instant::from_nanos(2));
+    input(
+        &mut ep,
+        &Segment {
+            flags: TcpFlags::RST,
+            ..peer_data(&syn, 5001, &[], &[])
+        },
+    );
+    assert_eq!(ep.poll_event(), None);
+    ep.handle_timeout(Instant::from_nanos(3));
+    assert!(ep.connection(h).is_some());
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut [0; 1]),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+    let deadline = ep.poll_timeout().unwrap();
+    assert_eq!(deadline, Instant::from_nanos(2) + Duration::from_secs(60));
+    ep.handle_timeout(deadline);
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            h,
+            Event::Closed {
+                reason: CloseReason::Timeout
+            }
+        ))
+    );
+    assert_eq!(ep.poll_event(), None);
+    assert!(ep.connection(h).is_none());
+}
+
+#[test]
+fn combined_tcp_and_data_fin_allows_reply_and_local_close() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    let opts = fin_option(dsn, 0, 1, None);
+    input(
+        &mut ep,
+        &Segment {
+            flags: TcpFlags::ACK | TcpFlags::FIN,
+            ..peer_data(&syn, 5001, &opts, &[])
+        },
+    );
+    transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(ep.connection(h).unwrap().read(&mut [0; 1]), Ok(0));
+    ep.connection(h).unwrap().write(b"reply").unwrap();
+    ep.connection(h).unwrap().close();
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.payload, b"reply");
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    assert_eq!(d.mapping.unwrap().data_len, 6);
+    assert!(!seg.flags.contains(TcpFlags::FIN));
+}
+
+#[test]
+fn data_fin_retry_backs_off_without_consuming_tcp_sequence_space() {
+    let (mut ep, h, _, _) = connected_with_capacity(4096);
+    ep.connection(h).unwrap().close();
+    let first = transmit(&mut ep, Instant::from_nanos(2));
+    let first = packet::parse(&first).unwrap();
+    let mut previous = Instant::from_nanos(2);
+    for interval in [1, 2, 4, 8] {
+        let at = ep.poll_timeout().unwrap();
+        assert_eq!(at - previous, Duration::from_secs(interval));
+        ep.handle_timeout(at);
+        let bytes = transmit(&mut ep, at);
+        let retry = packet::parse(&bytes).unwrap();
+        assert_eq!(retry.seq, first.seq);
+        assert_eq!(retry.options, first.options);
+        previous = at;
+    }
+}
+
+#[test]
+fn attached_data_fin_waits_for_dsn_hole_and_reads_before_eof() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    input(
+        &mut ep,
+        &peer_data(
+            &syn,
+            5003,
+            &fin_option(dsn.wrapping_add(2), 3, 3, None),
+            b"cd",
+        ),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(dack(&packet::parse(&bytes).unwrap()), dsn);
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut [0; 4]),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+    input(&mut ep, &peer_data(&syn, 5001, &mapping(1, dsn, 2), b"ab"));
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    assert_eq!(dack(&packet::parse(&bytes).unwrap()), dsn.wrapping_add(5));
+    let mut out = [0; 4];
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(4));
+    assert_eq!(&out, b"abcd");
+    assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(0));
+}
+
+#[test]
+fn malformed_or_out_of_window_data_fin_does_not_close_or_fall_back() {
+    for (ssn, len, offset, payload) in [
+        (1, 1, 0, &b""[..]),
+        (0, 0, 0, &b""[..]),
+        (0, 1, 4096, &b""[..]),
+        (1, 2, 0, &b""[..]),
+    ] {
+        let (mut ep, h, syn, dsn) = connected_with_capacity(4096);
+        let syn = packet::parse(&syn).unwrap();
+        input(
+            &mut ep,
+            &peer_data(
+                &syn,
+                5001,
+                &fin_option(dsn.wrapping_add(offset), ssn, len, None),
+                payload,
+            ),
+        );
+        assert!(ep.conns[&h].hooks.active());
+        assert_eq!(
+            ep.connection(h).unwrap().read(&mut [0; 1]),
+            Err(crate::connection::ReadError::WouldBlock)
+        );
+        assert_eq!(ep.conns[&h].hooks.data.as_ref().unwrap().recv.next, dsn);
+    }
+}
+
+#[test]
+fn bare_tcp_fin_retires_subflow_without_data_eof_or_new_assignments() {
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.next;
+    ep.connection(h).unwrap().write(b"queued").unwrap();
+    input(
+        &mut ep,
+        &Segment {
+            flags: TcpFlags::ACK | TcpFlags::FIN,
+            ..peer_data(&syn, 5001, &[], &[])
+        },
+    );
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut [0; 1]),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    let fin = packet::parse(&bytes).unwrap();
+    assert!(fin.flags.contains(TcpFlags::FIN));
+    assert!(fin.payload.is_empty());
+    assert_eq!(ep.conns[&h].hooks.data.as_ref().unwrap().send.next, head);
+    let ack = Segment {
+        ack: fin.seq.wrapping_add(1),
+        ..peer_data(&syn, 5002, &[], &[])
+    };
+    input(&mut ep, &ack);
+    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.connection(h).unwrap().write(b"more"), Ok(4));
+    let at = ep.poll_timeout().unwrap();
+    assert_eq!(at, Instant::from_nanos(2) + Duration::from_secs(60));
+    ep.handle_timeout(at);
+    assert_eq!(
+        ep.poll_event(),
+        Some((
+            h,
+            Event::Closed {
+                reason: CloseReason::Timeout
+            }
+        ))
+    );
+}
+
+#[test]
+fn queued_close_initial_capable_mapping_gets_separate_data_fin() {
+    let (mut ep, h, _, _) = connected_with_capacity(4096);
+    ep.connection(h).unwrap().write(b"initial").unwrap();
+    ep.connection(h).unwrap().close();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let first = packet::parse(&bytes).unwrap();
+    assert_eq!(first.payload, b"initial");
+    assert!(matches!(
+        mptcp::parse(mpc(first.options)[0]).unwrap(),
+        MptcpOption::Capable(_)
+    ));
+    assert!(!first.flags.contains(TcpFlags::FIN));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let second = packet::parse(&bytes).unwrap();
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(second.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    assert_eq!(d.mapping.unwrap().ssn, 0);
+    assert_eq!(d.mapping.unwrap().data_len, 1);
+    assert_eq!(second.seq, first.seq.wrapping_add(7));
+}
+
+#[test]
+fn fallback_cancels_data_fin_timer_and_keeps_tcp_halfclose_reply() {
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"initial").unwrap();
+    ep.connection(h).unwrap().close();
+    transmit(&mut ep, Instant::from_nanos(2));
+    transmit(&mut ep, Instant::from_nanos(2)); // standalone DATA_FIN
+    let seg = Segment {
+        ack: syn.seq.wrapping_add(8),
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    input(&mut ep, &seg); // options stripped: TCP fallback
+    assert!(!ep.conns[&h].hooks.active());
+    assert!(ep.conns[&h].hooks.recovery_deadline().is_none());
+    assert_eq!(ep.poll_event(), Some((h, Event::FellBack)));
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::FIN));
+
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    ep.connection(h).unwrap().write(b"initial").unwrap();
+    transmit(&mut ep, Instant::from_nanos(2));
+    input(
+        &mut ep,
+        &Segment {
+            ack: syn.seq.wrapping_add(8),
+            flags: TcpFlags::ACK | TcpFlags::FIN,
+            ..peer_data(&syn, 5001, &[], &[])
+        },
+    );
+    transmit(&mut ep, Instant::from_nanos(3));
+    ep.connection(h).unwrap().write(b"reply").unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(4));
+    assert_eq!(packet::parse(&bytes).unwrap().payload, b"reply");
+}
+
+#[test]
+fn attached_data_fin_reinjects_with_data_before_standalone_retry() {
+    let (mut ep, h, syn, _) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    input(&mut ep, &peer_data(&syn, 5001, &data_ack(head), &[]));
+    ep.connection(h).unwrap().write(b"final").unwrap();
+    ep.connection(h).unwrap().close();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let data = packet::parse(&bytes).unwrap();
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(data.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    input(
+        &mut ep,
+        &Segment {
+            ack: data.seq.wrapping_add(5),
+            ..peer_data(&syn, 5001, &data_ack(head), &[])
+        },
+    );
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    let bytes = transmit(&mut ep, at);
+    let retry = packet::parse(&bytes).unwrap();
+    assert_eq!(retry.payload, b"final");
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(retry.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    assert_eq!(d.mapping.unwrap().data_len, 6);
+    assert_eq!(d.mapping.unwrap().ssn, 6);
+    // DATA_ACK for the bytes alone leaves only the FIN to retransmit.
+    input(
+        &mut ep,
+        &Segment {
+            ack: retry.seq.wrapping_add(5),
+            ..peer_data(&syn, 5001, &data_ack(head.wrapping_add(5)), &[])
+        },
+    );
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    let bytes = transmit(&mut ep, at);
+    let fin = packet::parse(&bytes).unwrap();
+    assert!(fin.payload.is_empty());
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(fin.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert!(d.data_fin);
+    assert_eq!(d.mapping.unwrap().ssn, 0);
+}
+
+#[test]
+fn combined_fin_with_dsn_hole_keeps_local_half_open() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(4096);
+    let syn = packet::parse(&syn).unwrap();
+    let opts = fin_option(dsn.wrapping_add(2), 1, 3, None);
+    input(
+        &mut ep,
+        &Segment {
+            flags: TcpFlags::ACK | TcpFlags::FIN,
+            ..peer_data(&syn, 5001, &opts, b"cd")
+        },
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(3));
+    assert!(!packet::parse(&bytes).unwrap().flags.contains(TcpFlags::FIN));
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut [0; 4]),
+        Err(crate::connection::ReadError::WouldBlock)
+    );
+    ep.connection(h).unwrap().write(b"reply").unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(4));
+    assert_eq!(packet::parse(&bytes).unwrap().payload, b"reply");
+}
+
+#[test]
+fn fastclose_outside_closed_tcp_window_is_not_an_ack_only_probe() {
+    let (mut ep, h, syn, dsn) = connected_with_capacity(1);
+    let syn = packet::parse(&syn).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let MptcpOption::Capable(keys) =
+        mptcp::parse(mpc(packet::parse(&bytes).unwrap().options)[0]).unwrap()
+    else {
+        panic!()
+    };
+    input(&mut ep, &peer_data(&syn, 5001, &mapping(1, dsn, 1), b"x"));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().wnd, 0);
+    let mut opts = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::FastClose {
+            receiver_key: keys.sender_key.unwrap(),
+        },
+        &mut opts,
+    )
+    .unwrap();
+    input(&mut ep, &peer_data(&syn, 5003, &opts[..n], &[]));
+    assert_eq!(ep.poll_event(), None);
+    assert!(ep.conns[&h].hooks.retained());
 }

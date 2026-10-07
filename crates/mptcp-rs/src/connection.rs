@@ -38,7 +38,10 @@ pub struct Connection {
 impl Connection {
     /// Queues `data` for sending; may accept less than `data.len()` (send buffer full), even 0.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        if self.closed_by_app || self.reset || self.tcb.state() == TcpState::Closed {
+        let closed = self.tcb.state() == TcpState::Closed;
+        #[cfg(test)]
+        let closed = closed && !self.hooks.retained();
+        if self.closed_by_app || self.reset || closed {
             return Err(WriteError::Closed);
         }
         Ok(self.hooks.write(data))
@@ -52,8 +55,11 @@ impl Connection {
         if self.reset {
             return Err(ReadError::Reset);
         }
+        let eof = self.tcb.fin_received();
+        #[cfg(test)]
+        let eof = self.hooks.eof(eof);
         match self.hooks.read(buf) {
-            0 if self.tcb.fin_received() => Ok(0),
+            0 if eof => Ok(0),
             0 => Err(ReadError::WouldBlock),
             n => Ok(n),
         }
@@ -69,7 +75,7 @@ impl Connection {
     pub fn close(&mut self) {
         self.closed_by_app = true;
         #[cfg(test)]
-        if self.hooks.pending_data() {
+        if self.hooks.close() {
             return;
         }
         self.tcb.close();
