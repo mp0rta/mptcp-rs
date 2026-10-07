@@ -818,3 +818,424 @@ fn peer_dsn_signed_boundary_preserves_tcp_and_data_ack_rules() {
         );
     }
 }
+
+#[test]
+fn automatic_initial_mapping_reserves_dss_and_retransmits_immutable_mapping() {
+    let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    ep.connection(h).unwrap().write(&vec![7; 1600]).unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.payload.len(), 508); // default peer MSS 536 minus DSS layout 28
+    assert_eq!(seg.options.len(), 24);
+    let MptcpOption::Capable(c) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(c.data_len, Some(1016)); // two full segments fit initial unscaled 1234 credit
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().payload.len(), 508);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+            .is_none()
+    );
+    // Partial TCP ACK confirms DSS; retransmission must retain full original coordinates.
+    let mut options = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(origin)),
+            mapping: None,
+        }),
+        &mut options,
+    )
+    .unwrap();
+    let mut ack = peer_data(&syn, 5001, &options[..n], &[]);
+    ack.ack = syn.seq.wrapping_add(101);
+    input(&mut ep, &ack);
+    ep.handle_timeout(Instant::from_nanos(2_000_000_000));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2_000_000_000));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.seq, syn.seq.wrapping_add(101));
+    let MptcpOption::Dss(dss) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    let mapping = dss.mapping.unwrap();
+    assert_eq!(mapping.ssn, 1);
+    assert_eq!(mapping.dsn, mptcp::Dsn::Dsn64(origin));
+    assert_eq!(mapping.data_len, 1016);
+    assert_eq!(seg.options.len(), 28);
+}
+
+#[test]
+fn shared_window_read_reopens_and_peer_window_requires_valid_data_ack() {
+    let (mut ep, h, syn_bytes, dsn) = connected_with_capacity(8);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &mapping(1, dsn, 8), b"abcdefgh"),
+    );
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().wnd, 0);
+    ep.connection(h).unwrap().read(&mut [0; 8]).unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().wnd, 8);
+    input(
+        &mut ep,
+        &peer_data(&syn, 5009, &mapping(9, dsn.wrapping_add(8), 1), b"i"),
+    );
+    assert_eq!(ep.connection(h).unwrap().read(&mut [0; 1]), Ok(1));
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    for (ack, window, expected) in [
+        (origin.wrapping_sub(1), 6000, 1234),
+        (origin.wrapping_add(1), 6000, 1234),
+        (origin, 5000, 5000),
+        (origin, 1, 5000),
+    ] {
+        let mut options = [0; 40];
+        let n = mptcp::encode(
+            &MptcpOption::Dss(mptcp::Dss {
+                data_fin: false,
+                data_ack: Some(mptcp::DataAck::Ack64(ack)),
+                mapping: None,
+            }),
+            &mut options,
+        )
+        .unwrap();
+        let mut seg = peer_data(&syn, 5010, &options[..n], &[]);
+        seg.wnd = window;
+        input(&mut ep, &seg);
+        assert_eq!(
+            ep.conns[&h]
+                .hooks
+                .negotiation
+                .as_ref()
+                .unwrap()
+                .send_right_edge,
+            Some(origin.wrapping_add(expected))
+        );
+    }
+}
+
+#[test]
+fn connection_window_persists_without_assigned_bytes_and_recovers_lost_update() {
+    let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    ep.connection(h).unwrap().set_nodelay(true);
+    ep.connection(h).unwrap().write(&vec![3; 1235]).unwrap();
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    for _ in 0..3 {
+        transmit(&mut ep, Instant::from_nanos(2));
+    }
+    let next = origin.wrapping_add(1234);
+    let mut options = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(next)),
+            mapping: None,
+        }),
+        &mut options,
+    )
+    .unwrap();
+    let mut ack = peer_data(&syn, 5001, &options[..n], &[]);
+    ack.ack = syn.seq.wrapping_add(1235);
+    ack.wnd = 0;
+    input(&mut ep, &ack);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(3), &mut [0; 1500])
+            .is_none()
+    );
+    // Even repeated answers for longer than R2 must not close the connection.
+    for sec in [2, 5, 10, 20, 40, 80, 140, 200] {
+        let now = Instant::from_nanos(sec * 1_000_000_000);
+        ep.handle_timeout(now);
+        let bytes = transmit(&mut ep, now);
+        let probe = packet::parse(&bytes).unwrap();
+        assert_eq!(probe.seq, syn.seq.wrapping_add(1234));
+        assert!(probe.payload.is_empty());
+        assert_eq!(ep.conns[&h].hooks.data.as_ref().unwrap().send.next, next);
+        let mut wire = [0; 1500];
+        let len = packet::build(&ack, 0, &mut wire).unwrap();
+        ep.handle_packet(now, &wire[..len]);
+        ep.poll_transmit(now, &mut wire);
+    }
+    // The initial reopening ACK was lost; a response to a later probe supplies the credit.
+    ack.wnd = 16;
+    let mut wire = [0; 1500];
+    let len = packet::build(&ack, 0, &mut wire).unwrap();
+    ep.handle_packet(Instant::from_nanos(201_000_000_000), &wire[..len]);
+    let bytes = transmit(&mut ep, Instant::from_nanos(201_000_000_000));
+    assert_eq!(packet::parse(&bytes).unwrap().payload, &[3]);
+}
+
+#[test]
+fn stored_chunk_boundary_does_not_bypass_sender_sws_and_timeout_releases_it() {
+    let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    ep.connection(h).unwrap().write(&[1; 8]).unwrap();
+    ep.connection(h).unwrap().write(&[2; 1000]).unwrap();
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.wnd = 100;
+    input(&mut ep, &ack);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+            .is_none()
+    );
+    let deadline = ep
+        .poll_timeout()
+        .expect("SWS override for unassigned bytes");
+    assert!(deadline <= Instant::from_nanos(500_000_002));
+    ep.handle_timeout(deadline);
+    let bytes = transmit(&mut ep, deadline);
+    assert_eq!(packet::parse(&bytes).unwrap().payload, &[1; 8]);
+}
+
+#[test]
+fn padded_dss_and_sack_fit_tiny_mss_and_mapping_splits() {
+    for mss in [28u16, 29, 40, 64] {
+        let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(21));
+        let h = open(&mut ep);
+        let bytes = transmit(&mut ep, Instant::from_nanos(0));
+        let syn = packet::parse(&bytes).unwrap();
+        let mut opts = capable(1, CAP_H);
+        let mut tcp = [0; 8];
+        let n = crate::wire::tcp_options::write_mss(&mut tcp, mss);
+        opts.extend_from_slice(&tcp[..n]);
+        let n = crate::wire::tcp_options::write_sack_permitted(&mut tcp);
+        opts.extend_from_slice(&tcp[..n]);
+        reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+        transmit(&mut ep, Instant::from_nanos(1));
+        ep.connection(h).unwrap().set_nodelay(true);
+        ep.connection(h).unwrap().write(&[3; 100]).unwrap();
+        let dsn = crate::crypto::key_token_idsn(PEER_KEY).1.wrapping_add(1);
+        input(
+            &mut ep,
+            &peer_data(&syn, 5003, &mapping(3, dsn.wrapping_add(2), 2), b"ab"),
+        );
+        // The ACK first reports the out-of-order receipt, then data coexists with SACK.
+        transmit(&mut ep, Instant::from_nanos(2));
+        let mut wire = [0; 1500];
+        let n = ep.poll_transmit(Instant::from_nanos(2), &mut wire);
+        if mss == 28 {
+            assert!(n.is_none());
+            continue;
+        }
+        let seg = packet::parse(&wire[..n.unwrap()]).unwrap();
+        assert!(seg.options.len() + seg.payload.len() <= usize::from(mss));
+        assert_eq!(seg.options.len(), if mss > 40 { 40 } else { 28 });
+        if mss > 40 {
+            assert!(walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Sack(_)))));
+        }
+        let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+            panic!()
+        };
+        assert!(usize::from(d.mapping.unwrap().data_len) >= seg.payload.len());
+    }
+}
+
+#[test]
+fn shared_window_scaling_rounds_only_to_preserve_edge() {
+    let mut recv = crate::mptcp::data::RecvAssembler::new(1000, 10, 4);
+    assert_eq!(recv.window_offer(2, 536), 3); // 10-byte promise rounds to 12
+    recv.window_sent(3, 2);
+    recv.accept(1000, b"abcdefghij");
+    assert_eq!(recv.free(), 0);
+    assert_eq!(recv.window_offer(2, 536), 1); // preserves promise despite memory pressure
+    recv.window_sent(1, 2);
+    assert_eq!(recv.right_edge, 1014);
+    recv.read(&mut [0; 10]);
+    assert_eq!(recv.window_offer(2, 536), 2); // floor(10 / 4), sufficient to move edge
+    recv.window_sent(2, 2);
+    assert_eq!(recv.right_edge, 1018);
+}
+
+#[test]
+fn short_chunk_waits_for_sws_override_even_with_full_segment_budget() {
+    let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    ep.connection(h).unwrap().write(&[1; 8]).unwrap();
+    ep.connection(h).unwrap().write(&[2; 2000]).unwrap();
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.wnd = 1000;
+    input(&mut ep, &ack);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+            .is_none()
+    );
+    let deadline = ep.poll_timeout().expect("short chunk needs SWS override");
+    ep.handle_timeout(deadline);
+    let bytes = transmit(&mut ep, deadline);
+    assert_eq!(packet::parse(&bytes).unwrap().payload, &[1; 8]);
+}
+
+#[test]
+fn signaling_acks_do_not_trigger_fast_retransmit_but_dss_duplicates_do() {
+    let (mut ep, h, syn_bytes, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    ep.connection(h).unwrap().write(&[8; 100]).unwrap();
+    transmit(&mut ep, Instant::from_nanos(2));
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    for _ in 0..4 {
+        input(&mut ep, &peer_data(&syn, 5001, &capable(1, CAP_H), &[]));
+        assert!(
+            ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+                .is_none()
+        );
+    }
+    let mut options = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(origin)),
+            mapping: None,
+        }),
+        &mut options,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        input(&mut ep, &peer_data(&syn, 5001, &options[..n], &[]));
+        assert!(
+            ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+                .is_none()
+        );
+    }
+    input(&mut ep, &peer_data(&syn, 5001, &options[..n], &[]));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.seq, syn.seq.wrapping_add(1));
+    assert_eq!(seg.payload, &[8; 100]);
+}
+
+#[test]
+fn syn_credit_is_unscaled_then_data_ack_window_uses_negotiated_scale() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(22));
+    let h = open(&mut ep);
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    let mut opts = capable(1, CAP_H);
+    let mut ws = [0; 4];
+    let n = crate::wire::tcp_options::write_ws(&mut ws, 3);
+    opts.extend_from_slice(&ws[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    assert_eq!(
+        ep.conns[&h]
+            .hooks
+            .negotiation
+            .as_ref()
+            .unwrap()
+            .send_right_edge,
+        Some(origin.wrapping_add(1234))
+    );
+    let mut options = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(origin)),
+            mapping: None,
+        }),
+        &mut options,
+    )
+    .unwrap();
+    input(&mut ep, &peer_data(&syn, 5001, &options[..n], &[]));
+    assert_eq!(
+        ep.conns[&h]
+            .hooks
+            .negotiation
+            .as_ref()
+            .unwrap()
+            .send_right_edge,
+        Some(origin.wrapping_add(1234 << 3))
+    );
+    // A much larger window without DATA_ACK cannot change the connection edge.
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.wnd = 65535;
+    input(&mut ep, &ack);
+    assert_eq!(
+        ep.conns[&h]
+            .hooks
+            .negotiation
+            .as_ref()
+            .unwrap()
+            .send_right_edge,
+        Some(origin.wrapping_add(1234 << 3))
+    );
+}
+
+#[test]
+fn dsack_coexists_with_covering_mapping_when_remainder_is_split() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(23));
+    let h = open(&mut ep);
+    let syn_bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&syn_bytes).unwrap();
+    let mut opts = capable(1, CAP_H);
+    let mut sack = [0; 4];
+    let n = crate::wire::tcp_options::write_sack_permitted(&mut sack);
+    opts.extend_from_slice(&sack[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let dsn = crate::crypto::key_token_idsn(PEER_KEY).1.wrapping_add(1);
+    let map = mapping(1, dsn, 2);
+    input(&mut ep, &peer_data(&syn, 5001, &map, b"ab"));
+    transmit(&mut ep, Instant::from_nanos(2));
+    ep.connection(h).unwrap().write(&[4; 1600]).unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().payload.len(), 508);
+    input(&mut ep, &peer_data(&syn, 5001, &map, b"ab"));
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    let seg = packet::parse(&bytes).unwrap();
+    assert_eq!(seg.options.len(), 40);
+    assert_eq!(seg.payload.len(), 496);
+    assert!(walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Sack(_)))));
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!()
+    };
+    let map = d.mapping.unwrap();
+    assert_eq!(map.ssn, 1);
+    assert_eq!(map.data_len, 1016);
+}
+
+#[test]
+fn read_advertises_shared_edge_after_sws_threshold_even_with_open_window() {
+    let (mut ep, h, syn_bytes, dsn) = connected_with_capacity(10000);
+    let syn = packet::parse(&syn_bytes).unwrap();
+    input(
+        &mut ep,
+        &peer_data(&syn, 5001, &mapping(1, dsn, 1000), &[1; 1000]),
+    );
+    transmit(&mut ep, Instant::from_nanos(2));
+    ep.connection(h).unwrap().read(&mut [0; 1000]).unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(2));
+    assert_eq!(packet::parse(&bytes).unwrap().wnd, 10000);
+}
+
+#[test]
+fn short_chunk_cannot_use_a_larger_sws_partial_budget() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(24));
+    let h = open(&mut ep);
+    let syn_bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&syn_bytes).unwrap();
+    let mut opts = capable(1, CAP_H);
+    let mut mss = [0; 4];
+    let n = crate::wire::tcp_options::write_mss(&mut mss, 1000);
+    opts.extend_from_slice(&mss[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    ep.connection(h).unwrap().write(&[1; 8]).unwrap();
+    ep.connection(h).unwrap().write(&[2; 2000]).unwrap();
+    let origin = ep.conns[&h].hooks.data.as_ref().unwrap().send.next;
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.wnd = 800;
+    input(&mut ep, &ack);
+    assert!(
+        ep.poll_transmit(Instant::from_nanos(2), &mut [0; 1500])
+            .is_none()
+    );
+    assert_eq!(
+        ep.conns[&h].hooks.data.as_ref().unwrap().send.next,
+        origin,
+        "nothing assigned before it can send"
+    );
+}

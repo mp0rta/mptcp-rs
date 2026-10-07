@@ -43,6 +43,10 @@ pub trait CongestionControl: Send {
     fn on_idle_restart(&mut self) {}
     /// Octets that may be outstanding.
     fn cwnd(&self) -> u32;
+    /// Side-effect-free window after an idle restart.
+    fn restart_cwnd(&self) -> u32 {
+        self.cwnd()
+    }
 }
 
 impl fmt::Debug for dyn CongestionControl {
@@ -100,6 +104,10 @@ impl Reno {
 }
 
 impl CongestionControl for Reno {
+    fn restart_cwnd(&self) -> u32 {
+        self.cwnd.min(self.iw)
+    }
+
     /// IW per RFC 5681 §3.1, or one segment after a lost SYN.
     fn init(&mut self, smss: u32, syn_lost: bool) {
         self.smss = smss;

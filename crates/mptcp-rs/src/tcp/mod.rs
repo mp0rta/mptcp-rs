@@ -7,4 +7,6 @@ pub(crate) mod rtt;
 mod tcb;
 
 pub use hooks::{Hooks, PlainHooks, SegmentHooks, SendBuf};
-pub use tcb::{CloseReason, ConnectConfig, Reaction, SegmentWriter, SentMeta, Tcb, TcpState};
+pub use tcb::{
+    CloseReason, ConnectConfig, Reaction, SegmentWriter, SendBudget, SentMeta, Tcb, TcpState,
+};

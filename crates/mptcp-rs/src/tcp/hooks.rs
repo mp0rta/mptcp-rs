@@ -11,6 +11,18 @@ pub trait SendBuf {
     /// long. The run may be shorter than `max` and than what is buffered (it ends at an internal
     /// buffer boundary). `None` if no byte at `rel_ssn` is buffered.
     fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R>;
+    /// Limit one segment to a protocol mapping; ordinary TCP may span buffer runs.
+    fn segment_limit(&self, _ssn: u32) -> usize {
+        usize::MAX
+    }
+    /// Reinjected bytes are retransmissions for Nagle/SWS purposes.
+    fn is_reinjection(&self, _ssn: u32) -> bool {
+        false
+    }
+    /// Pending connection bytes, used by sender SWS before assignment.
+    fn unassigned_len(&self) -> usize {
+        0
+    }
     /// Relative SSN one past the last assigned octet.
     fn assigned_end(&self) -> u32;
     /// Releases every octet below `rel_ssn_una`.
@@ -45,6 +57,25 @@ pub trait SegmentHooks {
     /// The remaining option space is available for TCP SACK blocks.
     fn options_for(&mut self, _flags: crate::wire::packet::TcpFlags, _out: &mut [u8]) -> usize {
         0
+    }
+
+    /// Reserved data layout, including padding (may exceed the initial wire layout).
+    fn data_option_len(&self) -> usize {
+        0
+    }
+    fn data_options_for(&mut self, _ssn: u32, out: &mut [u8]) -> usize {
+        self.options_for(crate::wire::packet::TcpFlags::ACK, out)
+    }
+    /// Connection receive-window override and commit, called only for transmitted segments.
+    fn window_offer(&self, _scale: u8, _mss: u16) -> Option<u16> {
+        None
+    }
+    fn window_sent(&mut self, _field: u16, _scale: u8) {}
+    fn window_update_due(&self, _scale: u8, _mss: u16) -> bool {
+        false
+    }
+    fn duplicate_ack_allowed(&self, _seg: &crate::wire::packet::Segment<'_>) -> bool {
+        true
     }
 
     /// New octets starting at `rel_ssn` (the first data octet is 1). Each octet is handed over

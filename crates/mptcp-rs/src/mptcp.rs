@@ -1,13 +1,14 @@
 //! M1 negotiation and DSN storage. Temporarily test-gated until full data/close integration.
 //!
-//! Step 3 supplies TX assignment, mapping option plans and shared window advertisements. Before
+//! TX assignment, mapping options and shared windows are integrated. Before
 //! Step 6 enables public MPTCP, remove the staging gates in lib, connection, endpoint and Tcb;
 //! use this same negotiation logic in production (no separate test implementation).
 pub(crate) mod data;
 use crate::crypto::key_token_idsn;
 use data::{RecvAssembler, RxMaps, SendStore, TxMaps, promote32};
 
-use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBuf};
+use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBuf, Tcb};
+use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
     mptcp::{self, CAP_C, CAP_H, MpCapable, MptcpOption},
@@ -42,6 +43,53 @@ impl ConnectionHooks {
             send_cap: cfg.send_buffer as usize,
         }
     }
+    pub fn prepare_send(&self, tcb: &mut Tcb, now: Instant) {
+        let demand = match (&self.negotiation, &self.data) {
+            (Some(m), Some(d)) => {
+                d.send.next != d.send.end
+                    && (tcb.peer_window_closed()
+                        || m.send_right_edge
+                            .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0))
+            }
+            _ => false,
+        };
+        tcb.set_probe_demand(demand);
+        tcb.pending_send(
+            now,
+            self.unassigned_len(),
+            self.candidate_len(),
+            self.data_option_len(),
+            self,
+        );
+    }
+    pub fn assign(&mut self, tcb: &Tcb, now: Instant) -> bool {
+        let len = tcb
+            .send_budget(
+                now,
+                self.unassigned_len(),
+                self.candidate_len(),
+                false,
+                28,
+                self,
+            )
+            .bytes();
+        if len == 0 {
+            return false;
+        }
+        let d = self.data.as_mut().unwrap();
+        if !d.send.assign(&mut d.tx, d.send.next, len) {
+            return false;
+        }
+        true
+    }
+    fn candidate_len(&self) -> usize {
+        self.data.as_ref().map_or(0, |d| {
+            d.send
+                .run_len(d.send.next)
+                .min(self.unassigned_len())
+                .min(u16::MAX as usize)
+        })
+    }
     pub fn write(&mut self, bytes: &[u8]) -> usize {
         self.data
             .as_mut()
@@ -60,6 +108,22 @@ impl ConnectionHooks {
     }
 }
 impl SendBuf for ConnectionHooks {
+    fn unassigned_len(&self) -> usize {
+        match (&self.data, &self.negotiation) {
+            (Some(d), Some(m)) => (d.send.end.wrapping_sub(d.send.next) as usize)
+                .min((m.send_right_edge.unwrap().wrapping_sub(d.send.next) as i64).max(0) as usize),
+            _ => 0,
+        }
+    }
+
+    fn segment_limit(&self, ssn: u32) -> usize {
+        self.data
+            .as_ref()
+            .map_or(usize::MAX, |d| d.tx.segment_limit(ssn))
+    }
+    fn is_reinjection(&self, ssn: u32) -> bool {
+        self.data.as_ref().is_some_and(|d| d.tx.is_reinjection(ssn))
+    }
     fn peek_with<R>(&self, ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         match &self.data {
             Some(d) => d.tx.peek_with(ssn, max, f),
@@ -79,6 +143,52 @@ impl SendBuf for ConnectionHooks {
     }
 }
 impl SegmentHooks for ConnectionHooks {
+    fn data_option_len(&self) -> usize {
+        if self.data.is_some() { 28 } else { 0 }
+    }
+    fn data_options_for(&mut self, ssn: u32, out: &mut [u8]) -> usize {
+        let (Some(m), Some(d)) = (&self.negotiation, &self.data) else {
+            return self.options_for(TcpFlags::ACK, out);
+        };
+        let mapping = d.tx.mapping(ssn).expect("payload has mapping");
+        let option = if m.state == State::PreConfirmed && mapping.ssn == 1 {
+            MptcpOption::Capable(MpCapable {
+                version: 1,
+                flags: CAP_H,
+                sender_key: Some(m.local_key),
+                receiver_key: m.peer_key,
+                data_len: Some(mapping.data_len),
+                checksum: None,
+            })
+        } else {
+            MptcpOption::Dss(mptcp::Dss {
+                data_fin: false,
+                data_ack: Some(mptcp::DataAck::Ack64(d.recv.next)),
+                mapping: Some(mapping),
+            })
+        };
+        let n = mptcp::encode(&option, out).expect("fixed mapping layout fits");
+        let padded = n.next_multiple_of(4);
+        out[n..padded].fill(1);
+        padded
+    }
+    fn window_offer(&self, scale: u8, mss: u16) -> Option<u16> {
+        self.data.as_ref().map(|d| d.recv.window_offer(scale, mss))
+    }
+    fn window_sent(&mut self, field: u16, scale: u8) {
+        if let Some(d) = &mut self.data {
+            d.recv.window_sent(field, scale);
+        }
+    }
+    fn window_update_due(&self, scale: u8, mss: u16) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.recv.window_update_due(scale, mss))
+    }
+    fn duplicate_ack_allowed(&self, seg: &Segment<'_>) -> bool {
+        self.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
+    }
+
     fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
         if let (Some(m), Some(d)) = (&self.negotiation, &self.data) {
             if m.state == State::Confirmed && flags.contains(TcpFlags::ACK) {
@@ -123,6 +233,11 @@ impl SegmentHooks for ConnectionHooks {
                 reset: false,
                 sanity_failures: 0,
             });
+        }
+        if seg.flags.contains(TcpFlags::SYN) {
+            if let Some(d) = &mut self.data {
+                d.recv.right_edge = d.recv.next.wrapping_add(self.recv_cap.min(65535) as u64);
+            }
         }
         if seg.flags.contains(TcpFlags::SYN) || seg.flags.contains(TcpFlags::RST) {
             return;
@@ -177,7 +292,14 @@ impl SegmentHooks for ConnectionHooks {
                     mptcp::DataAck::Ack32(x) => promote32(x, d.send.una),
                     mptcp::DataAck::Ack64(x) => x,
                 };
-                d.send.ack(ack);
+                if d.send.ack(ack) {
+                    let edge = ack.wrapping_add(u64::from(seg.wnd) << m.peer_scale);
+                    if m.send_right_edge
+                        .is_none_or(|old| edge.wrapping_sub(old) as i64 > 0)
+                    {
+                        m.send_right_edge = Some(edge);
+                    }
+                }
             }
         }
     }
@@ -260,6 +382,7 @@ pub(crate) struct Negotiation {
     pub local_idsn: u64,
     pub send_right_edge: Option<u64>,
     syns_sent: u8,
+    peer_scale: u8,
     connected_pending: bool,
 }
 
@@ -275,6 +398,7 @@ impl Negotiation {
             peer_idsn: None,
             peer_key: None,
             syns_sent: 0,
+            peer_scale: 0,
             connected_pending: false,
         }
     }
@@ -333,6 +457,13 @@ impl Negotiation {
                 _ => {}
             }
         }
+        self.peer_scale = walk(seg.options)
+            .filter_map(|o| match o {
+                Ok(TcpOpt::WindowScale(s)) => Some(s.min(14)),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(0);
         self.peer_key = peer_key;
         self.peer_idsn = peer_key.map(|key| key_token_idsn(key).1);
         self.send_right_edge =

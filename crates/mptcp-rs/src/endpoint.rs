@@ -265,10 +265,18 @@ impl<R: CryptoRng> Endpoint<R> {
                 if c.hooks.negotiation.is_some() && buf.len() < c.tcb.mtu() {
                     continue;
                 }
-                if c.tcb
-                    .poll_send(now, &mut c.hooks, &mut self.scratch)
-                    .is_none()
-                {
+                #[cfg(test)]
+                c.hooks.prepare_send(&mut c.tcb, now);
+                let sent = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch);
+                #[cfg(test)]
+                let sent = sent.or_else(|| {
+                    if c.hooks.assign(&c.tcb, now) {
+                        c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch)
+                    } else {
+                        None
+                    }
+                });
+                if sent.is_none() {
                     continue;
                 }
                 self.cursor = h.0 + 1;

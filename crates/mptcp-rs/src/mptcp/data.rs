@@ -137,6 +137,15 @@ impl SendStore {
         }
         n
     }
+    pub fn run_len(&self, dsn: u64) -> usize {
+        self.chunks
+            .iter()
+            .find_map(|c| {
+                let off = dsn.wrapping_sub(c.dsn) as usize;
+                (off < c.len()).then(|| c.len() - off)
+            })
+            .unwrap_or(0)
+    }
     /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
     pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
         if len == 0 || len > u16::MAX as usize || maps.maps.len() >= maps.cap {
@@ -159,6 +168,13 @@ impl SendStore {
         }
         maps.maps.push_back(TxMap {
             ssn: maps.end,
+            mapping: crate::wire::mptcp::Mapping {
+                dsn: crate::wire::mptcp::Dsn::Dsn64(dsn),
+                ssn: maps.end,
+                data_len: len as u16,
+                checksum: None,
+            },
+            reinjected: dsn != self.next,
             chunk: Chunk {
                 dsn,
                 bytes: c.bytes.clone(),
@@ -195,6 +211,8 @@ impl SendStore {
 }
 struct TxMap {
     ssn: u32,
+    mapping: crate::wire::mptcp::Mapping,
+    reinjected: bool,
     chunk: Chunk,
 }
 pub(crate) struct TxMaps {
@@ -203,6 +221,12 @@ pub(crate) struct TxMaps {
     cap: usize,
 }
 impl TxMaps {
+    pub fn mapping(&self, ssn: u32) -> Option<crate::wire::mptcp::Mapping> {
+        self.maps
+            .iter()
+            .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+            .map(|m| m.mapping)
+    }
     pub fn new(end: u32, cap: usize) -> Self {
         Self {
             maps: VecDeque::new(),
@@ -212,13 +236,23 @@ impl TxMaps {
     }
 }
 impl SendBuf for TxMaps {
+    fn segment_limit(&self, ssn: u32) -> usize {
+        self.peek_with(ssn, usize::MAX, |b| b.len()).unwrap_or(0)
+    }
+    fn is_reinjection(&self, ssn: u32) -> bool {
+        self.maps
+            .iter()
+            .any(|m| m.reinjected && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+    }
     fn peek_with<R>(&self, ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let m = self
             .maps
             .iter()
             .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())?;
         let start = m.chunk.start + ssn.wrapping_sub(m.ssn) as usize;
-        Some(f(&m.chunk.bytes[start..m.chunk.end.min(start + max)]))
+        Some(f(
+            &m.chunk.bytes[start..m.chunk.end.min(start.saturating_add(max))]
+        ))
     }
     fn assigned_end(&self) -> u32 {
         self.end
@@ -270,6 +304,31 @@ impl RecvAssembler {
             cap,
             range_cap,
         }
+    }
+    pub fn window_offer(&self, scale: u8, mss: u16) -> u16 {
+        let remaining = self.right_edge.wrapping_sub(self.next) as i64;
+        let free = self.free() as i64;
+        let threshold = (self.cap / 2).min(usize::from(mss)) as i64;
+        let floor = if free - remaining >= threshold {
+            (free as u64 >> scale).min(65535)
+        } else {
+            0
+        };
+        floor
+            .max((remaining.max(0) as u64).div_ceil(1 << scale))
+            .min(65535) as u16
+    }
+    pub fn window_sent(&mut self, field: u16, scale: u8) {
+        let edge = self.next.wrapping_add(u64::from(field) << scale);
+        if edge.wrapping_sub(self.right_edge) as i64 > 0 {
+            self.right_edge = edge;
+        }
+    }
+    pub fn window_update_due(&self, scale: u8, mss: u16) -> bool {
+        let remaining = self.right_edge.wrapping_sub(self.next) as i64;
+        let offer = i64::from(self.window_offer(scale, mss)) << scale;
+        self.free() as i64 - remaining >= (self.cap / 2).min(usize::from(mss)) as i64
+            && offer > remaining
     }
     pub fn free(&self) -> usize {
         self.cap - self.ready.len() - self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>()

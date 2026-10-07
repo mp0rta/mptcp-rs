@@ -2838,3 +2838,51 @@ fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
     assert_eq!(f.h.read(&mut out), 4);
     assert_eq!(&out, b"abcd");
 }
+
+#[test]
+fn protocol_options_consuming_mss_preserve_fin_and_persist() {
+    for zero in [false, true] {
+        let cfg = ConnectConfig::default();
+        let h = ShortRuns(PlainHooks::new(&cfg), 28);
+        let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
+        f.establish(if zero { 0 } else { 1000 });
+        f.tcb.eff_mss = 24;
+        f.tcb.close();
+        if zero {
+            assert!(f.send(t(0)).is_none());
+            assert!(f.tcb.persist_at.is_some());
+            f.tcb.on_timeout(t(1), &mut f.h);
+            assert_eq!(f.send(t(1)).unwrap().seq, ISN);
+        } else {
+            assert!(f.send(t(0)).unwrap().flags.contains(TcpFlags::FIN));
+        }
+    }
+}
+
+#[test]
+fn assignment_budget_obeys_nagle_windows_and_reinjection() {
+    let mut f = Fixture::established(ConnectConfig::default(), 1500);
+    assert_eq!(
+        f.tcb.send_budget(t(0), 2000, 2000, false, 28, &f.h).bytes(),
+        972
+    );
+    f.write(&pattern(972));
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        f.tcb.send_budget(t(0), 100, 100, false, 28, &f.h).bytes(),
+        0
+    );
+    assert_eq!(
+        f.tcb.send_budget(t(0), 100, 100, true, 28, &f.h).bytes(),
+        100
+    );
+    f.tcb.set_nodelay(true);
+    assert_eq!(
+        f.tcb.send_budget(t(0), 100, 100, false, 28, &f.h).bytes(),
+        100
+    );
+    assert_eq!(
+        f.tcb.send_budget(t(0), 100, 100, false, 1000, &f.h).bytes(),
+        0
+    );
+}
