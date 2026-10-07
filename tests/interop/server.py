@@ -5,10 +5,14 @@ import argparse, socket, sys, time
 ap = argparse.ArgumentParser()
 ap.add_argument("--mode", choices=["tcp", "mptcp"], required=True)
 ap.add_argument("--port", type=int, required=True)
-ap.add_argument("--bytes", type=int, required=True)
+ap.add_argument("--bytes", type=int, default=0)  # default for --send-bytes and --expect
+ap.add_argument("--send-bytes", type=int)
+ap.add_argument("--expect", help="BYTES or 'any' (verify until EOF)")
+ap.add_argument("--send-secs", type=float, help="send for S seconds after accept, then shut down writes")
 ap.add_argument("--pause-read-ms", type=int, default=0)
 a = ap.parse_args()
-N = a.bytes
+N = a.bytes if a.expect is None else None if a.expect == "any" else int(a.expect)  # None = any
+S = a.bytes if a.send_bytes is None else a.send_bytes
 
 # pattern byte i = (i*31+7) % 251; one repeating buffer, sliced at (offset % 251)
 PAT = bytes((i * 31 + 7) % 251 for i in range(251))
@@ -25,8 +29,9 @@ c, peer = ls.accept()
 
 got = 0
 ok = True
-while got < N:
-    d = c.recv(min(262144, N - got))
+first = last = None
+while N is None or got < N:
+    d = c.recv(262144 if N is None else min(262144, N - got))
     if not d:
         break
     if d != BUF[got % 251 : got % 251 + len(d)]:
@@ -34,19 +39,27 @@ while got < N:
         print(f"mismatch in chunk at offset {got}", file=sys.stderr)
         break
     got += len(d)
+    last = time.monotonic()
+    first = first or last
     if a.pause_read_ms:
         print(f"read paused at {got} bytes", flush=True)
         time.sleep(a.pause_read_ms / 1000)
         a.pause_read_ms = 0
-if not ok or got != N:
+if not ok or (N is not None and got != N):
     print(f"FAIL recv {got}/{N} ok={ok}")
     sys.exit(1)
 
+if first:  # receiver-side goodput: first to last received byte
+    secs = last - first
+    print(f"goodput: {got} bytes in {secs:.3f} s = {got * 8 / max(secs, 1e-9) / 1e6:.1f} Mbit/s", flush=True)
 sent = 0
-while sent < N:
-    n = min(len(BUF) - sent % 251, N - sent)
+deadline = time.monotonic() + a.send_secs if a.send_secs else None
+while sent < S if deadline is None else time.monotonic() < deadline:
+    n = len(BUF) - sent % 251 if deadline else min(len(BUF) - sent % 251, S - sent)
     c.sendall(BUF[sent % 251 : sent % 251 + n])
     sent += n
+if deadline:
+    c.shutdown(socket.SHUT_WR)
 
 extra = 0
 while True:  # read until EOF; any byte beyond N is a failure
@@ -56,6 +69,6 @@ while True:  # read until EOF; any byte beyond N is a failure
     extra += len(d)
 c.close()
 if extra:
-    print(f"FAIL {extra} extra bytes after {N}")
+    print(f"FAIL {extra} extra bytes after {got}")
     sys.exit(1)
 print(f"server ok: received {got} sent {sent} from {peer[0]} eof=true")
