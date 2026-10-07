@@ -45,6 +45,8 @@ pub(crate) struct DataState {
     final_mapping: Option<mptcp::Mapping>,
     rx_infinite: Option<(u32, u64)>,
     tcp_acked_dsn: u64,
+    local_isn: crate::SeqNum,
+    tcp_acked_ssn: Option<u32>,
 }
 
 impl ConnectionHooks {
@@ -226,6 +228,7 @@ impl SendBuf for ConnectionHooks {
             Some(d) => {
                 if let Some(dsn) = d.tx.acked_dsn(ssn) {
                     d.tcp_acked_dsn = dsn;
+                    d.tcp_acked_ssn = Some(ssn);
                     if !d.fallback && !d.dss_confirmed {
                         match self.valid_data_ack {
                             Some(true) => d.dss_confirmed = true,
@@ -389,6 +392,8 @@ impl SegmentHooks for ConnectionHooks {
                 final_mapping: None,
                 rx_infinite: None,
                 tcp_acked_dsn: m.local_idsn.wrapping_add(1),
+                local_isn: seg.ack.wrapping_add(u32::MAX),
+                tcp_acked_ssn: None,
             });
         }
         if seg.flags.contains(TcpFlags::SYN) {
@@ -446,6 +451,14 @@ impl SegmentHooks for ConnectionHooks {
                 };
                 if d.send.ack(ack) {
                     self.valid_data_ack = Some(true);
+                    // A corrected DATA_ACK can arrive after TCP has released the mapping.
+                    // Keep its ACK coverage independently of the live TxMaps entries;
+                    // stale/SYN-only TCP ACKs cannot confirm the data path.
+                    if d.tcp_acked_ssn
+                        .is_some_and(|ssn| seg.ack.ge(d.local_isn.wrapping_add(ssn)))
+                    {
+                        d.dss_confirmed = true;
+                    }
                     let edge = ack.wrapping_add(u64::from(seg.wnd) << m.peer_scale);
                     if m.send_right_edge
                         .is_none_or(|old| edge.wrapping_sub(old) as i64 > 0)

@@ -1627,3 +1627,48 @@ fn infinite_receive_mapping_tracks_ssn_wrap() {
         assert_eq!(hooks.read(&mut [0; 1]), 1);
     }
 }
+
+#[test]
+fn corrected_data_ack_confirms_already_tcp_acked_mapping() {
+    for corrected in [true, false] {
+        let (mut ep, h, syn, _) = connected_with_capacity(64);
+        let syn = packet::parse(&syn).unwrap();
+        ep.connection(h).unwrap().write(b"abc").unwrap();
+        let sent = transmit(&mut ep, Instant::from_nanos(2));
+        let sent = packet::parse(&sent).unwrap();
+        let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+        let invalid = data_ack(head.wrapping_add(100));
+        let mut ack = peer_data(&syn, 5001, &invalid, &[]);
+        ack.ack = sent.seq.wrapping_add(3);
+        input(&mut ep, &ack);
+        assert!(
+            ep.conns[&h]
+                .hooks
+                .data
+                .as_ref()
+                .unwrap()
+                .tx
+                .mapping(1)
+                .is_none()
+        );
+        let valid = data_ack(head.wrapping_add(3));
+        ack.options = &valid;
+        if !corrected {
+            ack.ack = sent.seq;
+        } // Old SYN-only ACK cannot confirm data.
+        input(&mut ep, &ack);
+        ep.connection(h).unwrap().write(b"def").unwrap();
+        let next = transmit(&mut ep, Instant::from_nanos(3));
+        ack.ack = packet::parse(&next).unwrap().seq.wrapping_add(3);
+        ack.options = &[];
+        input(&mut ep, &ack);
+        assert_eq!(
+            ep.poll_event(),
+            if corrected {
+                None
+            } else {
+                Some((h, Event::FellBack))
+            }
+        );
+    }
+}
