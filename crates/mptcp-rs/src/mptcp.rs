@@ -206,10 +206,10 @@ impl SegmentHooks for ConnectionHooks {
             let pos = ssn.wrapping_add(at as u32);
             if let Some((dsn, len)) = d.rx.translate(pos) {
                 let len = len.min(bytes.len() - at);
+                let dsn_offset = dsn.wrapping_sub(d.recv.next) as i64;
                 if at == 0
-                    && (dsn.wrapping_add(len as u64).wrapping_sub(d.recv.next) as i64) > 0
-                    && i64::from(ssn.wrapping_sub(tcp_ack) as i32)
-                        > (dsn.wrapping_sub(d.recv.next) as i64)
+                    && dsn_offset.saturating_add(len as i64) > 0
+                    && i64::from(ssn.wrapping_sub(tcp_ack) as i32) > dsn_offset
                 {
                     d.sanity_failures = d.sanity_failures.saturating_add(1);
                 }

@@ -287,7 +287,9 @@ impl RecvAssembler {
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
         let off = dsn.wrapping_sub(self.next) as i64;
-        let end = off + data.len() as i64;
+        // Peer-controlled offsets may sit at i64::MAX. Only comparisons and window
+        // clipping use this end, so saturation preserves the out-of-window result.
+        let end = off.saturating_add(data.len() as i64);
         if end <= 0 {
             return (Outcome::Duplicate, data.len());
         }
@@ -515,5 +517,36 @@ mod bounds_tests {
         assert!(!s.assign(&mut maps, 110, 1));
         maps.mark_acked(11);
         assert!(s.assign(&mut maps, 105, 5));
+    }
+}
+
+#[cfg(test)]
+mod signed_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn peer_dsn_near_signed_boundary_cannot_overflow_acceptance() {
+        for head in [0, u64::MAX - 3] {
+            for (offset, expected) in [
+                (i64::MAX, (Outcome::OutOfWindow, 0)),
+                (i64::MAX - 1, (Outcome::OutOfWindow, 0)),
+                (i64::MIN, (Outcome::Duplicate, 2)),
+                (i64::MIN + 1, (Outcome::Duplicate, 2)),
+            ] {
+                let mut recv = RecvAssembler::new(head, 8, 4);
+                assert_eq!(
+                    recv.accept(head.wrapping_add_signed(offset), b"ab"),
+                    expected
+                );
+                let single = if offset > 0 {
+                    (Outcome::OutOfWindow, 0)
+                } else {
+                    (Outcome::Duplicate, 1)
+                };
+                assert_eq!(recv.accept(head.wrapping_add_signed(offset), b"a"), single);
+                assert_eq!(recv.next, head);
+                assert_eq!(recv.free(), 8);
+            }
+        }
     }
 }

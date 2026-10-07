@@ -800,3 +800,21 @@ fn queued_handshake_bytes_move_into_connection_store() {
     let d = ep.conns[&h].hooks.data.as_ref().unwrap();
     assert_eq!(d.send.end.wrapping_sub(d.send.una), 4);
 }
+
+#[test]
+fn peer_dsn_signed_boundary_preserves_tcp_and_data_ack_rules() {
+    for offset in [i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1] {
+        let (mut ep, h, bytes, dsn) = connected_with_capacity(64);
+        let syn = packet::parse(&bytes).unwrap();
+        let opts = mapping(1, dsn.wrapping_add_signed(offset), 2);
+        input(&mut ep, &peer_data(&syn, 5001, &opts, b"ab"));
+        let bytes = transmit(&mut ep, Instant::from_nanos(2));
+        let ack = packet::parse(&bytes).unwrap();
+        assert_eq!(ack.ack, SeqNum(if offset > 0 { 5001 } else { 5003 }));
+        assert_eq!(dack(&ack), dsn);
+        assert_eq!(
+            ep.connection(h).unwrap().read(&mut [0; 2]),
+            Err(crate::connection::ReadError::WouldBlock)
+        );
+    }
+}
