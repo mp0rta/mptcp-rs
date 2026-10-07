@@ -2319,8 +2319,13 @@ fn fastclose_reset_survives_timeout_drive() {
         let bytes = transmit(&mut ep, now);
         assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
         assert!(ep.poll_transmit(now, &mut [0; 1500]).is_none());
+        let cleanup = ep
+            .poll_timeout()
+            .expect("closed connection must schedule cleanup");
+        assert!(cleanup <= now);
         ep.handle_timeout(now);
         assert!(ep.connection(h).is_none());
+        assert_eq!(ep.poll_timeout(), None);
         assert_eq!(ep.poll_event(), None);
     }
 }

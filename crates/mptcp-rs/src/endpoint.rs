@@ -342,7 +342,7 @@ impl<R: CryptoRng> Endpoint<R> {
             .filter(|c| !c.detached)
             .filter_map(|c| {
                 let at = c.tcb.poll_send_at();
-                at.filter(|_| !c.hooks.active() || c.tcb.state() != TcpState::Closed)
+                at.filter(|_| !c.hooks.retained() || c.tcb.state() != TcpState::Closed)
                     .into_iter()
                     .chain(c.hooks.recovery_deadline())
                     .min()
