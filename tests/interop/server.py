@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Plain-TCP peer for the M0 interop test: receive N pattern bytes, send N, wait for EOF."""
-import argparse, socket, sys
+import argparse, socket, sys, time
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--mode", choices=["tcp"], required=True)
+ap.add_argument("--mode", choices=["tcp", "mptcp"], required=True)
 ap.add_argument("--port", type=int, required=True)
 ap.add_argument("--bytes", type=int, required=True)
+ap.add_argument("--pause-read-ms", type=int, default=0)
 a = ap.parse_args()
 N = a.bytes
 
@@ -13,7 +14,9 @@ N = a.bytes
 PAT = bytes((i * 31 + 7) % 251 for i in range(251))
 BUF = PAT * (262144 // 251 + 2)
 
-ls = socket.socket()
+ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262 if a.mode == "mptcp" else 0)
+if a.pause_read_ms:
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 ls.bind(("0.0.0.0", a.port))
 ls.listen(1)
@@ -31,6 +34,10 @@ while got < N:
         print(f"mismatch in chunk at offset {got}", file=sys.stderr)
         break
     got += len(d)
+    if a.pause_read_ms:
+        print(f"read paused at {got} bytes", flush=True)
+        time.sleep(a.pause_read_ms / 1000)
+        a.pause_read_ms = 0
 if not ok or got != N:
     print(f"FAIL recv {got}/{N} ok={ok}")
     sys.exit(1)
@@ -51,4 +58,4 @@ c.close()
 if extra:
     print(f"FAIL {extra} extra bytes after {N}")
     sys.exit(1)
-print(f"server ok: received {got} sent {sent} from {peer[0]}")
+print(f"server ok: received {got} sent {sent} from {peer[0]} eof=true")

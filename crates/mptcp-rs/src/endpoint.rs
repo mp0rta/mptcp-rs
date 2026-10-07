@@ -24,14 +24,9 @@ pub struct ConnectionHandle(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Connected {
-        mptcp: bool,
-    },
-    #[cfg(test)]
+    Connected { mptcp: bool },
     FellBack,
-    Closed {
-        reason: CloseReason,
-    },
+    Closed { reason: CloseReason },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,9 +131,8 @@ impl<R: CryptoRng> Endpoint<R> {
         Ok(h)
     }
 
-    // M1 staging: use from the normal connect path only once the DSS data path is ready.
-    #[cfg(test)]
-    fn connect_mptcp(
+    /// Opens an MPTCP v1 connection, falling back to TCP if the peer does not support it.
+    pub fn connect_mptcp(
         &mut self,
         now: Instant,
         local: IpAddr,
@@ -190,17 +184,13 @@ impl<R: CryptoRng> Endpoint<R> {
             Reaction::None => {}
             r => Self::push_event(&mut self.events, c, h, r),
         }
-        #[cfg(test)]
         c.hooks.update_recovery(&c.tcb, now);
-        #[cfg(test)]
         Self::update_close(&mut self.events, c, h, now);
-        #[cfg(test)]
         if std::mem::take(&mut c.hooks.fallback_event) {
             self.events.push_back((h, Event::FellBack));
         }
     }
 
-    #[cfg(test)]
     fn update_close(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         c: &mut Connection,
@@ -222,14 +212,12 @@ impl<R: CryptoRng> Endpoint<R> {
         match r {
             Reaction::None => {}
             Reaction::Established => {
-                #[cfg(test)]
                 if c.hooks.negotiation.is_some() {
                     return;
                 }
                 events.push_back((h, Event::Connected { mptcp: false }));
             }
             Reaction::Closed(reason) => {
-                #[cfg(test)]
                 if c.hooks.active() {
                     return;
                 }
@@ -291,19 +279,15 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
-                // A staged MPTCP third ACK must remain due until it can be emitted.
-                #[cfg(test)]
+                // An MPTCP third ACK must remain due until it can be emitted.
                 if c.hooks.negotiation.is_some() && buf.len() < c.tcb.mtu() {
                     continue;
                 }
-                #[cfg(test)]
                 c.hooks.prepare_send(&mut c.tcb, now);
-                #[cfg(test)]
                 if c.closed_by_app && !c.hooks.close() {
                     c.tcb.close();
                 }
                 let sent = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch);
-                #[cfg(test)]
                 let sent = sent.or_else(|| {
                     if c.hooks.assign(&c.tcb, now) {
                         c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch)
@@ -327,10 +311,8 @@ impl<R: CryptoRng> Endpoint<R> {
                     payload: &w.payload,
                 };
                 if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                    #[cfg(test)]
                     c.hooks
                         .on_transmitted(&seg, now, c.tcb.retransmission_timeout());
-                    #[cfg(test)]
                     if let Some(mptcp) = c
                         .hooks
                         .negotiation
@@ -360,13 +342,10 @@ impl<R: CryptoRng> Endpoint<R> {
             .filter(|c| !c.detached)
             .filter_map(|c| {
                 let at = c.tcb.poll_send_at();
-                #[cfg(test)]
-                let at = at
-                    .filter(|_| !c.hooks.active() || c.tcb.state() != TcpState::Closed)
+                at.filter(|_| !c.hooks.active() || c.tcb.state() != TcpState::Closed)
                     .into_iter()
                     .chain(c.hooks.recovery_deadline())
-                    .min();
-                at
+                    .min()
             })
             .min()
     }
@@ -375,18 +354,15 @@ impl<R: CryptoRng> Endpoint<R> {
     /// its `Closed(Normal)` there), then frees the TCBs that are `Closed`.
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
-            #[cfg(test)]
             c.hooks.update_recovery(&c.tcb, now);
             if c.tcb.poll_send_at().is_some_and(|t| t <= now) {
                 let r = c.tcb.on_timeout(now, &mut c.hooks);
                 Self::push_event(&mut self.events, c, h, r);
             }
-            #[cfg(test)]
             Self::update_close(&mut self.events, c, h, now);
         }
         let demux = &mut self.demux;
         self.conns.retain(|&h, c| {
-            #[cfg(test)]
             if c.hooks.retained() {
                 return true;
             }

@@ -1,12 +1,9 @@
-//! One plain TCP connection as the application sees it: a `Tcb` plus its buffers.
+//! One TCP or MPTCP connection as the application sees it: a `Tcb` plus its buffers.
 
 use std::net::SocketAddr;
 
 use crate::tcp::{Tcb, TcpState};
 
-#[cfg(not(test))]
-pub(crate) type ConnectionHooks = crate::tcp::PlainHooks;
-#[cfg(test)]
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
 /// `write` failed because the connection is closed (by `close`, a reset or a timeout).
@@ -38,16 +35,15 @@ pub struct Connection {
 impl Connection {
     /// Queues `data` for sending; may accept less than `data.len()` (send buffer full), even 0.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        let closed = self.tcb.state() == TcpState::Closed;
-        #[cfg(test)]
-        let closed = closed && !self.hooks.retained();
+        let closed = self.tcb.state() == TcpState::Closed && !self.hooks.retained();
         if self.closed_by_app || self.reset || closed {
             return Err(WriteError::Closed);
         }
         Ok(self.hooks.write(data))
     }
 
-    /// Reads received bytes. `Ok(0)` is EOF (the peer's FIN, all data read) or a 0-length `buf`.
+    /// Reads received bytes. `Ok(0)` is EOF (TCP FIN or MPTCP DATA_FIN, all data read)
+    /// or a 0-length `buf`.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         if buf.is_empty() {
             return Ok(0);
@@ -55,9 +51,7 @@ impl Connection {
         if self.reset {
             return Err(ReadError::Reset);
         }
-        let eof = self.tcb.fin_received();
-        #[cfg(test)]
-        let eof = self.hooks.eof(eof);
+        let eof = self.hooks.eof(self.tcb.fin_received());
         match self.hooks.read(buf) {
             0 if eof => Ok(0),
             0 => Err(ReadError::WouldBlock),
@@ -65,7 +59,7 @@ impl Connection {
         }
     }
 
-    /// Half-closes: the FIN follows the queued data. Reading stays possible, also after the
+    /// Half-closes: TCP FIN or MPTCP DATA_FIN follows queued data. Reading stays possible after the
     /// connection has fully closed: unread data stays readable through `Endpoint::connection`
     /// until `read` returns `Ok(0)`; the next `Endpoint::handle_timeout` then frees it.
     ///
@@ -74,7 +68,6 @@ impl Connection {
     /// queued data must be delivered.
     pub fn close(&mut self) {
         self.closed_by_app = true;
-        #[cfg(test)]
         if self.hooks.close() {
             return;
         }

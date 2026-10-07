@@ -388,7 +388,6 @@ impl Tcb {
         };
     }
 
-    #[cfg(test)]
     pub(crate) fn mtu(&self) -> usize {
         usize::from(self.cfg.mtu)
     }
@@ -527,11 +526,9 @@ impl Tcb {
     pub fn set_probe_demand(&mut self, demand: bool) {
         self.probe_demand = demand;
     }
-    #[cfg(test)]
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }
-    #[cfg(test)]
     pub(crate) fn retransmission_timeout(&self) -> Duration {
         self.rtt.rto()
     }

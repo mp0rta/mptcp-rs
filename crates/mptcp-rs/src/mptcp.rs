@@ -1,8 +1,4 @@
-//! M1 negotiation and DSN storage. Temporarily test-gated until full data/close integration.
-//!
-//! TX assignment, mapping options and shared windows are integrated. Before
-//! Step 6 enables public MPTCP, remove the staging gates in lib, connection, endpoint and Tcb;
-//! use this same negotiation logic in production (no separate test implementation).
+//! Single-subflow MPTCP negotiation, data transfer, recovery and closure.
 mod close;
 pub(crate) mod data;
 use crate::crypto::key_token_idsn;
