@@ -3179,7 +3179,8 @@ fn app_limited_reason(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Option
 }
 
 /// A paced connection with the peer's window open and `len` octets written; the first
-/// segment goes out at `T0`. Returns the endpoint, handle, SYN, head DSN and that segment.
+/// release quantum (at `RATE` the 2-segment floor) goes out at `T0`. Returns the endpoint,
+/// handle, SYN, head DSN and the first segment.
 fn paced_first_segment(
     len: usize,
 ) -> (
@@ -3194,13 +3195,61 @@ fn paced_first_segment(
     let head = una(&ep, h);
     ep.connection(h).unwrap().write(&vec![1; len]).unwrap();
     let out = drain(&mut ep, T0);
-    assert_eq!(out.len(), 1, "one segment per release");
-    assert_eq!(packet::parse(&out[0]).unwrap().payload.len(), 1432);
+    assert_eq!(
+        out.len(),
+        (len / 1432).clamp(1, 2),
+        "one quantum per release"
+    );
+    assert!(
+        out.iter()
+            .all(|p| packet::parse(p).unwrap().payload.len() == 1432)
+    );
     (ep, h, syn, head, out[0].clone())
 }
+#[test]
+fn paced_bulk_flight_is_not_bounded_by_mapping_slots() {
+    // A 4 MiB cwnd paced at 1.432 GB/s and 8 MiB peer windows: with one mapping per
+    // release quantum, flight passes 1024 mapping slots × 1432 octets.
+    fn bulk() -> Box<dyn CongestionControl> {
+        Box::new(FixedPacing {
+            rate: Some(1_432_000_000),
+            cwnd: 4 << 20,
+        })
+    }
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(bulk));
+    let head = una(&ep, h);
+    peer_ack(
+        &mut ep,
+        &syn,
+        Instant::from_nanos(2),
+        syn.seq.wrapping_add(1),
+        head,
+        65535,
+    );
+    let chunk = vec![7; 1 << 16];
+    let (mut now, mut sent) = (Instant::from_nanos(10), 0usize);
+    let end = Instant::from_nanos(100_000_000);
+    loop {
+        while ep.connection(h).unwrap().write(&chunk).is_ok_and(|n| n > 0) {}
+        sent += drain(&mut ep, now)
+            .iter()
+            .map(|p| packet::parse(p).unwrap().payload.len())
+            .sum::<usize>();
+        match ep.poll_timeout() {
+            Some(t) if t < end && sent < 2_000_000 => {
+                now = t.max(now);
+                ep.handle_timeout(now);
+            }
+            _ => break,
+        }
+    }
+    assert!(sent > 1024 * 1432, "{sent} octets in flight");
+}
+
 const T0: Instant = Instant::from_nanos(10);
+/// The release after the 2-segment quantum at `T0`: 2 × 1432 octets at `RATE`.
 fn release() -> Instant {
-    T0 + Duration::from_millis(10)
+    T0 + Duration::from_millis(20)
 }
 
 #[test]
@@ -3213,8 +3262,8 @@ fn endpoint_poll_timeout_wakes_paced_subflow() {
         &mut ep,
         &syn,
         t1,
-        first.seq.wrapping_add(1432),
-        head + 1432,
+        first.seq.wrapping_add(2 * 1432),
+        head + 2 * 1432,
         1000,
     );
     assert!(drain(&mut ep, t1).is_empty());
@@ -3223,7 +3272,7 @@ fn endpoint_poll_timeout_wakes_paced_subflow() {
     let out = drain(&mut ep, release());
     assert_eq!(out.len(), 1);
     let seg = packet::parse(&out[0]).unwrap();
-    assert_eq!(dsn_of(&seg, syn.seq), Some((head + 1432, 1432)));
+    assert_eq!(dsn_of(&seg, syn.seq), Some((head + 2 * 1432, 1432)));
 }
 
 #[test]
@@ -3272,9 +3321,11 @@ fn paced_reinjection_alone_wakes_at_release() {
         drain(&mut ep, t1).is_empty(),
         "the reinjection waits for the release"
     );
-    assert_eq!(ep.poll_timeout(), Some(release()));
-    ep.handle_timeout(release());
-    let out = drain(&mut ep, release());
+    // One segment went out at T0: its release is 1432 octets at `RATE` later.
+    let release = T0 + Duration::from_millis(10);
+    assert_eq!(ep.poll_timeout(), Some(release));
+    ep.handle_timeout(release);
+    let out = drain(&mut ep, release);
     let seg = packet::parse(&out[0]).unwrap();
     assert_eq!(dsn_of(&seg, syn.seq), Some((head, 1432)));
     assert_eq!(queue_first(&ep, h), None);

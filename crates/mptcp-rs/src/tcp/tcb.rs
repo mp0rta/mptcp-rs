@@ -259,8 +259,11 @@ pub struct Tcb {
     /// (the flow was cwnd-limited, RFC 7661 §3); an ACK up to it is `AckSample::cwnd_limited`.
     /// Cleared by an ACK beyond it.
     cwnd_full_at: Option<SeqNum>,
-    /// Pacing release time: no data segment goes out before it. Reaching it consumes it.
+    /// Pacing release time: no data segment goes out before it, beyond the burst opened at
+    /// the previous release. Reaching it consumes it.
     next_send_at: Option<Instant>,
+    /// Octets the burst opened at the last release may still send before `next_send_at`.
+    burst_left: u32,
     /// Assigned data or a FIN was unsent at the last `poll_send`.
     unsent: bool,
     /// Unassigned connection data or a queued reinjection at the last `pending_send`.
@@ -358,6 +361,7 @@ impl Tcb {
             app_limited: None,
             cwnd_full_at: None,
             next_send_at: None,
+            burst_left: 0,
             unsent: false,
             conn_pending: false,
             last_data_sent: None,
@@ -520,7 +524,7 @@ impl Tcb {
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
             || self.retransmit_due
             || self.snd_nxt != self.snd_max
-            || self.next_send_at.is_some_and(|t| t > now)
+            || (self.burst_left == 0 && self.next_send_at.is_some_and(|t| t > now))
         {
             return SendBudget::default();
         }
@@ -548,9 +552,16 @@ impl Tcb {
         } else {
             0
         };
-        // ponytail: one segment per release, no send quantum; BBR adds a quantum later.
+        // ponytail: one quantum per release (Linux tcp_tso_autosize); BBR may later set its own.
         let full_segments = match self.cc.pacing_rate() {
-            Some(_) => (len / mss).min(1),
+            Some(rate) => {
+                let allowance = if self.next_send_at.is_some_and(|t| t > now) {
+                    self.burst_left as usize
+                } else {
+                    pacing_quantum(rate, mss)
+                };
+                len.min(allowance) / mss
+            }
             None => len / mss,
         };
         SendBudget {
@@ -753,6 +764,8 @@ impl Tcb {
                 self.ack_sent();
                 return Some(meta);
             }
+            // No data segment now: the burst opened at the last release is over.
+            self.burst_left = 0;
             // A read that let the window edge move is announced (RFC 9293 §3.8.6.2.2), while
             // data can still arrive.
             if !self.ack_due && !self.fin_received && self.window_update_due(h) {
@@ -1343,7 +1356,7 @@ impl Tcb {
         if self.next_send_at.is_some_and(|t| now >= t) {
             self.next_send_at = None;
         }
-        let paced = self.next_send_at.is_some();
+        let paced = self.next_send_at.is_some() && self.burst_left == 0;
         let mss = u32::from(self.eff_mss.saturating_sub(options_len));
         let in_flight = self.in_flight();
         let queued = self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end()));
@@ -1508,6 +1521,16 @@ impl Tcb {
             self.cwnd_full_at = Some(max);
         }
         if let Some(rate) = self.cc.pacing_rate().filter(|_| meta.len > 0) {
+            if !self.next_send_at.is_some_and(|t| t > now) {
+                // At a release: a new burst of one quantum.
+                self.burst_left = pacing_quantum(rate, usize::from(self.eff_mss)) as u32;
+            }
+            // A remainder smaller than this segment closes the burst.
+            self.burst_left = self
+                .burst_left
+                .checked_sub(meta.len)
+                .filter(|&left| left >= meta.len)
+                .unwrap_or(0);
             let gap = Duration::from_nanos(u64::from(meta.len) * 1_000_000_000 / rate.max(1));
             self.next_send_at = Some(self.next_send_at.map_or(now, |t| t.max(now)) + gap);
         }
@@ -1770,6 +1793,15 @@ impl Tcb {
 }
 
 /// Sequence numbers a segment we sent occupies: its data and the FIN.
+/// Octets one pacing release may send (Linux tcp_tso_autosize): `rate` × 1 ms, at least two
+/// `seg` segments, at most 64 KiB (the cap wins).
+fn pacing_quantum(rate: u64, seg: usize) -> usize {
+    usize::try_from(rate / 1000)
+        .unwrap_or(usize::MAX)
+        .max(2 * seg)
+        .min(64 << 10)
+}
+
 fn seq_len(m: &SentMeta) -> u32 {
     m.len + u32::from(m.flags.contains(TcpFlags::FIN))
 }

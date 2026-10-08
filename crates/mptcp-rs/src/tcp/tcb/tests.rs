@@ -3018,6 +3018,10 @@ const BIG_CWND: u32 = 64 << 10;
 impl Fixture {
     /// ESTABLISHED at t(0) with `TestCc`, peer MSS 1460, shift 0 and window `wnd`.
     fn test_cc(rate: Option<u64>, cwnd: u32, wnd: u16) -> (Self, Samples) {
+        Self::test_cc_ws(rate, cwnd, wnd, 0)
+    }
+    /// As `test_cc` with peer window shift `ws`; the SYN/ACK window `wnd` is unscaled.
+    fn test_cc_ws(rate: Option<u64>, cwnd: u32, wnd: u16, ws: u8) -> (Self, Samples) {
         let samples = Samples::default();
         let cfg = ConnectConfig::default();
         let h = PlainHooks::new(&cfg);
@@ -3028,7 +3032,7 @@ impl Fixture {
         };
         let mut f = Fixture::with(cfg, Box::new(cc), h);
         assert_eq!(
-            f.synack(wnd, &opts(Some(1460), Some(0))),
+            f.synack(wnd, &opts(Some(1460), Some(ws))),
             Reaction::Established
         );
         assert_eq!(f.send(t(0)).unwrap().flags, TcpFlags::ACK);
@@ -3062,24 +3066,32 @@ fn pacing_blocks_budget_before_release() {
         assert_eq!(budget(&f, now, false), SendBudget::default(), "{now:?}");
         assert_eq!(budget(&f, now, true), SendBudget::default(), "{now:?}");
     }
-    // At the release: one segment, whatever cwnd and the window would allow.
+    // At the release: one quantum (here the 2-segment floor), whatever cwnd and the window
+    // would allow.
     for reinject in [false, true] {
         let b = budget(&f, release, reinject);
-        assert_eq!((b.seg_payload, b.full_segments, b.bytes()), (1460, 1, 1460));
+        assert_eq!((b.seg_payload, b.full_segments, b.bytes()), (1460, 2, 2920));
     }
 }
 
 #[test]
 fn pacing_release_time_in_poll_send_at() {
     let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
-    f.write(&pattern(3 * SEG as usize));
-    assert_eq!(f.drain(t(0)).len(), 1, "one segment per release");
+    f.write(&pattern(5 * SEG as usize));
+    assert_eq!(
+        f.drain(t(0)).len(),
+        2,
+        "one quantum (the 2-segment floor) per release"
+    );
     // ACKed at once: nothing in flight, no ACK expected, no RTO.
-    assert_eq!(f.ack(tm(1), data(SEG), BIG), Reaction::None);
+    assert_eq!(f.ack(tm(1), data(2 * SEG), BIG), Reaction::None);
     assert!(f.drain(tm(1)).is_empty());
-    assert_eq!(f.tcb.poll_send_at(), Some(tm(10)));
-    assert_eq!(seq_lens(&f.drain(tm(10))), [(data(SEG), SEG)]);
     assert_eq!(f.tcb.poll_send_at(), Some(tm(20)));
+    assert_eq!(
+        seq_lens(&f.drain(tm(20))),
+        [(data(2 * SEG), SEG), (data(3 * SEG), SEG)]
+    );
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(40)));
 }
 
 #[test]
@@ -3111,7 +3123,7 @@ fn pacing_deadline_consumed_when_blocked_otherwise() {
 fn pacing_does_not_delay_acks() {
     let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
     f.write(&pattern(3 * SEG as usize));
-    assert_eq!(f.drain(t(0)).len(), 1);
+    assert_eq!(f.drain(t(0)).len(), 2, "one quantum");
     // Out-of-order data: ACKed at once although data sending waits for the release.
     let r = f.seg_ack(tm(1), 10, data(0), TcpFlags::ACK, b"x");
     assert_eq!(r, Reaction::None);
@@ -3139,6 +3151,57 @@ fn retransmission_is_paced() {
     assert_eq!(seq_lens(&f.drain(t(2))), [(data(0), SEG)]);
 }
 
+// ---- Send quantum (M2 Task 4b, ruling R13): clamp(rate × 1 ms, 2 segments, 64 KiB) ----
+
+/// Paced at `rate` with a 1 MiB cwnd and a 1 MiB peer window (shift 4).
+fn quantum_fixture(rate: u64) -> Fixture {
+    let (mut f, _) = Fixture::test_cc_ws(Some(rate), 1 << 20, BIG, 4);
+    f.ack(t(0), data(0), BIG);
+    f
+}
+
+#[test]
+fn paced_budget_at_release_is_the_quantum() {
+    // 146 octets per ms: the 2-segment floor. 14 600: ten segments. 146 000: the 64 KiB cap
+    // (44 segments of 1460, not 100).
+    for (rate, segs) in [(146_000, 2), (14_600_000, 10), (146_000_000, 44)] {
+        let f = quantum_fixture(rate);
+        let n = 200 * SEG as usize;
+        let b = f.tcb.send_budget(t(0), n, n, false, 0, &f.h);
+        assert_eq!(
+            (b.seg_payload, b.full_segments),
+            (1460, segs),
+            "rate {rate}"
+        );
+    }
+}
+
+#[test]
+fn paced_burst_then_release_after_bytes_over_rate() {
+    // One quantum (10 segments, 100 µs each at 14.6 MB/s) per release.
+    let mut f = quantum_fixture(14_600_000);
+    f.write(&pattern(30 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 10);
+    // 14 600 octets / 14.6 MB/s = 1 ms after the burst started.
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1)));
+    assert!(f.drain(t(0) + Duration::from_nanos(999_999)).is_empty());
+    let b = f.tcb.send_budget(
+        t(0) + Duration::from_nanos(999_999),
+        1460,
+        1460,
+        true,
+        0,
+        &f.h,
+    );
+    assert_eq!(
+        b.bytes(),
+        0,
+        "nothing before the release, reinjection included"
+    );
+    assert_eq!(f.drain(tm(1)).len(), 10);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2)));
+}
+
 #[test]
 fn reno_unpaced_unchanged() {
     // Reno never paces, also after RTT samples: the ramp sends two segments per ACK at once.
@@ -3154,32 +3217,32 @@ fn default_cc_paces_after_first_rtt_sample() {
     // No RTT sample yet: the IW goes out at once.
     assert_eq!(f.drain(t(0)).len(), 4);
     // The ACK of two segments at 10 ms: srtt 10 ms, cwnd 6000, slow start ratio 2:
-    // 1 200 000 octets/s, one 1000-octet segment per 833 333 ns.
+    // 1 200 000 octets/s. A release sends one quantum, here the floor of two 1000-octet
+    // segments, and the next release follows 2000 octets / rate = 2 × 833 333 ns later.
     f.ack(tm(10), data(2000), BIG);
     assert_eq!(f.tcb.cc.pacing_rate(), Some(1_200_000));
-    let gap = Duration::from_nanos(833_333);
+    let gap = Duration::from_nanos(2 * 833_333);
     let mut release = tm(10);
-    for k in 0..4u32 {
+    for k in 0..2u32 {
+        let at = data(4000 + 2000 * k);
         assert_eq!(
             seq_lens(&f.drain(release)),
-            [(data(4000 + 1000 * k), 1000)],
+            [(at, 1000), (at.wrapping_add(1000), 1000)],
             "release {k}"
         );
         release = release + gap;
-        if k == 3 {
+        if k == 1 {
             break;
         }
         assert_eq!(f.tcb.poll_send_at(), Some(release));
-        let before = tm(10) + (gap * (k + 1) - Duration::from_nanos(1));
+        let before = tm(10) + (gap - Duration::from_nanos(1));
         assert!(f.drain(before).is_empty());
-        if k == 1 {
-            // While data waits for the release, an out-of-order segment is ACKed at once.
-            f.seg_ack(before, 10, data(2000), TcpFlags::ACK, b"x");
-            let segs = f.drain(before);
-            assert_eq!(segs.len(), 1);
-            assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
-            assert_eq!(f.tcb.poll_send_at(), Some(release));
-        }
+        // While data waits for the release, an out-of-order segment is ACKed at once.
+        f.seg_ack(before, 10, data(2000), TcpFlags::ACK, b"x");
+        let segs = f.drain(before);
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
+        assert_eq!(f.tcb.poll_send_at(), Some(release));
     }
     // cwnd full (6000 outstanding): the release fires once and sends nothing.
     assert_eq!(f.tcb.poll_send_at(), Some(release));
@@ -3295,7 +3358,7 @@ fn no_mark_without_room() {
     // Pacing-blocked with assigned data pending: it has something to send.
     let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
     f.write(&pattern(3 * SEG as usize));
-    assert_eq!(f.drain(t(0)).len(), 1);
+    assert_eq!(f.drain(t(0)).len(), 2, "one quantum");
     f.mark(t(0), AppLimited::NotScheduled);
     assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
 }
