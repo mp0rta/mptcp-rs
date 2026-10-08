@@ -37,7 +37,8 @@ pub(crate) struct Cubic {
     plan_from_start: bool,
     /// The current congestion avoidance stage, from its first ACK.
     epoch: Option<Epoch>,
-    /// The RTT of target = W_cubic(t + RTT) (§4.2), smoothed per RFC 6298 §2 (α = 1/8).
+    /// The RTT of target = W_cubic(t + RTT) (§4.2) and of the pacing rate, smoothed per
+    /// RFC 6298 §2 (α = 1/8).
     srtt: Option<Duration>,
     /// HyStart++, for the initial slow start only (RFC 9406 §4.3 SHOULD); `None` once it is
     /// over, or to run RFC 5681 slow start throughout.
@@ -180,8 +181,14 @@ impl CongestionControl for Cubic {
             }
             return;
         };
+        // RFC 9406 §4.3: L = infinity once the sender paces (it has an srtt), 8 before.
+        let cap = if self.srtt.is_some() {
+            u32::MAX
+        } else {
+            L * self.smss
+        };
         // HyStart++ keeps its rounds and RTT samples; only the growth is withheld.
-        let (n, done) = hs.on_ack(acked, rtt, in_flight, self.smss);
+        let (n, done) = hs.on_ack(acked, rtt, in_flight, cap);
         if grow {
             self.cwnd += f64::from(n);
         }
@@ -236,9 +243,23 @@ impl CongestionControl for Cubic {
     fn cwnd(&self) -> u32 {
         self.cwnd as u32
     }
+
+    /// cwnd / srtt × 2.0 below ssthresh / 2, × 1.2 otherwise (Linux tcp_pacing_ss_ratio /
+    /// tcp_pacing_ca_ratio). HyStart++'s CSS keeps the slow start ratio: ssthresh is still
+    /// infinite there, and 1.2 would hold the flow below CSS's own growth of 1.25× per round.
+    fn pacing_rate(&self) -> Option<u64> {
+        let srtt = self.srtt?.as_nanos().max(1);
+        let (num, den) = if self.cwnd() < self.ssthresh / 2 {
+            (2, 1)
+        } else {
+            (6, 5)
+        };
+        // At most (2³² − 1)·6·10⁹ / 5: no overflow in u128, and it fits in u64.
+        Some((u128::from(self.cwnd()) * num * 1_000_000_000 / (den * srtt)) as u64)
+    }
 }
 
-/// RFC 9406 §4.3 recommended constants (L for a sender that does not pace).
+/// RFC 9406 §4.3 recommended constants (L for a sender that does not pace yet).
 const MIN_RTT_THRESH: Duration = Duration::from_millis(4);
 const MAX_RTT_THRESH: Duration = Duration::from_millis(16);
 const MIN_RTT_DIVISOR: u32 = 8;
@@ -297,15 +318,15 @@ impl HyStart {
     }
 
     /// One ACK in slow start or CSS: the cwnd increase, and whether CSS is over (the caller
-    /// then sets ssthresh = cwnd).
+    /// then sets ssthresh = cwnd). `cap` is L·SMSS.
     fn on_ack(
         &mut self,
         acked: u32,
         rtt: Option<Duration>,
         in_flight: u32,
-        smss: u32,
+        cap: u32,
     ) -> (u32, bool) {
-        let mut grow = acked.min(L * smss);
+        let mut grow = acked.min(cap);
         if self.css.is_some() {
             grow /= CSS_GROWTH_DIVISOR;
         }
@@ -720,7 +741,8 @@ mod tests {
 
     #[test]
     fn hystart_growth_limit_l() {
-        // Slow start under HyStart++: + min(N, L·SMSS) with L = 8 (non-paced).
+        // Slow start under HyStart++ before the first RTT sample (not paced yet):
+        // + min(N, L·SMSS) with L = 8.
         let mut c = cubic();
         c.on_ack(&ack(3000, None, 0, T0));
         assert_eq!(c.cwnd(), 7000);
@@ -731,6 +753,91 @@ mod tests {
         c.hystart = None;
         c.on_ack(&ack(3000, None, 0, T0));
         assert_eq!(c.cwnd(), 5000);
+    }
+
+    #[test]
+    fn hystart_growth_unlimited_when_paced() {
+        // RFC 9406 §4.3: a paced sender uses L = infinity. The first RTT sample makes CUBIC
+        // pace, so the same ACK and every later one grow by all of N.
+        let mut c = cubic();
+        c.on_ack(&ack(3000, Some(ms(100)), 8 * SMSS, T0));
+        assert!(c.pacing_rate().is_some());
+        assert_eq!(c.cwnd(), 7000);
+        c.on_ack(&ack(20_000, Some(ms(100)), 8 * SMSS, T0));
+        assert_eq!(c.cwnd(), 27_000, "not capped at L·SMSS = 8000");
+        // CSS: + N / CSS_GROWTH_DIVISOR, N uncapped too.
+        let mut c = css();
+        c.on_ack(&ack(20_000, Some(ms(113)), 8 * SMSS, T0));
+        assert_eq!(c.cwnd(), 34_000, "29 000 + 20 000 / 4");
+    }
+
+    // Pacing rate (Linux tcp_update_pacing_rate): cwnd / srtt × 2.0 below ssthresh / 2,
+    // × 1.2 otherwise; octets per second.
+
+    /// One ACK of one SMSS with RTT sample `rtt`, no other change worth noting.
+    fn sampled(c: &mut Cubic, rtt: Duration) {
+        c.on_ack(&ack(SMSS, Some(rtt), 0, T0));
+    }
+
+    #[test]
+    fn cubic_pacing_rate_none_before_rtt_sample() {
+        let mut c = cubic();
+        assert_eq!(c.pacing_rate(), None);
+        c.on_ack(&ack(SMSS, None, 0, T0));
+        assert_eq!(c.pacing_rate(), None, "no RTT sample yet");
+        sampled(&mut c, ms(100));
+        // cwnd 6000, srtt 100 ms, slow start (ssthresh infinite): 6000 / 0.1 × 2.
+        assert_eq!((c.cwnd(), c.pacing_rate()), (6000, Some(120_000)));
+    }
+
+    #[test]
+    fn cubic_pacing_rate_slow_start_and_ca() {
+        // CSS keeps the slow start ratio: ssthresh is still infinite. srtt is the RFC 6298
+        // average of 16 samples of 100 ms then 8 of 113 ms.
+        let c = css();
+        let srtt = c.srtt.unwrap().as_nanos();
+        assert_eq!(srtt, 108_533_083);
+        assert_eq!(c.pacing_rate(), Some(534_399), "29 000 / srtt × 2");
+        // Congestion avoidance after a loss: 70 007 / 0.1 × 1.2.
+        let mut c = after_loss();
+        sampled(&mut c, ms(100));
+        assert_eq!((c.cwnd(), c.pacing_rate()), (70_007, Some(840_084)));
+        // The switch at cwnd = ssthresh / 2 (after an RTO: ssthresh 70 000, slow start).
+        let mut c = grown(100_000);
+        c.on_congestion(CongestionEvent::Rto, 100_000, T0);
+        while c.cwnd() < 34_000 {
+            sampled(&mut c, ms(100));
+        }
+        assert_eq!((c.cwnd(), c.pacing_rate()), (34_000, Some(680_000)));
+        sampled(&mut c, ms(100));
+        assert_eq!((c.cwnd(), c.pacing_rate()), (35_000, Some(420_000)));
+    }
+
+    #[test]
+    fn cubic_pacing_rate_follows_loss_and_rto() {
+        let mut c = grown(99_000);
+        sampled(&mut c, ms(100));
+        assert_eq!((c.cwnd(), c.pacing_rate()), (100_000, Some(2_000_000)));
+        // Fast retransmit: cwnd = 0.7 · 100 000 + 3 SMSS, at or above ssthresh / 2.
+        c.on_congestion(CongestionEvent::FastRetransmit, 100_000, T0);
+        assert_eq!((c.cwnd(), c.pacing_rate()), (73_000, Some(876_000)));
+        c.on_recovery_ack(RecoveryAck::Full { in_flight: 80_000 });
+        assert_eq!((c.cwnd(), c.pacing_rate()), (70_000, Some(840_000)));
+        // RTO: cwnd = 1 SMSS, ssthresh 49 000: slow start again.
+        c.on_congestion(CongestionEvent::Rto, 70_000, T0);
+        assert_eq!((c.cwnd(), c.pacing_rate()), (SMSS, Some(20_000)));
+    }
+
+    #[test]
+    fn cubic_pacing_rate_zero_srtt_and_largest_cwnd() {
+        let mut c = cubic();
+        sampled(&mut c, Duration::ZERO);
+        // srtt 0 is taken as 1 ns: 5000 · 2 · 10⁹.
+        assert_eq!(c.pacing_rate(), Some(10_000_000_000_000));
+        // The largest cwnd at the 1.2 ratio over 1 ns does not overflow.
+        c.cwnd = f64::from(u32::MAX);
+        c.ssthresh = 0;
+        assert_eq!(c.pacing_rate(), Some(5_153_960_754_000_000_000));
     }
 
     // RFC 9438 §5.8 / §4.2: app-limited ACKs neither grow cwnd nor count toward t.

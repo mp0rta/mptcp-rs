@@ -634,7 +634,14 @@ fn unmapped_data_is_tcp_acked_but_not_delivered() {
 }
 
 fn connected_with_capacity(cap: u32) -> (Endpoint<ChaCha20Rng>, ConnectionHandle, Vec<u8>, u64) {
+    connected_with_capacity_cc(cap, None)
+}
+fn connected_with_capacity_cc(
+    cap: u32,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+) -> (Endpoint<ChaCha20Rng>, ConnectionHandle, Vec<u8>, u64) {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(19));
+    ep.cc = cc;
     let h = ep
         .connect_mptcp(
             Instant::from_nanos(0),
@@ -1658,7 +1665,7 @@ fn invalid_data_ack_does_not_confirm_mapping() {
 
 #[test]
 fn recovery_reevaluates_head_and_cancels_after_data_ack() {
-    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let (mut ep, h, syn, _) = connected_with_capacity_cc(64, Some(reno));
     let syn = packet::parse(&syn).unwrap();
     ep.connection(h).unwrap().write(b"abcd").unwrap();
     let sent = transmit(&mut ep, Instant::from_nanos(2));
@@ -1697,7 +1704,7 @@ fn recovery_reevaluates_head_and_cancels_after_data_ack() {
 
 #[test]
 fn reinjection_respects_zero_tcp_window_and_deduplicates_live_copy() {
-    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let (mut ep, h, syn, _) = connected_with_capacity_cc(64, Some(reno));
     let syn = packet::parse(&syn).unwrap();
     ep.connection(h).unwrap().write(b"data").unwrap();
     let sent = transmit(&mut ep, Instant::from_nanos(2));
@@ -2611,6 +2618,19 @@ fn drain(ep: &mut Endpoint<ChaCha20Rng>, now: Instant) -> Vec<Vec<u8>> {
     }
     out
 }
+/// `drain` at `now` and at every deadline (a pacing release) before `until`.
+fn drain_until(ep: &mut Endpoint<ChaCha20Rng>, now: Instant, until: Instant) -> Vec<Vec<u8>> {
+    let mut out = drain(ep, now);
+    while let Some(t) = ep.poll_timeout().filter(|&t| t < until) {
+        ep.handle_timeout(t);
+        out.extend(drain(ep, t));
+    }
+    out
+}
+/// Reno, which never paces: for tests whose sends assume the whole budget at once.
+fn reno() -> Box<dyn crate::tcp::cc::CongestionControl> {
+    Box::new(crate::tcp::cc::Reno::new())
+}
 /// The peer's ACK: TCP up to `ack`, DATA_ACK `data`, window field `wnd` (scale 7).
 fn peer_ack(
     ep: &mut Endpoint<ChaCha20Rng>,
@@ -2851,7 +2871,7 @@ fn sent_and_discarded(
 
 #[test]
 fn rule5_recovers_with_no_new_data() {
-    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(reno));
     open_window(&mut ep, &syn, h);
     let (log, _) = install_probe(&mut ep, h);
     let (head, _) = sent_and_discarded(&mut ep, h, &syn, &[&[4; 2864]], 1000);
@@ -2879,7 +2899,7 @@ fn rule5_recovers_with_no_new_data() {
 
 #[test]
 fn rule5_recovers_while_new_data_waits_on_nagle() {
-    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(reno));
     open_window(&mut ep, &syn, h);
     ep.connection(h)
         .unwrap()
@@ -2999,7 +3019,7 @@ fn full_mapping_slots_zero_budgets() {
 
 #[test]
 fn reinject_across_adjacent_write_chunks() {
-    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(reno));
     open_window(&mut ep, &syn, h);
     let writes: [&[u8]; 3] = [&[0xa; 1000], &[0xb; 1000], &[0xc; 864]];
     let (head, _) = sent_and_discarded(&mut ep, h, &syn, &writes, 1000);
@@ -3045,7 +3065,7 @@ fn reinject_across_adjacent_write_chunks() {
 
 #[test]
 fn rogue_reinject_outside_head_rejected() {
-    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(reno));
     open_window(&mut ep, &syn, h);
     let (log, rogue) = install_probe(&mut ep, h);
     let (head, _) = sent_and_discarded(&mut ep, h, &syn, &[&[4; 2864]], 1000);
@@ -3365,7 +3385,8 @@ fn cubic_connection_window_limited_does_not_grow_cwnd() {
     let mut dack = head;
     let mut rounds = 0;
     loop {
-        for pkt in drain(&mut ep, now) {
+        // CUBIC paces after its first RTT sample: send at every release of the round.
+        for pkt in drain_until(&mut ep, now, now + Duration::from_millis(10)) {
             let seg = packet::parse(&pkt).unwrap();
             if let Some((dsn, _)) = dsn_of(&seg, syn.seq) {
                 tcp_ack = seg.seq.wrapping_add(seg.payload.len() as u32);
@@ -3391,7 +3412,7 @@ fn cubic_connection_window_limited_does_not_grow_cwnd() {
         dack += 2864;
         peer_ack(&mut ep, &syn, now, tcp_ack, dack, 1000);
         let mut sent = 0;
-        for pkt in drain(&mut ep, now) {
+        for pkt in drain_until(&mut ep, now, now + Duration::from_millis(10)) {
             let seg = packet::parse(&pkt).unwrap();
             if dsn_of(&seg, syn.seq).is_some() {
                 tcp_ack = seg.seq.wrapping_add(seg.payload.len() as u32);

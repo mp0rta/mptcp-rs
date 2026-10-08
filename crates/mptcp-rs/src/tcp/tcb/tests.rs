@@ -2738,9 +2738,12 @@ fn synack_fin_closes_receive_side() {
     }
 }
 
-/// The default CC grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s.
+/// Reno grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s. Reno:
+/// the restart window is sent at once, which a pacing controller would spread out.
 fn grown_idle_fixture() -> Fixture {
-    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
     assert_eq!(
         f.synack(65535, &opts(Some(MSS), Some(0))),
         Reaction::Established
@@ -3138,8 +3141,49 @@ fn retransmission_is_paced() {
 
 #[test]
 fn reno_unpaced_unchanged() {
-    assert_eq!(Reno::new().pacing_rate(), None);
-    assert_eq!(Cubic::new().pacing_rate(), None);
+    // Reno never paces, also after RTT samples: the ramp sends two segments per ACK at once.
+    // CUBIC paces from its first RTT sample (M2 Task 4b), so Reno alone pins the unpaced path.
+    let f = Fixture::reno_ramp(&pattern(20_000));
+    assert_eq!(f.tcb.cc.pacing_rate(), None);
+}
+
+#[test]
+fn default_cc_paces_after_first_rtt_sample() {
+    let mut f = cubic_fixture(BIG);
+    f.write(&pattern(20_000));
+    // No RTT sample yet: the IW goes out at once.
+    assert_eq!(f.drain(t(0)).len(), 4);
+    // The ACK of two segments at 10 ms: srtt 10 ms, cwnd 6000, slow start ratio 2:
+    // 1 200 000 octets/s, one 1000-octet segment per 833 333 ns.
+    f.ack(tm(10), data(2000), BIG);
+    assert_eq!(f.tcb.cc.pacing_rate(), Some(1_200_000));
+    let gap = Duration::from_nanos(833_333);
+    let mut release = tm(10);
+    for k in 0..4u32 {
+        assert_eq!(
+            seq_lens(&f.drain(release)),
+            [(data(4000 + 1000 * k), 1000)],
+            "release {k}"
+        );
+        release = release + gap;
+        if k == 3 {
+            break;
+        }
+        assert_eq!(f.tcb.poll_send_at(), Some(release));
+        let before = tm(10) + (gap * (k + 1) - Duration::from_nanos(1));
+        assert!(f.drain(before).is_empty());
+        if k == 1 {
+            // While data waits for the release, an out-of-order segment is ACKed at once.
+            f.seg_ack(before, 10, data(2000), TcpFlags::ACK, b"x");
+            let segs = f.drain(before);
+            assert_eq!(segs.len(), 1);
+            assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
+            assert_eq!(f.tcb.poll_send_at(), Some(release));
+        }
+    }
+    // cwnd full (6000 outstanding): the release fires once and sends nothing.
+    assert_eq!(f.tcb.poll_send_at(), Some(release));
+    assert!(f.drain(release).is_empty());
 }
 
 #[test]
@@ -3327,6 +3371,8 @@ fn cubic_rwnd_limited_does_not_grow_cwnd() {
     for round in 1..=50 {
         let now = tm(10 * round);
         assert!(!f.drain(now).is_empty());
+        // The second segment of the window at CUBIC's pacing release (625 µs here).
+        f.drain(now + Duration::from_millis(1));
         let ack = f.tcb.snd_max;
         f.ack(now + Duration::from_millis(5), ack, 2000);
     }
