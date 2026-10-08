@@ -143,11 +143,13 @@ impl CongestionControl for Cubic {
     /// avoidance otherwise.
     ///
     /// §5.8: "CUBIC does not increase its congestion window if a flow is application
-    /// limited", and t "MUST NOT include periods during which cwnd has not been updated due
-    /// to application-limited behavior" (§4.2). An ACK of data sent inside an app-limited
-    /// interval (`AckSample::app_limited`: the flow was not cwnd-limited) grows neither cwnd
-    /// nor W_est, and moves t_epoch by the time since the stage's previous ACK. W_max at the
-    /// next loss is then the cwnd the flow actually used, and K stays what that implies.
+    /// limited" — limited by the sender application or by the receiver's advertised window —
+    /// and t "MUST NOT include periods during which cwnd has not been updated due to
+    /// application-limited behavior" (§4.2). cwnd grows only on an ACK that is
+    /// `cwnd_limited` (its data was outstanding when the sender filled cwnd, RFC 7661 §3) and
+    /// not `app_limited` (data sent inside an app-limited interval). Any other ACK grows neither cwnd nor
+    /// W_est, and moves t_epoch by the time since the stage's previous ACK. W_max at the next
+    /// loss is then the cwnd the flow actually used, and K stays what that implies.
     fn on_ack(&mut self, ack: &AckSample) {
         let AckSample {
             acked,
@@ -155,13 +157,15 @@ impl CongestionControl for Cubic {
             in_flight,
             now,
             app_limited,
+            cwnd_limited,
             ..
         } = *ack;
+        let grow = cwnd_limited && !app_limited;
         if let Some(r) = rtt {
             self.srtt = Some(self.srtt.map_or(r, |s| s * 7 / 8 + r / 8));
         }
         if self.cwnd >= f64::from(self.ssthresh) {
-            if !app_limited {
+            if grow {
                 return self.congestion_avoidance(acked, now);
             }
             if let Some(ep) = &mut self.epoch {
@@ -171,15 +175,15 @@ impl CongestionControl for Cubic {
             return;
         }
         let Some(hs) = &mut self.hystart else {
-            if !app_limited {
+            if grow {
                 self.cwnd += f64::from(acked.min(self.smss));
             }
             return;
         };
         // HyStart++ keeps its rounds and RTT samples; only the growth is withheld.
-        let (grow, done) = hs.on_ack(acked, rtt, in_flight, self.smss);
-        if !app_limited {
-            self.cwnd += f64::from(grow);
+        let (n, done) = hs.on_ack(acked, rtt, in_flight, self.smss);
+        if grow {
+            self.cwnd += f64::from(n);
         }
         if done {
             // RFC 9406 §4.2: ssthresh = cwnd; RFC 9438 §4.10: cwnd_prior = cwnd, and the
@@ -359,6 +363,7 @@ mod tests {
             now,
             delivered: 0,
             app_limited: false,
+            cwnd_limited: true,
         }
     }
     fn ms(n: u64) -> Duration {
@@ -733,6 +738,34 @@ mod tests {
     fn limited(mut a: AckSample) -> AckSample {
         a.app_limited = true;
         a
+    }
+
+    fn rate_limited(mut a: AckSample) -> AckSample {
+        a.cwnd_limited = false;
+        a
+    }
+
+    #[test]
+    fn cubic_not_cwnd_limited_acks_do_not_advance_t_or_cwnd() {
+        let mut c = cubic();
+        c.on_ack(&rate_limited(ack(SMSS, None, 0, T0)));
+        assert_eq!(c.cwnd(), 4000, "slow start");
+        let (mut a, mut b) = (after_loss(), after_loss());
+        a.on_ack(&ack(SMSS, None, 0, T0));
+        b.on_ack(&ack(SMSS, None, 0, T0));
+        let cwnd = a.cwnd;
+        for s in 1..=10 {
+            a.on_ack(&rate_limited(ack(
+                SMSS,
+                None,
+                0,
+                at(Duration::from_secs(s)),
+            )));
+            assert_eq!(a.cwnd, cwnd);
+        }
+        a.on_ack(&ack(SMSS, None, 0, at(Duration::from_secs(10) + ms(100))));
+        b.on_ack(&ack(SMSS, None, 0, at(ms(100))));
+        assert_eq!(a.cwnd, b.cwnd, "t excludes the period");
     }
 
     #[test]

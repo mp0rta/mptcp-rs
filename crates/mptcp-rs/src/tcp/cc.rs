@@ -29,6 +29,13 @@ pub struct AckSample {
     /// segment this ACK covers carried the mark (draft-ietf-ccwg-bbr-06 §4.1.2.3,
     /// RS.is_app_limited). Its delivery says nothing about path capacity.
     pub app_limited: bool,
+    /// Everything this ACK covers was outstanding when the sender filled cwnd: a data
+    /// transmission left less than one SMSS of cwnd unused (RFC 7661 §3, "cwnd-limited: A TCP
+    /// flow that has sent the maximum number of segments permitted by the cwnd"). Otherwise
+    /// the flow sent less than cwnd allowed — limited by the application or by the receiver's
+    /// window, both application-limited in RFC 9438 §5.8. Separate from `app_limited`, which
+    /// does not count receiver-limited periods (draft-ietf-ccwg-bbr-06 §4.1.1.3.1).
+    pub cwnd_limited: bool,
 }
 
 /// Why a sender with room in cwnd and in the peer's window sent nothing.
@@ -228,6 +235,7 @@ mod tests {
             now: T0,
             delivered: 0,
             app_limited: false,
+            cwnd_limited: true,
         }
     }
 

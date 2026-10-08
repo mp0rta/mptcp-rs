@@ -255,6 +255,10 @@ pub struct Tcb {
     app_limited_until: Option<u64>,
     /// Why the interval was last (re)started; cleared with it, or once new data goes out.
     app_limited: Option<AppLimited>,
+    /// SND.MAX after the latest data transmission that left less than one SMSS of cwnd unused
+    /// (the flow was cwnd-limited, RFC 7661 §3); an ACK up to it is `AckSample::cwnd_limited`.
+    /// Cleared by an ACK beyond it.
+    cwnd_full_at: Option<SeqNum>,
     /// Pacing release time: no data segment goes out before it. Reaching it consumes it.
     next_send_at: Option<Instant>,
     /// Assigned data or a FIN was unsent at the last `poll_send`.
@@ -352,6 +356,7 @@ impl Tcb {
             delivered: 0,
             app_limited_until: None,
             app_limited: None,
+            cwnd_full_at: None,
             next_send_at: None,
             unsent: false,
             conn_pending: false,
@@ -1218,6 +1223,10 @@ impl Tcb {
             }
             let rtt = newest.filter(|r| !r.resent).map(|r| now - r.sent_at);
             let app_limited = newest.is_some_and(|r| r.app_limited);
+            let cwnd_limited = self.cwnd_full_at.is_some_and(|m| seg.ack.le(m));
+            if !cwnd_limited {
+                self.cwnd_full_at = None;
+            }
             // The app-limited bubble is acknowledged and gone (GenerateRateSample).
             if self.app_limited_until.is_some_and(|m| self.delivered > m) {
                 self.app_limited_until = None;
@@ -1235,6 +1244,7 @@ impl Tcb {
                     now,
                     delivered: self.delivered,
                     app_limited,
+                    cwnd_limited,
                 }),
                 NewAck::Partial { first } => {
                     self.cc.on_recovery_ack(RecoveryAck::Partial { acked });
@@ -1481,6 +1491,16 @@ impl Tcb {
                 }
                 break;
             }
+        }
+        // The flow filled cwnd: what is outstanding now was sent cwnd-limited.
+        let max = if rec.end.gt(self.snd_max) {
+            rec.end
+        } else {
+            self.snd_max
+        };
+        let flight = self.snd_una.distance(max) as u32;
+        if self.cc.cwnd().saturating_sub(flight) < u32::from(self.eff_mss) {
+            self.cwnd_full_at = Some(max);
         }
         if let Some(rate) = self.cc.pacing_rate().filter(|_| meta.len > 0) {
             let gap = Duration::from_nanos(u64::from(meta.len) * 1_000_000_000 / rate.max(1));

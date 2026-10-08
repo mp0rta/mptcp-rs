@@ -3304,3 +3304,90 @@ fn marker_refreshed_on_repeated_app_limited() {
     assert_eq!(f.tcb.app_limited_until, None);
     assert_eq!(flags_of(&samples), [false, true, true]);
 }
+
+// ---- cwnd-limited (RFC 9438 §5.8, RFC 7661 §3): fix round 1 ----
+
+/// The default CC (CUBIC), MSS 1000 (IW 4000), peer window `wnd`, ESTABLISHED at t(0).
+fn cubic_fixture(wnd: u16) -> Fixture {
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    assert_eq!(
+        f.synack(wnd, &opts(Some(MSS), Some(0))),
+        Reaction::Established
+    );
+    f.send(t(0)).unwrap();
+    assert_eq!(f.tcb.cc.cwnd(), 4000);
+    f
+}
+
+#[test]
+fn cubic_rwnd_limited_does_not_grow_cwnd() {
+    // A 2000-octet peer window below IW: the flow never fills cwnd.
+    let mut f = cubic_fixture(2000);
+    f.write(&pattern(200_000));
+    for round in 1..=50 {
+        let now = tm(10 * round);
+        assert!(!f.drain(now).is_empty());
+        let ack = f.tcb.snd_max;
+        f.ack(now + Duration::from_millis(5), ack, 2000);
+    }
+    assert!(f.tcb.snd_una.gt(data(90_000)), "the transfer runs");
+    assert_eq!(f.tcb.cc.cwnd(), 4000, "receiver-limited: no growth");
+}
+
+#[test]
+fn cubic_app_limited_with_data_outstanding_does_not_grow_cwnd() {
+    // The application writes one segment per 10 ms; one segment is always outstanding.
+    let mut f = cubic_fixture(BIG);
+    for round in 0..50u32 {
+        let now = tm(10 * u64::from(round));
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(now).len(), 1);
+        if round > 0 {
+            f.ack(now + Duration::from_millis(1), data(1000 * round), BIG);
+        }
+    }
+    assert_eq!(f.tcb.cc.cwnd(), 4000, "application-limited: no growth");
+}
+
+#[test]
+fn cwnd_limited_marks_acks_of_a_full_window() {
+    // cwnd 4 segments: the burst fills it, so every ACK of it is cwnd-limited, also when the
+    // ACKs come in one batch before anything more is sent.
+    let (mut f, samples) = Fixture::test_cc(None, 4 * SEG, BIG);
+    f.write(&pattern(8 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 4);
+    for k in 1..=4 {
+        f.ack(tm(10), data(k * SEG), BIG);
+    }
+    let lim: Vec<bool> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.cwnd_limited)
+        .collect();
+    assert_eq!(lim, [true; 4]);
+    // The rest (4 segments) leaves cwnd full again; ACKed, the queue is empty.
+    assert_eq!(f.drain(tm(10)).len(), 4);
+    f.ack(tm(20), data(8 * SEG), BIG);
+    // One segment with cwnd unused: not cwnd-limited.
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(20)).len(), 1);
+    f.ack(tm(30), data(9 * SEG), BIG);
+    let lim: Vec<bool> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.cwnd_limited)
+        .collect();
+    assert_eq!(lim, [true, true, true, true, true, false]);
+    // Receiver-limited: the peer window holds 2 segments of a 64 KiB cwnd.
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, 2 * 1460);
+    f.write(&pattern(8 * SEG as usize));
+    for k in 1..=4 {
+        assert_eq!(f.drain(tm(10 * u64::from(k))).len(), 2);
+        f.ack(tm(10 * u64::from(k) + 5), data(2 * k * SEG), 2 * 1460);
+    }
+    let s = samples.lock().unwrap();
+    assert_eq!(s.len(), 4);
+    assert!(s.iter().all(|a| !a.cwnd_limited && !a.app_limited), "{s:?}");
+}

@@ -3345,3 +3345,64 @@ fn idle_scheduler_marks_not_scheduled() {
     assert!(!drain(&mut ep, now).is_empty());
     assert_eq!(app_limited_reason(&ep, h), None, "MinRTT assigned data");
 }
+
+#[test]
+fn cubic_connection_window_limited_does_not_grow_cwnd() {
+    // RFC 9438 §5.8: limited by the receiver's (here the connection-level) window is
+    // application-limited for CUBIC, though not app-limited for BBR's samples.
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().write(&vec![6; 400_000]).unwrap();
+    let cwnd = |ep: &Endpoint<ChaCha20Rng>| ep.conns[&h].subflows[0].tcb.cwnd();
+    // Phase 1: the peer TCP-ACKs everything but holds DATA_ACK at the head, so the
+    // connection-level edge stays at head + 128,000 while the subflow window stays open.
+    let mut now = Instant::from_nanos(10);
+    let (mut tcp_ack, mut data_end) = (syn.seq.wrapping_add(1), head);
+    let mut dack = head;
+    let mut rounds = 0;
+    loop {
+        for pkt in drain(&mut ep, now) {
+            let seg = packet::parse(&pkt).unwrap();
+            if let Some((dsn, _)) = dsn_of(&seg, syn.seq) {
+                tcp_ack = seg.seq.wrapping_add(seg.payload.len() as u32);
+                data_end = dsn + seg.payload.len() as u64;
+            }
+        }
+        now = now + Duration::from_millis(10);
+        if rounds > 0 && data_end == head + 128_000 {
+            // Phase 2: two segments of connection credit per round, every one TCP-ACKed.
+            peer_ack(&mut ep, &syn, now, tcp_ack, dack, 1000);
+            break;
+        }
+        peer_ack(&mut ep, &syn, now, tcp_ack, dack, 1000);
+        rounds += 1;
+        assert!(rounds < 20);
+    }
+    let before = cwnd(&ep);
+    assert!(
+        before > 20 * 1460,
+        "slow start ran while cwnd-limited: {before}"
+    );
+    for _ in 0..30 {
+        dack += 2864;
+        peer_ack(&mut ep, &syn, now, tcp_ack, dack, 1000);
+        let mut sent = 0;
+        for pkt in drain(&mut ep, now) {
+            let seg = packet::parse(&pkt).unwrap();
+            if dsn_of(&seg, syn.seq).is_some() {
+                tcp_ack = seg.seq.wrapping_add(seg.payload.len() as u32);
+                sent += seg.payload.len();
+            }
+        }
+        assert_eq!(sent, 2864, "connection-window-limited");
+        now = now + Duration::from_millis(10);
+        peer_ack(&mut ep, &syn, now, tcp_ack, dack, 1000);
+    }
+    assert_eq!(cwnd(&ep), before, "no growth while not cwnd-limited");
+    assert_eq!(
+        app_limited_reason(&ep, h),
+        None,
+        "and not app-limited for BBR samples"
+    );
+}
