@@ -1,9 +1,9 @@
 //! One TCP or MPTCP connection as the application sees it: its subflows plus its buffers.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use crate::mptcp::Subflow;
-use crate::tcp::TcpState;
+use crate::mptcp::{Subflow, SubflowId};
+use crate::tcp::{ConnectConfig, TcpState};
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
@@ -30,6 +30,21 @@ pub struct Connection {
     /// Closed and out of the demux table, kept only until the application has read the
     /// remaining data (no timers, no packets).
     pub(crate) detached: bool,
+    /// The configuration subflows are opened with (each with its own MTU).
+    pub(crate) cfg: ConnectConfig,
+    /// Joins waiting for the connection to be Confirmed (RFC 8684 L884–887).
+    pub(crate) queued_joins: Vec<QueuedJoin>,
+    /// The next subflow ID; IDs are never reused within a connection.
+    pub(crate) next_subflow: u8,
+    /// Local IPs by address ID: the initial one is 0 (spec §5.6).
+    pub(crate) addr_ids: Vec<IpAddr>,
+}
+
+/// An `add_subflow` made before the connection was Confirmed.
+pub(crate) struct QueuedJoin {
+    pub id: SubflowId,
+    pub local: IpAddr,
+    pub mtu: u16,
 }
 
 impl Connection {

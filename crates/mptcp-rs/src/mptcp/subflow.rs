@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use super::ConnectionHooks;
 use super::data::{RxMaps, TxMaps};
+use super::join::Join;
 use crate::SeqNum;
 use crate::tcp::Tcb;
 use crate::wire::mptcp;
@@ -14,8 +15,7 @@ pub struct SubflowId(pub(crate) u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubflowState {
-    /// Used once MP_JOIN subflows exist (M2 MP_JOIN task).
-    #[allow(dead_code)]
+    /// MP_JOIN not complete: no data, not usable by the scheduler.
     Joining,
     Active,
     /// Used by stale-path detection (M2 stale/reinjection task).
@@ -35,7 +35,9 @@ pub(crate) struct Subflow {
     pub mp: SubflowMp,
 }
 
-/// MPTCP state tied to one subflow's TCP sequence space, options or window scale.
+/// MPTCP state tied to one subflow's TCP sequence space, options or window scale. The creator
+/// must set `local_isn`, `tcp_acked_dsn` and (from its SYN/ACK) `peer_scale`: the MP_CAPABLE
+/// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`.
 pub(crate) struct SubflowMp {
     pub tx: TxMaps,
     pub rx: RxMaps,
@@ -57,6 +59,8 @@ pub(crate) struct SubflowMp {
     /// A scheduling step offered this subflow a nonzero budget and installed no mapping on
     /// it; consumed by the next app-limited evaluation (`Connection::mark_passed_over`).
     pub offered_unused: bool,
+    /// MP_JOIN state; `None` on the initial subflow.
+    pub join: Option<Join>,
 }
 
 impl SubflowMp {
@@ -77,7 +81,12 @@ impl SubflowMp {
             rx_infinite: None,
             peer_scale: 0,
             offered_unused: false,
+            join: None,
         }
+    }
+    /// A joined subflow whose MP_JOIN handshake is not complete.
+    pub fn joining(&self) -> bool {
+        self.join.as_ref().is_some_and(Join::joining)
     }
 }
 

@@ -610,6 +610,11 @@ impl Tcb {
     pub(crate) fn reset_pending(&self) -> bool {
         self.rst_due.is_some()
     }
+    /// RFC 9293 §3.10.5 ABORT: a RST `<SEQ=SND.MAX>` is due and the TCB is Closed.
+    pub(crate) fn abort(&mut self, reason: CloseReason, now: Instant) -> Reaction {
+        self.rst_due = Some(self.snd_max);
+        self.terminate(reason, now)
+    }
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }

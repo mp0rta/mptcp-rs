@@ -1,10 +1,12 @@
-//! Single-subflow MPTCP negotiation, data transfer, recovery and closure.
+//! MPTCP negotiation, MP_JOIN subflows, data transfer, recovery and closure.
 mod close;
 pub(crate) mod data;
+mod join;
 pub(crate) mod sched;
 mod subflow;
 use crate::crypto::key_token_idsn;
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
+pub(crate) use join::Join;
 use sched::{MinRtt, Payload, Pending, Plan, ReinjectQueue, Scheduler, SubflowSnapshot};
 pub use subflow::SubflowId;
 pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
@@ -40,7 +42,7 @@ pub(crate) struct ConnectionHooks {
 }
 
 /// Subflows per connection (M2: snapshot buffer capacity).
-const SUBFLOW_CAP: usize = 8;
+pub(crate) const SUBFLOW_CAP: usize = 8;
 
 /// Connection-level MPTCP data state; absent for plain TCP and before MP_CAPABLE completes.
 pub(crate) struct DataState {
@@ -321,7 +323,8 @@ impl SubflowHooks<'_> {
         let Some(d) = &mut self.conn.data else {
             return;
         };
-        if tcb.state() == crate::tcp::TcpState::Closed {
+        // A joining subflow carries no data and has no say in connection-level timers.
+        if tcb.state() == crate::tcp::TcpState::Closed || self.sf.joining() {
             return;
         }
         if !d.fallback
@@ -356,6 +359,13 @@ impl SubflowHooks<'_> {
         }
     }
     pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant) {
+        if self.sf.joining() {
+            // No data, probes or DATA_FIN while joining; it still closes with the rest.
+            if self.conn.data.as_ref().is_some_and(|d| d.close.acked) {
+                tcb.close();
+            }
+            return;
+        }
         self.update_recovery(tcb, now);
         // Preserve the third ACK and replies to repeated SYN/ACKs before
         // requesting a separate DATA_FIN ACK. An idle peer need not send DSS first.
@@ -427,6 +437,7 @@ impl SubflowHooks<'_> {
             return false;
         };
         !self.sf.tx.is_full()
+            && !self.sf.joining()
             && (tcb.state() == crate::tcp::TcpState::Established
                 || (tcb.state() == crate::tcp::TcpState::CloseWait
                     && (d.fallback || d.recv.has_fin())))
@@ -582,6 +593,9 @@ impl SegmentHooks for SubflowHooks<'_> {
     }
 
     fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
+        if let Some(n) = self.join_options(flags, out) {
+            return n;
+        }
         if let (Some(m), Some(d)) = (&self.conn.negotiation, &mut self.conn.data) {
             if let Some(mapping) = self.sf.final_mapping {
                 let n = mptcp::encode(
@@ -665,6 +679,14 @@ impl SegmentHooks for SubflowHooks<'_> {
         } else {
             Some(false)
         };
+        // A join's SYN/ACK is its own (the handshake state and SYN window are the initial
+        // subflow's); later segments find the connection Confirmed and go on as usual.
+        if self.sf.join.is_some() {
+            self.join_segment(seg);
+            if seg.flags.contains(TcpFlags::SYN) {
+                return;
+            }
+        }
         let Some(m) = &mut self.conn.negotiation else {
             return;
         };
@@ -938,7 +960,9 @@ pub(crate) enum State {
 pub(crate) struct Negotiation {
     pub state: State,
     pub token: u32,
-    local_key: u64,
+    pub local_key: u64,
+    /// The peer's SYN/ACK MP_CAPABLE had C=1: it accepts no MP_JOIN to its source address.
+    pub peer_c: bool,
     pub peer_idsn: Option<u64>,
     pub peer_key: Option<u64>,
     pub local_idsn: u64,
@@ -955,6 +979,7 @@ impl Negotiation {
             token,
             local_key,
             local_idsn,
+            peer_c: false,
             send_right_edge: None,
             peer_idsn: None,
             peer_key: None,
@@ -1008,6 +1033,7 @@ impl Negotiation {
                             && peer_key.is_none() =>
                     {
                         peer_key = c.sender_key;
+                        self.peer_c = c.flags & CAP_C != 0;
                     }
                     _ => {
                         peer_key = None;

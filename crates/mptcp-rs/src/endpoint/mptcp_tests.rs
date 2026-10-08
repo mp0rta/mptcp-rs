@@ -2539,6 +2539,8 @@ enum Rogue {
     NoSuchSubflow,
     /// A New plan within budget for the first subflow, whatever its state.
     FirstSubflow,
+    /// A New plan with the first subflow's budget for the named subflow, whatever its state.
+    Named(SubflowId),
     /// A reinjection `(dsn, len)` that is not a prefix of the head candidate.
     ForeignReinject(u64, u32),
     /// Never sends anything.
@@ -2563,6 +2565,7 @@ impl Scheduler for Probe {
             Some(Rogue::OverBudget) => new(first.id, budget + 1),
             Some(Rogue::NoSuchSubflow) => new(SubflowId(7), budget),
             Some(Rogue::FirstSubflow) => new(first.id, budget),
+            Some(Rogue::Named(id)) => new(id, budget),
             Some(Rogue::ForeignReinject(dsn, len)) => Plan::Send {
                 subflow: first.id,
                 payload: Payload::Reinject { dsn, len },
@@ -3406,3 +3409,7 @@ fn cubic_connection_window_limited_does_not_grow_cwnd() {
         "and not app-limited for BBR samples"
     );
 }
+
+// M2 Task 4: MP_JOIN, reusing the helpers above.
+#[path = "join_tests.rs"]
+mod join_tests;

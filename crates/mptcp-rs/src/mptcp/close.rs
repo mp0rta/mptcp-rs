@@ -67,7 +67,13 @@ impl ConnectionHooks {
 }
 
 impl SubflowHooks<'_> {
-    pub fn update_close(&mut self, tcb: &Tcb, now: Instant) -> Option<crate::tcp::CloseReason> {
+    /// `last`: no other subflow of the connection is open.
+    pub fn update_close(
+        &mut self,
+        tcb: &Tcb,
+        now: Instant,
+        last: bool,
+    ) -> Option<crate::tcp::CloseReason> {
         let d = self.conn.data.as_mut().filter(|d| !d.fallback)?;
         if d.close.closed {
             return None;
@@ -76,6 +82,11 @@ impl SubflowHooks<'_> {
             Some(crate::tcp::CloseReason::Reset)
         } else if tcb.state() == crate::tcp::TcpState::Closed {
             self.sf.tx = TxMaps::new(self.sf.tx.assigned_end(), 1024);
+            if !last {
+                // Another subflow is open: the connection carries on, no no-subflow wait.
+                d.close.no_subflow_at = None;
+                return None;
+            }
             d.recovery_at = None;
             d.reinject.clear();
             d.close.at = None;
@@ -97,6 +108,7 @@ impl SubflowHooks<'_> {
         reason
     }
     pub fn on_transmitted(&mut self, seg: &Segment<'_>, now: Instant, rto: Duration) {
+        self.join_transmitted(seg.flags, now, rto);
         if let Some(d) = &mut self.conn.data {
             self.sf.final_mapping = None;
             for opt in walk(seg.options) {
