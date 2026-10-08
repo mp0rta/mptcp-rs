@@ -198,7 +198,7 @@ fn syn_carries_mss_and_ws() {
             parsed(f.out.options()),
             vec![
                 TcpOpt::Mss(mss),
-                TcpOpt::WindowScale(7),
+                TcpOpt::WindowScale(9),
                 TcpOpt::SackPermitted
             ]
         );
@@ -274,7 +274,7 @@ fn peer_ws_above_14_clamped() {
         Reaction::Established
     );
     assert_eq!(f.tcb.snd_shift, 14);
-    assert_eq!(f.tcb.rcv_shift, 7);
+    assert_eq!(f.tcb.rcv_shift, 9);
 }
 
 #[test]
@@ -1349,7 +1349,7 @@ fn wraparound_transfer() {
 #[test]
 fn no_memory_means_not_acked() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     assert_eq!(f.tcb.rcv_shift, 7);
     let p = pattern(BUF as usize + 24);
     // The app does not read: two in-order segments leave 1000 B of free memory. The window
@@ -1527,7 +1527,7 @@ fn ooo_range_cap() {
 #[test]
 fn full_memory_advertises_zero_window_and_reopens() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     let p = pattern(BUF as usize + 2000);
     let fill = BUF - 1000;
     f.data_in(t(0), 0, &p[..2_000_000]);
@@ -1618,7 +1618,7 @@ fn text_processed_when_ack_is_old() {
 /// edge to a scale-aligned point inside the memory.
 fn reading_receiver(mss: u16) {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::unbounded(ConnectConfig::default());
+    let mut f = Fixture::unbounded(rx_cfg(BUF));
     f.synack(65535, &opts(Some(mss), Some(0)));
     assert_eq!(f.acks(t(0)).len(), 1);
     assert_eq!((f.tcb.rcv_shift, f.tcb.eff_mss), (7, mss));
@@ -1672,7 +1672,7 @@ fn reads_move_the_edge_aligned_within_one_unit() {
 #[test]
 fn rounding_alone_draws_no_window_update() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     let p = pattern(BUF as usize);
     let fill = BUF - 1000;
     f.data_in(t(0), 0, &p[..2_000_000]);
@@ -1690,7 +1690,7 @@ fn rounding_alone_draws_no_window_update() {
 fn sws_edge_never_moves_left() {
     // eff_mss 64 puts the SWS threshold (64) below the scale unit (128).
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::unbounded(ConnectConfig::default());
+    let mut f = Fixture::unbounded(rx_cfg(BUF));
     f.synack(65535, &opts(Some(64), Some(0)));
     assert_eq!(f.acks(t(0)).len(), 1);
     let p = pattern(BUF as usize);
@@ -2379,7 +2379,7 @@ fn time_wait_acks_retransmitted_fin_and_restarts() {
     assert!(f.read_all().is_empty());
     f.seg_in(t(131), 1, TcpFlags::SYN | TcpFlags::ACK, &[]);
     assert_eq!(f.ack_nos(t(131)), vec![pdata(1)]);
-    f.data_in(t(132), 8 << 20, &[1; 10]);
+    f.data_in(t(132), 32 << 20, &[1; 10]);
     assert_eq!(f.ack_nos(t(132)), vec![pdata(1)]);
     assert_eq!(f.tcb.poll_send_at(), Some(t(181)));
     assert_eq!(f.timeout(t(180)), Reaction::None);

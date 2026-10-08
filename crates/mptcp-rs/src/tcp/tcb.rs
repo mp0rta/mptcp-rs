@@ -48,7 +48,9 @@ impl Default for ConnectConfig {
     fn default() -> Self {
         Self {
             mtu: 1500,
-            recv_buffer: 4 << 20,
+            // 16 MiB (scale 9): two-path s2c needs about 7 MB of span plus held data (rate
+            // 350 Mbit/s x max path RTT incl. queueing, Task 9b); 4 and 8 MiB bound it.
+            recv_buffer: 16 << 20,
             send_buffer: 4 << 20,
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),
