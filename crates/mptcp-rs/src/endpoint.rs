@@ -445,12 +445,18 @@ impl<R: CryptoRng> Endpoint<R> {
         c: &mut Connection,
     ) {
         let mut first = true;
+        let freed = &mut c.hooks.freed_dsn_end;
         c.subflows.retain(|sf| {
             let keep = std::mem::take(&mut first)
                 || sf.tcb.state() != TcpState::Closed
                 || sf.tcb.reset_pending();
-            if !keep && demux.get(&(sf.local, sf.remote)) == Some(&(h, sf.id)) {
-                demux.remove(&(sf.local, sf.remote));
+            if !keep {
+                if let Some(end) = sf.mp.dsn_end {
+                    *freed = crate::mptcp::later(*freed, end);
+                }
+                if demux.get(&(sf.local, sf.remote)) == Some(&(h, sf.id)) {
+                    demux.remove(&(sf.local, sf.remote));
+                }
             }
             keep
         });

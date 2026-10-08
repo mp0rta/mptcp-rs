@@ -2563,3 +2563,85 @@ fn ended_joined_subflow_freed_at_teardown() {
     input_at(&mut ep, &peer_data(&jsyn, 5001, &[], &[]), ms(21));
     assert!(rst_from(&drain(&mut ep, ms(21)), &jsyn));
 }
+
+// Task 7 fix round 1 (ruling R17): only other subflows' data counts as stranded.
+
+#[test]
+fn stale_then_stripped_single_subflow_falls_back() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(syn.leak()).unwrap();
+    let t0 = ms(1);
+    ep.connection(h).unwrap().write(b"first").unwrap();
+    let sent = data_on(&drain(&mut ep, t0), &syn).pop().unwrap();
+    assert_eq!(sent.payload, b"first");
+    // Three RTOs: the only subflow goes Stale and its range is queued.
+    drain_until(&mut ep, t0, t0 + Duration::from_secs(8));
+    let stale = Event::SubflowStale {
+        subflow: SubflowId(0),
+    };
+    assert_eq!(events(&mut ep), vec![stale]);
+    // Then the data is ACKed without any MPTCP option: the path strips options.
+    let t = t0 + Duration::from_secs(8);
+    let stripped = Segment {
+        ack: end(&sent),
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &stripped, t);
+    assert_eq!(events(&mut ep), vec![Event::FellBack]);
+    ep.connection(h).unwrap().write(b"second").unwrap();
+    let out = on(&drain(&mut ep, t), &syn);
+    assert!(out.iter().any(infinite_mapping));
+    let data: Vec<_> = out.iter().filter(|s| !s.payload.is_empty()).collect();
+    assert_eq!(data.len(), 1);
+    assert_eq!((data[0].seq, data[0].payload), (end(&sent), &b"second"[..]));
+    assert!(
+        mpc(data[0].options).is_empty(),
+        "plain TCP after the switch"
+    );
+}
+
+#[test]
+fn infinite_mapping_on_stale_survivor_is_not_data_loss() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    // Subflow 0's window is closed, so nothing moves to it.
+    peer_ack(&mut ep, &syn, ms(20), syn.seq.wrapping_add(1), head, 0);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().write(&[4; 1000]).unwrap();
+    let b = data_on(&drain(&mut ep, ms(20)), &jsyn).pop().unwrap();
+    pin(&mut ep, h, None);
+    let t = ms(20) + Duration::from_secs(8);
+    let out = drain_until(&mut ep, ms(20), t);
+    assert!(data_on(&out, &syn).is_empty());
+    assert_eq!(events(&mut ep), vec![STALE1]);
+    // The infinite mapping arrives on Stale subflow 1 and TCP-ACKs its data.
+    let inf = mapping(1, peer_dsn(), 0);
+    let seg = Segment {
+        ack: end(&b),
+        ..peer_data(&jsyn, 5001, &inf, b"reply")
+    };
+    input_at(&mut ep, &seg, t);
+    assert_eq!(events(&mut ep), vec![Event::FellBack]);
+    assert_eq!(una(&ep, h), head + 1000);
+    // Subflow 1 carries the connection now, Stale or not.
+    ep.connection(h).unwrap().write(&[5; 500]).unwrap();
+    let more = data_on(&drain(&mut ep, t), &jsyn);
+    assert_eq!(more.iter().map(|s| s.payload.len()).sum::<usize>(), 500);
+}
+
+#[test]
+fn infinite_mapping_after_other_subflow_acked_without_data_ack_closes() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    // Subflow 0's data is subflow-ACKed but not DATA_ACKed.
+    pin(&mut ep, h, Some(SubflowId(0)));
+    ep.connection(h).unwrap().write(&[6; 1000]).unwrap();
+    let a = data_on(&drain(&mut ep, ms(20)), &syn).pop().unwrap();
+    pin(&mut ep, h, None);
+    peer_ack(&mut ep, &syn, ms(30), end(&a), head, 65535);
+    peer_infinite_mapping(&mut ep, &jsyn, ms(31));
+    let loss = Event::Closed {
+        reason: CloseReason::FallbackDataLoss,
+    };
+    assert_eq!(events(&mut ep), vec![loss]);
+}

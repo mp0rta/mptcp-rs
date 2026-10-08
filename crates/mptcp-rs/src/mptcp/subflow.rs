@@ -63,6 +63,8 @@ pub(crate) struct SubflowMp {
     pub final_mapping: Option<mptcp::Mapping>,
     /// SSN where our infinite mapping starts; data below it keeps its finite mapping.
     pub infinite_from: Option<u32>,
+    /// The highest DSN end of any mapping ever installed on this subflow (fallback data loss).
+    pub dsn_end: Option<u64>,
     pub rx_infinite: Option<(u32, u64)>,
     /// Window scale this subflow's SYN/ACK negotiated; scales DATA_ACK windows it carries.
     pub peer_scale: u8,
@@ -99,6 +101,7 @@ impl SubflowMp {
             capable_ack_due: false,
             final_mapping: None,
             infinite_from: None,
+            dsn_end: None,
             rx_infinite: None,
             peer_scale: 0,
             offered_unused: false,

@@ -40,6 +40,8 @@ pub(crate) struct ConnectionHooks {
     /// An MP_JOIN SYN has been sent on this connection (a history, not a subflow count): from
     /// then on stripping resets its subflow and never falls back (RFC 8684 L2321–2328).
     pub joined_ever: bool,
+    /// The highest `SubflowMp::dsn_end` of the subflows already freed.
+    pub freed_dsn_end: Option<u64>,
     /// MinRTT; tests inject others (spec §4: crate-internal, one implementation).
     pub scheduler: Box<dyn Scheduler>,
     /// Refilled every scheduling step; capacity = subflow cap, so steps never allocate.
@@ -84,6 +86,7 @@ impl ConnectionHooks {
             fallback_event: false,
             fast_closed: false,
             joined_ever: false,
+            freed_dsn_end: None,
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             rejected_plans: 0,
@@ -147,6 +150,14 @@ fn active_maps(subflows: &[Subflow]) -> impl Iterator<Item = &TxMaps> + Clone {
         .iter()
         .filter(|s| s.is(SubflowState::Active))
         .map(|s| &s.mp.tx)
+}
+
+/// The later of two DSNs (`end` if there is no `old`).
+pub(crate) fn later(old: Option<u64>, end: u64) -> Option<u64> {
+    Some(
+        old.filter(|&o| o.wrapping_sub(end) as i64 > 0)
+            .unwrap_or(end),
+    )
 }
 
 /// Index of the lowest-`srtt` subflow that passes `f` (the first on ties).
@@ -346,22 +357,27 @@ impl Connection {
 
     /// Fallback found on subflow `i` in the current input (spec §5.2): `i` alone carries the
     /// connection from now on (RFC 8684 L2437–2440) and becomes `subflows[0]`; every other
-    /// subflow is reset. Nothing is reinjected. Returns `true` when another subflow held
-    /// un-DATA_ACKed data that `i` has no live copy of (it cannot be delivered any more): then
-    /// `i` is reset too and the caller closes with `FallbackDataLoss`. Data the peer has
-    /// subflow-ACKed elsewhere counts as delivered.
+    /// subflow is reset. Nothing is reinjected. Returns `true` when any other subflow, live or
+    /// freed, ever carried data whose DSN end is above `send.una` (ruling R17: conservative,
+    /// it may have been dropped after a subflow ACK, RFC 8684 L1531–1534; MP_FAIL, M4, is the
+    /// precise mechanism): that data may be undeliverable, so `i` is reset too and the caller
+    /// closes with `FallbackDataLoss`. The survivor's own data never counts; a Stale survivor
+    /// becomes Active.
     pub(crate) fn on_fallback(&mut self, i: usize, now: Instant) -> bool {
         let d = self.hooks.data.as_mut().unwrap();
-        let survivor = std::iter::once(&self.subflows[i].mp.tx);
-        for (_, sf) in (self.subflows.iter().enumerate()).filter(|&(j, _)| j != i) {
-            for (dsn, len) in sf.mp.tx.ranges() {
-                d.reinject.insert_uncovered(dsn, len, survivor.clone());
-            }
-        }
-        let lost = d.reinject.head(survivor, &d.send, false).is_some();
+        let others = (self.subflows.iter().enumerate())
+            .filter(|&(j, _)| j != i)
+            .map(|(_, sf)| sf.mp.dsn_end);
+        let una = d.send.una;
+        let lost = (others.chain([self.hooks.freed_dsn_end]).flatten())
+            .any(|end| end.wrapping_sub(una) as i64 > 0);
         d.reinject.clear();
         d.settling = false;
         d.release(self.subflows[i].mp.tcp_acked_dsn);
+        // Health no longer applies after fallback: a Stale survivor carries the data again.
+        if self.subflows[i].state == SubflowState::Stale {
+            self.subflows[i].state = SubflowState::Active;
+        }
         self.abort_all(now, (!lost).then_some(i));
         for (_, sf) in (self.subflows.iter_mut().enumerate()).filter(|&(j, _)| j != i) {
             sf.mp.tx.clear();
@@ -619,6 +635,10 @@ impl SubflowHooks<'_> {
     /// Installs a validated plan's mapping; DATA_FIN rides on the final data mapping.
     fn install(&mut self, payload: Payload) -> bool {
         let d = self.conn.data.as_mut().unwrap();
+        let (dsn, len) = match payload {
+            Payload::Reinject { dsn, len } => (dsn, len),
+            Payload::New { bytes } => (d.send.next, bytes),
+        };
         match payload {
             Payload::Reinject { dsn, len } => {
                 let len = len as usize;
@@ -646,6 +666,7 @@ impl SubflowHooks<'_> {
                 }
             }
         }
+        self.sf.dsn_end = later(self.sf.dsn_end, dsn.wrapping_add(u64::from(len)));
         true
     }
     fn candidate_len(&self) -> usize {
