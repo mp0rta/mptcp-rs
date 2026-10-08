@@ -6,6 +6,7 @@ use super::data::{RxMaps, TxMaps};
 use super::join::Join;
 use crate::SeqNum;
 use crate::tcp::Tcb;
+use crate::time::Instant;
 use crate::wire::mptcp;
 
 /// Identifies a subflow within its connection. The initial subflow is `SubflowId(0)`, which
@@ -83,6 +84,9 @@ pub(crate) struct SubflowMp {
     pub probe: bool,
     /// The `Tcb::rto_streak` last turned into a `HealthEvent`.
     pub rto_seen: u32,
+    /// Reset deadline while both DATA_FINs are DATA_ACKed and this subflow still holds TCP
+    /// data (`Connection::update_recovery`).
+    pub strand_at: Option<Instant>,
 }
 
 impl SubflowMp {
@@ -110,6 +114,7 @@ impl SubflowMp {
             fin_carrier: false,
             probe: false,
             rto_seen: 0,
+            strand_at: None,
         }
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.

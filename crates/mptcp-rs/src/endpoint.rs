@@ -41,7 +41,8 @@ pub enum Event {
         subflow: SubflowId,
     },
     /// A joined subflow ended (`Reset`: refused or reset, also a queued join that can no
-    /// longer start; `Timeout`: R2; `Normal`: FIN exchange). The connection carries on; data
+    /// longer start, or reset by us at close because it held only DATA_ACKed data; `Timeout`:
+    /// R2; `Normal`: FIN exchange). The connection carries on; data
     /// the subflow had in flight is resent on the others. Not emitted for the subflows a
     /// fallback or MP_FASTCLOSE resets.
     SubflowDown {
@@ -682,7 +683,8 @@ impl<R: CryptoRng> Endpoint<R> {
                             .filter(|_| !c.hooks.retained() || open);
                         let join = (sf.mp.join.as_ref().filter(|_| open))
                             .and_then(|j| j.deadline(c.cfg.r2_data));
-                        tcb.into_iter().chain(join)
+                        let strand = sf.mp.strand_at.filter(|_| open);
+                        tcb.into_iter().chain(join).chain(strand)
                     })
                     .chain(c.hooks.recovery_deadline())
                     .min()
@@ -705,7 +707,10 @@ impl<R: CryptoRng> Endpoint<R> {
                     sf: &mut sf.mp,
                 };
                 let mut r = Reaction::None;
-                if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
+                if hk.sf.strand_at.is_some_and(|t| t <= now) && sf.tcb.state() != TcpState::Closed {
+                    // Like a FIN exchange's end, a joined subflow reports `SubflowDown`.
+                    r = sf.tcb.abort(CloseReason::Reset, now);
+                } else if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
                     r = sf.tcb.on_timeout(now, &mut hk);
                 }
                 if let Some(j) = &mut hk.sf.join {

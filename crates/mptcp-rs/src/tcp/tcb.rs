@@ -697,6 +697,10 @@ impl Tcb {
     pub(crate) fn has_unacked(&self) -> bool {
         self.in_flight() > 0
     }
+    /// Data octets (not the FIN) between SND.UNA and SND.MAX.
+    pub(crate) fn unacked_data(&self) -> bool {
+        self.data_len(self.snd_una, self.snd_max) > 0
+    }
     /// Effective send MSS (RFC 9293 MUST-14/15/16), before protocol options.
     pub(crate) fn eff_mss(&self) -> u16 {
         self.eff_mss

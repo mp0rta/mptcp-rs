@@ -270,6 +270,19 @@ impl Connection {
             .filter_map(|sf| sf.tcb.base_rto())
             .max()
             .unwrap_or(INITIAL_RTO);
+        // Ruling R18 (RFC 8684 L1600–1611): once both DATA_FINs are DATA_ACKed, a subflow
+        // still holding TCP data holds only data that is DATA_ACKed (delivered via another
+        // subflow). If it is not TCP-ACKed within one un-backed-off RTO it never needs to be,
+        // so `Endpoint::handle_timeout` resets the subflow then (plain RST: MP_TCPRST is M3).
+        let closing = !d.fallback && d.close.acked && d.close.peer_acked;
+        for sf in &mut self.subflows {
+            if closing && sf.tcb.state() != TcpState::Closed && sf.tcb.unacked_data() {
+                let rto = sf.tcb.base_rto().unwrap_or(INITIAL_RTO);
+                sf.mp.strand_at.get_or_insert(now + rto);
+            } else {
+                sf.mp.strand_at = None;
+            }
+        }
         if !d.fallback
             && d.close.sent
             && !d.close.acked

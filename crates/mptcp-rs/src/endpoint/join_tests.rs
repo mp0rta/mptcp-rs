@@ -2645,3 +2645,205 @@ fn infinite_mapping_after_other_subflow_acked_without_data_ack_closes() {
     };
     assert_eq!(events(&mut ep), vec![loss]);
 }
+
+// Task 8c (ruling R18): subflows left with only DATA_ACKed data at close.
+
+/// `drain` at `now`, then `handle_timeout` and `drain` at every deadline up to `until`; every
+/// segment we sent, with its time.
+fn drive(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    now: Instant,
+    until: Instant,
+) -> Vec<(Instant, Segment<'static>)> {
+    let mut out: Vec<_> = drain(ep, now).into_iter().map(|p| (now, leak(p))).collect();
+    while let Some(t) = ep.poll_timeout().filter(|&t| t <= until) {
+        ep.handle_timeout(t);
+        out.extend(drain(ep, t).into_iter().map(|p| (t, leak(p))));
+    }
+    out
+}
+const BIG_R2: Duration = Duration::from_secs(1000);
+
+#[test]
+fn stranded_subflow_reset_once_both_data_fins_acked() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(BIG_R2, n);
+    let syn = peer.syns[0].clone();
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let now = peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(events(&mut ep), vec![STALE1]);
+    assert_eq!(una(&ep, h), head + n as u64, "reinjected via subflow 0");
+    assert!(ep.conns[&h].subflows[1].tcb.has_unacked(), "stranded");
+    // Close: the DATA_FIN goes on subflow 0; the peer DATA_ACKs it and sends its own there.
+    ep.connection(h).unwrap().close();
+    let out = drain(&mut ep, now);
+    let dfin = (on(&out, &syn).into_iter().find(data_fin)).expect("DATA_FIN on subflow 0");
+    let t1 = now + Duration::from_millis(30);
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + n as u64 + 1));
+    let seg = Segment {
+        ack: dfin.seq,
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t1);
+    let out = drain(&mut ep, t1);
+    let fin0 = (on(&out, &syn).into_iter())
+        .find(|s| s.flags.contains(TcpFlags::FIN))
+        .expect("FIN on subflow 0");
+    assert!(
+        out.iter()
+            .map(|p| leak(p.clone()))
+            .all(|s| !s.flags.contains(TcpFlags::RST))
+    );
+    // The peer completes subflow 0's FIN exchange; subflow 1's path stays dead.
+    let dack_fin = data_ack(head + n as u64 + 1);
+    let seg = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: fin0.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &dack_fin, &[])
+    };
+    let t2 = t1 + Duration::from_millis(30);
+    input_at(&mut ep, &seg, t2);
+    let out = drive(&mut ep, t2, t1 + Duration::from_secs(300));
+    let jsrc = peer.syns[1].src;
+    let on1: Vec<_> = out.iter().filter(|(_, s)| s.src == jsrc).collect();
+    let rst = (on1
+        .iter()
+        .position(|(_, s)| s.flags.contains(TcpFlags::RST)))
+    .expect("RST on 1");
+    // One un-backed-off RTO (1 s minimum) after both DATA_FINs were DATA_ACKed.
+    assert_eq!(on1[rst].0, t1 + Duration::from_secs(1));
+    assert!(
+        on1.iter().all(|(_, s)| !s.flags.contains(TcpFlags::FIN)),
+        "no FIN on 1"
+    );
+    assert_eq!(on1.len(), rst + 1, "nothing on subflow 1 after the RST");
+    let ev = events(&mut ep);
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Reset,
+    };
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert_eq!(ev, vec![down, closed]);
+    assert!(
+        ep.conns.is_empty(),
+        "closed at subflow 0's TIME-WAIT end, not at R2"
+    );
+}
+
+#[test]
+fn subflow_with_data_not_data_acked_is_not_reset() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(BIG_R2, n);
+    let syn = peer.syns[0].clone();
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let now = peer.run(&mut ep, h, t, t + Duration::from_secs(2));
+    assert!(una(&ep, h) < head + n as u64, "subflow 1 holds a hole");
+    // The peer's DATA_FIN is DATA_ACKed and the app closes; ours cannot be DATA_ACKed yet.
+    let opts = fin_option(peer_dsn(), 0, 1, None);
+    let seg = peer_data(&syn, 5001, &opts, &[]);
+    input_at(&mut ep, &seg, now);
+    ep.connection(h).unwrap().close();
+    let out = drive(&mut ep, now, t + Duration::from_millis(6900));
+    assert!(out.iter().all(|(_, s)| !s.flags.contains(TcpFlags::RST)));
+    assert!(ep.conns[&h].subflows[1].tcb.state() != TcpState::Closed);
+    assert!(events(&mut ep).is_empty());
+}
+
+#[test]
+fn late_tcp_ack_within_rto_closes_with_fin() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    events(&mut ep);
+    let head = una(&ep, h);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().write(&[7; 1000]).unwrap();
+    ep.connection(h).unwrap().close();
+    let out = drain(&mut ep, t);
+    let b = data_on(&out, &jsyn).pop().unwrap();
+    assert!(data_fin(&b), "DATA_FIN rides on the data");
+    // The DATA_ACK of the data and DATA_FIN comes on subflow 0, with the peer's DATA_FIN,
+    // before subflow 1's own TCP ACK.
+    let t1 = t + Duration::from_millis(5);
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1001));
+    let seg = Segment {
+        ack: una0,
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t1);
+    let mut out = drive(&mut ep, t1, t1 + Duration::from_millis(500));
+    peer_ack(
+        &mut ep,
+        &jsyn,
+        t1 + Duration::from_millis(500),
+        end(&b),
+        head + 1001,
+        65535,
+    );
+    out.extend(drive(
+        &mut ep,
+        t1 + Duration::from_millis(500),
+        t1 + Duration::from_secs(2),
+    ));
+    assert!(
+        out.iter().all(|(_, s)| !s.flags.contains(TcpFlags::RST)),
+        "no RST"
+    );
+    let fin1 = |(_, s): &&(Instant, Segment)| s.src == jsyn.src && s.flags.contains(TcpFlags::FIN);
+    assert!(
+        out.iter().any(|x| fin1(&x)),
+        "subflow 1 FINs once its data is ACKed"
+    );
+    assert!(events(&mut ep).is_empty());
+}
+
+#[test]
+fn single_subflow_close_is_fin_only() {
+    let (mut ep, h, syn, _) = confirmed_cc(reno);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().write(&[8; 1000]).unwrap();
+    ep.connection(h).unwrap().close();
+    let mut out = drive(&mut ep, ms(10), ms(10));
+    let seg = (out.iter().map(|x| &x.1))
+        .find(|s| !s.payload.is_empty())
+        .unwrap()
+        .clone();
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1001));
+    let ack = Segment {
+        ack: end(&seg),
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &ack, ms(40));
+    let dack_fin = data_ack(head + 1001);
+    let more = drive(&mut ep, ms(40), ms(40));
+    let fin = (more.iter().map(|x| &x.1))
+        .find(|s| s.flags.contains(TcpFlags::FIN))
+        .unwrap()
+        .clone();
+    out.extend(more);
+    let seg = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: fin.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &dack_fin, &[])
+    };
+    input_at(&mut ep, &seg, ms(70));
+    out.extend(drive(&mut ep, ms(70), ms(70) + Duration::from_secs(300)));
+    assert!(
+        out.iter().all(|(_, s)| !s.flags.contains(TcpFlags::RST)),
+        "no RST"
+    );
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert_eq!(events(&mut ep), vec![closed]);
+    assert!(ep.conns.is_empty());
+}
