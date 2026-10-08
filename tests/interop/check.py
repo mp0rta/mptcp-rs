@@ -68,20 +68,33 @@ def data_fin_acked(side, n):
     assert acked, f"DATA_FIN from {src} not DATA_ACKed"
     return min(acked)
 rsts = [r for r in rows if r[7] == "1"]
-no_rst, reset = "no RST", set()
+no_rst, srv_reset, cli_reset = "no RST", set(), set()
 if scenario.startswith("m2-blackhole-") and want_s2c == "0":
-    # c2s: the blackholed subflow keeps retransmitting its own stranded TCP data after its
-    # ranges were reinjected and DATA_ACKed (RFC 8684 L1536-1540); if that arrives after Linux
-    # closed the subflow, Linux answers RST. Allowed only from the server, on the blackholed
-    # 4-tuple, after both DATA_FINs are DATA_ACKed and after the server's FIN on that 4-tuple.
+    # c2s, on the blackholed 4-tuple only, after both DATA_FINs are DATA_ACKed (RFC 8684
+    # L1600-1611). The server's RST: the subflow keeps retransmitting its own stranded TCP data
+    # after its ranges were reinjected and DATA_ACKed (RFC 8684 L1536-1540); if that arrives
+    # after Linux closed the subflow, Linux answers RST; allowed only after the server's FIN on
+    # that 4-tuple. The client's RST (ruling R18): strictly after close, only while that
+    # 4-tuple still had client TCP data the server had not ACKed.
     hip = "10.0.9.2" if scenario.endswith("-a") else "10.0.8.2"
     closed = max(data_fin_acked(cips, c2s), data_fin_acked({SRV}, s2c))
-    srv_fin = lambda f, t: any(flow(r) == f and r[1] == SRV and r[6] == "1" and float(r[0]) < t for r in rows)
-    ok = lambda r: r[1] == SRV and r[19] == hip and float(r[0]) >= closed and srv_fin(flow(r), float(r[0]))
-    reset = {flow(r) for r in rsts if ok(r)}
-    rsts = [r for r in rsts if not ok(r)]
-    if reset:
-        no_rst = f"no RST except the server's after close on the blackholed subflow {[sorted(f) for f in reset]}"
+    before = lambda f, t: [r for r in rows if flow(r) == f and float(r[0]) < t]
+    srv_fin = lambda f, t: any(r[1] == SRV and r[6] == "1" for r in before(f, t))
+    def outstanding(f, t):
+        rs = before(f, t)
+        isn = next((int(r[2]) for r in rs if r[1] == hip and r[5] == "1"), None)
+        assert isn is not None, f"no client SYN on {sorted(f)}"
+        off = lambda x: (x - isn) % (1 << 32)
+        snd_max = max((off(int(r[2])) + int(r[4]) for r in rs if r[1] == hip and int(r[4] or 0) > 0), default=0)
+        acked = max((off(int(r[3])) for r in rs if r[1] == SRV and r[18] == "1"), default=0)
+        return snd_max > acked
+    srv_ok = lambda r: r[1] == SRV and r[19] == hip and float(r[0]) >= closed and srv_fin(flow(r), float(r[0]))
+    cli_ok = lambda r: r[1] == hip and r[19] == SRV and float(r[0]) > closed and outstanding(flow(r), float(r[0]))
+    srv_reset = {flow(r) for r in rsts if srv_ok(r)}
+    cli_reset = {flow(r) for r in rsts if cli_ok(r)}
+    rsts = [r for r in rsts if not (srv_ok(r) or cli_ok(r))]
+    if srv_reset or cli_reset:
+        no_rst = f"no RST except after close on the blackholed subflow: server's {[sorted(f) for f in srv_reset]}, client's {[sorted(f) for f in cli_reset]}"
 assert not rsts, "RST present"
 for side in [cips, {SRV}]:
     assert any(r[1] in side and r[6] == "1" for r in rows), f"missing TCP FIN from {side}"
@@ -89,8 +102,10 @@ if m2:
     data = {flow(r) for r in rows if r[4] and int(r[4]) > 0}
     assert len(data) == 2 and {r[1] for r in rows if flow(r) in data} - {SRV} == cips, f"want two data-carrying subflows from {cips}: {data}"
     for f in data:
-        # A subflow the server reset after close (above) needs only the server's FIN.
-        for side in [{SRV}] if f in reset else [cips, {SRV}]:
+        # A subflow the client reset after close needs no FIN; one the server reset after close
+        # (above) needs only the server's FIN.
+        sides = [] if f in cli_reset else [{SRV}] if f in srv_reset else [cips, {SRV}]
+        for side in sides:
             assert any(flow(r) == f and r[1] in side and r[6] == "1" for r in rows), f"subflow {sorted(f)}: no FIN from {side}"
     join = [r for r in rows if r[9] == "1"]
     assert any(r[1] == "10.0.8.2" and (r[5], r[18]) == ("1", "0") for r in join), "no MP_JOIN SYN"
