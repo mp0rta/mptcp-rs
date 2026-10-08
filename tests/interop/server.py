@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Plain-TCP peer for the M0 interop test: receive N pattern bytes, send N, wait for EOF."""
+"""Linux TCP/MPTCP peer for the interop tests, listening on 10.0.1.2: receive the pattern
+(--expect bytes, or until EOF), then send it (--send-bytes, or for --send-secs), then read
+until EOF. --bytes sets both counts."""
 import argparse, socket, sys, time
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--mode", choices=["tcp", "mptcp"], required=True)
 ap.add_argument("--port", type=int, required=True)
-ap.add_argument("--bytes", type=int, default=0)  # default for --send-bytes and --expect
+ap.add_argument("--bytes", type=int, help="default for --send-bytes and --expect")
 ap.add_argument("--send-bytes", type=int)
 ap.add_argument("--expect", help="BYTES or 'any' (verify until EOF)")
-ap.add_argument("--send-secs", type=float, help="send for S seconds after accept, then shut down writes")
+ap.add_argument("--send-secs", type=float, help="after receiving, send for S seconds, then shut down writes")
 ap.add_argument("--pause-read-ms", type=int, default=0)
 a = ap.parse_args()
+if a.bytes is None and (a.expect is None or a.send_bytes is None and not a.send_secs):
+    ap.error("give --bytes, or --expect and one of --send-bytes/--send-secs")
 N = a.bytes if a.expect is None else None if a.expect == "any" else int(a.expect)  # None = any
 S = a.bytes if a.send_bytes is None else a.send_bytes
 
@@ -22,7 +26,7 @@ ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262 if a.mode == "mptcp" 
 if a.pause_read_ms:
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ls.bind(("0.0.0.0", a.port))
+ls.bind(("10.0.1.2", a.port))  # every case connects (and joins) to 10.0.1.2
 ls.listen(1)
 print("listening", flush=True)
 c, peer = ls.accept()
