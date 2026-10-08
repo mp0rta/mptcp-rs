@@ -17,7 +17,7 @@ def run(mutate):
         rows = [line.split("\t") for line in original(cmd, **kwargs).splitlines()]
         return "\n".join("\t".join(r) for r in mutate(rows))
     subprocess.check_output = patched
-    sys.argv = ["tests/interop/check.py", "m2-blackhole-b", directory, "268435456", "0"]
+    sys.argv = ["tests/interop/check.py", "m2-blackhole-b", directory, "1073741824", "0"]
     try:
         runpy.run_path(sys.argv[0], run_name="__main__")
     except AssertionError as error:

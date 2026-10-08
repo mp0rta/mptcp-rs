@@ -89,9 +89,9 @@ fi
 tdtun=; bhpid=
 trap 'kill "$tdpid" "$tdcli" ${tdb:-} ${tdtun:-} ${bhpid:-} 2>/dev/null || true' EXIT
 # Fixed cases: N bytes each way. Timed cases: 30 s in $dir, the other direction idle.
-# Blackhole cases: 256 MiB in $dir, the other direction idle.
+# Blackhole cases: 1 GiB in $dir, the other direction idle (outlasts the 15 s blackhole).
 sargs=(--bytes "$N"); cargs=(--send "$N" --expect "$N"); want_c2s=$N; want_s2c=$N
-B=268435456
+B=1073741824
 case "$scenario:$dir" in
   m2-blackhole-*:c2s) sargs=(--expect "$B" --send-bytes 0); cargs=(--send "$B" --expect 0); want_c2s=$B; want_s2c=0;;
   m2-blackhole-*:s2c) sargs=(--expect 0 --send-bytes "$B"); cargs=(--send 0 --expect "$B"); want_c2s=0; want_s2c=$B;;
