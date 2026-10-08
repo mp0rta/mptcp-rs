@@ -38,6 +38,18 @@ fn capable_syn_uses_version_one_and_only_h() {
     let bytes = transmit(&mut ep, Instant::from_nanos(0));
     let syn = packet::parse(&bytes).unwrap();
     assert_eq!(mpc(syn.options), vec![&[30, 4, 1, 1][..]]);
+    // With MSS, WS and SACK-Permitted (RFC 2018 §2): 16 octets of the 40.
+    let kinds: Vec<_> = walk(syn.options).map(Result::unwrap).collect();
+    assert!(matches!(
+        kinds[..],
+        [
+            TcpOpt::Mptcp(_),
+            TcpOpt::Mss(_),
+            TcpOpt::WindowScale(_),
+            TcpOpt::SackPermitted
+        ]
+    ));
+    assert_eq!(syn.options.len(), 16);
 }
 
 use crate::wire::mptcp::{self, CAP_H, MpCapable, MptcpOption};
@@ -488,7 +500,8 @@ fn capable_has_priority_over_sack_and_dsack_within_forty_bytes() {
             panic!()
         };
         assert_eq!(&blocks[..4], &seq.to_be_bytes());
-        assert!(blocks.len() <= 16);
+        // 40 − 20 octets leave room for exactly two blocks once two ranges are held.
+        assert_eq!(blocks.len(), if seq == 5010 { 8 } else { 16 });
         assert!(ack.options.len() <= 40);
         assert_eq!(ack.options.len() % 4, 0);
     }
@@ -2468,6 +2481,14 @@ fn connected_scaled_cc(
     cap: u32,
     cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
 ) -> Connected {
+    connected_with(cap, cc, false)
+}
+/// `connected_scaled_cc`, with SACK-Permitted in the peer's SYN/ACK if `sack`.
+fn connected_with(
+    cap: u32,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+    sack: bool,
+) -> Connected {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
     ep.cc = cc;
     let h = ep
@@ -2489,6 +2510,10 @@ fn connected_scaled_cc(
     opts.extend_from_slice(&o[..n]);
     let n = crate::wire::tcp_options::write_ws(&mut o, 7);
     opts.extend_from_slice(&o[..n]);
+    if sack {
+        let n = crate::wire::tcp_options::write_sack_permitted(&mut o);
+        opts.extend_from_slice(&o[..n]);
+    }
     reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
     transmit(&mut ep, Instant::from_nanos(1));
     ep.poll_event();
@@ -3499,3 +3524,30 @@ fn cubic_connection_window_limited_does_not_grow_cwnd() {
 // M2 Task 4: MP_JOIN, reusing the helpers above.
 #[path = "join_tests.rs"]
 mod join_tests;
+
+/// Once Confirmed, a pure ACK carries DSS DATA_ACK64 (12 octets) and so exactly three SACK
+/// blocks (2 + 24 + 2 padding): the 40 octets are full.
+#[test]
+fn confirmed_pure_ack_carries_three_sack_blocks() {
+    let (mut ep, h, syn, dsn) = connected_with(1 << 20, None, true);
+    open_window(&mut ep, &syn, h);
+    for (k, ssn) in [11u32, 21, 31, 41].into_iter().enumerate() {
+        let opts = mapping(ssn, dsn + u64::from(ssn) - 1, 1);
+        input(&mut ep, &peer_data(&syn, 5000 + ssn, &opts, b"x"));
+        let bytes = transmit(&mut ep, Instant::from_nanos(3));
+        let ack = packet::parse(&bytes).unwrap();
+        assert!(ack.payload.is_empty());
+        let opts: Vec<_> = walk(ack.options).map(Result::unwrap).collect();
+        assert!(matches!(opts[0], TcpOpt::Mptcp(raw) if raw.len() == 12));
+        let TcpOpt::Sack(blocks) = opts[1] else {
+            panic!("{opts:?}")
+        };
+        assert_eq!(blocks.len(), 8 * (k + 1).min(3), "after {} ranges", k + 1);
+        // The block holding the newest segment first (RFC 2018 §4).
+        assert_eq!(&blocks[..4], &(5000 + ssn).to_be_bytes());
+        assert_eq!(
+            ack.options.len(),
+            if k < 2 { 12 + 4 + 8 * (k + 1) } else { 40 }
+        );
+    }
+}

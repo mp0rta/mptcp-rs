@@ -251,6 +251,9 @@ fn join_syn_layout() {
         walk(jsyn.options).any(|o| matches!(o, Ok(TcpOpt::WindowScale(_)))),
         "window scale offered"
     );
+    // SACK-Permitted too (RFC 2018 §2): MP_JOIN 12 + MSS 4 + WS 4 + SACK-Permitted 4.
+    assert!(walk(jsyn.options).any(|o| matches!(o, Ok(TcpOpt::SackPermitted))));
+    assert_eq!(jsyn.options.len(), 24);
     // Retransmitted on RTO with the same ISN and nonce.
     let rto = ep.poll_timeout().unwrap();
     assert_eq!(rto, now + Duration::from_secs(1));
@@ -2846,4 +2849,52 @@ fn single_subflow_close_is_fin_only() {
     };
     assert_eq!(events(&mut ep), vec![closed]);
     assert!(ep.conns.is_empty());
+}
+
+/// With SACK negotiated on both subflows and an out-of-order receipt held on each, every
+/// segment carries a SACK block beside its DSS (28 + 12 = 40 octets), and `seg_payload`
+/// leaves room for it: no IP packet exceeds its subflow's MTU (1500 and 1280).
+#[test]
+fn per_subflow_mtu_bound_with_sack_blocks() {
+    let (mut ep, h, syn, dsn) = connected_with(1 << 20, Some(reno), true);
+    open_window(&mut ep, &syn, h);
+    ep.cc = Some(reno);
+    let (id1, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1280);
+    let mut opts = synack_opts(&ep, h, &jsyn, 7, None);
+    opts.extend_from_slice(&[4, 2, 1, 1]);
+    synack(&mut ep, &jsyn, &opts, ms(10));
+    let ack = from(&drain(&mut ep, ms(10)), JOIN_IP)
+        .pop()
+        .expect("third ACK");
+    assert_third_ack(&ep, h, &jsyn, &ack);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, ms(10), jsyn.seq.wrapping_add(1), head, 1000);
+    assert_eq!(events(&mut ep), vec![Event::SubflowUp { subflow: id1 }]);
+    // One out-of-order octet on each subflow (a hole at SSN 1–2).
+    for (s, off) in [(&syn, 0), (&jsyn, 100)] {
+        let m = mapping(3, dsn + 1000 + off, 1);
+        input_at(&mut ep, &peer_data(s, 5003, &m, b"x"), ms(15));
+    }
+    drain(&mut ep, ms(15));
+    // 1460 − 40 and 1240 − 40 octets of payload.
+    for (s, id, mtu, seg) in [(&syn, SubflowId(0), 1500, 1420), (&jsyn, id1, 1280, 1200)] {
+        pin(&mut ep, h, Some(id));
+        ep.connection(h).unwrap().write(&vec![1; 2 * seg]).unwrap();
+        let out = drain(&mut ep, ms(20));
+        assert!(
+            out.iter().all(|p| p.len() <= mtu),
+            "IP packet within MTU {mtu}"
+        );
+        let data = data_on(&out, s);
+        assert_eq!(data.len(), 2, "two full segments on MTU {mtu}");
+        for d in &data {
+            assert_eq!(d.payload.len(), seg);
+            assert_eq!(d.options.len(), 40);
+            assert!(walk(d.options).any(|o| matches!(o, Ok(TcpOpt::Sack(b)) if b.len() == 8)));
+        }
+        let last = data.last().unwrap();
+        let head = una(&ep, h);
+        peer_ack(&mut ep, s, ms(20), end(last), head, 1000);
+        drain(&mut ep, ms(20));
+    }
 }
