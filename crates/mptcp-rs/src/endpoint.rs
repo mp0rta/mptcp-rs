@@ -63,6 +63,9 @@ pub struct Endpoint<R: CryptoRng> {
     events: VecDeque<(ConnectionHandle, Event)>,
     pending_rst: VecDeque<PendingRst>,
     scratch: SegmentWriter,
+    /// Congestion controller for new connections; `None` is the default (CUBIC).
+    #[cfg(test)]
+    pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
 }
 
 impl<R: CryptoRng> Endpoint<R> {
@@ -80,6 +83,8 @@ impl<R: CryptoRng> Endpoint<R> {
             events: VecDeque::new(),
             pending_rst: VecDeque::new(),
             scratch: SegmentWriter::default(),
+            #[cfg(test)]
+            cc: None,
         }
     }
 
@@ -114,6 +119,11 @@ impl<R: CryptoRng> Endpoint<R> {
             .find(|l| !self.demux.contains_key(&(*l, remote)))
             .ok_or(ConnectError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
+        let tcb = Tcb::new_active(&cfg, local, remote, isn, now);
+        #[cfg(test)]
+        let tcb = self
+            .cc
+            .map_or(tcb, |cc| Tcb::with_cc(&cfg, local, remote, isn, now, cc()));
         let h = ConnectionHandle(self.next_handle);
         self.next_handle += 1;
         self.demux.insert((local, remote), (h, SubflowId(0)));
@@ -122,7 +132,7 @@ impl<R: CryptoRng> Endpoint<R> {
             Connection {
                 subflows: vec![Subflow {
                     id: SubflowId(0),
-                    tcb: Tcb::new_active(&cfg, local, remote, isn, now),
+                    tcb,
                     local,
                     remote,
                     state: SubflowState::Active,
@@ -186,6 +196,7 @@ impl<R: CryptoRng> Endpoint<R> {
         let Some(c) = self.conns.get_mut(&h) else {
             return;
         };
+        c.mark_passed_over(now);
         let Some(sf) = c.subflows.iter_mut().find(|sf| sf.id == id) else {
             return;
         };
@@ -396,6 +407,7 @@ impl<R: CryptoRng> Endpoint<R> {
     /// its `Closed(Normal)` there), then frees the TCBs that are `Closed`.
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
+            c.mark_passed_over(now);
             for sf in &mut c.subflows {
                 let mut hk = SubflowHooks {
                     conn: &mut c.hooks,

@@ -743,8 +743,12 @@ impl CongestionControl for Recording {
     fn init(&mut self, smss: u32, _: bool) {
         self.0.lock().unwrap().init = Some(smss);
     }
-    fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
-        self.0.lock().unwrap().acks.push((acked, rtt, in_flight));
+    fn on_ack(&mut self, a: &AckSample) {
+        self.0
+            .lock()
+            .unwrap()
+            .acks
+            .push((a.acked, a.rtt, a.in_flight));
     }
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
         self.0.lock().unwrap().events.push((ev, in_flight));
@@ -2976,4 +2980,327 @@ fn assignment_budget_obeys_nagle_windows_and_reinjection() {
         f.tcb.send_budget(t(0), 100, 100, false, 1000, &f.h).bytes(),
         0
     );
+}
+
+// ---- Pacing gate, release timer and app-limited marking (M2 Task 3b) ----
+
+/// Fixed cwnd and, if `rate` is set, a fixed pacing rate; records every ACK sample.
+struct TestCc {
+    rate: Option<u64>,
+    cwnd: u32,
+    samples: Samples,
+}
+type Samples = Arc<Mutex<Vec<AckSample>>>;
+
+impl CongestionControl for TestCc {
+    fn on_ack(&mut self, a: &AckSample) {
+        self.samples.lock().unwrap().push(*a);
+    }
+    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
+    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+    fn pacing_rate(&self) -> Option<u64> {
+        self.rate
+    }
+}
+
+/// Segment payload with peer MSS 1460.
+const SEG: u32 = 1460;
+/// One segment per 10 ms.
+const RATE: u64 = 146_000;
+const BIG_CWND: u32 = 64 << 10;
+
+impl Fixture {
+    /// ESTABLISHED at t(0) with `TestCc`, peer MSS 1460, shift 0 and window `wnd`.
+    fn test_cc(rate: Option<u64>, cwnd: u32, wnd: u16) -> (Self, Samples) {
+        let samples = Samples::default();
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let cc = TestCc {
+            rate,
+            cwnd,
+            samples: samples.clone(),
+        };
+        let mut f = Fixture::with(cfg, Box::new(cc), h);
+        assert_eq!(
+            f.synack(wnd, &opts(Some(1460), Some(0))),
+            Reaction::Established
+        );
+        assert_eq!(f.send(t(0)).unwrap().flags, TcpFlags::ACK);
+        (f, samples)
+    }
+    fn mark(&mut self, now: Instant, reason: AppLimited) {
+        self.tcb.mark_unused_opportunity(now, reason, &self.h);
+    }
+}
+
+fn flags_of(samples: &Samples) -> Vec<bool> {
+    samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.app_limited)
+        .collect()
+}
+
+#[test]
+fn pacing_blocks_budget_before_release() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(seq_lens(&f.drain(t(0))), [(data(0), SEG)]);
+    let release = tm(10);
+    let budget = |f: &Fixture, now, reinject| {
+        let n = 10 * SEG as usize;
+        f.tcb.send_budget(now, n, n, reinject, 0, &f.h)
+    };
+    for now in [t(0), tm(5), t(0) + Duration::from_nanos(9_999_999)] {
+        assert_eq!(budget(&f, now, false), SendBudget::default(), "{now:?}");
+        assert_eq!(budget(&f, now, true), SendBudget::default(), "{now:?}");
+    }
+    // At the release: one segment, whatever cwnd and the window would allow.
+    for reinject in [false, true] {
+        let b = budget(&f, release, reinject);
+        assert_eq!((b.seg_payload, b.full_segments, b.bytes()), (1460, 1, 1460));
+    }
+}
+
+#[test]
+fn pacing_release_time_in_poll_send_at() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(3 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1, "one segment per release");
+    // ACKed at once: nothing in flight, no ACK expected, no RTO.
+    assert_eq!(f.ack(tm(1), data(SEG), BIG), Reaction::None);
+    assert!(f.drain(tm(1)).is_empty());
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(10)));
+    assert_eq!(seq_lens(&f.drain(tm(10))), [(data(SEG), SEG)]);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(20)));
+}
+
+#[test]
+fn pacing_deadline_consumed_when_blocked_otherwise() {
+    // (a) cwnd full: cwnd is one segment. (b) The peer window closes.
+    for cwnd_full in [true, false] {
+        let cwnd = if cwnd_full { SEG } else { BIG_CWND };
+        let (mut f, _) = Fixture::test_cc(Some(RATE), cwnd, if cwnd_full { BIG } else { 1460 });
+        f.write(&pattern(2 * SEG as usize));
+        assert_eq!(f.drain(t(0)).len(), 1);
+        if !cwnd_full {
+            assert_eq!(f.ack(tm(1), data(SEG), 0), Reaction::None);
+            assert!(f.drain(tm(1)).is_empty());
+            assert!(f.tcb.peer_window_closed());
+        }
+        let release = tm(10);
+        assert_eq!(f.tcb.poll_send_at(), Some(release), "cwnd_full {cwnd_full}");
+        assert_eq!(f.timeout(release), Reaction::None);
+        let next = f.tcb.poll_send_at().expect("RTO or persist");
+        assert!(next > release, "cwnd_full {cwnd_full}: {next:?}");
+        for _ in 0..3 {
+            assert!(f.drain(release).is_empty());
+            assert_eq!(f.tcb.poll_send_at(), Some(next), "fires once");
+        }
+    }
+}
+
+#[test]
+fn pacing_does_not_delay_acks() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(3 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    // Out-of-order data: ACKed at once although data sending waits for the release.
+    let r = f.seg_ack(tm(1), 10, data(0), TcpFlags::ACK, b"x");
+    assert_eq!(r, Reaction::None);
+    let segs = f.drain(tm(1));
+    assert_eq!(segs.len(), 1);
+    assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
+    assert_eq!(f.out.ack, pdata(0));
+}
+
+#[test]
+fn retransmission_is_paced() {
+    // One segment per 2 s: the RTO at 1 s comes before the release.
+    let (mut f, _) = Fixture::test_cc(Some(730), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    assert_eq!(
+        f.tcb.poll_send_at(),
+        Some(t(1)),
+        "nothing unsent: the RTO only"
+    );
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert!(f.drain(t(1)).is_empty(), "the retransmission waits");
+    assert_eq!(f.tcb.poll_send_at(), Some(t(2)));
+    assert_eq!(f.timeout(t(2)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(t(2))), [(data(0), SEG)]);
+}
+
+#[test]
+fn reno_unpaced_unchanged() {
+    assert_eq!(Reno::new().pacing_rate(), None);
+    assert_eq!(Cubic::new().pacing_rate(), None);
+}
+
+#[test]
+fn app_limited_flag_recorded_at_send() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(2 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(2 * u64::from(SEG)));
+    assert_eq!(f.tcb.app_limited(), Some(AppLimited::NoData));
+    f.write(&pattern(2 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    assert_eq!(
+        f.tcb.app_limited(),
+        None,
+        "data went out: the reason clears"
+    );
+    for k in 1..=2 {
+        f.ack(tm(10 * u64::from(k)), data(k * SEG), BIG);
+    }
+    assert_eq!(
+        f.tcb.app_limited_until,
+        Some(2 * u64::from(SEG)),
+        "delivered == marker"
+    );
+    f.ack(tm(30), data(3 * SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None, "delivered > marker");
+    f.ack(tm(40), data(4 * SEG), BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(40)).len(), 1);
+    f.ack(tm(50), data(5 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [false, false, true, true, false]);
+    let delivered: Vec<u64> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.delivered)
+        .collect();
+    assert_eq!(delivered, [1, 2, 3, 4, 5].map(|k| k * u64::from(SEG)));
+}
+
+#[test]
+fn app_limited_resume_from_zero_in_flight() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(0));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(10), data(SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(10)).len(), 1);
+    f.ack(tm(20), data(2 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [true, false]);
+}
+
+#[test]
+fn retransmission_rerecords_app_limited() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    assert!(!f.tcb.sent[0].app_limited);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), SEG)]);
+    f.ack(tm(1010), data(SEG), BIG);
+    let s = samples.lock().unwrap()[0];
+    assert!(s.app_limited, "the retransmission was sent marked");
+    assert_eq!(s.rtt, None, "Karn");
+}
+
+#[test]
+fn sample_uses_newest_transmission_not_highest_seq() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(2 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    // Only S1 is resent (marked, newest) before the ACK covering S1 and S2 arrives.
+    assert_eq!(f.send(t(1)).map(|m| (m.seq, m.len)), Some((data(0), SEG)));
+    f.ack(tm(1010), data(2 * SEG), BIG);
+    let s = samples.lock().unwrap()[0];
+    assert!(
+        s.app_limited,
+        "S1's retransmission, not S2's original transmission"
+    );
+    assert_eq!(
+        s.rtt, None,
+        "the newest transmission is a retransmission (Karn)"
+    );
+    assert!(f.tcb.sent.is_empty());
+}
+
+#[test]
+fn no_mark_without_room() {
+    // cwnd full.
+    let (mut f, _) = Fixture::test_cc(None, SEG, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    // Peer window closed.
+    let (mut f, _) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(1), data(SEG), 0);
+    f.mark(tm(1), AppLimited::NoData);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    // Pacing-blocked with assigned data pending: it has something to send.
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(3 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.mark(t(0), AppLimited::NotScheduled);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+}
+
+#[test]
+fn drained_paced_sender_marked_before_next_burst() {
+    let (mut f, samples) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(1), data(SEG), BIG);
+    assert!(f.drain(tm(1)).is_empty());
+    assert_eq!(
+        f.tcb.poll_send_at(),
+        None,
+        "nothing to send: the release is no timer"
+    );
+    // The pending release (10 ms) does not keep the sender from being app-limited.
+    f.mark(tm(1), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited(), Some(AppLimited::NoData));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(100)).len(), 1);
+    assert!(f.tcb.sent.back().unwrap().app_limited);
+    f.ack(tm(110), data(2 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [false, true]);
+}
+
+#[test]
+fn marker_refreshed_on_repeated_app_limited() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(10), data(SEG), BIG);
+    f.mark(tm(10), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(u64::from(SEG)));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(10)).len(), 1);
+    // The pass ends again with room and no data: delivered + in_flight.
+    f.mark(tm(10), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(2 * u64::from(SEG)));
+    f.ack(tm(20), data(2 * SEG), BIG);
+    assert_eq!(
+        f.tcb.app_limited_until,
+        Some(2 * u64::from(SEG)),
+        "not cleared early"
+    );
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(20)).len(), 1);
+    assert!(f.tcb.sent.back().unwrap().app_limited);
+    f.ack(tm(30), data(3 * SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None);
+    assert_eq!(flags_of(&samples), [false, true, true]);
 }

@@ -12,7 +12,7 @@ pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
 use crate::connection::Connection;
 use crate::tcp::rtt::INITIAL_RTO;
 
-use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb};
+use crate::tcp::{AppLimited, ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb};
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
@@ -198,6 +198,7 @@ impl Connection {
                 new_budget,
                 reinject_budget,
                 srtt: sf.tcb.srtt().unwrap_or(INITIAL_RTO),
+                app_limited: sf.tcb.app_limited(),
             });
         }
         self.hooks.snapshots = snapshots;
@@ -209,9 +210,72 @@ impl Connection {
     }
 
     /// `poll_transmit` step 2 (spec §3.1): trim the reinjection head, snapshot, `plan`,
-    /// validate and install the mapping. Returns the index of the subflow that got it.
+    /// validate and install the mapping. Returns the index of the subflow that got it. A step
+    /// that installs no mapping ends the pass: it is an app-limited evaluation point.
     pub(crate) fn schedule(&mut self, now: Instant, buf: usize) -> Option<usize> {
         self.hooks.data.as_ref()?;
+        let installed = self.schedule_step(now, buf);
+        // Every subflow offered a budget and given nothing in this step is passed over.
+        for (k, (sf, s)) in self
+            .subflows
+            .iter_mut()
+            .zip(&self.hooks.snapshots)
+            .enumerate()
+        {
+            if Some(k) == installed {
+                sf.mp.offered_unused = false;
+            } else if s.state == SubflowState::Active
+                && (s.new_budget.bytes() > 0 || s.reinject_budget.bytes() > 0)
+            {
+                sf.mp.offered_unused = true;
+            }
+        }
+        if installed.is_none() {
+            self.mark_passed_over(now);
+            let d = self.hooks.data.as_ref().unwrap();
+            if d.send.next == d.send.end && d.reinject.is_empty() {
+                for sf in &mut self.subflows {
+                    if sf.state == SubflowState::Active {
+                        let hk = SubflowHooks {
+                            conn: &mut self.hooks,
+                            sf: &mut sf.mp,
+                        };
+                        sf.tcb.mark_unused_opportunity(now, AppLimited::NoData, &hk);
+                    }
+                }
+            }
+        }
+        installed
+    }
+
+    /// App-limited evaluation point: at the end of a pass, and before an input reaches the
+    /// connection (for drivers that interleave one `poll_transmit` per input). Every subflow
+    /// passed over since the last evaluation is marked `NotScheduled`, unless data is queued
+    /// but the connection-level window admits none of it: receiver-limited is not app-limited
+    /// (draft-ietf-ccwg-bbr-06 §4.1.1.3.1), and the flags are dropped.
+    pub(crate) fn mark_passed_over(&mut self, now: Instant) {
+        if !self.subflows.iter().any(|sf| sf.mp.offered_unused) {
+            return;
+        }
+        let receiver_limited = self
+            .hooks
+            .data
+            .as_ref()
+            .is_some_and(|d| d.send.next != d.send.end && !d.fallback && d.reinject.is_empty())
+            && self.hooks.unassigned_len() == 0;
+        for sf in &mut self.subflows {
+            if std::mem::take(&mut sf.mp.offered_unused) && !receiver_limited {
+                let hk = SubflowHooks {
+                    conn: &mut self.hooks,
+                    sf: &mut sf.mp,
+                };
+                sf.tcb
+                    .mark_unused_opportunity(now, AppLimited::NotScheduled, &hk);
+            }
+        }
+    }
+
+    fn schedule_step(&mut self, now: Instant, buf: usize) -> Option<usize> {
         let head = self.reinject_head();
         self.build_snapshots(now, head, buf);
         let hooks = &mut self.hooks;
@@ -343,11 +407,17 @@ impl SubflowHooks<'_> {
             _ => false,
         };
         tcb.set_probe_demand(demand);
+        let reinject = self
+            .conn
+            .data
+            .as_ref()
+            .is_some_and(|d| !d.reinject.is_empty());
         tcb.pending_send(
             now,
             self.unassigned_len(),
             self.candidate_len(),
             self.data_option_len(),
+            reinject,
             self,
         );
     }

@@ -7,6 +7,7 @@ mod recovery;
 pub(crate) mod rtt;
 mod tcb;
 
+pub use cc::AppLimited;
 pub use hooks::{Hooks, PlainHooks, SegmentHooks, SendBuf};
 pub use tcb::{
     CloseReason, ConnectConfig, Reaction, SegmentWriter, SendBudget, SentMeta, Tcb, TcpState,

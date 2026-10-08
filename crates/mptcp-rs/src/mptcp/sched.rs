@@ -6,7 +6,7 @@ use rangemap::RangeSet;
 
 use super::data::{SendStore, TxMaps};
 use super::{SubflowId, SubflowState};
-use crate::tcp::SendBudget;
+use crate::tcp::{AppLimited, SendBudget};
 use crate::time::Instant;
 
 /// What one subflow could send now, computed before any segment exists.
@@ -20,6 +20,9 @@ pub(crate) struct SubflowSnapshot {
     pub reinject_budget: SendBudget,
     /// Smoothed RTT, or the initial RTO before the first sample.
     pub srtt: Duration,
+    /// Why the subflow is in an app-limited interval, if it is: its ACK samples then say
+    /// nothing about path capacity.
+    pub app_limited: Option<AppLimited>,
 }
 
 pub(crate) struct Pending<'a> {
@@ -248,6 +251,7 @@ mod tests {
             new_budget: new,
             reinject_budget: re,
             srtt: Duration::from_millis(srtt_ms),
+            app_limited: None,
         }
     }
     fn plan(q: &ReinjectQueue, new_bytes: u64, subflows: &[SubflowSnapshot]) -> Plan {

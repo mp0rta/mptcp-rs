@@ -2448,15 +2448,21 @@ fn flood_unread(
     (sent, tcp_ack)
 }
 
-fn connected_scaled(
-    cap: u32,
-) -> (
+type Connected = (
     Endpoint<ChaCha20Rng>,
     ConnectionHandle,
     Segment<'static>,
     u64,
-) {
+);
+fn connected_scaled(cap: u32) -> Connected {
+    connected_scaled_cc(cap, None)
+}
+fn connected_scaled_cc(
+    cap: u32,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+) -> Connected {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
+    ep.cc = cc;
     let h = ep
         .connect_mptcp(
             Instant::from_nanos(0),
@@ -2535,6 +2541,8 @@ enum Rogue {
     FirstSubflow,
     /// A reinjection `(dsn, len)` that is not a prefix of the head candidate.
     ForeignReinject(u64, u32),
+    /// Never sends anything.
+    Idle,
 }
 
 /// MinRTT, or a rogue plan when one is set; records everything.
@@ -2559,6 +2567,7 @@ impl Scheduler for Probe {
                 subflow: first.id,
                 payload: Payload::Reinject { dsn, len },
             },
+            Some(Rogue::Idle) => Plan::Idle,
         };
         self.log.lock().unwrap().plans.push(plan);
         plan
@@ -3096,4 +3105,243 @@ fn rogue_reinject_outside_head_rejected() {
     );
     assert_eq!(queue_first(&ep, h), None);
     assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}
+
+// M2 Task 3b: pacing gate, release timer and app-limited marking.
+
+use crate::tcp::AppLimited;
+use crate::tcp::cc::{AckSample, CongestionControl, CongestionEvent, RecoveryAck};
+use std::cell::RefCell;
+
+thread_local! {
+    /// Every ACK sample a `FixedPacing` controller on this test's thread received.
+    static SAMPLES: RefCell<Vec<AckSample>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One MPTCP data segment (1460 − 28 octets of DSS) per 10 ms.
+const RATE: u64 = 143_200;
+
+/// Fixed cwnd and, if `rate` is set, a fixed pacing rate; records ACK samples in `SAMPLES`.
+struct FixedPacing {
+    rate: Option<u64>,
+    cwnd: u32,
+}
+impl CongestionControl for FixedPacing {
+    fn on_ack(&mut self, a: &AckSample) {
+        SAMPLES.with(|s| s.borrow_mut().push(*a));
+    }
+    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
+    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+    fn pacing_rate(&self) -> Option<u64> {
+        self.rate
+    }
+}
+fn paced() -> Box<dyn CongestionControl> {
+    Box::new(FixedPacing {
+        rate: Some(RATE),
+        cwnd: 64 << 10,
+    })
+}
+fn recording() -> Box<dyn CongestionControl> {
+    Box::new(FixedPacing {
+        rate: None,
+        cwnd: 64 << 10,
+    })
+}
+fn app_limited_reason(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Option<AppLimited> {
+    ep.conns[&h].subflows[0].tcb.app_limited()
+}
+
+/// A paced connection with the peer's window open and `len` octets written; the first
+/// segment goes out at `T0`. Returns the endpoint, handle, SYN, head DSN and that segment.
+fn paced_first_segment(
+    len: usize,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    u64,
+    Vec<u8>,
+) {
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(paced));
+    open_window(&mut ep, &syn, h);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().write(&vec![1; len]).unwrap();
+    let out = drain(&mut ep, T0);
+    assert_eq!(out.len(), 1, "one segment per release");
+    assert_eq!(packet::parse(&out[0]).unwrap().payload.len(), 1432);
+    (ep, h, syn, head, out[0].clone())
+}
+const T0: Instant = Instant::from_nanos(10);
+fn release() -> Instant {
+    T0 + Duration::from_millis(10)
+}
+
+#[test]
+fn endpoint_poll_timeout_wakes_paced_subflow() {
+    let (mut ep, _, syn, head, first) = paced_first_segment(3 * 1432);
+    let first = packet::parse(&first).unwrap();
+    // ACKed at once: nothing in flight, no RTO; only the release can wake the driver.
+    let t1 = T0 + Duration::from_millis(1);
+    peer_ack(
+        &mut ep,
+        &syn,
+        t1,
+        first.seq.wrapping_add(1432),
+        head + 1432,
+        1000,
+    );
+    assert!(drain(&mut ep, t1).is_empty());
+    assert_eq!(ep.poll_timeout(), Some(release()));
+    ep.handle_timeout(release());
+    let out = drain(&mut ep, release());
+    assert_eq!(out.len(), 1);
+    let seg = packet::parse(&out[0]).unwrap();
+    assert_eq!(dsn_of(&seg, syn.seq), Some((head + 1432, 1432)));
+}
+
+#[test]
+fn paced_subflow_budget_zero_reaches_scheduler() {
+    let (mut ep, h, _, head, _) = paced_first_segment(3 * 1432);
+    let c = ep.conns.get_mut(&h).unwrap();
+    c.build_snapshots(T0, Some((head, 1432)), 1500);
+    let s = c.snapshots()[0];
+    assert_eq!((s.new_budget, s.reinject_budget), Default::default());
+    c.build_snapshots(release(), Some((head, 1432)), 1500);
+    let s = c.snapshots()[0];
+    assert_eq!(
+        (s.new_budget.bytes(), s.reinject_budget.bytes()),
+        (1432, 1432)
+    );
+}
+
+#[test]
+fn pacing_deadline_consumed_when_scheduler_idle() {
+    // Case (c) of `tcb::tests::pacing_deadline_consumed_when_blocked_otherwise`.
+    let (mut ep, h, _, _, _) = paced_first_segment(3 * 1432);
+    let (_, rogue) = install_probe(&mut ep, h);
+    *rogue.lock().unwrap() = Some(Rogue::Idle);
+    assert_eq!(ep.poll_timeout(), Some(release()));
+    ep.handle_timeout(release());
+    let next = ep.poll_timeout().expect("the RTO");
+    assert!(next > release(), "{next:?}");
+    for _ in 0..3 {
+        assert!(drain(&mut ep, release()).is_empty());
+        assert_eq!(ep.poll_timeout(), Some(next), "fires once");
+    }
+}
+
+#[test]
+fn paced_reinjection_alone_wakes_at_release() {
+    // Carried from Task 3: a queued reinjection is demand although nothing is unassigned.
+    let (mut ep, h, syn, head, first) = paced_first_segment(1432);
+    let first = packet::parse(&first).unwrap();
+    let t1 = T0 + Duration::from_millis(1);
+    // TCP-ACKed, DATA_ACK still at the head: the peer discarded it.
+    peer_ack(&mut ep, &syn, t1, first.seq.wrapping_add(1432), head, 1000);
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    assert_eq!((d.send.next, d.send.end), (head + 1432, head + 1432));
+    d.reinject.insert(head, 1432);
+    assert!(
+        drain(&mut ep, t1).is_empty(),
+        "the reinjection waits for the release"
+    );
+    assert_eq!(ep.poll_timeout(), Some(release()));
+    ep.handle_timeout(release());
+    let out = drain(&mut ep, release());
+    let seg = packet::parse(&out[0]).unwrap();
+    assert_eq!(dsn_of(&seg, syn.seq), Some((head, 1432)));
+    assert_eq!(queue_first(&ep, h), None);
+}
+
+#[test]
+fn connection_window_exhausted_is_not_app_limited() {
+    SAMPLES.with(|s| s.borrow_mut().clear());
+    let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(recording));
+    let head = una(&ep, h);
+    // A window of 179 << 7 = 22,912 octets: exactly 16 segments of 1432.
+    const WND: u16 = 179;
+    peer_ack(&mut ep, &syn, T0, syn.seq.wrapping_add(1), head, WND);
+    ep.connection(h).unwrap().write(&[2; 50_000]).unwrap();
+    let out = drain(&mut ep, T0);
+    let sent: usize = out
+        .iter()
+        .map(|p| packet::parse(p).unwrap().payload.len())
+        .sum();
+    assert_eq!(sent, 22_912);
+    let end = syn.seq.wrapping_add(1 + 22_912);
+    // All TCP-ACKed (the subflow window is open again, cwnd has room), DATA_ACK unmoved: the
+    // connection-level window stays exhausted with data queued.
+    let t1 = T0 + Duration::from_millis(1);
+    peer_ack(&mut ep, &syn, t1, end, head, WND);
+    for pkt in drain(&mut ep, t1) {
+        let seg = packet::parse(&pkt).unwrap();
+        assert!(seg.payload.is_empty(), "connection window exhausted");
+    }
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert!(d.send.next != d.send.end && d.reinject.is_empty());
+    let edge = ep.conns[&h]
+        .hooks
+        .negotiation
+        .as_ref()
+        .unwrap()
+        .send_right_edge;
+    assert_eq!(
+        edge,
+        Some(d.send.next),
+        "nothing unassigned fits the window"
+    );
+    assert_eq!(
+        app_limited_reason(&ep, h),
+        None,
+        "neither NoData nor NotScheduled"
+    );
+    // The window opens: everything from here on is cwnd- or window-limited until the queue
+    // drains.
+    let mut now = t1 + Duration::from_millis(1);
+    let (mut tcp_ack, mut data_ack) = (end, head + 22_912);
+    while data_ack != head + 50_000 {
+        peer_ack(&mut ep, &syn, now, tcp_ack, data_ack, 1000);
+        for pkt in drain(&mut ep, now) {
+            let seg = packet::parse(&pkt).unwrap();
+            if let Some((dsn, _)) = dsn_of(&seg, syn.seq) {
+                tcp_ack = seg.seq.wrapping_add(seg.payload.len() as u32);
+                data_ack = dsn + seg.payload.len() as u64;
+            }
+        }
+        now = now + Duration::from_millis(10);
+    }
+    peer_ack(&mut ep, &syn, now, tcp_ack, data_ack, 1000);
+    SAMPLES.with(|s| {
+        let s = s.borrow();
+        assert!(s.len() > 2);
+        assert!(s.iter().all(|a| !a.app_limited), "{s:?}");
+    });
+}
+
+#[test]
+fn idle_scheduler_marks_not_scheduled() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let (_, rogue) = install_probe(&mut ep, h);
+    let now = Instant::from_nanos(10);
+    drain(&mut ep, now);
+    assert_eq!(
+        app_limited_reason(&ep, h),
+        Some(AppLimited::NoData),
+        "nothing to send"
+    );
+    *rogue.lock().unwrap() = Some(Rogue::Idle);
+    ep.connection(h).unwrap().write(&[3; 5000]).unwrap();
+    assert!(drain(&mut ep, now).is_empty());
+    assert_eq!(app_limited_reason(&ep, h), Some(AppLimited::NotScheduled));
+    let c = ep.conns.get_mut(&h).unwrap();
+    c.build_snapshots(now, None, 1500);
+    assert_eq!(c.snapshots()[0].app_limited, Some(AppLimited::NotScheduled));
+    *rogue.lock().unwrap() = None;
+    assert!(!drain(&mut ep, now).is_empty());
+    assert_eq!(app_limited_reason(&ep, h), None, "MinRTT assigned data");
 }

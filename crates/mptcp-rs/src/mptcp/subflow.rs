@@ -54,6 +54,9 @@ pub(crate) struct SubflowMp {
     pub rx_infinite: Option<(u32, u64)>,
     /// Window scale this subflow's SYN/ACK negotiated; scales DATA_ACK windows it carries.
     pub peer_scale: u8,
+    /// A scheduling step offered this subflow a nonzero budget and installed no mapping on
+    /// it; consumed by the next app-limited evaluation (`Connection::mark_passed_over`).
+    pub offered_unused: bool,
 }
 
 impl SubflowMp {
@@ -73,6 +76,7 @@ impl SubflowMp {
             final_mapping: None,
             rx_infinite: None,
             peer_scale: 0,
+            offered_unused: false,
         }
     }
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rangemap::RangeSet;
 
-use super::cc::{CongestionControl, CongestionEvent, RecoveryAck};
+use super::cc::{AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck};
 use super::cubic::Cubic;
 use super::hooks::Hooks;
 use super::recovery::{DupAck, NewAck, NewReno};
@@ -155,6 +155,22 @@ impl SegmentWriter {
     }
 }
 
+/// One transmitted data segment still outstanding (draft-ietf-ccwg-bbr-06 §4.1.2.1.2,
+/// per-packet state).
+#[derive(Debug, Clone, Copy)]
+struct SentRecord {
+    /// One past its last sequence number, FIN included.
+    end: SeqNum,
+    /// Transmission order, new and resent segments alike: the ACK's sample is taken from
+    /// the covered record sent last (§4.1.2.3 IsNewestPacket), not the highest in sequence.
+    tx_order: u64,
+    /// Sent inside an app-limited interval (P.is_app_limited).
+    app_limited: bool,
+    sent_at: Instant,
+    /// A retransmission: no RTT sample from it (Karn).
+    resent: bool,
+}
+
 #[derive(Debug)]
 pub struct Tcb {
     cfg: ConnectConfig,
@@ -225,10 +241,26 @@ pub struct Tcb {
     rto_not_before: Option<(SeqNum, Instant)>,
     /// The one timed segment (Karn): its end and send time; cleared by any RTO.
     rtt_timed: Option<(SeqNum, Instant)>,
-    /// End and send time of every new-data segment outstanding since the last retransmission,
-    /// for the per-ACK RTT samples the CC gets (RFC 9406 §4.3 recommends N_RTT_SAMPLE per
-    /// round); the RTO estimator keeps the one timed segment.
-    cc_sent: VecDeque<(SeqNum, Instant)>,
+    /// Every data segment outstanding, in sequence order; a retransmission replaces the
+    /// records it covers. Gives the CC one RTT sample per ACK (RFC 9406 §4.3 recommends
+    /// N_RTT_SAMPLE per round) and the app-limited flag; the RTO estimator keeps the one
+    /// timed segment.
+    sent: VecDeque<SentRecord>,
+    /// Data segments transmitted so far, new and resent (`SentRecord::tx_order`).
+    tx_count: u64,
+    /// Cumulative octets acknowledged (draft-ietf-ccwg-bbr-06 §4.1.2.1.1 C.delivered).
+    delivered: u64,
+    /// The app-limited interval (C.app_limited): data sent while it is set is marked, and the
+    /// ACK that makes `delivered` pass it clears it (§4.1.2.3 GenerateRateSample).
+    app_limited_until: Option<u64>,
+    /// Why the interval was last (re)started; cleared with it, or once new data goes out.
+    app_limited: Option<AppLimited>,
+    /// Pacing release time: no data segment goes out before it. Reaching it consumes it.
+    next_send_at: Option<Instant>,
+    /// Assigned data or a FIN was unsent at the last `poll_send`.
+    unsent: bool,
+    /// Unassigned connection data or a queued reinjection at the last `pending_send`.
+    conn_pending: bool,
     /// When data octets last went out (RFC 5681 §4.1 idle detection).
     last_data_sent: Option<Instant>,
     /// R2 base for data: first transmission of the segment at SND.UNA, restarted when SND.UNA
@@ -315,7 +347,14 @@ impl Tcb {
             rto_at: None,
             rto_not_before: None,
             rtt_timed: None,
-            cc_sent: VecDeque::new(),
+            sent: VecDeque::new(),
+            tx_count: 0,
+            delivered: 0,
+            app_limited_until: None,
+            app_limited: None,
+            next_send_at: None,
+            unsent: false,
+            conn_pending: false,
             last_data_sent: None,
             r2_since: None,
             persist_at: None,
@@ -472,25 +511,19 @@ impl Tcb {
         option_len: usize,
         h: &impl Hooks,
     ) -> SendBudget {
+        // Pacing is part of the budget: nothing before the release time.
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
             || self.retransmit_due
             || self.snd_nxt != self.snd_max
+            || self.next_send_at.is_some_and(|t| t > now)
         {
             return SendBudget::default();
         }
-        let mss = usize::from(self.eff_mss).saturating_sub(option_len + self.sack_len(option_len));
+        let mss = self.seg_payload(option_len);
         if mss == 0 {
             return SendBudget::default();
         }
-        let cwnd = if self.in_flight() == 0
-            && self
-                .last_data_sent
-                .is_some_and(|t| now > t + self.rtt.rto())
-        {
-            self.cc.restart_cwnd()
-        } else {
-            self.cc.cwnd()
-        };
+        let cwnd = self.send_cwnd(now);
         let assigned =
             self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end())) as usize;
         let usable =
@@ -510,22 +543,50 @@ impl Tcb {
         } else {
             0
         };
+        // ponytail: one segment per release, no send quantum; BBR adds a quantum later.
+        let full_segments = match self.cc.pacing_rate() {
+            Some(_) => (len / mss).min(1),
+            None => len / mss,
+        };
         SendBudget {
             seg_payload: mss,
-            full_segments: len / mss,
+            full_segments,
             partial,
         }
     }
 
+    /// Payload of one segment that carries `option_len` octets of protocol options (and the
+    /// SACK blocks due with them).
+    fn seg_payload(&self, option_len: usize) -> usize {
+        usize::from(self.eff_mss).saturating_sub(option_len + self.sack_len(option_len))
+    }
+
+    /// cwnd for a send at `now`: the restart window after an idle period (RFC 5681 §4.1).
+    fn send_cwnd(&self, now: Instant) -> u32 {
+        if self.in_flight() == 0
+            && self
+                .last_data_sent
+                .is_some_and(|t| now > t + self.rtt.rto())
+        {
+            self.cc.restart_cwnd()
+        } else {
+            self.cc.cwnd()
+        }
+    }
+
     /// Arm sender SWS for data awaiting assignment; budget queries remain read-only.
+    /// `bytes` (unassigned data) or `reinject` (a queued reinjection) is demand that the
+    /// pacing release time must wake for.
     pub fn pending_send(
         &mut self,
         now: Instant,
         bytes: usize,
         contiguous: usize,
         option_len: usize,
+        reinject: bool,
         h: &impl Hooks,
     ) {
+        self.conn_pending = bytes > 0 || reinject;
         if bytes > 0 && self.in_flight() == 0 && self.snd_wnd > 0 && !self.probe_demand {
             let budget = self.send_budget(now, bytes, contiguous, false, option_len, h);
             if budget.seg_payload > 0 && budget.bytes() == 0 {
@@ -563,6 +624,40 @@ impl Tcb {
     #[cfg(test)]
     pub(crate) fn cwnd(&self) -> u32 {
         self.cc.cwnd()
+    }
+    /// This sender had a sending opportunity and nothing to send (draft-ietf-ccwg-bbr-06
+    /// §4.1.2.4 MarkConnectionAppLimited): data sent until `delivered` passes the data now in
+    /// flight is marked app-limited. Refreshed on every call that qualifies. A no-op unless
+    /// ESTABLISHED or CLOSE-WAIT, nothing assigned is unsent, nothing is due for resending
+    /// and min(cwnd, SND.WND) − in-flight holds a full segment. A pending pacing release does
+    /// not prevent it: it leaves the sender with nothing to send all the same.
+    pub(crate) fn mark_unused_opportunity(
+        &mut self,
+        now: Instant,
+        reason: AppLimited,
+        h: &impl Hooks,
+    ) {
+        let seg = self.seg_payload(h.data_option_len());
+        let room = self
+            .snd_wnd
+            .min(self.send_cwnd(now))
+            .saturating_sub(self.in_flight());
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            || self.retransmit_due
+            || self.snd_nxt != self.snd_max
+            || self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end())) > 0
+            || seg == 0
+            || (room as usize) < seg
+        {
+            return;
+        }
+        let mark = self.delivered + u64::from(self.in_flight());
+        self.app_limited_until = Some(self.app_limited_until.map_or(mark, |m| m.max(mark)));
+        self.app_limited = Some(reason);
+    }
+    /// Why the current app-limited interval started, if one is open.
+    pub(crate) fn app_limited(&self) -> Option<AppLimited> {
+        self.app_limited
     }
     pub fn peer_window_closed(&self) -> bool {
         self.snd_wnd == 0
@@ -681,12 +776,17 @@ impl Tcb {
             TcpState::TimeWait => self.time_wait_at,
             _ => {
                 let r2 = self.r2_since.map(|t| t + self.cfg.r2_data);
+                // The pacing release, while something waits for it.
+                let release = self
+                    .next_send_at
+                    .filter(|_| self.unsent || self.retransmit_due || self.conn_pending);
                 [
                     self.rto_deadline(),
                     r2,
                     self.persist_at,
                     self.sws_at,
                     self.ack_at,
+                    release,
                 ]
                 .into_iter()
                 .flatten()
@@ -1090,6 +1190,7 @@ impl Tcb {
         if seg.ack.gt(self.snd_una) {
             let acked = self.snd_una.distance(seg.ack) as u32;
             self.snd_una = seg.ack;
+            self.delivered += u64::from(acked);
             self.rto_streak = 0;
             if self.rto_not_before.is_some_and(|(end, _)| end.le(seg.ack)) {
                 self.rto_not_before = None;
@@ -1105,18 +1206,36 @@ impl Tcb {
                 self.rtt_timed = None;
                 self.rtt.sample(now - sent);
             }
-            // The newest segment this ACK covers.
-            let mut rtt = None;
-            while let Some(&(_, sent)) = self.cc_sent.front().filter(|(end, _)| end.le(seg.ack)) {
-                self.cc_sent.pop_front();
-                rtt = Some(now - sent);
+            // The most recently sent segment this ACK covers (draft-ietf-ccwg-bbr-06
+            // §4.1.2.3) gives the RTT sample, unless it was resent (Karn), and the app-limited
+            // flag.
+            let mut newest: Option<SentRecord> = None;
+            while let Some(&r) = self.sent.front().filter(|r| r.end.le(seg.ack)) {
+                self.sent.pop_front();
+                if newest.is_none_or(|n| r.tx_order > n.tx_order) {
+                    newest = Some(r);
+                }
+            }
+            let rtt = newest.filter(|r| !r.resent).map(|r| now - r.sent_at);
+            let app_limited = newest.is_some_and(|r| r.app_limited);
+            // The app-limited bubble is acknowledged and gone (GenerateRateSample).
+            if self.app_limited_until.is_some_and(|m| self.delivered > m) {
+                self.app_limited_until = None;
+                self.app_limited = None;
             }
             let in_flight = self.in_flight();
             // RFC 6298 §5.2 / §5.3, except that only the first partial ACK of a fast recovery
             // restarts the timer (RFC 6582 §3.2 step 3); R2 restarts with SND.UNA (ruling R8).
             let mut restart_rto = true;
             match self.recovery.on_new_ack(seg.ack) {
-                NewAck::Normal => self.cc.on_ack(acked, rtt, in_flight, now),
+                NewAck::Normal => self.cc.on_ack(&AckSample {
+                    acked,
+                    rtt,
+                    in_flight,
+                    now,
+                    delivered: self.delivered,
+                    app_limited,
+                }),
                 NewAck::Partial { first } => {
                     self.cc.on_recovery_ack(RecoveryAck::Partial { acked });
                     self.retransmit_due = true;
@@ -1157,6 +1276,10 @@ impl Tcb {
     }
 
     fn on_timeout_data(&mut self, now: Instant) -> Reaction {
+        // Reaching the release time consumes it, whether or not anything can go out then.
+        if self.next_send_at.is_some_and(|t| now >= t) {
+            self.next_send_at = None;
+        }
         if self.r2_since.is_some_and(|t| now >= t + self.cfg.r2_data) {
             return self.terminate(CloseReason::Timeout, now);
         }
@@ -1168,7 +1291,6 @@ impl Tcb {
             self.rto_streak = self.rto_streak.saturating_add(1);
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
-            self.cc_sent.clear();
             self.cc
                 .on_congestion(CongestionEvent::Rto, self.in_flight(), now);
             self.recovery.on_rto(self.snd_max);
@@ -1202,17 +1324,25 @@ impl Tcb {
         out: &mut SegmentWriter,
         options_len: u16,
     ) -> Option<SentMeta> {
+        // Reaching the release time consumes it, whether or not anything can go out now.
+        if self.next_send_at.is_some_and(|t| now >= t) {
+            self.next_send_at = None;
+        }
+        let paced = self.next_send_at.is_some();
         let mss = u32::from(self.eff_mss.saturating_sub(options_len));
         let in_flight = self.in_flight();
-        if std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
+        let queued = self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end()));
+        let fin_pending = self.fin_rel.is_some() && !self.fin_sent();
+        self.unsent = queued > 0 || fin_pending;
+        if !paced && std::mem::take(&mut self.retransmit_due) && in_flight > 0 {
             // The segment at SND.UNA (RTO, fast retransmit, partial ACK): sent regardless of
             // cwnd, Nagle and SWS, even into a zero window, where it is the probe (spec §3).
-            // Karn: no RTT sample from anything now in flight.
+            // Karn: the RTO estimator times nothing now in flight.
             self.rtt_timed = None;
-            self.cc_sent.clear();
             let len = self.data_len(self.snd_una, self.snd_max).min(mss);
             let fin = self.fin_sent();
             let meta = self.write_data(self.snd_una, len, fin, now, h, out)?;
+            self.on_data_sent(self.snd_una, &meta, now, true);
             let end = self.snd_una.wrapping_add(seq_len(&meta));
             self.rto_not_before = Some((end, now + self.rtt.rto()));
             if end.gt(self.snd_nxt) {
@@ -1220,8 +1350,6 @@ impl Tcb {
             }
             return Some(meta);
         }
-        let queued = self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end()));
-        let fin_pending = self.fin_rel.is_some() && !self.fin_sent();
         let idle = in_flight == 0;
 
         // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is
@@ -1249,6 +1377,10 @@ impl Tcb {
         }
         self.persist_at = None;
         self.probe_due = false;
+        // Data (new, resent or reinjected) waits for the release; ACKs and probes do not.
+        if paced {
+            return None;
+        }
 
         // RFC 5681 §4.1: "a TCP SHOULD set cwnd to no more than RW before beginning
         // transmission if the TCP has not sent data in an interval exceeding the
@@ -1277,6 +1409,7 @@ impl Tcb {
                 .min(mss);
             let fin = self.fin_sent() && usable > len;
             let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
+            self.on_data_sent(self.snd_nxt, &meta, now, true);
             self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
             return Some(meta);
         }
@@ -1307,14 +1440,52 @@ impl Tcb {
             return None;
         }
         let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
+        self.on_data_sent(self.snd_nxt, &meta, now, false);
+        if meta.len > 0 {
+            self.app_limited = None;
+        }
         self.sws_at = None;
         self.sws_override = false;
         self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
         self.snd_max = self.snd_nxt;
         // New data only (SEQ = SND.MAX): resends never get here (Karn).
         self.rtt_timed.get_or_insert((self.snd_nxt, now));
-        self.cc_sent.push_back((self.snd_nxt, now));
         Some(meta)
+    }
+
+    /// Logs the data segment `meta` just written from `seq` (draft-ietf-ccwg-bbr-06
+    /// §4.1.2.2 OnPacketSent) and, if the CC paces, moves the release time past it. A resend
+    /// replaces the records it covers.
+    fn on_data_sent(&mut self, seq: SeqNum, meta: &SentMeta, now: Instant, resent: bool) {
+        self.tx_count += 1;
+        let rec = SentRecord {
+            end: seq.wrapping_add(seq_len(meta)),
+            tx_order: self.tx_count,
+            app_limited: self.app_limited_until.is_some(),
+            sent_at: now,
+            resent,
+        };
+        if !resent {
+            self.sent.push_back(rec);
+        } else {
+            // Records ending above `seq`, up to the one `rec` ends in, which it splits.
+            let mut i = self.sent.partition_point(|r| r.end.le(seq));
+            while let Some(end) = self.sent.get(i).map(|r| r.end) {
+                if end.le(rec.end) {
+                    self.sent[i] = SentRecord { end, ..rec };
+                    i += 1;
+                    continue;
+                }
+                if i == 0 || self.sent[i - 1].end.lt(rec.end) {
+                    self.sent.insert(i, rec);
+                }
+                break;
+            }
+        }
+        if let Some(rate) = self.cc.pacing_rate().filter(|_| meta.len > 0) {
+            let gap = Duration::from_nanos(u64::from(meta.len) * 1_000_000_000 / rate.max(1));
+            self.next_send_at = Some(self.next_send_at.map_or(now, |t| t.max(now)) + gap);
+        }
     }
 
     /// Writes up to `len` data octets from SEQ `seq`, PSH if they end at the last queued octet,

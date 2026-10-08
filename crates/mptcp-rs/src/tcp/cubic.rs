@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use super::cc::{CongestionControl, CongestionEvent, RecoveryAck, initial_window, recovery_window};
+use super::cc::{
+    AckSample, CongestionControl, CongestionEvent, RecoveryAck, initial_window, recovery_window,
+};
 use crate::time::Instant;
 
 /// RFC 9438 §5.1: C = 0.4 segments / s³.
@@ -44,8 +46,10 @@ pub(crate) struct Cubic {
 
 #[derive(Debug, Clone, Copy)]
 struct Epoch {
-    /// t_epoch.
+    /// t_epoch, moved later by every app-limited period so that t excludes it (§4.2).
     start: Instant,
+    /// The stage's last ACK.
+    last: Instant,
     /// K, in seconds (Fig. 2).
     k: f64,
     /// W_est (§4.3).
@@ -84,6 +88,7 @@ impl Cubic {
                 }
                 Epoch {
                     start: now,
+                    last: now,
                     // Fig. 2.
                     k: ((self.w_max - self.cwnd).max(0.0) / (C * smss)).cbrt(),
                     // §4.3: W_est = cwnd_epoch at the start of the stage.
@@ -91,9 +96,7 @@ impl Cubic {
                 }
             }
         };
-        // ponytail: t includes rwnd- or application-limited time while data is outstanding
-        // (§5.8 excludes it); only idle restarts end the epoch. Exclude it once ACKs carry an
-        // app-limited mark.
+        ep.last = now;
         let t = (now - ep.start).as_secs_f64();
         let rtt = self.srtt.map_or(0.0, |d| d.as_secs_f64());
         let target = self.w_cubic(&ep, t + rtt).clamp(self.cwnd, 1.5 * self.cwnd);
@@ -138,19 +141,46 @@ impl CongestionControl for Cubic {
 
     /// Slow start below ssthresh (§4.10: HyStart++, or RFC 5681 once it is over); congestion
     /// avoidance otherwise.
-    fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, now: Instant) {
+    ///
+    /// §5.8: "CUBIC does not increase its congestion window if a flow is application
+    /// limited", and t "MUST NOT include periods during which cwnd has not been updated due
+    /// to application-limited behavior" (§4.2). An ACK of data sent inside an app-limited
+    /// interval (`AckSample::app_limited`: the flow was not cwnd-limited) grows neither cwnd
+    /// nor W_est, and moves t_epoch by the time since the stage's previous ACK. W_max at the
+    /// next loss is then the cwnd the flow actually used, and K stays what that implies.
+    fn on_ack(&mut self, ack: &AckSample) {
+        let AckSample {
+            acked,
+            rtt,
+            in_flight,
+            now,
+            app_limited,
+            ..
+        } = *ack;
         if let Some(r) = rtt {
             self.srtt = Some(self.srtt.map_or(r, |s| s * 7 / 8 + r / 8));
         }
         if self.cwnd >= f64::from(self.ssthresh) {
-            return self.congestion_avoidance(acked, now);
+            if !app_limited {
+                return self.congestion_avoidance(acked, now);
+            }
+            if let Some(ep) = &mut self.epoch {
+                ep.start = ep.start + (now - ep.last);
+                ep.last = now;
+            }
+            return;
         }
         let Some(hs) = &mut self.hystart else {
-            self.cwnd += f64::from(acked.min(self.smss));
+            if !app_limited {
+                self.cwnd += f64::from(acked.min(self.smss));
+            }
             return;
         };
+        // HyStart++ keeps its rounds and RTT samples; only the growth is withheld.
         let (grow, done) = hs.on_ack(acked, rtt, in_flight, self.smss);
-        self.cwnd += f64::from(grow);
+        if !app_limited {
+            self.cwnd += f64::from(grow);
+        }
         if done {
             // RFC 9406 §4.2: ssthresh = cwnd; RFC 9438 §4.10: cwnd_prior = cwnd, and the
             // stage starts with K = 0 (`plan_from_start` is still set: no loss yet).
@@ -321,6 +351,16 @@ mod tests {
     const SMSS: u32 = 1000;
     const T0: Instant = Instant::from_nanos(0);
 
+    fn ack(acked: u32, rtt: Option<Duration>, in_flight: u32, now: Instant) -> AckSample {
+        AckSample {
+            acked,
+            rtt,
+            in_flight,
+            now,
+            delivered: 0,
+            app_limited: false,
+        }
+    }
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
@@ -336,7 +376,7 @@ mod tests {
     fn grown(cwnd: u32) -> Cubic {
         let mut c = cubic();
         while c.cwnd() < cwnd {
-            c.on_ack(SMSS, None, 0, T0);
+            c.on_ack(&ack(SMSS, None, 0, T0));
         }
         assert_eq!(c.cwnd(), cwnd);
         c
@@ -371,8 +411,8 @@ mod tests {
             .take(200)
             .enumerate()
         {
-            c.on_ack(*n, None, 0, T0);
-            r.on_ack(*n, None, 0, T0);
+            c.on_ack(&ack(*n, None, 0, T0));
+            r.on_ack(&ack(*n, None, 0, T0));
             assert_eq!(c.cwnd(), r.cwnd(), "ACK {i}");
         }
         assert_eq!(c.ssthresh, u32::MAX);
@@ -414,7 +454,7 @@ mod tests {
     #[test]
     fn cubic_window_function_reaches_w_max_at_k() {
         let mut c = after_loss();
-        c.on_ack(SMSS, None, 0, T0);
+        c.on_ack(&ack(SMSS, None, 0, T0));
         let ep = c.epoch.expect("congestion avoidance started an epoch");
         // Fig. 2: K = ∛((W_max − cwnd_epoch)/C) = ∛((100 − 70) segments / 0.4) = ∛75 s.
         assert!((ep.k - 75f64.cbrt()).abs() < 1e-12, "K = {}", ep.k);
@@ -439,7 +479,7 @@ mod tests {
                 let now = at(start + rtt * i);
                 let mut left = c.cwnd();
                 while left > 0 {
-                    c.on_ack(SMSS.min(left), Some(rtt), 0, now);
+                    c.on_ack(&ack(SMSS.min(left), Some(rtt), 0, now));
                     left = left.saturating_sub(SMSS);
                 }
                 c.cwnd()
@@ -480,7 +520,7 @@ mod tests {
         c.on_recovery_ack(RecoveryAck::Full { in_flight: 10_000 });
         assert_eq!(c.cwnd(), 7000);
         let rtt = ms(1);
-        c.on_ack(SMSS, Some(rtt), 0, T0);
+        c.on_ack(&ack(SMSS, Some(rtt), 0, T0));
         // 7000 + 0.5294·1000·1000/7000 = 7075.63.
         assert_eq!(c.cwnd(), 7075);
         let mut alpha_one = false;
@@ -488,7 +528,7 @@ mod tests {
             let before = c.cwnd;
             let ep = c.epoch.unwrap();
             let now = at(Duration::from_micros(100 * i));
-            c.on_ack(SMSS, Some(rtt), 0, now);
+            c.on_ack(&ack(SMSS, Some(rtt), 0, now));
             let ep_after = c.epoch.unwrap();
             let t = (now - ep.start).as_secs_f64();
             assert!(
@@ -519,14 +559,14 @@ mod tests {
         c.on_congestion(CongestionEvent::Rto, 100_000, T0);
         assert_eq!((c.cwnd(), c.ssthresh), (SMSS, 70_000));
         // Standard slow start (no HyStart++ after a loss): + min(N, SMSS).
-        c.on_ack(3000, None, 0, T0);
+        c.on_ack(&ack(3000, None, 0, T0));
         assert_eq!(c.cwnd(), 2000);
         while c.cwnd() < 70_000 {
-            c.on_ack(SMSS, None, 0, T0);
+            c.on_ack(&ack(SMSS, None, 0, T0));
         }
         assert_eq!(c.cwnd(), 70_000);
         // The first congestion avoidance stage after it: K = 0, W_max = W_est = cwnd_epoch.
-        c.on_ack(SMSS, None, 0, at(ms(5)));
+        c.on_ack(&ack(SMSS, None, 0, at(ms(5))));
         let ep = c.epoch.unwrap();
         assert_eq!((ep.k, c.w_max, ep.start), (0.0, 70_000.0, at(ms(5))));
         assert_eq!(c.cwnd(), 70_007, "W_est = 70 000 + α·1000·1000/70 000");
@@ -542,7 +582,7 @@ mod tests {
         // In congestion avoidance the restart also ends the epoch: t must not count the idle
         // period (§5.8).
         let mut c = after_loss();
-        c.on_ack(SMSS, None, 0, T0);
+        c.on_ack(&ack(SMSS, None, 0, T0));
         assert!(c.epoch.is_some());
         c.on_idle_restart();
         assert_eq!((c.cwnd(), c.ssthresh), (4000, 70_000));
@@ -560,13 +600,13 @@ mod tests {
     /// outstanding at init): cwnd 5000, lastRoundMinRTT = infinity, round 1 next.
     fn hy() -> Cubic {
         let mut c = cubic();
-        c.on_ack(SMSS, None, 8 * SMSS, T0);
+        c.on_ack(&ack(SMSS, None, 8 * SMSS, T0));
         assert_eq!(c.cwnd(), 5000);
         c
     }
     fn round(c: &mut Cubic, rtt: Duration) {
         for _ in 0..8 {
-            c.on_ack(SMSS, Some(rtt), 8 * SMSS, T0);
+            c.on_ack(&ack(SMSS, Some(rtt), 8 * SMSS, T0));
         }
     }
     fn in_css(c: &Cubic) -> bool {
@@ -605,10 +645,10 @@ mod tests {
         round(&mut c, ms(100));
         round(&mut c, ms(100));
         for i in 0..7 {
-            c.on_ack(SMSS, Some(ms(113)), 8 * SMSS, T0);
+            c.on_ack(&ack(SMSS, Some(ms(113)), 8 * SMSS, T0));
             assert!(!in_css(&c), "sample {i}: fewer than N_RTT_SAMPLE");
         }
-        c.on_ack(SMSS, Some(ms(113)), 8 * SMSS, T0);
+        c.on_ack(&ack(SMSS, Some(ms(113)), 8 * SMSS, T0));
         assert!(in_css(&c));
         assert_eq!(
             c.cwnd(),
@@ -636,7 +676,7 @@ mod tests {
         assert!(c.hystart.is_none());
         assert_eq!(c.cwnd_prior, 37_000.0);
         // RFC 9438 §4.10: congestion avoidance with K = 0 and W_max = cwnd_epoch.
-        c.on_ack(SMSS, Some(ms(113)), 8 * SMSS, at(ms(1)));
+        c.on_ack(&ack(SMSS, Some(ms(113)), 8 * SMSS, at(ms(1))));
         let ep = c.epoch.unwrap();
         assert_eq!((ep.k, c.w_max), (0.0, 37_000.0));
         // α = 1 at once (W_est ≥ cwnd_prior): 37 000 + 1000·1000/37 000 = 37 027.03.
@@ -669,7 +709,7 @@ mod tests {
         c.on_recovery_ack(RecoveryAck::Full { in_flight: 5000 });
         assert_eq!((c.cwnd(), c.ssthresh), (6000, 20_300));
         // The later slow start is RFC 5681's: + min(N, SMSS), no L, no delay check.
-        c.on_ack(3000, Some(ms(500)), 0, T0);
+        c.on_ack(&ack(3000, Some(ms(500)), 0, T0));
         assert_eq!(c.cwnd(), 7000);
     }
 
@@ -677,14 +717,75 @@ mod tests {
     fn hystart_growth_limit_l() {
         // Slow start under HyStart++: + min(N, L·SMSS) with L = 8 (non-paced).
         let mut c = cubic();
-        c.on_ack(3000, None, 0, T0);
+        c.on_ack(&ack(3000, None, 0, T0));
         assert_eq!(c.cwnd(), 7000);
-        c.on_ack(10_000, None, 0, T0);
+        c.on_ack(&ack(10_000, None, 0, T0));
         assert_eq!(c.cwnd(), 15_000);
         // HyStart++ off: RFC 5681 slow start, + min(N, SMSS).
         let mut c = cubic();
         c.hystart = None;
-        c.on_ack(3000, None, 0, T0);
+        c.on_ack(&ack(3000, None, 0, T0));
         assert_eq!(c.cwnd(), 5000);
+    }
+
+    // RFC 9438 §5.8 / §4.2: app-limited ACKs neither grow cwnd nor count toward t.
+
+    fn limited(mut a: AckSample) -> AckSample {
+        a.app_limited = true;
+        a
+    }
+
+    #[test]
+    fn cubic_app_limited_acks_do_not_advance_t_or_cwnd() {
+        // Slow start (HyStart++ and RFC 5681 alike): no growth.
+        let mut c = cubic();
+        c.on_ack(&limited(ack(SMSS, None, 0, T0)));
+        assert_eq!(c.cwnd(), 4000);
+        c.hystart = None;
+        c.on_ack(&limited(ack(SMSS, None, 0, T0)));
+        assert_eq!(c.cwnd(), 4000);
+        // Congestion avoidance: two stages from the same first ACK; one then sees 10 s of
+        // app-limited ACKs. Its next ACK at 10.1 s finds t = 0.1 s, as the other's at 0.1 s.
+        let (mut a, mut b) = (after_loss(), after_loss());
+        a.on_ack(&ack(SMSS, None, 0, T0));
+        b.on_ack(&ack(SMSS, None, 0, T0));
+        let cwnd = a.cwnd;
+        for s in 1..=10 {
+            a.on_ack(&limited(ack(SMSS, None, 0, at(Duration::from_secs(s)))));
+            assert_eq!(a.cwnd, cwnd);
+        }
+        a.on_ack(&ack(SMSS, None, 0, at(Duration::from_secs(10) + ms(100))));
+        b.on_ack(&ack(SMSS, None, 0, at(ms(100))));
+        assert_eq!(a.cwnd, b.cwnd);
+        assert_eq!(a.epoch.unwrap().w_est, b.epoch.unwrap().w_est);
+        // Without the exclusion t = 10.1 s > K: convex growth at the 1.5×/RTT clamp.
+        assert!(a.cwnd < cwnd + 100.0, "{} vs {cwnd}", a.cwnd);
+    }
+
+    #[test]
+    fn cubic_w_max_after_app_limited_period_is_cwnd_reached() {
+        // cwnd-limited past W_max = 100 000 (K ≈ 4.2 s at 100 ms RTT) ...
+        let mut c = after_loss();
+        let rtt = ms(100);
+        ack_clock(&mut c, Duration::ZERO, rtt, 60);
+        let reached = c.cwnd;
+        assert!(reached > 100_000.0, "{reached}");
+        // ... then 30 s with the application keeping well below cwnd: every ACK is
+        // app-limited, a third of a window per RTT.
+        for i in 0..300u32 {
+            let now = at(Duration::from_secs(6) + rtt * i);
+            for _ in 0..30 {
+                c.on_ack(&limited(ack(SMSS, Some(rtt), 0, now)));
+            }
+        }
+        assert_eq!(c.cwnd, reached, "no growth while not cwnd-limited");
+        // The loss after it records the window actually used, not an inflated one: K stays
+        // small and the backoff is not undone within a few RTTs.
+        c.on_congestion(
+            CongestionEvent::FastRetransmit,
+            reached as u32,
+            at(ms(36_000)),
+        );
+        assert_eq!(c.w_max, reached);
     }
 }
