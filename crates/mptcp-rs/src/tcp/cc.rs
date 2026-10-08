@@ -1,4 +1,5 @@
-//! Congestion control: the one swappable trait in M0–M2 (spec §3).
+//! Congestion control: the one swappable trait in M0–M2 (spec §3). CUBIC (`super::cubic`) is
+//! the default; Reno stays for tests that pin its arithmetic.
 
 use std::fmt;
 use std::time::Duration;
@@ -27,7 +28,9 @@ pub trait CongestionControl: Send {
     /// `syn_lost` is true if our SYN was retransmitted (RFC 5681 §3.1: IW is then one segment).
     fn init(&mut self, _smss: u32, _syn_lost: bool) {}
     /// Called when an ACK advances SND.UNA outside fast recovery. `acked` is the number of
-    /// octets newly acknowledged; `rtt` is the RTT sample this ACK produced, if any;
+    /// octets newly acknowledged; `rtt` is the RTT sample this ACK produced, if any: the time
+    /// since the newest segment it covers was sent, none of whose octets were ever resent
+    /// (Karn);
     /// `in_flight` is SND.MAX − SND.UNA *after* this ACK moved SND.UNA (octets still
     /// outstanding).
     fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, now: Instant);
@@ -72,8 +75,35 @@ impl CongestionControl for Unbounded {
     }
 }
 
-/// Reno (RFC 5681 §3.1–3.2) with the NewReno window rules of RFC 6582 §3.2.
+/// IW per RFC 5681 §3.1, or one segment after a lost SYN.
+pub(crate) fn initial_window(smss: u32, syn_lost: bool) -> u32 {
+    let segs = match smss {
+        _ if syn_lost => 1,
+        0..=1095 => 4,
+        1096..=2190 => 3,
+        _ => 2,
+    };
+    segs * smss
+}
+
+/// The fast recovery window rules: RFC 5681 §3.2 step 4 and RFC 6582 §3.2 step 3; the full
+/// ACK takes option (1), min(ssthresh, max(FlightSize, SMSS) + SMSS), which needs no burst
+/// mitigation.
+pub(crate) fn recovery_window(cwnd: u32, ssthresh: u32, smss: u32, ack: RecoveryAck) -> u32 {
+    match ack {
+        RecoveryAck::Duplicate => cwnd.saturating_add(smss),
+        RecoveryAck::Partial { acked } => {
+            let back = if acked >= smss { smss } else { 0 };
+            cwnd.saturating_sub(acked) + back
+        }
+        RecoveryAck::Full { in_flight } => ssthresh.min(in_flight.max(smss).saturating_add(smss)),
+    }
+}
+
+/// Reno (RFC 5681 §3.1–3.2) with the NewReno window rules of RFC 6582 §3.2. Not the default;
+/// kept for tests that pin its arithmetic.
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Reno {
     smss: u32,
     /// The initial window, from `init`; the restart window of RFC 5681 §4.1 is min(iw, cwnd).
@@ -84,6 +114,7 @@ pub(crate) struct Reno {
     ca_acked: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Reno {
     pub(crate) fn new() -> Self {
         Self {
@@ -108,16 +139,9 @@ impl CongestionControl for Reno {
         self.cwnd.min(self.iw)
     }
 
-    /// IW per RFC 5681 §3.1, or one segment after a lost SYN.
     fn init(&mut self, smss: u32, syn_lost: bool) {
         self.smss = smss;
-        let segs = match smss {
-            _ if syn_lost => 1,
-            0..=1095 => 4,
-            1096..=2190 => 3,
-            _ => 2,
-        };
-        self.iw = segs * smss;
+        self.iw = initial_window(smss, syn_lost);
         self.cwnd = self.iw;
     }
 
@@ -152,19 +176,8 @@ impl CongestionControl for Reno {
         };
     }
 
-    /// RFC 5681 §3.2 step 4 and RFC 6582 §3.2 step 3; the full ACK takes option (1),
-    /// min(ssthresh, max(FlightSize, SMSS) + SMSS), which needs no burst mitigation.
     fn on_recovery_ack(&mut self, ack: RecoveryAck) {
-        self.cwnd = match ack {
-            RecoveryAck::Duplicate => self.cwnd.saturating_add(self.smss),
-            RecoveryAck::Partial { acked } => {
-                let back = if acked >= self.smss { self.smss } else { 0 };
-                self.cwnd.saturating_sub(acked) + back
-            }
-            RecoveryAck::Full { in_flight } => self
-                .ssthresh
-                .min(in_flight.max(self.smss).saturating_add(self.smss)),
-        };
+        self.cwnd = recovery_window(self.cwnd, self.ssthresh, self.smss, ack);
     }
 
     fn cwnd(&self) -> u32 {

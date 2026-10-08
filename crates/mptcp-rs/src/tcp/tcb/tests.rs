@@ -1,5 +1,5 @@
 use super::*;
-use crate::tcp::cc::{CongestionEvent, RecoveryAck, Unbounded};
+use crate::tcp::cc::{CongestionEvent, RecoveryAck, Reno, Unbounded};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
 use std::sync::{Arc, Mutex};
 
@@ -783,6 +783,34 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
     // Go-back from SND.UNA within this CC's fixed 2-segment window.
     let segs = f.drain(tm(1100));
     assert_eq!(seq_lens(&segs), [(data(1000), 1000), (data(2000), 1000)]);
+}
+
+#[test]
+fn cc_gets_an_rtt_sample_per_ack_except_after_a_retransmission() {
+    let log = Arc::new(Mutex::new(CcLog::default()));
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let mut f = Fixture::with(cfg, Box::new(Recording(log.clone())), h);
+    f.establish(10 * MSS);
+    f.write(&pattern(5000));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.ack(tm(100), data(1000), 10 * MSS);
+    assert_eq!(f.drain(tm(100)).len(), 1);
+    // Segment 1 was not the RTO's timed segment, but the CC still gets its sample.
+    f.ack(tm(150), data(2000), 10 * MSS);
+    assert_eq!(f.drain(tm(150)).len(), 1);
+    // The RTO resends segments 2 and 3 (Karn): their ACK carries no sample, ...
+    assert_eq!(f.timeout(tm(1150)), Reaction::None);
+    assert_eq!(f.drain(tm(1150)).len(), 2);
+    f.ack(tm(1200), data(4000), 10 * MSS);
+    assert_eq!(f.drain(tm(1200)).len(), 1);
+    // ... but new data sent after them does.
+    f.ack(tm(1250), data(5000), 10 * MSS);
+    let rtts: Vec<_> = log.lock().unwrap().acks.iter().map(|a| a.1).collect();
+    assert_eq!(
+        rtts,
+        [Some(100), Some(150), None, Some(50)].map(|r| r.map(Duration::from_millis))
+    );
 }
 
 /// A send buffer whose runs are at most 7 octets, as at many internal buffer boundaries.
@@ -1719,9 +1747,64 @@ impl Fixture {
     }
 }
 
+/// The default controller against a modeled bottleneck: base RTT 20 ms, 2500 segments/s (BDP
+/// 50 segments of MSS) and a 100-segment drop-tail queue, as base-a's ratios (queue = 2·BDP).
+/// Every segment is ACKed on arrival, so the RTT the sender sees rises with the queue once
+/// cwnd passes the BDP. Standard slow start doubles on until the queue overflows near
+/// 2·(BDP + queue); the default must leave slow start (an ACK of one SMSS growing cwnd by
+/// less than one SMSS) well before that, and before the queue would drop anything. (HyStart++
+/// leaves into CSS here, at cwnd 106 segments; CSS's five rounds at 1.25× per round still pass
+/// BDP + queue later, at a quarter of the slow start rate.)
+#[test]
+fn default_cc_leaves_slow_start_before_queue_overflow() {
+    const BDP: u32 = 50;
+    const QUEUE: u32 = 100;
+    let base = Duration::from_millis(20);
+    let service = Duration::from_micros(400);
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.synack(BIG, &opts(Some(MSS), Some(7)));
+    f.write(&pattern(2 << 20));
+    let mut link_free = t(0);
+    let mut acks = std::collections::VecDeque::new();
+    let mut max_queue = 0;
+    let mut send = |f: &mut Fixture, now: Instant, acks: &mut std::collections::VecDeque<_>| {
+        for (m, _) in f.drain(now) {
+            if m.len == 0 {
+                continue;
+            }
+            let queued = (link_free.max(now) - now).as_nanos() / service.as_nanos();
+            max_queue = max_queue.max(queued as u32);
+            link_free = link_free.max(now) + service;
+            acks.push_back((link_free + base, m.seq.wrapping_add(m.len)));
+        }
+    };
+    send(&mut f, t(0), &mut acks);
+    let limit = (2 * (BDP + QUEUE)) * u32::from(MSS);
+    let exit = loop {
+        let (at, ack) = acks.pop_front().expect("ACK-clocked");
+        let before = f.tcb.cc.cwnd();
+        assert_eq!(f.ack(at, ack, BIG), Reaction::None);
+        let grew = f.tcb.cc.cwnd() - before;
+        if grew < u32::from(MSS) {
+            break Some(before);
+        }
+        if f.tcb.cc.cwnd() >= limit {
+            break None;
+        }
+        send(&mut f, at, &mut acks);
+    };
+    let exit = exit.expect("slow start ran on to 2·(BDP + queue)");
+    assert!(
+        exit < (BDP + QUEUE) * u32::from(MSS),
+        "left slow start at cwnd {exit}"
+    );
+    assert!(max_queue < QUEUE, "queue reached {max_queue}");
+}
+
 #[test]
 fn initial_window_is_rfc5681() {
-    // new_active uses Reno: IW = 3 segments for SMSS 1460, 4 for 1000, 2 for 2200.
+    // The default CC (CUBIC) takes RFC 5681 IW: 3 segments for SMSS 1460, 4 for 1000, 2 for
+    // 2200.
     for (mtu, mss, segs) in [(1500, 1460, 3), (1500, 1000, 4), (9000, 2200, 2)] {
         let cfg = ConnectConfig {
             mtu,
@@ -2649,7 +2732,7 @@ fn synack_fin_closes_receive_side() {
     }
 }
 
-/// Reno grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s.
+/// The default CC grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s.
 fn grown_idle_fixture() -> Fixture {
     let mut f = Fixture::new(ConnectConfig::default(), v4());
     assert_eq!(

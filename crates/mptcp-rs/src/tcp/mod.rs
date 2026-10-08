@@ -1,6 +1,7 @@
 //! Plain TCP engine: the pure `Tcb` state machine and the hooks it drives (spec §3).
 
 pub mod cc;
+mod cubic;
 mod hooks;
 mod recovery;
 pub(crate) mod rtt;

@@ -1,12 +1,14 @@
 //! Pure TCP state machine (RFC 9293), driven by segments, time and hooks (spec §3, §3.1).
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use rangemap::RangeSet;
 
-use super::cc::{CongestionControl, CongestionEvent, RecoveryAck, Reno};
+use super::cc::{CongestionControl, CongestionEvent, RecoveryAck};
+use super::cubic::Cubic;
 use super::hooks::Hooks;
 use super::recovery::{DupAck, NewAck, NewReno};
 use super::rtt::{INITIAL_RTO, RttEstimator};
@@ -221,6 +223,10 @@ pub struct Tcb {
     rto_not_before: Option<(SeqNum, Instant)>,
     /// The one timed segment (Karn): its end and send time; cleared by any RTO.
     rtt_timed: Option<(SeqNum, Instant)>,
+    /// End and send time of every new-data segment outstanding since the last retransmission,
+    /// for the per-ACK RTT samples the CC gets (RFC 9406 §4.3 recommends N_RTT_SAMPLE per
+    /// round); the RTO estimator keeps the one timed segment.
+    cc_sent: VecDeque<(SeqNum, Instant)>,
     /// When data octets last went out (RFC 5681 §4.1 idle detection).
     last_data_sent: Option<Instant>,
     /// R2 base for data: first transmission of the segment at SND.UNA, restarted when SND.UNA
@@ -261,7 +267,7 @@ impl Tcb {
         isn: SeqNum,
         now: Instant,
     ) -> Tcb {
-        Self::with_cc(cfg, local, remote, isn, now, Box::new(Reno::new()))
+        Self::with_cc(cfg, local, remote, isn, now, Box::new(Cubic::new()))
     }
 
     pub(crate) fn with_cc(
@@ -306,6 +312,7 @@ impl Tcb {
             rto_at: None,
             rto_not_before: None,
             rtt_timed: None,
+            cc_sent: VecDeque::new(),
             last_data_sent: None,
             r2_since: None,
             persist_at: None,
@@ -341,7 +348,8 @@ impl Tcb {
         peer_ws: Option<u8>,
         now: Instant,
     ) -> Tcb {
-        let mut tcb = Self::with_cc(cfg, local, remote, isn, now, Box::new(Reno::new()));
+        let reno = Box::new(super::cc::Reno::new());
+        let mut tcb = Self::with_cc(cfg, local, remote, isn, now, reno);
         tcb.syn_due = false;
         tcb.snd_nxt = isn.wrapping_add(1);
         tcb.snd_max = tcb.snd_nxt;
@@ -1075,14 +1083,16 @@ impl Tcb {
             // The FIN is not in the send buffer.
             let data_una = self.fin_seq().filter(|f| f.lt(seg.ack)).unwrap_or(seg.ack);
             h.mark_acked(self.rel(data_una));
-            let rtt = match self.rtt_timed {
-                Some((end, sent)) if end.le(seg.ack) => {
-                    self.rtt_timed = None;
-                    self.rtt.sample(now - sent);
-                    Some(now - sent)
-                }
-                _ => None,
-            };
+            if let Some((_, sent)) = self.rtt_timed.filter(|(end, _)| end.le(seg.ack)) {
+                self.rtt_timed = None;
+                self.rtt.sample(now - sent);
+            }
+            // The newest segment this ACK covers.
+            let mut rtt = None;
+            while let Some(&(_, sent)) = self.cc_sent.front().filter(|(end, _)| end.le(seg.ack)) {
+                self.cc_sent.pop_front();
+                rtt = Some(now - sent);
+            }
             let in_flight = self.in_flight();
             // RFC 6298 §5.2 / §5.3, except that only the first partial ACK of a fast recovery
             // restarts the timer (RFC 6582 §3.2 step 3); R2 restarts with SND.UNA (ruling R8).
@@ -1139,6 +1149,7 @@ impl Tcb {
             self.rtt.backoff();
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
+            self.cc_sent.clear();
             self.cc
                 .on_congestion(CongestionEvent::Rto, self.in_flight(), now);
             self.recovery.on_rto(self.snd_max);
@@ -1179,6 +1190,7 @@ impl Tcb {
             // cwnd, Nagle and SWS, even into a zero window, where it is the probe (spec §3).
             // Karn: no RTT sample from anything now in flight.
             self.rtt_timed = None;
+            self.cc_sent.clear();
             let len = self.data_len(self.snd_una, self.snd_max).min(mss);
             let fin = self.fin_sent();
             let meta = self.write_data(self.snd_una, len, fin, now, h, out)?;
@@ -1282,6 +1294,7 @@ impl Tcb {
         self.snd_max = self.snd_nxt;
         // New data only (SEQ = SND.MAX): resends never get here (Karn).
         self.rtt_timed.get_or_insert((self.snd_nxt, now));
+        self.cc_sent.push_back((self.snd_nxt, now));
         Some(meta)
     }
 
