@@ -520,8 +520,9 @@ fn rto_retransmits_with_backoff_and_karn() {
     assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
     assert_eq!(f.timeout(tm(999)), Reaction::None);
     assert!(f.drain(tm(999)).is_empty());
-    for (at, next) in [(1, 3), (3, 7)] {
+    for (streak, (at, next)) in [(1, 3), (3, 7)].into_iter().enumerate() {
         assert_eq!(f.timeout(t(at)), Reaction::None);
+        assert_eq!(f.tcb.rto_streak(), streak as u32 + 1);
         let segs = f.drain(t(at));
         assert_eq!(segs.len(), 1, "retransmission at {at} s");
         assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
@@ -530,7 +531,8 @@ fn rto_retransmits_with_backoff_and_karn() {
     }
     // The ACK covers a retransmitted segment: no RTT sample, RTO stays backed off.
     assert_eq!(f.ack(tm(3100), data(500), 10 * MSS), Reaction::None);
-    assert_eq!(f.tcb.rtt.srtt(), None);
+    assert_eq!(f.tcb.rto_streak(), 0, "SND.UNA advanced");
+    assert_eq!(f.tcb.srtt(), None);
     assert_eq!(f.tcb.rtt.rto(), Duration::from_secs(4));
     assert_eq!(f.tcb.poll_send_at(), None);
     // A fresh segment is timed and its ACK yields a sample, collapsing the RTO.

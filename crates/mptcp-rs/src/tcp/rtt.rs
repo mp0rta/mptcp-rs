@@ -30,7 +30,6 @@ impl RttEstimator {
         self.rto
     }
 
-    #[cfg(test)]
     pub(crate) fn srtt(&self) -> Option<Duration> {
         self.srtt
     }

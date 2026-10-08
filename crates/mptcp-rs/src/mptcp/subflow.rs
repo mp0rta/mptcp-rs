@@ -31,8 +31,6 @@ pub(crate) struct Subflow {
     pub tcb: Tcb,
     pub local: SocketAddr,
     pub remote: SocketAddr,
-    /// Read once subflows change state (M2 MP_JOIN, stale and close tasks).
-    #[allow(dead_code)]
     pub state: SubflowState,
     pub mp: SubflowMp,
 }

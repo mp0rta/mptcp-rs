@@ -77,7 +77,7 @@ impl SubflowHooks<'_> {
         } else if tcb.state() == crate::tcp::TcpState::Closed {
             self.sf.tx = TxMaps::new(self.sf.tx.assigned_end(), 1024);
             d.recovery_at = None;
-            d.reinject = false;
+            d.reinject.clear();
             d.close.at = None;
             if d.close.acked && d.close.peer_acked {
                 Some(crate::tcp::CloseReason::Normal)

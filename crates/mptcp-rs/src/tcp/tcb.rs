@@ -216,6 +216,8 @@ pub struct Tcb {
 
     // Timers.
     rtt: RttEstimator,
+    /// Consecutive data RTO expirations since SND.UNA last advanced.
+    rto_streak: u32,
     /// Retransmission timer (SYN, then data at SND.UNA).
     rto_at: Option<Instant>,
     /// End of the last retransmission at SND.UNA and its earliest permitted RTO expiry
@@ -309,6 +311,7 @@ impl Tcb {
             cc,
             recovery: NewReno::new(isn),
             rtt: RttEstimator::new(),
+            rto_streak: 0,
             rto_at: None,
             rto_not_before: None,
             rtt_timed: None,
@@ -546,6 +549,20 @@ impl Tcb {
     }
     pub(crate) fn retransmission_timeout(&self) -> Duration {
         self.rtt.rto()
+    }
+    /// Smoothed RTT; `None` before the first sample.
+    pub(crate) fn srtt(&self) -> Option<Duration> {
+        self.rtt.srtt()
+    }
+    /// Consecutive RTO expirations since SND.UNA last advanced (0 after an advance).
+    /// Read by stale detection (M2 stale/reinjection task).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rto_streak(&self) -> u32 {
+        self.rto_streak
+    }
+    #[cfg(test)]
+    pub(crate) fn cwnd(&self) -> u32 {
+        self.cc.cwnd()
     }
     pub fn peer_window_closed(&self) -> bool {
         self.snd_wnd == 0
@@ -1073,6 +1090,7 @@ impl Tcb {
         if seg.ack.gt(self.snd_una) {
             let acked = self.snd_una.distance(seg.ack) as u32;
             self.snd_una = seg.ack;
+            self.rto_streak = 0;
             if self.rto_not_before.is_some_and(|(end, _)| end.le(seg.ack)) {
                 self.rto_not_before = None;
             }
@@ -1147,6 +1165,7 @@ impl Tcb {
             self.rto_at = None;
             self.rto_not_before = None;
             self.rtt.backoff();
+            self.rto_streak = self.rto_streak.saturating_add(1);
             // Karn: nothing in flight now is timed.
             self.rtt_timed = None;
             self.cc_sent.clear();

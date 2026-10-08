@@ -152,7 +152,7 @@ impl SendStore {
     }
     /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
     pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
-        if len == 0 || len > u16::MAX as usize || maps.maps.len() >= maps.cap {
+        if len == 0 || len > u16::MAX as usize || maps.is_full() {
             return false;
         }
         // New assignments are contiguous; reinjections cover previously assigned DSNs only.
@@ -253,6 +253,17 @@ impl TxMaps {
                 (n > 0).then(|| m.dsn.wrapping_add((n as usize).min(m.len) as u64))
             })
             .next_back()
+    }
+    /// End DSN of an un-subflow-ACKed mapping covering `dsn`, if any.
+    pub fn covering_end(&self, dsn: u64) -> Option<u64> {
+        self.maps
+            .iter()
+            .find(|m| dsn.wrapping_sub(m.dsn) < m.len as u64)
+            .map(|m| m.dsn.wrapping_add(m.len as u64))
+    }
+    /// Every mapping slot is taken: `SendStore::assign` fails until a TCP ACK frees one.
+    pub fn is_full(&self) -> bool {
+        self.maps.len() >= self.cap
     }
     /// Prefix without a live TCP copy, clipped at the next active mapping.
     pub fn uncovered_len(&self, dsn: u64, max: usize) -> usize {

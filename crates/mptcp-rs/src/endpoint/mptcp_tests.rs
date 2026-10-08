@@ -2510,3 +2510,523 @@ fn unread_flood_keeps_data_up_to_the_rounded_data_level_edge() {
     let ack = transmit(&mut ep, Instant::from_nanos(3));
     assert_eq!(dack(&packet::parse(&ack).unwrap()), dsn.wrapping_add(sent));
 }
+
+// M2 Task 3: the scheduler boundary with one subflow.
+
+use crate::mptcp::sched::SubflowSnapshot;
+use crate::mptcp::sched::{HealthEvent, HealthVerdict, MinRtt, Payload, Pending, Plan, Scheduler};
+use std::sync::{Arc, Mutex};
+
+/// What a `Probe` scheduler saw: every plan it returned and every `on_assigned` call.
+#[derive(Default)]
+struct Log {
+    plans: Vec<Plan>,
+    assigned: Vec<(SubflowId, u32, bool)>,
+}
+
+/// Deliberately wrong plans a buggy scheduler might return.
+#[derive(Clone, Copy)]
+enum Rogue {
+    /// One octet more than the New budget allows.
+    OverBudget,
+    /// A New plan within budget for a subflow that does not exist.
+    NoSuchSubflow,
+    /// A New plan within budget for the first subflow, whatever its state.
+    FirstSubflow,
+    /// A reinjection of a range that is not queued.
+    ForeignReinject(u64),
+}
+
+/// MinRTT, or a rogue plan when one is set; records everything.
+struct Probe {
+    log: Arc<Mutex<Log>>,
+    rogue: Arc<Mutex<Option<Rogue>>>,
+}
+impl Scheduler for Probe {
+    fn plan(&mut self, now: Instant, pending: &Pending<'_>, subflows: &[SubflowSnapshot]) -> Plan {
+        let first = subflows[0];
+        let budget = first.new_budget.bytes() as u32;
+        let new = |subflow, bytes| Plan::Send {
+            subflow,
+            payload: Payload::New { bytes },
+        };
+        let plan = match *self.rogue.lock().unwrap() {
+            None => MinRtt.plan(now, pending, subflows),
+            Some(Rogue::OverBudget) => new(first.id, budget + 1),
+            Some(Rogue::NoSuchSubflow) => new(SubflowId(7), budget),
+            Some(Rogue::FirstSubflow) => new(first.id, budget),
+            Some(Rogue::ForeignReinject(dsn)) => Plan::Send {
+                subflow: first.id,
+                payload: Payload::Reinject { dsn, len: 1 },
+            },
+        };
+        self.log.lock().unwrap().plans.push(plan);
+        plan
+    }
+    fn on_health(&mut self, ev: &HealthEvent, subflows: &[SubflowSnapshot]) -> HealthVerdict {
+        MinRtt.on_health(ev, subflows)
+    }
+    fn on_assigned(&mut self, subflow: SubflowId, bytes: u32, reinject: bool) {
+        self.log
+            .lock()
+            .unwrap()
+            .assigned
+            .push((subflow, bytes, reinject));
+    }
+}
+type Rogues = Arc<Mutex<Option<Rogue>>>;
+fn install_probe(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> (Arc<Mutex<Log>>, Rogues) {
+    let (log, rogue) = (Arc::default(), Arc::default());
+    ep.conns.get_mut(&h).unwrap().hooks.scheduler = Box::new(Probe {
+        log: Arc::clone(&log),
+        rogue: Arc::clone(&rogue),
+    });
+    (log, rogue)
+}
+
+fn una(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> u64 {
+    ep.conns[&h].hooks.data.as_ref().unwrap().send.una
+}
+fn queue_first(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Option<(u64, u64)> {
+    ep.conns[&h].hooks.data.as_ref().unwrap().reinject.first()
+}
+/// Every packet due at `now`.
+fn drain(ep: &mut Endpoint<ChaCha20Rng>, now: Instant) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0; 1500];
+    while let Some(n) = ep.poll_transmit(now, &mut buf) {
+        out.push(buf[..n].to_vec());
+    }
+    out
+}
+/// The peer's ACK: TCP up to `ack`, DATA_ACK `data`, window field `wnd` (scale 7).
+fn peer_ack(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    syn: &Segment,
+    now: Instant,
+    ack: SeqNum,
+    data: u64,
+    wnd: u16,
+) {
+    let opts = data_ack(data);
+    let seg = Segment {
+        ack,
+        wnd,
+        ..peer_data(syn, 5001, &opts, &[])
+    };
+    let mut wire = [0; 1500];
+    let n = packet::build(&seg, 0, &mut wire).unwrap();
+    ep.handle_packet(now, &wire[..n]);
+}
+/// Opens the peer's window to 128,000 octets at both levels (scale 7).
+fn open_window(ep: &mut Endpoint<ChaCha20Rng>, syn: &Segment, h: ConnectionHandle) {
+    let head = una(ep, h);
+    peer_ack(
+        ep,
+        syn,
+        Instant::from_nanos(2),
+        syn.seq.wrapping_add(1),
+        head,
+        1000,
+    );
+}
+/// DSN of the segment's first payload octet and its mapping's Data-Level Length.
+fn dsn_of(seg: &Segment, iss: SeqNum) -> Option<(u64, u16)> {
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options).first()?).ok()? else {
+        return None;
+    };
+    let m = d.mapping?;
+    let mptcp::Dsn::Dsn64(dsn) = m.dsn else {
+        panic!("64-bit DSNs only")
+    };
+    let rel = seg.seq.0.wrapping_sub(iss.0);
+    (!seg.payload.is_empty()).then(|| (dsn + u64::from(rel.wrapping_sub(m.ssn)), m.data_len))
+}
+
+#[test]
+fn snapshot_is_side_effect_free() {
+    fn mid_transfer() -> (Endpoint<ChaCha20Rng>, ConnectionHandle, Instant) {
+        let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+        open_window(&mut ep, &syn, h);
+        ep.connection(h).unwrap().write(&[3; 50_000]).unwrap();
+        let sent = drain(&mut ep, Instant::from_nanos(10));
+        assert_eq!(sent.len(), 3, "IW");
+        let seg = packet::parse(&sent[1]).unwrap();
+        let end = seg.seq.wrapping_add(seg.payload.len() as u32);
+        let now = Instant::from_nanos(1_000_000);
+        let head = una(&ep, h);
+        peer_ack(&mut ep, &syn, now, end, head + 2864, 1000);
+        (ep, h, now)
+    }
+    let (mut a, h, now) = mid_transfer();
+    let (mut b, _, _) = mid_transfer();
+    let head = Some((una(&a, h), 1000));
+    for _ in 0..100 {
+        a.conns
+            .get_mut(&h)
+            .unwrap()
+            .build_snapshots(now, head, 1500);
+    }
+    let snapshot = a.conns[&h].snapshots()[0];
+    assert!(snapshot.new_budget.bytes() > 0 && snapshot.reinject_budget.bytes() > 0);
+    assert_eq!(a.poll_timeout(), b.poll_timeout());
+    let (ta, tb) = (&a.conns[&h].subflows[0].tcb, &b.conns[&h].subflows[0].tcb);
+    assert_eq!((ta.cwnd(), ta.rto_streak()), (tb.cwnd(), tb.rto_streak()));
+    assert_eq!(format!("{ta:?}"), format!("{tb:?}"), "no Tcb state changed");
+    let out = drain(&mut a, now);
+    assert!(!out.is_empty());
+    assert_eq!(out, drain(&mut b, now));
+}
+
+#[test]
+fn rogue_scheduler_plan_rejected() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let (log, rogue) = install_probe(&mut ep, h);
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    ep.connection(h).unwrap().write(&data).unwrap();
+    let mut now = Instant::from_nanos(10);
+    let head = una(&ep, h);
+    for r in [
+        Rogue::OverBudget,
+        Rogue::NoSuchSubflow,
+        Rogue::ForeignReinject(head),
+    ] {
+        *rogue.lock().unwrap() = Some(r);
+        assert!(
+            drain(&mut ep, now).is_empty(),
+            "nothing is sent for a rejected plan"
+        );
+    }
+    assert_eq!(log.lock().unwrap().plans.len(), 3);
+    assert_eq!(ep.conns[&h].hooks.rejected_plans, 3);
+    // A Joining subflow: with no Active subflow `plan` is not even called ...
+    *rogue.lock().unwrap() = Some(Rogue::FirstSubflow);
+    ep.conns.get_mut(&h).unwrap().subflows[0].state = SubflowState::Joining;
+    assert!(drain(&mut ep, now).is_empty());
+    assert_eq!(log.lock().unwrap().plans.len(), 3);
+    // ... and a plan naming it is rejected by validation (as with a second, Active subflow).
+    let c = ep.conns.get_mut(&h).unwrap();
+    c.build_snapshots(now, None, 1500);
+    let snapshot = c.snapshots()[0];
+    let plan = Plan::Send {
+        subflow: SubflowId(0),
+        payload: Payload::New {
+            bytes: snapshot.new_budget.bytes() as u32,
+        },
+    };
+    assert!(snapshot.new_budget.bytes() > 0);
+    assert_eq!(crate::mptcp::accept_plan(plan, &[snapshot], None), None);
+    let active = SubflowSnapshot {
+        state: SubflowState::Active,
+        ..snapshot
+    };
+    assert!(crate::mptcp::accept_plan(plan, &[active], None).is_some());
+    c.subflows[0].state = SubflowState::Active;
+    assert!(
+        log.lock().unwrap().assigned.is_empty(),
+        "no on_assigned for a rejected plan"
+    );
+    // Valid plans: one on_assigned per installed mapping, with its byte count.
+    *rogue.lock().unwrap() = None;
+    let mut mappings = Vec::new();
+    let mut received = vec![None; data.len()];
+    while una(&ep, h) != head + data.len() as u64 {
+        let mut last = None;
+        for pkt in drain(&mut ep, now) {
+            let seg = packet::parse(&pkt).unwrap();
+            if let Some((dsn, len)) = dsn_of(&seg, syn.seq) {
+                let rel = seg.seq.0.wrapping_sub(syn.seq.0);
+                let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+                    panic!()
+                };
+                if d.mapping.unwrap().ssn == rel {
+                    mappings.push((SubflowId(0), u32::from(len), false));
+                }
+                for (i, b) in seg.payload.iter().enumerate() {
+                    received[(dsn - head) as usize + i] = Some(*b);
+                }
+                let end = dsn + seg.payload.len() as u64;
+                last = Some((seg.seq.wrapping_add(seg.payload.len() as u32), end));
+            }
+        }
+        let (ack, data_end) = last.expect("progress");
+        now = now + Duration::from_millis(10);
+        peer_ack(&mut ep, &syn, now, ack, data_end, 1000);
+    }
+    let received: Vec<u8> = received.into_iter().map(Option::unwrap).collect();
+    assert_eq!(
+        received, data,
+        "the transfer completes once MinRTT is restored"
+    );
+    assert_eq!(log.lock().unwrap().assigned, mappings);
+    assert!(mappings.len() > 1);
+    assert_eq!(ep.conns[&h].hooks.rejected_plans, 3);
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}
+
+#[test]
+fn rule5_reinjection_goes_through_plan() {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(&syn).unwrap();
+    let (log, _) = install_probe(&mut ep, h);
+    ep.connection(h).unwrap().write(b"lost").unwrap();
+    let first = transmit(&mut ep, Instant::from_nanos(2));
+    let first = packet::parse(&first).unwrap();
+    let head = una(&ep, h);
+    let options = data_ack(head); // TCP received it, the DSN assembler discarded it.
+    let mut ack = peer_data(&syn, 5001, &options, &[]);
+    ack.ack = first.seq.wrapping_add(4);
+    input(&mut ep, &ack);
+    let deadline = ep.poll_timeout().expect("connection recovery timer");
+    assert_eq!(queue_first(&ep, h), None);
+    ep.handle_timeout(deadline);
+    assert_eq!(
+        queue_first(&ep, h),
+        Some((head, 4)),
+        "rule 5 fills the queue"
+    );
+    let plans = log.lock().unwrap().plans.len();
+    let retry = transmit(&mut ep, deadline);
+    let retry = packet::parse(&retry).unwrap();
+    assert_eq!(
+        retry.seq,
+        first.seq.wrapping_add(4),
+        "same subflow, new SSN mapping"
+    );
+    assert_eq!(retry.payload, b"lost");
+    assert_eq!(dsn_of(&retry, syn.seq), Some((head, 4)));
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.plans[plans..],
+        [Plan::Send {
+            subflow: SubflowId(0),
+            payload: Payload::Reinject { dsn: head, len: 4 }
+        }]
+    );
+    assert_eq!(
+        log.assigned,
+        [(SubflowId(0), 4, false), (SubflowId(0), 4, true)]
+    );
+    assert_eq!(queue_first(&ep, h), None);
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}
+
+/// Sends `len` octets in full segments, then lets the peer TCP-ACK them while DATA_ACK stays
+/// at the head (it discarded them). Returns the head DSN and the last segment's end.
+fn sent_and_discarded(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    syn: &Segment,
+    writes: &[&[u8]],
+    wnd: u16,
+) -> (u64, SeqNum) {
+    for w in writes {
+        ep.connection(h).unwrap().write(w).unwrap();
+    }
+    let head = una(ep, h);
+    let total: usize = writes.iter().map(|w| w.len()).sum();
+    let sent = drain(ep, Instant::from_nanos(10));
+    let payload: usize = sent
+        .iter()
+        .map(|p| packet::parse(p).unwrap().payload.len())
+        .sum();
+    assert_eq!(payload, total);
+    let end = syn.seq.wrapping_add(1 + total as u32);
+    peer_ack(ep, syn, Instant::from_nanos(1_000_000), end, head, wnd);
+    (head, end)
+}
+
+#[test]
+fn rule5_recovers_with_no_new_data() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let (log, _) = install_probe(&mut ep, h);
+    let (head, _) = sent_and_discarded(&mut ep, h, &syn, &[&[4; 2864]], 1000);
+    assert!(drain(&mut ep, Instant::from_nanos(1_000_000)).is_empty());
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_eq!(
+        (d.send.next, d.send.end),
+        (head + 2864, head + 2864),
+        "no new data"
+    );
+    let deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(deadline);
+    let out = drain(&mut ep, deadline);
+    let seg = packet::parse(&out[0]).unwrap();
+    assert_eq!(
+        dsn_of(&seg, syn.seq),
+        Some((head, 2864)),
+        "the recovery segment"
+    );
+    assert!(matches!(
+        log.lock().unwrap().plans.last(),
+        Some(Plan::Send { payload: Payload::Reinject { dsn, len: 2864 }, .. }) if *dsn == head
+    ));
+}
+
+#[test]
+fn rule5_recovers_while_new_data_waits_on_nagle() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    ep.connection(h)
+        .unwrap()
+        .write(&[5; 3 * 1432 + 100])
+        .unwrap();
+    let head = una(&ep, h);
+    let sent = drain(&mut ep, Instant::from_nanos(10));
+    assert_eq!(sent.len(), 3, "the 100-octet tail waits on Nagle");
+    let seg = |i: usize| packet::parse(&sent[i]).unwrap();
+    let t1 = Instant::from_nanos(1_000_000);
+    peer_ack(&mut ep, &syn, t1, seg(1).seq, head, 1000);
+    assert!(drain(&mut ep, t1).is_empty());
+    let t2 = t1 + Duration::from_millis(500); // restarts the TCP RTO, not rule 5's timer
+    peer_ack(&mut ep, &syn, t2, seg(2).seq, head, 1000);
+    assert!(drain(&mut ep, t2).is_empty());
+    let deadline = ep.poll_timeout().unwrap();
+    assert_eq!(deadline, t1 + Duration::from_secs(1));
+    ep.handle_timeout(deadline);
+    let c = ep.conns.get_mut(&h).unwrap();
+    let head_candidate = c.reinject_head();
+    c.build_snapshots(deadline, head_candidate, 1500);
+    let s = c.snapshots()[0];
+    assert_eq!(
+        s.new_budget.bytes(),
+        0,
+        "Nagle holds the tail with data in flight"
+    );
+    assert!(s.reinject_budget.bytes() > 0);
+    let out = drain(&mut ep, deadline);
+    let seg = packet::parse(&out[0]).unwrap();
+    assert_eq!(
+        dsn_of(&seg, syn.seq),
+        Some((head, 2864)),
+        "the recovery segment"
+    );
+    for pkt in &out {
+        let seg = packet::parse(pkt).unwrap();
+        let dsn = dsn_of(&seg, syn.seq).unwrap().0;
+        assert!(
+            dsn + (seg.payload.len() as u64) <= head + 2864,
+            "the tail stays held"
+        );
+    }
+}
+
+#[test]
+fn reinject_queue_pruned_by_late_data_ack() {
+    for (late_ack, queued) in [(500, (500, 500)), (2500, (2500, 1796))] {
+        let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+        open_window(&mut ep, &syn, h);
+        // A zero TCP window keeps the queued ranges from draining.
+        let (head, end) = sent_and_discarded(&mut ep, h, &syn, &[&[6; 4296]], 0);
+        let deadline = ep.poll_timeout().unwrap();
+        ep.handle_timeout(deadline);
+        assert_eq!(queue_first(&ep, h), Some((head, 4296)));
+        let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+        d.reinject.remove(head + 1000, 1000); // two ranges: [0,1000) and [2000,4296)
+        for pkt in drain(&mut ep, deadline) {
+            assert!(packet::parse(&pkt).unwrap().payload.is_empty());
+        }
+        peer_ack(&mut ep, &syn, deadline, end, head + late_ack, 0);
+        let una_now = una(&ep, h);
+        assert_eq!(una_now, head + late_ack);
+        assert_eq!(queue_first(&ep, h), Some((head + queued.0, queued.1)));
+        peer_ack(&mut ep, &syn, deadline, end, una_now, 1000);
+        let out = drain(&mut ep, deadline);
+        let first = packet::parse(&out[0]).unwrap();
+        assert_eq!(
+            dsn_of(&first, syn.seq).unwrap().0,
+            una_now,
+            "reinjected from una"
+        );
+        for pkt in &out {
+            if let Some((dsn, _)) = dsn_of(&packet::parse(pkt).unwrap(), syn.seq) {
+                assert!(dsn >= una_now, "nothing below send.una is sent again");
+            }
+        }
+        assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+    }
+}
+
+#[test]
+fn full_mapping_slots_zero_budgets() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let (log, _) = install_probe(&mut ep, h);
+    ep.connection(h).unwrap().set_nodelay(true);
+    let now = Instant::from_nanos(10);
+    for i in 0..1024u32 {
+        ep.connection(h).unwrap().write(&[i as u8]).unwrap();
+        assert_eq!(drain(&mut ep, now).len(), 1);
+    }
+    assert!(ep.conns[&h].subflows[0].mp.tx.is_full());
+    ep.connection(h).unwrap().write(&[9; 100]).unwrap();
+    let plans = log.lock().unwrap().plans.len();
+    assert!(drain(&mut ep, now).is_empty());
+    assert_eq!(log.lock().unwrap().plans.len(), plans, "plan is not called");
+    let head = una(&ep, h);
+    let c = ep.conns.get_mut(&h).unwrap();
+    c.build_snapshots(now, Some((head, 1)), 1500);
+    let s = c.snapshots()[0];
+    assert_eq!((s.new_budget, s.reinject_budget), Default::default());
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+    // A TCP ACK frees one slot: assignment resumes.
+    peer_ack(&mut ep, &syn, now, syn.seq.wrapping_add(2), head + 1, 1000);
+    let out = drain(&mut ep, now);
+    assert!(
+        out.iter()
+            .any(|p| packet::parse(p).unwrap().payload == [9; 100])
+    );
+    assert_eq!(
+        log.lock().unwrap().assigned.last(),
+        Some(&(SubflowId(0), 100, false))
+    );
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}
+
+#[test]
+fn reinject_across_adjacent_write_chunks() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let writes: [&[u8]; 3] = [&[0xa; 1000], &[0xb; 1000], &[0xc; 864]];
+    let (head, _) = sent_and_discarded(&mut ep, h, &syn, &writes, 1000);
+    let deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(deadline);
+    assert_eq!(queue_first(&ep, h), Some((head, 2864)));
+    let out = drain(&mut ep, deadline);
+    let mut peer = vec![None; 2864];
+    for pkt in &out {
+        let seg = packet::parse(pkt).unwrap();
+        let Some((dsn, len)) = dsn_of(&seg, syn.seq) else {
+            continue;
+        };
+        let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+            panic!()
+        };
+        let mptcp::Dsn::Dsn64(start) = d.mapping.unwrap().dsn else {
+            panic!()
+        };
+        let run = ep.conns[&h]
+            .hooks
+            .data
+            .as_ref()
+            .unwrap()
+            .send
+            .run_len(start);
+        assert!(
+            usize::from(len) <= run.min(65535),
+            "within the stored run and DLL limit"
+        );
+        for (i, b) in seg.payload.iter().enumerate() {
+            peer[(dsn - head) as usize + i] = Some(*b);
+        }
+    }
+    assert_eq!(queue_first(&ep, h), None, "the queue empties");
+    let peer: Vec<u8> = peer
+        .into_iter()
+        .map(|b| b.expect("every octet reinjected"))
+        .collect();
+    assert_eq!(peer, writes.concat(), "byte-exact");
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}

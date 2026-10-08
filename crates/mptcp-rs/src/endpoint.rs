@@ -295,7 +295,10 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
-                for sf in &mut c.subflows {
+                // Step 1 (spec §3.1): each subflow's own traffic — ACKs, TCP retransmissions,
+                // assigned data, control items — never through the scheduler.
+                let mut sent = None;
+                for (i, sf) in c.subflows.iter_mut().enumerate() {
                     let mut hk = SubflowHooks {
                         conn: &mut c.hooks,
                         sf: &mut sf.mp,
@@ -308,41 +311,55 @@ impl<R: CryptoRng> Endpoint<R> {
                     if c.closed_by_app && !hk.conn.close() {
                         sf.tcb.close();
                     }
-                    let sent = sf.tcb.poll_send(now, &mut hk, &mut self.scratch);
-                    let sent = sent.or_else(|| {
-                        if hk.assign(&sf.tcb, now) {
-                            sf.tcb.poll_send(now, &mut hk, &mut self.scratch)
-                        } else {
-                            None
-                        }
-                    });
-                    if sent.is_none() {
-                        continue;
+                    if sf.tcb.poll_send(now, &mut hk, &mut self.scratch).is_some() {
+                        sent = Some(i);
+                        break;
                     }
-                    self.cursor = h.0 + 1;
-                    let w = &self.scratch;
-                    let seg = Segment {
-                        src: sf.local,
-                        dst: sf.remote,
-                        seq: w.seq,
-                        ack: w.ack,
-                        flags: w.flags,
-                        wnd: w.wnd,
-                        options: w.options(),
-                        payload: &w.payload,
-                    };
-                    if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                        hk.on_transmitted(&seg, now, sf.tcb.retransmission_timeout());
-                        if let Some(mptcp) = hk
-                            .conn
-                            .negotiation
-                            .as_mut()
-                            .and_then(|m| m.on_transmitted(w.flags))
-                        {
-                            self.events.push_back((*h, Event::Connected { mptcp }));
+                }
+                // Steps 2–3: plan one mapping, install it, send it on its subflow.
+                if sent.is_none() {
+                    if let Some(i) = c.schedule(now, buf.len()) {
+                        let sf = &mut c.subflows[i];
+                        let mut hk = SubflowHooks {
+                            conn: &mut c.hooks,
+                            sf: &mut sf.mp,
+                        };
+                        if sf.tcb.poll_send(now, &mut hk, &mut self.scratch).is_some() {
+                            sent = Some(i);
                         }
-                        return Some(n);
                     }
+                }
+                let Some(i) = sent else {
+                    continue;
+                };
+                let sf = &mut c.subflows[i];
+                let mut hk = SubflowHooks {
+                    conn: &mut c.hooks,
+                    sf: &mut sf.mp,
+                };
+                self.cursor = h.0 + 1;
+                let w = &self.scratch;
+                let seg = Segment {
+                    src: sf.local,
+                    dst: sf.remote,
+                    seq: w.seq,
+                    ack: w.ack,
+                    flags: w.flags,
+                    wnd: w.wnd,
+                    options: w.options(),
+                    payload: &w.payload,
+                };
+                if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
+                    hk.on_transmitted(&seg, now, sf.tcb.retransmission_timeout());
+                    if let Some(mptcp) = hk
+                        .conn
+                        .negotiation
+                        .as_mut()
+                        .and_then(|m| m.on_transmitted(w.flags))
+                    {
+                        self.events.push_back((*h, Event::Connected { mptcp }));
+                    }
+                    return Some(n);
                 }
             }
         }

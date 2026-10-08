@@ -1,13 +1,18 @@
 //! Single-subflow MPTCP negotiation, data transfer, recovery and closure.
 mod close;
 pub(crate) mod data;
+pub(crate) mod sched;
 mod subflow;
 use crate::crypto::key_token_idsn;
-use data::{RecvAssembler, SendStore, promote32};
+use data::{RecvAssembler, SendStore, TxMaps, promote32};
+use sched::{MinRtt, Payload, Pending, Plan, ReinjectQueue, Scheduler, SubflowSnapshot};
 pub use subflow::SubflowId;
 pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
 
-use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBuf, Tcb};
+use crate::connection::Connection;
+use crate::tcp::rtt::INITIAL_RTO;
+
+use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb};
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
@@ -24,7 +29,18 @@ pub(crate) struct ConnectionHooks {
     send_cap: usize,
     pub fallback_event: bool,
     fast_closed: bool,
+    /// MinRTT; tests inject others (spec §4: crate-internal, one implementation).
+    pub scheduler: Box<dyn Scheduler>,
+    /// Refilled every scheduling step; capacity = subflow cap, so steps never allocate.
+    snapshots: Vec<SubflowSnapshot>,
+    /// Plans rejected by validation (spec §4 rule 1); debug counter.
+    pub rejected_plans: u64,
+    /// Validated plans `SendStore::assign` refused; stays 0 by construction.
+    pub assign_failures: u64,
 }
+
+/// Subflows per connection (M2: snapshot buffer capacity).
+const SUBFLOW_CAP: usize = 8;
 
 /// Connection-level MPTCP data state; absent for plain TCP and before MP_CAPABLE completes.
 pub(crate) struct DataState {
@@ -35,7 +51,8 @@ pub(crate) struct DataState {
     recovery_head: Option<u64>,
     recovery_at: Option<Instant>,
     recovery_interval: Duration,
-    reinject: bool,
+    /// DSN ranges awaiting reinjection, always within `[send.una, send.next)`.
+    pub reinject: ReinjectQueue,
     fallback: bool,
 }
 
@@ -49,7 +66,33 @@ impl ConnectionHooks {
             send_cap: cfg.send_buffer as usize,
             fallback_event: false,
             fast_closed: false,
+            scheduler: Box::new(MinRtt),
+            snapshots: Vec::with_capacity(SUBFLOW_CAP),
+            rejected_plans: 0,
+            assign_failures: 0,
         }
+    }
+    /// Unassigned data within the connection-level window (peer right edge).
+    fn unassigned_len(&self) -> usize {
+        match (&self.data, &self.negotiation) {
+            (Some(d), Some(m)) => {
+                (d.send.end.wrapping_sub(d.send.next) as usize).min(if d.fallback {
+                    usize::MAX
+                } else {
+                    (m.send_right_edge.unwrap().wrapping_sub(d.send.next) as i64).max(0) as usize
+                })
+            }
+            _ => 0,
+        }
+    }
+    /// The New candidate: one stored run, within the DSS length limit.
+    fn candidate_len(&self) -> usize {
+        self.data.as_ref().map_or(0, |d| {
+            d.send
+                .run_len(d.send.next)
+                .min(self.unassigned_len())
+                .min(u16::MAX as usize - usize::from(d.close.local.is_some()))
+        })
     }
     pub fn recovery_deadline(&self) -> Option<Instant> {
         self.data.as_ref().and_then(|d| {
@@ -76,6 +119,139 @@ impl ConnectionHooks {
             .map_or_else(|| self.plain.has_unread(), |d| d.recv.has_unread())
     }
 }
+/// Un-subflow-ACKed mappings of the Active subflows: the copies reinjection must not duplicate.
+fn active_maps(subflows: &[Subflow]) -> impl Iterator<Item = &TxMaps> + Clone {
+    subflows
+        .iter()
+        .filter(|s| s.state == SubflowState::Active)
+        .map(|s| &s.mp.tx)
+}
+
+/// Spec §4 rule 1: `k × seg_payload` with `1 <= k <= full_segments`, or at most `partial`.
+fn fits(b: SendBudget, bytes: u32) -> bool {
+    let n = bytes as usize;
+    n > 0
+        && b.seg_payload > 0
+        && ((n % b.seg_payload == 0 && n / b.seg_payload <= b.full_segments) || n <= b.partial)
+}
+
+/// Validates a plan against the snapshot it was made from (boundary invariant 5): the named
+/// subflow exists and is Active, `New` fits its New budget, `Reinject` is a prefix of the head
+/// candidate and fits its Reinject budget. Returns the subflow's index.
+pub(crate) fn accept_plan(
+    plan: Plan,
+    snapshots: &[SubflowSnapshot],
+    head: Option<(u64, u32)>,
+) -> Option<(usize, Payload)> {
+    let Plan::Send { subflow, payload } = plan else {
+        return None;
+    };
+    let i = snapshots.iter().position(|s| s.id == subflow)?;
+    let s = &snapshots[i];
+    let ok = s.state == SubflowState::Active
+        && match payload {
+            Payload::New { bytes } => fits(s.new_budget, bytes),
+            Payload::Reinject { dsn, len } => {
+                head.is_some_and(|(start, c)| start == dsn && len <= c)
+                    && fits(s.reinject_budget, len)
+            }
+        };
+    ok.then_some((i, payload))
+}
+
+impl Connection {
+    /// The head reinjection candidate `(dsn, len)` (Hot-path rules); trims covered head parts.
+    pub(crate) fn reinject_head(&mut self) -> Option<(u64, u32)> {
+        let d = self
+            .hooks
+            .data
+            .as_mut()
+            .filter(|d| !d.reinject.is_empty())?;
+        let fin = d.close.local.is_some();
+        d.reinject.head(active_maps(&self.subflows), &d.send, fin)
+    }
+
+    /// Refills the snapshot buffer: both budgets of every subflow, read-only (`send_budget`).
+    /// A subflow that may not take a mapping now (TCP state, all mapping slots taken, `buf`
+    /// smaller than its MTU) reports zero budgets.
+    pub(crate) fn build_snapshots(&mut self, now: Instant, head: Option<(u64, u32)>, buf: usize) {
+        let mut snapshots = std::mem::take(&mut self.hooks.snapshots);
+        snapshots.clear();
+        for sf in &mut self.subflows {
+            let hk = SubflowHooks {
+                conn: &mut self.hooks,
+                sf: &mut sf.mp,
+            };
+            let (mut new_budget, mut reinject_budget) = Default::default();
+            if buf >= sf.tcb.mtu() && hk.may_assign(&sf.tcb) {
+                let options = hk.data_option_len();
+                let (bytes, run) = (hk.conn.unassigned_len(), hk.conn.candidate_len());
+                new_budget = sf.tcb.send_budget(now, bytes, run, false, options, &hk);
+                if let Some((_, c)) = head {
+                    let c = c as usize;
+                    reinject_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
+                }
+            }
+            snapshots.push(SubflowSnapshot {
+                id: sf.id,
+                state: sf.state,
+                new_budget,
+                reinject_budget,
+                srtt: sf.tcb.srtt().unwrap_or(INITIAL_RTO),
+            });
+        }
+        self.hooks.snapshots = snapshots;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshots(&self) -> &[SubflowSnapshot] {
+        &self.hooks.snapshots
+    }
+
+    /// `poll_transmit` step 2 (spec §3.1): trim the reinjection head, snapshot, `plan`,
+    /// validate and install the mapping. Returns the index of the subflow that got it.
+    pub(crate) fn schedule(&mut self, now: Instant, buf: usize) -> Option<usize> {
+        self.hooks.data.as_ref()?;
+        let head = self.reinject_head();
+        self.build_snapshots(now, head, buf);
+        let hooks = &mut self.hooks;
+        if !hooks.snapshots.iter().any(|s| {
+            s.state == SubflowState::Active
+                && (s.new_budget.bytes() > 0 || s.reinject_budget.bytes() > 0)
+        }) {
+            return None;
+        }
+        let new_bytes = hooks.unassigned_len() as u64;
+        let reinject = &hooks.data.as_ref().unwrap().reinject;
+        let pending = Pending {
+            new_bytes,
+            reinject,
+        };
+        let plan = hooks.scheduler.plan(now, &pending, &hooks.snapshots);
+        let Some((i, payload)) = accept_plan(plan, &hooks.snapshots, head) else {
+            if plan != Plan::Idle {
+                hooks.rejected_plans += 1;
+            }
+            return None;
+        };
+        let sf = &mut self.subflows[i];
+        let mut hk = SubflowHooks {
+            conn: &mut self.hooks,
+            sf: &mut sf.mp,
+        };
+        if !hk.install(payload) {
+            hk.conn.assign_failures += 1;
+            return None;
+        }
+        let (bytes, reinject) = match payload {
+            Payload::New { bytes } => (bytes, false),
+            Payload::Reinject { len, .. } => (len, true),
+        };
+        self.hooks.scheduler.on_assigned(sf.id, bytes, reinject);
+        Some(i)
+    }
+}
+
 impl SubflowHooks<'_> {
     pub fn update_recovery(&mut self, tcb: &Tcb, now: Instant) {
         let Some(d) = &mut self.conn.data else {
@@ -99,15 +275,17 @@ impl SubflowHooks<'_> {
             d.recovery_head = head;
             d.recovery_at = None;
             d.recovery_interval = tcb.retransmission_timeout();
-            d.reinject = false;
         }
+        let queued = d.reinject.first().map(|(start, _)| start) == head;
         if head.is_none() || self.sf.tx.uncovered_len(d.send.una, 1) == 0 {
             d.recovery_at = None;
-            d.reinject = false;
-        } else if !d.reinject {
+        } else if !queued {
             let at = d.recovery_at.get_or_insert(now + d.recovery_interval);
             if now >= *at {
-                d.reinject = true;
+                // The uncovered head run: no live copy covers any of it.
+                let outstanding = d.send.next.wrapping_sub(d.send.una) as usize;
+                let run = self.sf.tx.uncovered_len(d.send.una, outstanding);
+                d.reinject.insert(d.send.una, run as u64);
                 d.recovery_at = None;
                 d.recovery_interval = (d.recovery_interval * 2).min(Duration::from_secs(60));
             }
@@ -156,7 +334,7 @@ impl SubflowHooks<'_> {
         }
         let demand = match (&self.conn.negotiation, &self.conn.data) {
             (Some(m), Some(d)) => {
-                (d.send.next != d.send.end || d.reinject)
+                (d.send.next != d.send.end || !d.reinject.is_empty())
                     && (tcb.peer_window_closed()
                         || (!d.fallback
                             && m.send_right_edge
@@ -173,89 +351,55 @@ impl SubflowHooks<'_> {
             self,
         );
     }
-    pub fn assign(&mut self, tcb: &Tcb, now: Instant) -> bool {
-        if tcb.state() != crate::tcp::TcpState::Established
-            && !(tcb.state() == crate::tcp::TcpState::CloseWait
-                && self
-                    .conn
-                    .data
-                    .as_ref()
-                    .is_some_and(|d| d.fallback || d.recv.has_fin()))
-        {
+    /// The subflow may take a new mapping: data can flow on it and a mapping slot is free.
+    fn may_assign(&self, tcb: &Tcb) -> bool {
+        let Some(d) = &self.conn.data else {
             return false;
-        }
-        if let Some(d) = &self.conn.data {
-            if d.reinject {
-                let head = d.send.una;
-                let len = self
-                    .sf
-                    .tx
-                    .uncovered_len(head, d.send.run_len(head))
-                    .min(d.send.next.wrapping_sub(head) as usize)
-                    .min(u16::MAX as usize - usize::from(d.close.local.is_some()));
-                let len = tcb
-                    .send_budget(now, len, len, true, self.data_option_len(), self)
-                    .bytes();
-                let d = self.conn.data.as_mut().unwrap();
-                if d.send.assign(&mut self.sf.tx, head, len) {
-                    d.reinject = false;
-                    if d.close.local == Some(head.wrapping_add(len as u64)) {
-                        self.sf.tx.attach_fin();
-                        d.close.attached = true;
-                    }
-                    return true;
-                }
-                return false;
-            }
-        }
-        let len = tcb
-            .send_budget(
-                now,
-                self.unassigned_len(),
-                self.candidate_len(),
-                false,
-                self.data_option_len(),
-                self,
-            )
-            .bytes();
-        if len == 0 {
-            return false;
-        }
+        };
+        !self.sf.tx.is_full()
+            && (tcb.state() == crate::tcp::TcpState::Established
+                || (tcb.state() == crate::tcp::TcpState::CloseWait
+                    && (d.fallback || d.recv.has_fin())))
+    }
+    /// Installs a validated plan's mapping; DATA_FIN rides on the final data mapping.
+    fn install(&mut self, payload: Payload) -> bool {
         let d = self.conn.data.as_mut().unwrap();
-        if !d.send.assign(&mut self.sf.tx, d.send.next, len) {
-            return false;
-        }
-        if d.close.local == Some(d.send.next)
-            && len < u16::MAX as usize
-            && !(self.conn.negotiation.as_ref().unwrap().state == State::PreConfirmed
-                && self.sf.tx.assigned_end().wrapping_sub(len as u32) == 1)
-        {
-            self.sf.tx.attach_fin();
-            d.close.attached = true;
+        match payload {
+            Payload::Reinject { dsn, len } => {
+                let len = len as usize;
+                if !d.send.assign(&mut self.sf.tx, dsn, len) {
+                    return false;
+                }
+                d.reinject.remove(dsn, len as u64);
+                if d.close.local == Some(dsn.wrapping_add(len as u64)) {
+                    self.sf.tx.attach_fin();
+                    d.close.attached = true;
+                }
+            }
+            Payload::New { bytes } => {
+                let len = bytes as usize;
+                if !d.send.assign(&mut self.sf.tx, d.send.next, len) {
+                    return false;
+                }
+                if d.close.local == Some(d.send.next)
+                    && len < u16::MAX as usize
+                    && !(self.conn.negotiation.as_ref().unwrap().state == State::PreConfirmed
+                        && self.sf.tx.assigned_end().wrapping_sub(len as u32) == 1)
+                {
+                    self.sf.tx.attach_fin();
+                    d.close.attached = true;
+                }
+            }
         }
         true
     }
     fn candidate_len(&self) -> usize {
-        self.conn.data.as_ref().map_or(0, |d| {
-            d.send
-                .run_len(d.send.next)
-                .min(self.unassigned_len())
-                .min(u16::MAX as usize - usize::from(d.close.local.is_some()))
-        })
+        self.conn.candidate_len()
     }
 }
 impl SendBuf for SubflowHooks<'_> {
     fn unassigned_len(&self) -> usize {
-        match (&self.conn.data, &self.conn.negotiation) {
-            (Some(d), Some(m)) => {
-                (d.send.end.wrapping_sub(d.send.next) as usize).min(if d.fallback {
-                    usize::MAX
-                } else {
-                    (m.send_right_edge.unwrap().wrapping_sub(d.send.next) as i64).max(0) as usize
-                })
-            }
-            _ => 0,
-        }
+        self.conn.unassigned_len()
     }
 
     fn segment_limit(&self, ssn: u32) -> usize {
@@ -301,7 +445,7 @@ impl SendBuf for SubflowHooks<'_> {
                 }
                 self.sf.tx.mark_acked(ssn);
                 if d.fallback {
-                    d.send.ack(self.sf.tcp_acked_dsn);
+                    d.release(self.sf.tcp_acked_dsn);
                 }
             }
             None => self.conn.plain.mark_acked(ssn),
@@ -487,7 +631,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 recovery_head: None,
                 recovery_at: None,
                 recovery_interval: Duration::from_secs(1),
-                reinject: false,
+                reinject: ReinjectQueue::new(m.local_idsn.wrapping_add(1)),
                 fallback: false,
             });
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
@@ -541,7 +685,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 if mapping.data_len == 0 {
                     d.fall_back(self.sf, m);
                     self.sf.rx_infinite = Some((mapping.ssn, dsn));
-                    d.send.ack(self.sf.tcp_acked_dsn);
+                    d.release(self.sf.tcp_acked_dsn);
                     self.conn.fallback_event = true;
                     return;
                 }
@@ -562,9 +706,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 };
                 let fin_ack =
                     d.close.sent && d.close.local.is_some_and(|fin| ack == fin.wrapping_add(1));
-                if d.send
-                    .ack(if fin_ack { d.close.local.unwrap() } else { ack })
-                {
+                if d.release(if fin_ack { d.close.local.unwrap() } else { ack }) {
                     if fin_ack {
                         d.close.acked = true;
                         d.close.at = None;
@@ -600,7 +742,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 .is_some_and(|ssn| seg.ack.ge(self.sf.local_isn.wrapping_add(ssn)))
         {
             d.fall_back(self.sf, m);
-            d.send.ack(self.sf.tcp_acked_dsn);
+            d.release(self.sf.tcp_acked_dsn);
             self.conn.fallback_event = true;
         }
     }
@@ -690,12 +832,21 @@ impl SegmentHooks for SubflowHooks<'_> {
 }
 
 impl DataState {
+    /// Every DATA_ACK release: frees the store, then prunes the reinjection queue below
+    /// the new `send.una`.
+    fn release(&mut self, ack: u64) -> bool {
+        let released = self.send.ack(ack);
+        if released {
+            self.reinject.ack(self.send.una);
+        }
+        released
+    }
     fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation) {
         self.fallback = true;
         self.close = close::Close::default();
         m.state = State::FellBack;
         self.recovery_at = None;
-        self.reinject = false;
+        self.reinject.clear();
         sf.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
         sf.final_mapping = Some(mptcp::Mapping {
             dsn: mptcp::Dsn::Dsn64(m.local_idsn.wrapping_add(1)),
