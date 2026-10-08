@@ -2738,6 +2738,98 @@ fn stranded_subflow_reset_once_both_data_fins_acked() {
     );
 }
 
+/// The single RST we send at `now` in answer to `seg` (exactly one packet out).
+fn answer(ep: &mut Endpoint<ChaCha20Rng>, seg: &Segment, now: Instant) -> Option<Segment<'static>> {
+    input_at(ep, seg, now);
+    let out: Vec<_> = drain(ep, now).into_iter().map(leak).collect();
+    assert!(out.len() <= 1, "one answer at most: {out:?}");
+    out.into_iter().next()
+}
+
+/// RFC 9293 §3.10.7.1: subflow 0 is reset (stranded, Task 8c) while subflow 1 lives on in
+/// TIME-WAIT, so its Closed TCB still owns the 4-tuple. Segments reaching it are answered as
+/// in CLOSED (Linux's FIN after a blackhole, a challenge ACK to our RST); TIME-WAIT is not.
+#[test]
+fn closed_initial_subflow_answers_with_rst() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(BIG_R2, n);
+    let (syn, jsyn) = (peer.syns[0].clone(), peer.syns[1].clone());
+    peer.drop[0] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let now = peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    events(&mut ep);
+    assert_eq!(una(&ep, h), head + n as u64, "reinjected via subflow 1");
+    assert!(ep.conns[&h].subflows[0].tcb.has_unacked(), "stranded");
+    // Both DATA_FINs and subflow 1's FIN exchange complete on subflow 1.
+    ep.connection(h).unwrap().close();
+    let out = drain(&mut ep, now);
+    let dfin = (on(&out, &jsyn).into_iter().find(data_fin)).expect("DATA_FIN on 1");
+    let t1 = now + Duration::from_millis(10);
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + n as u64 + 1));
+    let seg = Segment {
+        ack: dfin.seq,
+        wnd: 65535,
+        ..peer_data(&jsyn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t1);
+    let out = drain(&mut ep, t1);
+    let fin1 = (on(&out, &jsyn).into_iter())
+        .find(|s| s.flags.contains(TcpFlags::FIN))
+        .expect("FIN on 1");
+    let dack_fin = data_ack(head + n as u64 + 1);
+    let fin_ack = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: fin1.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(&jsyn, 5001, &dack_fin, &[])
+    };
+    input_at(&mut ep, &fin_ack, t1);
+    let out = drive(&mut ep, t1, t1 + Duration::from_secs(5));
+    let rst0 = |(_, s): &(Instant, Segment)| s.src == syn.src && s.flags.contains(TcpFlags::RST);
+    assert_eq!(out.iter().filter(|x| rst0(x)).count(), 1, "abort RST on 0");
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+    events(&mut ep);
+    let late = t1 + Duration::from_secs(20);
+    // The peer's FIN (lost in the blackhole until now): <SEQ=SEG.ACK><CTL=RST>.
+    let ack = syn.seq.wrapping_add(4321);
+    let fin = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack,
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    let rst = answer(&mut ep, &fin, late).expect("RST for the FIN");
+    assert_eq!((rst.src, rst.dst), (syn.src, syn.dst));
+    assert_eq!((rst.seq, rst.flags), (ack, TcpFlags::RST));
+    // A challenge ACK (RFC 5961) to our abort RST: the same rule.
+    let ack = syn.seq.wrapping_add(99);
+    let chal = Segment {
+        ack,
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    let rst = answer(&mut ep, &chal, late).expect("RST for the challenge ACK");
+    assert_eq!((rst.seq, rst.flags), (ack, TcpFlags::RST));
+    // No ACK bit: <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>.
+    let bare = Segment {
+        flags: TcpFlags::FIN,
+        ack: SeqNum(0),
+        ..peer_data(&syn, 5001, &[], b"xy")
+    };
+    let rst = answer(&mut ep, &bare, late).expect("RST for the bare FIN");
+    assert_eq!(
+        (rst.seq, rst.ack, rst.flags),
+        (SeqNum(0), SeqNum(5004), TcpFlags::RST | TcpFlags::ACK)
+    );
+    // Never a RST for a RST.
+    assert!(answer(&mut ep, &rst_on(&syn), late).is_none());
+    // Subflow 1 in TIME-WAIT ACKs a retransmitted FIN, no RST.
+    let ack1 = answer(&mut ep, &fin_ack, late).expect("TIME-WAIT ACK");
+    assert_eq!(ack1.src, jsyn.src);
+    assert!(!ack1.flags.contains(TcpFlags::RST));
+    assert!(events(&mut ep).is_empty());
+    assert!(ep.conns.contains_key(&h));
+}
+
 #[test]
 fn subflow_with_data_not_data_acked_is_not_reset() {
     let n = 200_000;

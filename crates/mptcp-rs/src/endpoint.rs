@@ -381,10 +381,19 @@ impl<R: CryptoRng> Endpoint<R> {
         let Some(c) = self.conns.get_mut(&h) else {
             return;
         };
-        c.mark_passed_over(now);
         let Some(mut i) = c.subflows.iter().position(|sf| sf.id == id) else {
             return;
         };
+        // A Closed TCB kept for its connection (`subflows[0]`, or until `handle_timeout`)
+        // answers as CLOSED (§3.10.7.1); a RST still due for it is the answer already.
+        let tcb = &c.subflows[i].tcb;
+        if tcb.state() == TcpState::Closed {
+            if !tcb.reset_pending() {
+                self.queue_rst(&seg);
+            }
+            return;
+        }
+        c.mark_passed_over(now);
         let last = !others_open(&c.subflows, i);
         let sf = &mut c.subflows[i];
         let mut hk = SubflowHooks {
