@@ -74,6 +74,9 @@ pub enum CloseReason {
     Normal,
     Reset,
     Timeout,
+    /// The peer fell back to TCP (infinite mapping) while another subflow held data not yet
+    /// acknowledged at connection level: that data can no longer be delivered.
+    FallbackDataLoss,
 }
 
 /// What the caller must report after an input. Every `Closed(_)` is returned exactly once.
@@ -644,6 +647,10 @@ impl Tcb {
     /// Consecutive RTO expirations since SND.UNA last advanced (0 after an advance).
     pub(crate) fn rto_streak(&self) -> u32 {
         self.rto_streak
+    }
+    #[cfg(test)]
+    pub(crate) fn set_r2_data(&mut self, r2: Duration) {
+        self.cfg.r2_data = r2;
     }
     #[cfg(test)]
     pub(crate) fn cwnd(&self) -> u32 {

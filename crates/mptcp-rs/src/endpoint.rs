@@ -30,6 +30,8 @@ pub enum Event {
     Connected {
         mptcp: bool,
     },
+    /// The connection continues as plain TCP on one subflow; every other one was reset (no
+    /// `SubflowDown` for them).
     FellBack,
     Closed {
         reason: CloseReason,
@@ -40,7 +42,8 @@ pub enum Event {
     },
     /// A joined subflow ended (`Reset`: refused or reset, also a queued join that can no
     /// longer start; `Timeout`: R2; `Normal`: FIN exchange). The connection carries on; data
-    /// the subflow had in flight is resent on the others.
+    /// the subflow had in flight is resent on the others. Not emitted for the subflows a
+    /// fallback or MP_FASTCLOSE resets.
     SubflowDown {
         subflow: SubflowId,
         reason: CloseReason,
@@ -291,6 +294,7 @@ impl<R: CryptoRng> Endpoint<R> {
         mp.local_isn = isn;
         mp.tcp_acked_dsn = c.hooks.data.as_ref().map_or(0, |d| d.send.una);
         mp.join = Some(Join::new(nonce, addr_id));
+        c.hooks.cancel_no_subflow_wait();
         self.demux.insert((local, remote), (h, q.id));
         c.subflows.push(Subflow {
             id: q.id,
@@ -377,7 +381,7 @@ impl<R: CryptoRng> Endpoint<R> {
             return;
         };
         c.mark_passed_over(now);
-        let Some(i) = c.subflows.iter().position(|sf| sf.id == id) else {
+        let Some(mut i) = c.subflows.iter().position(|sf| sf.id == id) else {
             return;
         };
         let last = !others_open(&c.subflows, i);
@@ -387,6 +391,20 @@ impl<R: CryptoRng> Endpoint<R> {
             sf: &mut sf.mp,
         };
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
+        // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
+        if c.hooks.fast_closed {
+            c.abort_all(now, Some(i));
+        }
+        let mut fell_back = std::mem::take(&mut c.hooks.fallback_event);
+        if fell_back {
+            if c.on_fallback(i, now) {
+                fell_back = false;
+                c.reset = true;
+                let reason = CloseReason::FallbackDataLoss;
+                self.events.push_back((h, Event::Closed { reason }));
+            }
+            i = 0;
+        }
         if let Some(e) = c.update_health(i) {
             self.events.push_back((h, e));
         }
@@ -395,7 +413,7 @@ impl<R: CryptoRng> Endpoint<R> {
             conn: &mut c.hooks,
             sf: &mut sf.mp,
         };
-        if hk.sf.join.is_some() {
+        if i != 0 {
             let joining = hk.sf.joining();
             let view = (sf.id, &mut sf.state, &sf.tcb);
             Self::subflow_event(&mut self.events, h, view, joining, r);
@@ -412,9 +430,30 @@ impl<R: CryptoRng> Endpoint<R> {
             last,
         );
         c.update_recovery(now);
-        if std::mem::take(&mut c.hooks.fallback_event) {
+        if fell_back {
             self.events.push_back((h, Event::FellBack));
         }
+        Self::free_ended(&mut self.demux, h, c);
+    }
+
+    /// Frees the ended subflows (TCB Closed, no RST left to send) other than `subflows[0]`,
+    /// with their demux entries and ports, as soon as they end. A subflow in TIME-WAIT is not
+    /// Closed, so it keeps its 4-tuple until 2·MSL.
+    fn free_ended(
+        demux: &mut BTreeMap<(SocketAddr, SocketAddr), (ConnectionHandle, SubflowId)>,
+        h: ConnectionHandle,
+        c: &mut Connection,
+    ) {
+        let mut first = true;
+        c.subflows.retain(|sf| {
+            let keep = std::mem::take(&mut first)
+                || sf.tcb.state() != TcpState::Closed
+                || sf.tcb.reset_pending();
+            if !keep && demux.get(&(sf.local, sf.remote)) == Some(&(h, sf.id)) {
+                demux.remove(&(sf.local, sf.remote));
+            }
+            keep
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -433,8 +472,8 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
-    /// A joined subflow's events: `SubflowDown` when its TCB ends, else `SubflowUp` once its
-    /// join completes (`joining` false), which also makes it Active.
+    /// The events of a subflow other than `subflows[0]`: `SubflowDown` when its TCB ends, else
+    /// `SubflowUp` once its join completes (`joining` false), which also makes it Active.
     fn subflow_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         h: ConnectionHandle,
@@ -604,6 +643,9 @@ impl<R: CryptoRng> Endpoint<R> {
                     {
                         self.events.push_back((*h, Event::Connected { mptcp }));
                     }
+                    if w.flags.contains(TcpFlags::RST) {
+                        Self::free_ended(&mut self.demux, *h, c);
+                    }
                     return Some(n);
                 }
             }
@@ -664,10 +706,15 @@ impl<R: CryptoRng> Endpoint<R> {
                     if r == Reaction::None && sf.tcb.state() != TcpState::Closed {
                         r = j.on_timeout(&mut sf.tcb, now, c.cfg.r2_data);
                     }
-                    // A joined subflow ended at R2 is reset, so that the peer frees it too.
-                    if r == Reaction::Closed(CloseReason::Timeout) && !sf.tcb.reset_pending() {
-                        sf.tcb.abort(CloseReason::Timeout, now);
-                    }
+                }
+                // Once a join was started, a subflow ended at R2 is reset, so that the peer
+                // frees it too and schedules nothing more on it; before that, the initial
+                // subflow keeps the M0/M1 behaviour.
+                if (hk.sf.join.is_some() || hk.conn.joined_ever)
+                    && r == Reaction::Closed(CloseReason::Timeout)
+                    && !sf.tcb.reset_pending()
+                {
+                    sf.tcb.abort(CloseReason::Timeout, now);
                 }
                 if let Some(e) = c.update_health(i) {
                     self.events.push_back((h, e));
@@ -677,8 +724,8 @@ impl<R: CryptoRng> Endpoint<R> {
                     conn: &mut c.hooks,
                     sf: &mut sf.mp,
                 };
-                if let Some(j) = &hk.sf.join {
-                    let joining = j.joining();
+                if i != 0 {
+                    let joining = hk.sf.joining();
                     let view = (sf.id, &mut sf.state, &sf.tcb);
                     Self::subflow_event(&mut self.events, h, view, joining, r);
                 } else {
@@ -694,19 +741,9 @@ impl<R: CryptoRng> Endpoint<R> {
                     last,
                 );
             }
-            // The initial subflow stays `subflows[0]`.
-            let demux = &mut self.demux;
-            c.subflows.retain(|sf| {
-                let keep = sf.mp.join.is_none()
-                    || sf.tcb.state() != TcpState::Closed
-                    || sf.tcb.reset_pending();
-                if !keep && demux.get(&(sf.local, sf.remote)) == Some(&(h, sf.id)) {
-                    demux.remove(&(sf.local, sf.remote));
-                }
-                keep
-            });
+            Self::free_ended(&mut self.demux, h, c);
         }
-        let demux = &mut self.demux;
+        let (demux, events) = (&mut self.demux, &mut self.events);
         self.conns.retain(|&h, c| {
             if c.hooks.retained() || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
                 return true;
@@ -722,6 +759,16 @@ impl<R: CryptoRng> Endpoint<R> {
                 if demux.get(&key) == Some(&(h, sf.id)) {
                     demux.remove(&key);
                 }
+            }
+            for q in c.queued_joins.drain(..) {
+                let reason = CloseReason::Reset;
+                events.push_back((
+                    h,
+                    Event::SubflowDown {
+                        subflow: q.id,
+                        reason,
+                    },
+                ));
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && c.hooks.has_unread();

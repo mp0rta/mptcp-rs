@@ -54,6 +54,13 @@ impl ConnectionHooks {
             .as_ref()
             .is_some_and(|d| !d.fallback && !d.close.closed)
     }
+    /// `add_subflow` on a Confirmed connection: the join starts at once, so the no-subflow
+    /// wait ends (spec §5.5).
+    pub fn cancel_no_subflow_wait(&mut self) {
+        if let Some(d) = &mut self.data {
+            d.close.no_subflow_at = None;
+        }
+    }
     pub fn close(&mut self) -> bool {
         if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
             d.close.local.get_or_insert(d.send.end);
@@ -87,8 +94,9 @@ impl SubflowHooks<'_> {
                 d.close.no_subflow_at = None;
                 return None;
             }
+            // The reinjection queue survives the wait: a subflow added during it resends at
+            // once. The timers stop (nothing can carry their retries).
             d.recovery_at = None;
-            d.reinject.clear();
             d.close.at = None;
             if d.close.acked && d.close.peer_acked {
                 Some(crate::tcp::CloseReason::Normal)
@@ -110,10 +118,13 @@ impl SubflowHooks<'_> {
     pub fn on_transmitted(&mut self, seg: &Segment<'_>, now: Instant, rto: Duration) {
         self.join_transmitted(seg.flags, now, rto);
         if let Some(d) = &mut self.conn.data {
-            self.sf.final_mapping = None;
             for opt in walk(seg.options) {
                 if let Ok(TcpOpt::Mptcp(raw)) = opt {
                     if let Ok(MptcpOption::Dss(v)) = mptcp::parse(raw) {
+                        // Only a segment that carried the infinite mapping makes it sent.
+                        if v.mapping.is_some_and(|m| m.data_len == 0) {
+                            self.sf.final_mapping = None;
+                        }
                         if v.data_fin {
                             d.close.sent = true;
                             d.close.due = false;

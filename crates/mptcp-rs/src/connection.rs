@@ -22,7 +22,8 @@ pub enum ReadError {
 }
 
 pub struct Connection {
-    /// The initial subflow is `subflows[0]`.
+    /// The initial subflow is `subflows[0]`; after a fallback, the subflow that carries the
+    /// connection as plain TCP is.
     pub(crate) subflows: Vec<Subflow>,
     pub(crate) hooks: ConnectionHooks,
     pub(crate) closed_by_app: bool,
@@ -50,12 +51,12 @@ pub(crate) struct QueuedJoin {
 }
 
 impl Connection {
-    /// The initial subflow's local address.
+    /// The initial subflow's local address (after a fallback: the surviving subflow's).
     pub fn local(&self) -> SocketAddr {
         self.subflows[0].local
     }
 
-    /// The initial subflow's remote address.
+    /// The initial subflow's remote address (after a fallback: the surviving subflow's).
     pub fn remote(&self) -> SocketAddr {
         self.subflows[0].remote
     }

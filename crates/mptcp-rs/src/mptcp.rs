@@ -36,7 +36,10 @@ pub(crate) struct ConnectionHooks {
     recv_cap: usize,
     send_cap: usize,
     pub fallback_event: bool,
-    fast_closed: bool,
+    pub fast_closed: bool,
+    /// An MP_JOIN SYN has been sent on this connection (a history, not a subflow count): from
+    /// then on stripping resets its subflow and never falls back (RFC 8684 L2321–2328).
+    pub joined_ever: bool,
     /// MinRTT; tests inject others (spec §4: crate-internal, one implementation).
     pub scheduler: Box<dyn Scheduler>,
     /// Refilled every scheduling step; capacity = subflow cap, so steps never allocate.
@@ -65,6 +68,9 @@ pub(crate) struct DataState {
     /// DSN ranges awaiting reinjection, always within `[send.una, send.next)`.
     pub reinject: ReinjectQueue,
     fallback: bool,
+    /// Fallback happened in the current input and `Connection::on_fallback` has not run yet:
+    /// no release until it has checked the other subflows' data.
+    settling: bool,
 }
 
 impl ConnectionHooks {
@@ -77,6 +83,7 @@ impl ConnectionHooks {
             send_cap: cfg.send_buffer as usize,
             fallback_event: false,
             fast_closed: false,
+            joined_ever: false,
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             rejected_plans: 0,
@@ -184,8 +191,9 @@ pub(crate) fn accept_plan(
 impl Connection {
     /// Connection-scoped roles, set before every `poll_transmit` step 1 (spec §3, §4 rule 2,
     /// §5.4): the window update a read makes due goes on the lowest-RTT Active subflow that
-    /// can still receive data; a standalone DATA_FIN on the lowest-RTT Active subflow, a
-    /// Closing one only when none is Active; while data waits (unassigned or queued for
+    /// can still receive data, and a standalone DATA_FIN on the lowest-RTT Active subflow;
+    /// with no such Active subflow, on a Stale one. A Closing subflow (bare peer FIN, closed
+    /// from our side at once) carries neither. While data waits (unassigned or queued for
     /// reinjection), every Active subflow whose own peer window is zero has probe demand, and
     /// if the connection window is closed so has one more: the lowest-RTT Active one without
     /// unacknowledged data, else the lowest-RTT Active one. Also refreshes the receiver-SWS
@@ -196,9 +204,13 @@ impl Connection {
         };
         let sfs = &self.subflows;
         let active = |sf: &Subflow| sf.is(SubflowState::Active);
-        let window = lowest_rtt(sfs, |sf| active(sf) && !sf.tcb.fin_received());
-        let fin =
-            lowest_rtt(sfs, active).or_else(|| lowest_rtt(sfs, |sf| sf.is(SubflowState::Closing)));
+        let role = |f: &dyn Fn(&Subflow) -> bool| {
+            [SubflowState::Active, SubflowState::Stale]
+                .into_iter()
+                .find_map(|s| lowest_rtt(sfs, |sf| sf.is(s) && f(sf)))
+        };
+        let window = role(&|sf| !sf.tcb.fin_received());
+        let fin = role(&|_| true);
         let waiting = d.send.next != d.send.end || !d.reinject.is_empty();
         let closed = !d.fallback
             && m.send_right_edge
@@ -281,7 +293,8 @@ impl Connection {
     /// Subflow health and teardown (spec §4 rule 3), after every input or timeout on subflow
     /// `i`. A TCB that ended (R2, RST either way, MP_JOIN give-up) queues the DSN ranges of its
     /// un-subflow-ACKed mappings for reinjection, minus the parts a copy on an Active subflow
-    /// covers, and drops them. A bare peer FIN makes it Closing. Otherwise a change of its
+    /// covers, and drops them. A bare peer FIN makes it Closing and closes it from our side at
+    /// once (spec §3; a DATA_FIN arriving later does not undo it). Otherwise a change of its
     /// `rto_streak` is a `HealthEvent` (`RtoFired` for a new nonzero value, `Progress` for a
     /// drop to 0) for `Scheduler::on_health`: Stale moves an Active subflow to Stale and
     /// queues its ranges the same way (its mappings stay: the `Tcb` keeps retransmitting
@@ -295,8 +308,12 @@ impl Connection {
             self.subflows[i].mp.tx.clear();
             return None;
         }
-        if sf.tcb.fin_received() && !d.recv.has_fin() && sf.state != SubflowState::Joining {
+        if sf.tcb.fin_received()
+            && !d.recv.has_fin()
+            && matches!(sf.state, SubflowState::Active | SubflowState::Stale)
+        {
             sf.state = SubflowState::Closing;
+            sf.tcb.close();
         }
         if !matches!(sf.state, SubflowState::Active | SubflowState::Stale) {
             return None;
@@ -324,6 +341,41 @@ impl Connection {
                 Some(Event::SubflowRecovered { subflow })
             }
             _ => None,
+        }
+    }
+
+    /// Fallback found on subflow `i` in the current input (spec §5.2): `i` alone carries the
+    /// connection from now on (RFC 8684 L2437–2440) and becomes `subflows[0]`; every other
+    /// subflow is reset. Nothing is reinjected. Returns `true` when another subflow held
+    /// un-DATA_ACKed data that `i` has no live copy of (it cannot be delivered any more): then
+    /// `i` is reset too and the caller closes with `FallbackDataLoss`. Data the peer has
+    /// subflow-ACKed elsewhere counts as delivered.
+    pub(crate) fn on_fallback(&mut self, i: usize, now: Instant) -> bool {
+        let d = self.hooks.data.as_mut().unwrap();
+        let survivor = std::iter::once(&self.subflows[i].mp.tx);
+        for (_, sf) in (self.subflows.iter().enumerate()).filter(|&(j, _)| j != i) {
+            for (dsn, len) in sf.mp.tx.ranges() {
+                d.reinject.insert_uncovered(dsn, len, survivor.clone());
+            }
+        }
+        let lost = d.reinject.head(survivor, &d.send, false).is_some();
+        d.reinject.clear();
+        d.settling = false;
+        d.release(self.subflows[i].mp.tcp_acked_dsn);
+        self.abort_all(now, (!lost).then_some(i));
+        for (_, sf) in (self.subflows.iter_mut().enumerate()).filter(|&(j, _)| j != i) {
+            sf.mp.tx.clear();
+        }
+        self.subflows.swap(0, i);
+        lost
+    }
+
+    /// Resets every open subflow except `except` (MP_FASTCLOSE, fallback).
+    pub(crate) fn abort_all(&mut self, now: Instant, except: Option<usize>) {
+        for (j, sf) in self.subflows.iter_mut().enumerate() {
+            if Some(j) != except && sf.tcb.state() != TcpState::Closed {
+                sf.tcb.abort(crate::tcp::CloseReason::Reset, now);
+            }
         }
     }
 
@@ -511,12 +563,9 @@ impl SubflowHooks<'_> {
                 .as_ref()
                 .is_some_and(|m| m.state == State::PreConfirmed);
         if let Some(d) = self.conn.data.as_mut().filter(|d| !d.fallback) {
+            // A bare TCP FIN closed its subflow at once (`Connection::update_health`);
+            // DATA_FIN+FIN leaves it open for our half-close response until now.
             if d.close.acked {
-                tcb.close();
-            }
-            // Bare TCP FIN retires this path, but DATA_FIN+FIN leaves it available
-            // for our half-close response until our own DATA_FIN is acknowledged.
-            if tcb.fin_received() && !d.recv.has_fin() {
                 tcb.close();
             }
             if d.close.at.is_some_and(|at| now >= at) {
@@ -641,11 +690,15 @@ impl SendBuf for SubflowHooks<'_> {
                     if !d.fallback && !self.sf.dss_confirmed {
                         match self.sf.valid_data_ack {
                             Some(true) => self.sf.dss_confirmed = true,
-                            // A joined subflow's path strips options: it alone is reset
-                            // (RFC 8684 L2313–2319, spec §5.2).
-                            Some(false) if self.sf.join.is_some() => self.sf.reset = true,
+                            // A joined subflow's path strips options, or any subflow's once
+                            // a join was started: it alone is reset (RFC 8684 L2313–2328,
+                            // spec §5.2).
+                            Some(false) if self.sf.join.is_some() || self.conn.joined_ever => {
+                                self.sf.reset = true
+                            }
                             Some(false) => {
-                                d.fall_back(self.sf, self.conn.negotiation.as_mut().unwrap());
+                                let m = self.conn.negotiation.as_mut().unwrap();
+                                d.fall_back(self.sf, m, false);
                                 self.conn.fallback_event = true;
                             }
                             None => {}
@@ -655,6 +708,11 @@ impl SendBuf for SubflowHooks<'_> {
                 self.sf.tx.mark_acked(ssn);
                 if d.fallback {
                     d.release(self.sf.tcp_acked_dsn);
+                    // Nothing below the infinite mapping is sent again.
+                    let from = self.sf.infinite_from;
+                    if from.is_some_and(|f| ssn.wrapping_sub(f) as i32 >= 0) {
+                        self.sf.infinite_from = None;
+                    }
                 }
             }
             None => self.conn.plain.mark_acked(ssn),
@@ -673,7 +731,8 @@ impl SegmentHooks for SubflowHooks<'_> {
         let (Some(m), Some(d)) = (&self.conn.negotiation, &self.conn.data) else {
             return self.options_for(TcpFlags::ACK, out);
         };
-        if d.fallback {
+        let below_infinite = |from: u32| (ssn.wrapping_sub(from) as i32) < 0;
+        if d.fallback && !self.sf.infinite_from.is_some_and(below_infinite) {
             return self.options_for(TcpFlags::ACK, out);
         }
         let mapping = self.sf.tx.mapping(ssn).expect("payload has mapping");
@@ -688,9 +747,11 @@ impl SegmentHooks for SubflowHooks<'_> {
                 checksum: None,
             })
         } else {
+            // After fallback, data below the infinite mapping keeps its finite mapping, which
+            // the peer needs to place it (RFC 8684 L1487–1494); no DATA_ACK (L2431–2435).
             MptcpOption::Dss(mptcp::Dss {
                 data_fin,
-                data_ack: Some(mptcp::DataAck::Ack64(d.recv.next)),
+                data_ack: (!d.fallback).then_some(mptcp::DataAck::Ack64(d.recv.next)),
                 mapping: Some(mapping),
             })
         };
@@ -858,6 +919,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 recovery_interval: Duration::from_secs(1),
                 reinject: ReinjectQueue::new(m.local_idsn.wrapping_add(1)),
                 fallback: false,
+                settling: false,
             });
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
             self.sf.local_isn = seg.ack.wrapping_add(u32::MAX);
@@ -908,9 +970,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                     return;
                 }
                 if mapping.data_len == 0 {
-                    d.fall_back(self.sf, m);
+                    d.fall_back(self.sf, m, self.conn.joined_ever);
                     self.sf.rx_infinite = Some((mapping.ssn, dsn));
-                    d.release(self.sf.tcp_acked_dsn);
                     self.conn.fallback_event = true;
                     return;
                 }
@@ -966,12 +1027,11 @@ impl SegmentHooks for SubflowHooks<'_> {
                 .tcp_acked_ssn
                 .is_some_and(|ssn| seg.ack.ge(self.sf.local_isn.wrapping_add(ssn)))
         {
-            if self.sf.join.is_some() {
+            if self.sf.join.is_some() || self.conn.joined_ever {
                 self.sf.reset = true;
                 return;
             }
-            d.fall_back(self.sf, m);
-            d.release(self.sf.tcp_acked_dsn);
+            d.fall_back(self.sf, m, false);
             self.conn.fallback_event = true;
         }
     }
@@ -1064,22 +1124,36 @@ impl DataState {
     /// Every DATA_ACK release: frees the store, then prunes the reinjection queue below
     /// the new `send.una`.
     fn release(&mut self, ack: u64) -> bool {
+        if self.settling {
+            return false;
+        }
         let released = self.send.ack(ack);
         if released {
             self.reinject.ack(self.send.una);
         }
         released
     }
-    fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation) {
+    /// Falls back on subflow `sf` (`Connection::on_fallback` finishes it) and makes our
+    /// infinite mapping due. Before any join it starts at the send origin `(SSN 1,
+    /// local_idsn + 1)`; once a join was started it is survivor-relative, `(sf`'s
+    /// `assigned_end`, `send.next)`: later data follows it linearly, and `sf`'s earlier finite
+    /// mappings keep covering its earlier SSNs (RFC 8684 L1496–1500).
+    fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation, joined_ever: bool) {
         self.fallback = true;
+        self.settling = true;
         self.close = close::Close::default();
         m.state = State::FellBack;
         self.recovery_at = None;
-        self.reinject.clear();
         sf.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
+        let (ssn, dsn) = if joined_ever {
+            (sf.tx.assigned_end(), self.send.next)
+        } else {
+            (1, m.local_idsn.wrapping_add(1))
+        };
+        sf.infinite_from = Some(ssn);
         sf.final_mapping = Some(mptcp::Mapping {
-            dsn: mptcp::Dsn::Dsn64(m.local_idsn.wrapping_add(1)),
-            ssn: 1,
+            dsn: mptcp::Dsn::Dsn64(dsn),
+            ssn,
             data_len: 0,
             checksum: None,
         });

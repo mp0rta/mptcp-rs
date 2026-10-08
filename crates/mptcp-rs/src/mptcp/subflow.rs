@@ -59,7 +59,10 @@ pub(crate) struct SubflowMp {
     pub valid_data_ack: Option<bool>,
     pub ack_now: bool,
     pub capable_ack_due: bool,
+    /// Our infinite mapping, due until a segment carries it.
     pub final_mapping: Option<mptcp::Mapping>,
+    /// SSN where our infinite mapping starts; data below it keeps its finite mapping.
+    pub infinite_from: Option<u32>,
     pub rx_infinite: Option<(u32, u64)>,
     /// Window scale this subflow's SYN/ACK negotiated; scales DATA_ACK windows it carries.
     pub peer_scale: u8,
@@ -95,6 +98,7 @@ impl SubflowMp {
             ack_now: false,
             capable_ack_due: false,
             final_mapping: None,
+            infinite_from: None,
             rx_infinite: None,
             peer_scale: 0,
             offered_unused: false,

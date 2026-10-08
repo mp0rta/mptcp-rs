@@ -159,9 +159,11 @@ impl SubflowHooks<'_> {
         }
     }
 
-    /// The third ACK went out: its control item starts (RTO, then backed off).
+    /// The MP_JOIN SYN went out (`joined_ever`), or the third ACK: its control item starts
+    /// (RTO, then backed off).
     pub(super) fn join_transmitted(&mut self, flags: TcpFlags, now: Instant, rto: Duration) {
         if let Some(j) = &mut self.sf.join {
+            self.conn.joined_ever |= flags.contains(TcpFlags::SYN);
             if j.peer_nonce.is_some()
                 && j.third_ack == ThirdAck::NotYet
                 && flags.contains(TcpFlags::ACK)
