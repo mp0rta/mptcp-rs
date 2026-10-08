@@ -681,7 +681,7 @@ fn dack(seg: &Segment) -> u64 {
 }
 
 #[test]
-fn discarded_full_memory_data_advances_tcp_ack_only() {
+fn data_held_beyond_memory_advances_tcp_ack_only() {
     let (mut ep, h, bytes, dsn) = connected_with_capacity(4);
     let syn = packet::parse(&bytes).unwrap();
     ep.conns
@@ -710,7 +710,7 @@ fn discarded_full_memory_data_advances_tcp_ack_only() {
     let mut out = [0; 8];
     assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(4));
     assert_eq!(&out[..4], b"abcd");
-    // New SSNs recover data that was discarded but already TCP-ACKed.
+    // The held copy was delivered by the read; a reinjection on new SSNs is a duplicate.
     input(
         &mut ep,
         &peer_data(&syn, 5007, &mapping(7, dsn.wrapping_add(4), 2), b"ef"),
@@ -2410,4 +2410,113 @@ fn fastclose_reset_survives_timeout_drive() {
         assert_eq!(ep.poll_timeout(), None);
         assert_eq!(ep.poll_event(), None);
     }
+}
+
+/// A peer that fills the advertised data-level window with segments of `size(i)` octets while
+/// the application does not read, as Linux does when the TUN driver floods before `read()`.
+/// Returns the octets sent and the last subflow ACK seen.
+fn flood_unread(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    syn: &Segment,
+    dsn: u64,
+    scale: u8,
+    mut size: impl FnMut(u64) -> usize,
+) -> (u64, SeqNum) {
+    let (mut sent, mut edge, mut tcp_ack) = (0u64, dsn.wrapping_add(65535), SeqNum(5001));
+    let payload = vec![7; 4096];
+    let mut now = Instant::from_nanos(2);
+    for i in 0.. {
+        let room = edge.wrapping_sub(dsn.wrapping_add(sent));
+        if room > 0 {
+            let len = (size(i) as u64).min(room) as usize;
+            let opts = mapping(1 + sent as u32, dsn.wrapping_add(sent), len as u16);
+            let seg = peer_data(syn, 5001 + sent as u32, &opts, &payload[..len]);
+            let mut wire = [0; 4200];
+            let n = packet::build(&seg, 0, &mut wire).unwrap();
+            ep.handle_packet(now, &wire[..n]);
+            sent += len as u64;
+        } else {
+            // Window used up: let a delayed ACK go out; stop once it opens nothing.
+            now = now + Duration::from_secs(1);
+            ep.handle_timeout(now);
+        }
+        let before = edge;
+        let mut out = [0; 1500];
+        while let Some(n) = ep.poll_transmit(now, &mut out) {
+            let ack = packet::parse(&out[..n]).unwrap();
+            tcp_ack = ack.ack;
+            let advertised = dack(&ack).wrapping_add(u64::from(ack.wnd) << scale);
+            if advertised.wrapping_sub(edge) as i64 > 0 {
+                edge = advertised;
+            }
+        }
+        if room == 0 && edge == before {
+            break;
+        }
+        now = now + Duration::from_micros(10);
+    }
+    (sent, tcp_ack)
+}
+
+fn connected_scaled(
+    cap: u32,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    u64,
+) {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
+    let h = ep
+        .connect_mptcp(
+            Instant::from_nanos(0),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2:80".parse().unwrap(),
+            ConnectConfig {
+                recv_buffer: cap,
+                ..ConnectConfig::default()
+            },
+        )
+        .unwrap();
+    let syn_bytes = transmit(&mut ep, Instant::from_nanos(0)).leak();
+    let syn = packet::parse(syn_bytes).unwrap();
+    let mut opts = capable(1, CAP_H);
+    let mut o = [0; 4];
+    let n = crate::wire::tcp_options::write_mss(&mut o, 1460);
+    opts.extend_from_slice(&o[..n]);
+    let n = crate::wire::tcp_options::write_ws(&mut o, 7);
+    opts.extend_from_slice(&o[..n]);
+    reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    ep.poll_event();
+    let dsn = crate::crypto::key_token_idsn(PEER_KEY).1.wrapping_add(1);
+    (ep, h, syn, dsn)
+}
+
+fn read_all(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> u64 {
+    let mut total = 0;
+    let mut buf = [0; 65536];
+    while let Ok(n) = ep.connection(h).unwrap().read(&mut buf) {
+        total += n as u64;
+    }
+    total
+}
+
+#[test]
+fn unread_flood_keeps_data_up_to_the_rounded_data_level_edge() {
+    // Scale 3 rounds the shared edge to 8 octets; 1001-octet segments leave 7 octets of
+    // rounding per DATA_ACK, so the advertised edge passes the 256 KiB memory edge.
+    let cap = 1 << 18;
+    let (mut ep, h, syn, dsn) = connected_scaled(cap);
+    let (sent, tcp_ack) = flood_unread(&mut ep, &syn, dsn, 3, |_| 1001);
+    assert!(
+        sent > u64::from(cap),
+        "the rounded edge promised {sent} octets"
+    );
+    // Every octet the peer sent was inside the advertised window and is subflow-ACKed ...
+    assert_eq!(tcp_ack, SeqNum(5001 + sent as u32));
+    // ... so it must be delivered and DATA_ACKed without a connection-level retransmission.
+    assert_eq!(read_all(&mut ep, h), sent);
+    let ack = transmit(&mut ep, Instant::from_nanos(3));
+    assert_eq!(dack(&packet::parse(&ack).unwrap()), dsn.wrapping_add(sent));
 }
