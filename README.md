@@ -25,14 +25,14 @@ All six Linux scenarios below passed: plain TCP, normal MPTCP, both option
 stripping cases, and both directions of zero-window recovery after losing a
 reopening update. The DATA_FIN checker also rejects a deliberately shifted DSN.
 
-M2 local validation is partial. Passed: 404 tests, both fuzz targets for 10
+M2 local validation is partial. Passed: 405 tests, both fuzz targets for 10
 minutes each, the six M1 scenarios, the per-path MTU case (path B at 1280
-octets), single-path goodput within 5 % of the reference, and client-to-server
-two-path goodput (median 338.8 Mbit/s, gate 338.5). Not yet passed:
-server-to-client goodput, which met the gate over three runs (341.0, gate 340.2)
-but not over six (332.0), and the client-to-server blackhole cases. Those
-transfers are byte-exact without an application error, but they fail the
-harness's close checks. The blackhole server-to-client cases passed. Details are
+octets), single-path goodput within 5 % of the reference, server-to-client
+two-path goodput (median 350.4 Mbit/s over three and over six runs, gate 340.2),
+and all four 1 GiB blackhole cases, including the stale report for the failed
+subflow in the client-to-server cases. Not yet passed: client-to-server two-path
+goodput, at a median of 332.0 Mbit/s over three runs and 337.7 over six, against
+a gate of 338.5. Details are
 in the local note `docs/superpowers/notes/2026-10-09-m2-verification.md`.
 
 ## Roadmap
