@@ -39,26 +39,58 @@ rows = capture("server.pcap") + (capture("server-b.pcap") if m2 else [])
 rows.sort(key=lambda r: float(r[0]))
 assert rows, "empty pcap"
 flow = lambda r: frozenset([(r[1], r[20]), (r[19], r[21])])
+def data_fin_acked(side, n):
+    """Time of the first DATA_ACK covering `side`'s DATA_FIN (which must end at IDSN+1+n+1)."""
+    src = "/".join(sorted(side))
+    fins = [r for r in rows if r[1] in side and r[12] == "1"]
+    assert fins, f"missing DATA_FIN from {src}"
+    # DLL already includes DATA_FIN's sequence-space byte.
+    keys = {int(r[17]) for r in rows if r[1] in side and r[17]}
+    assert len(keys) == 1, f"ambiguous MP_CAPABLE sender key for {src}"
+    digest = hashlib.sha256(keys.pop().to_bytes(8, "big")).digest()
+    initial = (int.from_bytes(digest[-8:], "big") + 1) % (1 << 64)
+    expected_end = (initial + n + 1) % (1 << 64)
+    acked = []
+    for fin in fins:
+        if fin[16] != "1":
+            continue  # Require an unambiguous 64-bit DSN/ACK witness.
+        end = (int(fin[13]) + int(fin[11])) % (1 << 64)
+        assert int(fin[11]) > 0 and end == expected_end, (
+            f"DATA_FIN from {src} must end at IDSN+1+{n}+1"
+        )
+        acked += [
+            float(a[0]) for a in rows
+            if a[1] not in side and a[14]
+            and float(a[0]) >= float(fin[0])
+            # The FIN's end is fixed by the 64-bit DSN witness above; Linux may DATA_ACK it with 32 bits.
+            and int(a[14]) == expected_end % (1 << (64 if a[15] == "1" else 32))
+        ]
+    assert acked, f"DATA_FIN from {src} not DATA_ACKed"
+    return min(acked)
 rsts = [r for r in rows if r[7] == "1"]
-no_rst = "no RST"
-if scenario.startswith("m2-blackhole-"):
-    # The blackholed subflow keeps retransmitting its own stranded TCP data after its ranges
-    # were reinjected and DATA_ACKed (RFC 8684 L1536-1540); if that arrives after Linux closed
-    # the subflow, Linux answers RST. Allowed only there, once both DATA_FINs are on the wire.
+no_rst, reset = "no RST", set()
+if scenario.startswith("m2-blackhole-") and want_s2c == "0":
+    # c2s: the blackholed subflow keeps retransmitting its own stranded TCP data after its
+    # ranges were reinjected and DATA_ACKed (RFC 8684 L1536-1540); if that arrives after Linux
+    # closed the subflow, Linux answers RST. Allowed only from the server, on the blackholed
+    # 4-tuple, after both DATA_FINs are DATA_ACKed and after the server's FIN on that 4-tuple.
     hip = "10.0.9.2" if scenario.endswith("-a") else "10.0.8.2"
-    closed = max(min((float(r[0]) for r in rows if r[1] in side and r[12] == "1"), default=float("inf")) for side in [cips, {SRV}])
-    reset = {flow(r) for r in rsts}
-    rsts = [r for r in rsts if hip not in {r[1], r[19]} or float(r[0]) < closed]
+    closed = max(data_fin_acked(cips, c2s), data_fin_acked({SRV}, s2c))
+    srv_fin = lambda f, t: any(flow(r) == f and r[1] == SRV and r[6] == "1" and float(r[0]) < t for r in rows)
+    ok = lambda r: r[1] == SRV and r[19] == hip and float(r[0]) >= closed and srv_fin(flow(r), float(r[0]))
+    reset = {flow(r) for r in rsts if ok(r)}
+    rsts = [r for r in rsts if not ok(r)]
     if reset:
-        no_rst = f"no RST except after close on the blackholed subflow {[sorted(f) for f in reset]}"
+        no_rst = f"no RST except the server's after close on the blackholed subflow {[sorted(f) for f in reset]}"
 assert not rsts, "RST present"
 for side in [cips, {SRV}]:
     assert any(r[1] in side and r[6] == "1" for r in rows), f"missing TCP FIN from {side}"
 if m2:
     data = {flow(r) for r in rows if r[4] and int(r[4]) > 0}
     assert len(data) == 2 and {r[1] for r in rows if flow(r) in data} - {SRV} == cips, f"want two data-carrying subflows from {cips}: {data}"
-    for f in data - (reset if scenario.startswith("m2-blackhole-") else set()):
-        for side in [cips, {SRV}]:
+    for f in data:
+        # A subflow the server reset after close (above) needs only the server's FIN.
+        for side in [{SRV}] if f in reset else [cips, {SRV}]:
             assert any(flow(r) == f and r[1] in side and r[6] == "1" for r in rows), f"subflow {sorted(f)}: no FIN from {side}"
     join = [r for r in rows if r[9] == "1"]
     assert any(r[1] == "10.0.8.2" and (r[5], r[18]) == ("1", "0") for r in join), "no MP_JOIN SYN"
@@ -84,31 +116,7 @@ else:
     else:
         assert "FellBack" not in client
         for side, n in [(cips, c2s), ({SRV}, s2c)]:
-            src = "/".join(sorted(side))
-            fins = [r for r in rows if r[1] in side and r[12] == "1"]
-            assert fins, f"missing DATA_FIN from {src}"
-            # DLL already includes DATA_FIN's sequence-space byte.
-            keys = {int(r[17]) for r in rows if r[1] in side and r[17]}
-            assert len(keys) == 1, f"ambiguous MP_CAPABLE sender key for {src}"
-            digest = hashlib.sha256(keys.pop().to_bytes(8, "big")).digest()
-            initial = (int.from_bytes(digest[-8:], "big") + 1) % (1 << 64)
-            expected_end = (initial + n + 1) % (1 << 64)
-            covered = False
-            for fin in fins:
-                if fin[16] != "1":
-                    continue  # Require an unambiguous 64-bit DSN/ACK witness.
-                end = (int(fin[13]) + int(fin[11])) % (1 << 64)
-                assert int(fin[11]) > 0 and end == expected_end, (
-                    f"DATA_FIN from {src} must end at IDSN+1+{n}+1"
-                )
-                covered |= any(
-                    a[1] not in side and a[14]
-                    and float(a[0]) >= float(fin[0])
-                    # The FIN's end is fixed by the 64-bit DSN witness above; Linux may DATA_ACK it with 32 bits.
-                    and int(a[14]) == expected_end % (1 << (64 if a[15] == "1" else 32))
-                    for a in rows
-                )
-            assert covered, f"DATA_FIN from {src} not DATA_ACKed"
+            data_fin_acked(side, n)
 if scenario.startswith("m2-blackhole-"):
     joins = dict(re.findall(r"^join: (SubflowId\(\d+\)) local (\S+)", client, re.M))
     holed = "SubflowId(0)" if scenario.endswith("-a") else next(i for i, ip in joins.items() if ip == "10.0.8.2")
