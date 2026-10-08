@@ -14,7 +14,9 @@ pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
 use crate::connection::Connection;
 use crate::tcp::rtt::INITIAL_RTO;
 
-use crate::tcp::{AppLimited, ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb};
+use crate::tcp::{
+    AppLimited, ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb, TcpState,
+};
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
@@ -39,6 +41,9 @@ pub(crate) struct ConnectionHooks {
     pub rejected_plans: u64,
     /// Validated plans `SendStore::assign` refused; stays 0 by construction.
     pub assign_failures: u64,
+    /// Receiver SWS MSS: the largest effective MSS among Active subflows (spec §5.4); 0 until
+    /// the first `Connection::select_control`.
+    sws_mss: u16,
 }
 
 /// Subflows per connection (M2: snapshot buffer capacity).
@@ -72,7 +77,11 @@ impl ConnectionHooks {
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             rejected_plans: 0,
             assign_failures: 0,
+            sws_mss: 0,
         }
+    }
+    fn sws_mss(&self, own: u16) -> u16 {
+        if self.sws_mss == 0 { own } else { self.sws_mss }
     }
     /// Unassigned data within the connection-level window (peer right edge).
     fn unassigned_len(&self) -> usize {
@@ -125,8 +134,15 @@ impl ConnectionHooks {
 fn active_maps(subflows: &[Subflow]) -> impl Iterator<Item = &TxMaps> + Clone {
     subflows
         .iter()
-        .filter(|s| s.state == SubflowState::Active)
+        .filter(|s| s.is(SubflowState::Active))
         .map(|s| &s.mp.tx)
+}
+
+/// Index of the lowest-`srtt` subflow that passes `f` (the first on ties).
+fn lowest_rtt(subflows: &[Subflow], f: impl Fn(&Subflow) -> bool) -> Option<usize> {
+    (0..subflows.len())
+        .filter(|&i| f(&subflows[i]))
+        .min_by_key(|&i| subflows[i].tcb.srtt().unwrap_or(INITIAL_RTO))
 }
 
 /// Spec §4 rule 1: `k × seg_payload` with `1 <= k <= full_segments`, or at most `partial`.
@@ -162,6 +178,95 @@ pub(crate) fn accept_plan(
 }
 
 impl Connection {
+    /// Connection-scoped roles, set before every `poll_transmit` step 1 (spec §3, §4 rule 2,
+    /// §5.4): the window update a read makes due goes on the lowest-RTT Active subflow that
+    /// can still receive data; a standalone DATA_FIN on the lowest-RTT Active subflow, a
+    /// Closing one only when none is Active; while data waits (unassigned or queued for
+    /// reinjection), every Active subflow whose own peer window is zero has probe demand, and
+    /// if the connection window is closed so has one more: the lowest-RTT Active one without
+    /// unacknowledged data, else the lowest-RTT Active one. Also refreshes the receiver-SWS
+    /// MSS.
+    pub(crate) fn select_control(&mut self) {
+        let (Some(d), Some(m)) = (&self.hooks.data, &self.hooks.negotiation) else {
+            return;
+        };
+        let sfs = &self.subflows;
+        let active = |sf: &Subflow| sf.is(SubflowState::Active);
+        let window = lowest_rtt(sfs, |sf| active(sf) && !sf.tcb.fin_received());
+        let fin =
+            lowest_rtt(sfs, active).or_else(|| lowest_rtt(sfs, |sf| sf.is(SubflowState::Closing)));
+        let waiting = d.send.next != d.send.end || !d.reinject.is_empty();
+        let closed = !d.fallback
+            && m.send_right_edge
+                .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0);
+        let prober = (waiting && closed)
+            .then(|| {
+                lowest_rtt(sfs, |sf| active(sf) && !sf.tcb.has_unacked())
+                    .or_else(|| lowest_rtt(sfs, active))
+            })
+            .flatten();
+        let mut mss = 0;
+        for (i, sf) in self.subflows.iter_mut().enumerate() {
+            let active = sf.is(SubflowState::Active);
+            sf.mp.window_owner = Some(i) == window;
+            sf.mp.fin_carrier = Some(i) == fin;
+            sf.mp.probe = Some(i) == prober || (waiting && active && sf.tcb.peer_window_closed());
+            if active {
+                mss = mss.max(sf.tcb.eff_mss());
+            }
+        }
+        self.hooks.sws_mss = mss;
+    }
+
+    /// Connection-level timers, evaluated once per input and per `poll_transmit` over all
+    /// subflows (spec §4 rule 5, §5.5). Arms the DATA_FIN retry once it went out and all data
+    /// is DATA_ACKed, and the data-retransmission timer while the head of the send queue is
+    /// subflow-ACKed but not DATA_ACKed: no Active subflow holds a live copy covering it. On
+    /// expiry the uncovered head run — stopping before a live copy on any Active subflow — is
+    /// queued for reinjection. Timers use the largest RTO among the subflows that may carry
+    /// data; with none (all Joining or closed) nothing is evaluated.
+    pub(crate) fn update_recovery(&mut self, now: Instant) {
+        let Some(d) = &mut self.hooks.data else {
+            return;
+        };
+        let Some(rto) = (self.subflows.iter())
+            .filter(|sf| sf.state != SubflowState::Joining && sf.tcb.state() != TcpState::Closed)
+            .map(|sf| sf.tcb.retransmission_timeout())
+            .max()
+        else {
+            return;
+        };
+        if !d.fallback
+            && d.close.sent
+            && !d.close.acked
+            && !d.close.due
+            && d.send.una == d.send.end
+            && d.close.at.is_none()
+        {
+            d.close.interval = rto;
+            d.close.at = Some(now + d.close.interval);
+        }
+        let head = (!d.fallback && d.send.una != d.send.next).then_some(d.send.una);
+        if d.recovery_head != head {
+            d.recovery_head = head;
+            d.recovery_at = None;
+            d.recovery_interval = rto;
+        }
+        let maps = active_maps(&self.subflows);
+        if head.is_none() || maps.clone().any(|m| m.covering_end(d.send.una).is_some()) {
+            d.recovery_at = None;
+        } else if d.reinject.first().map(|(start, _)| start) != head {
+            let at = d.recovery_at.get_or_insert(now + d.recovery_interval);
+            if now >= *at {
+                let outstanding = d.send.next.wrapping_sub(d.send.una) as usize;
+                let run = maps.fold(outstanding, |n, m| m.uncovered_len(d.send.una, n));
+                d.reinject.insert(d.send.una, run as u64);
+                d.recovery_at = None;
+                d.recovery_interval = (d.recovery_interval * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+
     /// The head reinjection candidate `(dsn, len)` (Hot-path rules); trims covered head parts.
     pub(crate) fn reinject_head(&mut self) -> Option<(u64, u32)> {
         let d = self
@@ -319,45 +424,6 @@ impl Connection {
 }
 
 impl SubflowHooks<'_> {
-    pub fn update_recovery(&mut self, tcb: &Tcb, now: Instant) {
-        let Some(d) = &mut self.conn.data else {
-            return;
-        };
-        // A joining subflow carries no data and has no say in connection-level timers.
-        if tcb.state() == crate::tcp::TcpState::Closed || self.sf.joining() {
-            return;
-        }
-        if !d.fallback
-            && d.close.sent
-            && !d.close.acked
-            && !d.close.due
-            && d.send.una == d.send.end
-            && d.close.at.is_none()
-        {
-            d.close.interval = tcb.retransmission_timeout();
-            d.close.at = Some(now + d.close.interval);
-        }
-        let head = (!d.fallback && d.send.una != d.send.next).then_some(d.send.una);
-        if d.recovery_head != head {
-            d.recovery_head = head;
-            d.recovery_at = None;
-            d.recovery_interval = tcb.retransmission_timeout();
-        }
-        let queued = d.reinject.first().map(|(start, _)| start) == head;
-        if head.is_none() || self.sf.tx.uncovered_len(d.send.una, 1) == 0 {
-            d.recovery_at = None;
-        } else if !queued {
-            let at = d.recovery_at.get_or_insert(now + d.recovery_interval);
-            if now >= *at {
-                // The uncovered head run: no live copy covers any of it.
-                let outstanding = d.send.next.wrapping_sub(d.send.una) as usize;
-                let run = self.sf.tx.uncovered_len(d.send.una, outstanding);
-                d.reinject.insert(d.send.una, run as u64);
-                d.recovery_at = None;
-                d.recovery_interval = (d.recovery_interval * 2).min(Duration::from_secs(60));
-            }
-        }
-    }
     pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant) {
         if self.sf.joining() {
             // No data, probes or DATA_FIN while joining; it still closes with the rest.
@@ -366,7 +432,6 @@ impl SubflowHooks<'_> {
             }
             return;
         }
-        self.update_recovery(tcb, now);
         // Preserve the third ACK and replies to repeated SYN/ACKs before
         // requesting a separate DATA_FIN ACK. An idle peer need not send DSS first.
         self.sf.capable_ack_due = tcb.ack_pending()
@@ -396,7 +461,7 @@ impl SubflowHooks<'_> {
             {
                 d.close.due = true;
             }
-            if d.close.due {
+            if d.close.due && self.sf.fin_carrier {
                 tcb.request_ack();
             }
         }
@@ -406,17 +471,7 @@ impl SubflowHooks<'_> {
         if self.conn.data.is_some() && self.sf.final_mapping.is_some() {
             tcb.request_ack();
         }
-        let demand = match (&self.conn.negotiation, &self.conn.data) {
-            (Some(m), Some(d)) => {
-                (d.send.next != d.send.end || !d.reinject.is_empty())
-                    && (tcb.peer_window_closed()
-                        || (!d.fallback
-                            && m.send_right_edge
-                                .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0)))
-            }
-            _ => false,
-        };
-        tcb.set_probe_demand(demand);
+        tcb.set_probe_demand(self.sf.probe);
         let reinject = self
             .conn
             .data
@@ -516,6 +571,9 @@ impl SendBuf for SubflowHooks<'_> {
                     if !d.fallback && !self.sf.dss_confirmed {
                         match self.sf.valid_data_ack {
                             Some(true) => self.sf.dss_confirmed = true,
+                            // A joined subflow's path strips options: it alone is reset
+                            // (RFC 8684 L2313–2319, spec §5.2).
+                            Some(false) if self.sf.join.is_some() => self.sf.reset = true,
                             Some(false) => {
                                 d.fall_back(self.sf, self.conn.negotiation.as_mut().unwrap());
                                 self.conn.fallback_event = true;
@@ -572,6 +630,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         padded
     }
     fn window_offer(&self, scale: u8, mss: u16) -> Option<u16> {
+        let mss = self.conn.sws_mss(mss);
         self.conn
             .data
             .as_ref()
@@ -582,11 +641,11 @@ impl SegmentHooks for SubflowHooks<'_> {
             d.recv.window_sent(field, scale);
         }
     }
+    /// Only the subflow chosen to announce a read's window (`window_owner`) sends it.
     fn window_update_due(&self, scale: u8, mss: u16) -> bool {
-        self.conn
-            .data
-            .as_ref()
-            .is_some_and(|d| d.recv.window_update_due(scale, mss))
+        let mss = self.conn.sws_mss(mss);
+        self.sf.window_owner
+            && (self.conn.data.as_ref()).is_some_and(|d| d.recv.window_update_due(scale, mss))
     }
     fn duplicate_ack_allowed(&self, seg: &Segment<'_>) -> bool {
         self.conn.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
@@ -614,7 +673,11 @@ impl SegmentHooks for SubflowHooks<'_> {
             if d.fallback {
                 return 0;
             }
-            if d.close.due && !self.sf.capable_ack_due && flags.contains(TcpFlags::ACK) {
+            if d.close.due
+                && self.sf.fin_carrier
+                && !self.sf.capable_ack_due
+                && flags.contains(TcpFlags::ACK)
+            {
                 let n = mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
                         data_fin: true,
@@ -833,6 +896,10 @@ impl SegmentHooks for SubflowHooks<'_> {
                 .tcp_acked_ssn
                 .is_some_and(|ssn| seg.ack.ge(self.sf.local_isn.wrapping_add(ssn)))
         {
+            if self.sf.join.is_some() {
+                self.sf.reset = true;
+                return;
+            }
             d.fall_back(self.sf, m);
             d.release(self.sf.tcp_acked_dsn);
             self.conn.fallback_event = true;

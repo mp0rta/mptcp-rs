@@ -35,6 +35,14 @@ pub(crate) struct Subflow {
     pub mp: SubflowMp,
 }
 
+impl Subflow {
+    /// In `state` and with a TCB that is not Closed (a dead subflow keeps its state until it
+    /// is freed).
+    pub fn is(&self, state: SubflowState) -> bool {
+        self.state == state && self.tcb.state() != crate::tcp::TcpState::Closed
+    }
+}
+
 /// MPTCP state tied to one subflow's TCP sequence space, options or window scale. The creator
 /// must set `local_isn`, `tcp_acked_dsn` and (from its SYN/ACK) `peer_scale`: the MP_CAPABLE
 /// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`.
@@ -61,6 +69,14 @@ pub(crate) struct SubflowMp {
     pub offered_unused: bool,
     /// MP_JOIN state; `None` on the initial subflow.
     pub join: Option<Join>,
+    /// Connection-scoped roles, set before every `poll_transmit` step 1
+    /// (`Connection::select_control`): this subflow sends the window update a read makes due
+    /// (spec §5.4) ...
+    pub window_owner: bool,
+    /// ... carries the standalone DATA_FIN (spec §4 rule 2) ...
+    pub fin_carrier: bool,
+    /// ... and has zero-window probe demand (spec §3).
+    pub probe: bool,
 }
 
 impl SubflowMp {
@@ -82,6 +98,9 @@ impl SubflowMp {
             peer_scale: 0,
             offered_unused: false,
             join: None,
+            window_owner: false,
+            fin_carrier: false,
+            probe: false,
         }
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.

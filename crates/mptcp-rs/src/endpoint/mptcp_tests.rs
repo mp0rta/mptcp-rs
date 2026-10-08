@@ -2552,6 +2552,8 @@ enum Rogue {
     ForeignReinject(u64, u32),
     /// Never sends anything.
     Idle,
+    /// MinRTT over the named subflow alone: always picks it, whatever the others offer.
+    Pin(SubflowId),
 }
 
 /// MinRTT, or a rogue plan when one is set; records everything.
@@ -2578,6 +2580,10 @@ impl Scheduler for Probe {
                 payload: Payload::Reinject { dsn, len },
             },
             Some(Rogue::Idle) => Plan::Idle,
+            Some(Rogue::Pin(id)) => {
+                let only: Vec<_> = subflows.iter().copied().filter(|s| s.id == id).collect();
+                MinRtt.plan(now, pending, &only)
+            }
         };
         self.log.lock().unwrap().plans.push(plan);
         plan
@@ -3139,6 +3145,8 @@ use std::cell::RefCell;
 thread_local! {
     /// Every ACK sample a `FixedPacing` controller on this test's thread received.
     static SAMPLES: RefCell<Vec<AckSample>> = const { RefCell::new(Vec::new()) };
+    /// The same for controllers built with `b` set (a second subflow's).
+    static SAMPLES_B: RefCell<Vec<AckSample>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One MPTCP data segment (1460 − 28 octets of DSS) per 10 ms.
@@ -3148,10 +3156,13 @@ const RATE: u64 = 143_200;
 struct FixedPacing {
     rate: Option<u64>,
     cwnd: u32,
+    /// Record into `SAMPLES_B` instead of `SAMPLES`.
+    b: bool,
 }
 impl CongestionControl for FixedPacing {
     fn on_ack(&mut self, a: &AckSample) {
-        SAMPLES.with(|s| s.borrow_mut().push(*a));
+        let sink = if self.b { &SAMPLES_B } else { &SAMPLES };
+        sink.with(|s| s.borrow_mut().push(*a));
     }
     fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
     fn on_recovery_ack(&mut self, _: RecoveryAck) {}
@@ -3166,12 +3177,14 @@ fn paced() -> Box<dyn CongestionControl> {
     Box::new(FixedPacing {
         rate: Some(RATE),
         cwnd: 64 << 10,
+        b: false,
     })
 }
 fn recording() -> Box<dyn CongestionControl> {
     Box::new(FixedPacing {
         rate: None,
         cwnd: 64 << 10,
+        b: false,
     })
 }
 fn app_limited_reason(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Option<AppLimited> {
@@ -3214,6 +3227,7 @@ fn paced_bulk_flight_is_not_bounded_by_mapping_slots() {
         Box::new(FixedPacing {
             rate: Some(1_432_000_000),
             cwnd: 4 << 20,
+            b: false,
         })
     }
     let (mut ep, h, syn, _) = connected_scaled_cc(1 << 20, Some(bulk));

@@ -169,6 +169,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 reset: false,
                 detached: false,
                 cfg,
+                nodelay: false,
                 queued_joins: Vec::new(),
                 next_subflow: 1,
                 addr_ids: vec![initial_ip],
@@ -266,9 +267,10 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         let local = (self.free_port(q.local, remote)).ok_or(AddSubflowError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
-        let tcb = self.new_tcb(&cfg, local, remote, isn, now);
+        let mut tcb = self.new_tcb(&cfg, local, remote, isn, now);
         let nonce = self.rng.next_u32();
         let c = self.conns.get_mut(&h).unwrap();
+        tcb.set_nodelay(c.nodelay);
         let addr_id = known.unwrap_or_else(|| {
             c.addr_ids.push(q.local);
             c.addr_ids.len() - 1
@@ -382,7 +384,6 @@ impl<R: CryptoRng> Endpoint<R> {
         } else if r != Reaction::None {
             Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r);
         }
-        hk.update_recovery(&sf.tcb, now);
         Self::update_close(
             &mut self.events,
             &mut hk,
@@ -392,6 +393,7 @@ impl<R: CryptoRng> Endpoint<R> {
             now,
             last,
         );
+        c.update_recovery(now);
         if std::mem::take(&mut c.hooks.fallback_event) {
             self.events.push_back((h, Event::FellBack));
         }
@@ -518,6 +520,8 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
+                c.update_recovery(now);
+                c.select_control();
                 // Step 1 (spec §3.1): each subflow's own traffic — ACKs, TCP retransmissions,
                 // assigned data, control items — never through the scheduler.
                 let mut sent = None;
@@ -626,6 +630,7 @@ impl<R: CryptoRng> Endpoint<R> {
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
             c.mark_passed_over(now);
+            c.update_recovery(now);
             for i in 0..c.subflows.len() {
                 let last = !others_open(&c.subflows, i);
                 let sf = &mut c.subflows[i];
@@ -633,7 +638,6 @@ impl<R: CryptoRng> Endpoint<R> {
                     conn: &mut c.hooks,
                     sf: &mut sf.mp,
                 };
-                hk.update_recovery(&sf.tcb, now);
                 let mut r = Reaction::None;
                 if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
                     r = sf.tcb.on_timeout(now, &mut hk);

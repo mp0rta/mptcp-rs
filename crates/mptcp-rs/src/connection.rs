@@ -32,6 +32,8 @@ pub struct Connection {
     pub(crate) detached: bool,
     /// The configuration subflows are opened with (each with its own MTU).
     pub(crate) cfg: ConnectConfig,
+    /// `set_nodelay`, applied to every subflow, joined ones included.
+    pub(crate) nodelay: bool,
     /// Joins waiting for the connection to be Confirmed (RFC 8684 L884–887).
     pub(crate) queued_joins: Vec<QueuedJoin>,
     /// The next subflow ID; IDs are never reused within a connection.
@@ -99,7 +101,12 @@ impl Connection {
         self.subflows[0].tcb.close();
     }
 
+    /// Switches Nagle off (`true`) or on (`false`, the default) on every subflow, including
+    /// those joined later.
     pub fn set_nodelay(&mut self, nodelay: bool) {
-        self.subflows[0].tcb.set_nodelay(nodelay);
+        self.nodelay = nodelay;
+        for sf in &mut self.subflows {
+            sf.tcb.set_nodelay(nodelay);
+        }
     }
 }

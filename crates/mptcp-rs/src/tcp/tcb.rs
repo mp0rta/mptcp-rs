@@ -683,6 +683,14 @@ impl Tcb {
     pub fn peer_window_closed(&self) -> bool {
         self.snd_wnd == 0
     }
+    /// Sequence space sent and not yet acknowledged (SND.MAX > SND.UNA).
+    pub(crate) fn has_unacked(&self) -> bool {
+        self.in_flight() > 0
+    }
+    /// Effective send MSS (RFC 9293 MUST-14/15/16), before protocol options.
+    pub(crate) fn eff_mss(&self) -> u16 {
+        self.eff_mss
+    }
 
     fn sack_len(&self, protocol: usize) -> usize {
         if protocol >= 40 {
