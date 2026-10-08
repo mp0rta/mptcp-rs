@@ -17,7 +17,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--join IP [--join-mtu N]]...";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -42,6 +42,8 @@ struct Args {
     send_secs: Option<Duration>,
     /// `None` = `--expect any`: verify the pattern until EOF.
     expect: Option<u64>,
+    /// `--join IP [--join-mtu N]`: extra subflows from these local addresses, with that MTU.
+    joins: Vec<(IpAddr, u16)>,
 }
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
@@ -49,6 +51,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let mut send_secs = None;
     let mut mode = None;
     let mut pause_read = Duration::ZERO;
+    let mut joins = Vec::new();
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -64,6 +67,9 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             "--local" => local = v.parse().ok(),
             "--remote" => remote = v.parse().ok(),
             "--send" => send = v.parse().ok(),
+            // The TUN device's MTU, which the initial subflow also uses.
+            "--join" => joins.push((v.parse().ok()?, ConnectConfig::default().mtu)),
+            "--join-mtu" => joins.last_mut()?.1 = v.parse().ok()?,
             "--send-secs" => {
                 send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
             }
@@ -90,6 +96,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         },
         send_secs,
         expect: expect?,
+        joins,
     })
 }
 
@@ -121,6 +128,12 @@ fn run(a: Args) -> Result<String, String> {
     };
     let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
         .map_err(|e| format!("connect: {e:?}"))?;
+    // Queued until the connection is Confirmed, then started at the next poll.
+    for &(ip, mtu) in &a.joins {
+        let id = (ep.add_subflow(now(start), h, ip, mtu))
+            .map_err(|e| format!("add_subflow {ip}: {e:?}"))?;
+        eprintln!("join: {id:?} local {ip} mtu {mtu}");
+    }
 
     let mut pkt = vec![0u8; 65535];
     let mut rbuf = vec![0u8; 65536];
@@ -157,12 +170,9 @@ fn run(a: Args) -> Result<String, String> {
             ep.handle_timeout(t);
         }
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
-        st.events(&mut ep, &a)?;
+        st.events(&mut ep, &a, start.elapsed())?;
 
         // After a normal close the connection is gone unless data is still unread.
-        if st.connected && st.connected_at.is_none() {
-            st.connected_at = Some(start.elapsed());
-        }
         if st.drives(ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
             while !st.closing && !st.send_done(&a, start.elapsed()) {
@@ -209,7 +219,7 @@ fn run(a: Args) -> Result<String, String> {
                 st.closing = true;
             }
         }
-        st.events(&mut ep, &a)?;
+        st.events(&mut ep, &a, start.elapsed())?;
 
         // Drain before returning: the final ACK of the active close must go out.
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
@@ -299,17 +309,32 @@ impl State {
         a.expect.map_or(self.eof, |e| self.verified == e)
     }
 
-    fn events(&mut self, ep: &mut Endpoint<ChaCha20Rng>, a: &Args) -> Result<(), String> {
+    fn events(
+        &mut self,
+        ep: &mut Endpoint<ChaCha20Rng>,
+        a: &Args,
+        now: Duration,
+    ) -> Result<(), String> {
+        // Subflow events carry the time since `Connected` (the harness's blackhole clock).
+        let at = |c: Option<Duration>| c.map_or(0.0, |c| (now - c).as_secs_f64());
         while let Some((_, ev)) = ep.poll_event() {
+            let t = at(self.connected_at);
             match ev {
                 Event::FellBack => eprintln!("event: FellBack"),
-                Event::SubflowUp { .. }
-                | Event::SubflowDown { .. }
-                | Event::SubflowStale { .. }
-                | Event::SubflowRecovered { .. } => {}
+                Event::SubflowUp { subflow } => eprintln!("event: SubflowUp {subflow:?} +{t:.3}s"),
+                Event::SubflowDown { subflow, reason } => {
+                    eprintln!("event: SubflowDown {subflow:?} {reason:?} +{t:.3}s")
+                }
+                Event::SubflowStale { subflow } => {
+                    eprintln!("event: SubflowStale {subflow:?} +{t:.3}s")
+                }
+                Event::SubflowRecovered { subflow } => {
+                    eprintln!("event: SubflowRecovered {subflow:?} +{t:.3}s")
+                }
                 Event::Connected { mptcp } => {
                     eprintln!("event: Connected mptcp={mptcp}");
                     self.connected = true;
+                    self.connected_at = Some(now);
                 }
                 Event::Closed {
                     reason: CloseReason::Normal,
@@ -389,6 +414,14 @@ mod tests {
         assert!(parse_args(v(&format!("{timed} --send-secs 0"))).is_none());
         assert!(parse_args(v(&format!("{timed} --send 5"))).is_some());
         assert!(parse_args(v(&format!("{timed} --send 5 --send-secs 3"))).is_none());
+        let a = parse_args(v(&format!(
+            "{timed} --send 5 --join 10.0.8.2 --join-mtu 1280 --join 10.0.7.2"
+        )))
+        .unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(a.joins, [(ip("10.0.8.2"), 1280), (ip("10.0.7.2"), 1500)]);
+        assert!(parse_args(v(&format!("{timed} --send 5 --join-mtu 1280"))).is_none());
+        assert!(parse_args(v(&format!("{timed} --send 5 --join x"))).is_none());
         assert!(
             parse_args(v(
                 "--mode tcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 1"
