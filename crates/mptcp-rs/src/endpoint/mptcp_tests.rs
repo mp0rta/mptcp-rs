@@ -2533,8 +2533,8 @@ enum Rogue {
     NoSuchSubflow,
     /// A New plan within budget for the first subflow, whatever its state.
     FirstSubflow,
-    /// A reinjection of a range that is not queued.
-    ForeignReinject(u64),
+    /// A reinjection `(dsn, len)` that is not a prefix of the head candidate.
+    ForeignReinject(u64, u32),
 }
 
 /// MinRTT, or a rogue plan when one is set; records everything.
@@ -2555,9 +2555,9 @@ impl Scheduler for Probe {
             Some(Rogue::OverBudget) => new(first.id, budget + 1),
             Some(Rogue::NoSuchSubflow) => new(SubflowId(7), budget),
             Some(Rogue::FirstSubflow) => new(first.id, budget),
-            Some(Rogue::ForeignReinject(dsn)) => Plan::Send {
+            Some(Rogue::ForeignReinject(dsn, len)) => Plan::Send {
                 subflow: first.id,
-                payload: Payload::Reinject { dsn, len: 1 },
+                payload: Payload::Reinject { dsn, len },
             },
         };
         self.log.lock().unwrap().plans.push(plan);
@@ -2690,7 +2690,7 @@ fn rogue_scheduler_plan_rejected() {
     for r in [
         Rogue::OverBudget,
         Rogue::NoSuchSubflow,
-        Rogue::ForeignReinject(head),
+        Rogue::ForeignReinject(head, 1),
     ] {
         *rogue.lock().unwrap() = Some(r);
         assert!(
@@ -3028,5 +3028,72 @@ fn reinject_across_adjacent_write_chunks() {
         .map(|b| b.expect("every octet reinjected"))
         .collect();
     assert_eq!(peer, writes.concat(), "byte-exact");
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+}
+
+#[test]
+fn rogue_reinject_outside_head_rejected() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    open_window(&mut ep, &syn, h);
+    let (log, rogue) = install_probe(&mut ep, h);
+    let (head, _) = sent_and_discarded(&mut ep, h, &syn, &[&[4; 2864]], 1000);
+    let deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(deadline);
+    assert_eq!(queue_first(&ep, h), Some((head, 2864)));
+    let c = ep.conns.get_mut(&h).unwrap();
+    let candidate = c.reinject_head();
+    assert_eq!(candidate, Some((head, 2864)));
+    c.build_snapshots(deadline, candidate, 1500);
+    let snapshot = c.snapshots()[0];
+    assert!(
+        snapshot.reinject_budget.bytes() >= 1,
+        "the budget admits a 1-octet reinjection"
+    );
+    let assigned = log.lock().unwrap().assigned.len();
+    // Queued but not the head, beyond the queue, and longer than the head candidate.
+    for (dsn, len) in [(head + 1, 1), (head + 5000, 1), (head, 2865)] {
+        *rogue.lock().unwrap() = Some(Rogue::ForeignReinject(dsn, len));
+        let before = ep.conns[&h].hooks.rejected_plans;
+        assert!(
+            drain(&mut ep, deadline).is_empty(),
+            "nothing is sent for ({dsn}, {len})"
+        );
+        assert_eq!(ep.conns[&h].hooks.rejected_plans, before + 1);
+        assert_eq!(
+            log.lock().unwrap().assigned.len(),
+            assigned,
+            "no on_assigned"
+        );
+        assert_eq!(queue_first(&ep, h), Some((head, 2864)), "queue unchanged");
+    }
+    // The connection's own budgets never exceed the candidate, so `len <= c` is checked on a
+    // snapshot whose Reinject budget would admit more than the candidate.
+    let wide = SubflowSnapshot {
+        reinject_budget: crate::tcp::SendBudget {
+            seg_payload: 1432,
+            full_segments: 0,
+            partial: 5000,
+        },
+        ..snapshot
+    };
+    let reinject = |len| Plan::Send {
+        subflow: SubflowId(0),
+        payload: Payload::Reinject { dsn: head, len },
+    };
+    assert_eq!(
+        crate::mptcp::accept_plan(reinject(2865), &[wide], candidate),
+        None
+    );
+    assert!(crate::mptcp::accept_plan(reinject(2864), &[wide], candidate).is_some());
+    // MinRTT restored: the head itself is reinjected.
+    *rogue.lock().unwrap() = None;
+    let out = drain(&mut ep, deadline);
+    let seg = packet::parse(&out[0]).unwrap();
+    assert_eq!(dsn_of(&seg, syn.seq), Some((head, 2864)));
+    assert_eq!(
+        log.lock().unwrap().assigned.last(),
+        Some(&(SubflowId(0), 2864, true))
+    );
+    assert_eq!(queue_first(&ep, h), None);
     assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
 }
