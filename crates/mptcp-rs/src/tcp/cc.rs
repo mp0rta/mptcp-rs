@@ -62,7 +62,8 @@ pub trait CongestionControl: Send {
     /// Called once when the connection reaches ESTABLISHED, with the effective send MSS;
     /// `syn_lost` is true if our SYN was retransmitted (RFC 5681 §3.1: IW is then one segment).
     fn init(&mut self, _smss: u32, _syn_lost: bool) {}
-    /// Called when an ACK advances SND.UNA outside fast recovery.
+    /// Called when an ACK advances SND.UNA outside fast recovery (with SACK: outside RFC 6675
+    /// loss recovery).
     fn on_ack(&mut self, ack: &AckSample);
     /// `in_flight` is FlightSize (RFC 5681): SND.MAX − SND.UNA at the event, before any
     /// retransmission it triggers. `FastRetransmit` starts fast recovery.
@@ -70,6 +71,12 @@ pub trait CongestionControl: Send {
     /// Called in place of `on_ack` for every ACK between `on_congestion(FastRetransmit)` and
     /// the full ACK (or an RTO) that ends fast recovery: the window inflation and deflation of
     /// RFC 5681 §3.2 / RFC 6582 §3.2 belong to the controller.
+    ///
+    /// With SACK (RFC 6675) the `Tcb` instead calls `on_recovery_ack(Full { in_flight })` once,
+    /// right after `on_congestion(FastRetransmit, in_flight)`: FlightSize ≥ ssthresh, so this
+    /// is cwnd = ssthresh (§5 (4.2)). No other recovery or `on_ack` call follows until the ACK
+    /// that ends recovery, which itself reaches neither; meanwhile the `Tcb` sends while
+    /// cwnd − pipe ≥ SMSS (§5 (C)).
     fn on_recovery_ack(&mut self, ack: RecoveryAck);
     /// Called before new data goes out after the sender sat idle for more than one RTO with
     /// nothing outstanding (RFC 5681 §4.1): cwnd is set to no more than the restart window.

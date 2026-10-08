@@ -1,6 +1,7 @@
 use super::*;
 use crate::tcp::cc::{CongestionEvent, RecoveryAck, Reno, Unbounded};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
+use rangemap::RangeSet;
 use std::sync::{Arc, Mutex};
 
 const ISN: SeqNum = SeqNum(0x1000);
@@ -3499,4 +3500,278 @@ fn cwnd_limited_marks_acks_of_a_full_window() {
     let s = samples.lock().unwrap();
     assert_eq!(s.len(), 4);
     assert!(s.iter().all(|a| !a.cwnd_limited && !a.app_limited), "{s:?}");
+}
+
+// ---- SACK-based loss recovery (RFC 6675), M2 Task 8b ----
+
+/// MSS, WS 0 and SACK-Permitted: the peer's SYN/ACK options of a SACK connection.
+fn sack_opts() -> Vec<u8> {
+    let mut o = opts(Some(MSS), Some(0));
+    let mut b = [0; 4];
+    let n = tcp_options::write_sack_permitted(&mut b);
+    o.extend_from_slice(&b[..n]);
+    o
+}
+
+/// The SACK blocks of a receiver holding `got` (data offsets above its cumulative ACK) just
+/// after receiving the segment at `latest`: the block holding it first (RFC 2018 §4), then
+/// the others from the highest, at most four.
+fn blocks_after(got: &RangeSet<u32>, latest: u32) -> Vec<(SeqNum, SeqNum)> {
+    let first = got.get(&latest).cloned();
+    first
+        .clone()
+        .into_iter()
+        .chain(
+            got.iter()
+                .rev()
+                .filter(|r| Some(*r) != first.as_ref())
+                .cloned(),
+        )
+        .take(4)
+        .map(|r| (data(r.start), data(r.end)))
+        .collect()
+}
+
+impl Fixture {
+    /// ESTABLISHED at t(0) with `Reno` (SMSS = MSS = 1000), peer window `BIG`, SACK
+    /// negotiated if `sack`; `bytes` written, the IW sent, then segments 0–9 ACKed one by
+    /// one at 1..10 ms, each ACK opening two more. Leaves segments 10–23 outstanding
+    /// (SND.UNA = data(10000), SND.MAX = data(24000)) with cwnd 14 segments.
+    fn ramp(sack: bool, bytes: &[u8]) -> Self {
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
+        let o = if sack {
+            sack_opts()
+        } else {
+            opts(Some(MSS), Some(0))
+        };
+        assert_eq!(f.synack(BIG, &o), Reaction::Established);
+        assert_eq!(f.tcb.sack_permitted, sack);
+        f.drain(t(0));
+        f.write(bytes);
+        assert_eq!(f.drain(t(0)).len(), 4, "IW");
+        for k in 1..=10 {
+            f.ack(tm(k), data(k as u32 * 1000), BIG);
+            assert_eq!(f.drain(tm(k)).len(), 2, "slow start");
+        }
+        assert_eq!((f.tcb.snd_una, f.tcb.snd_max), (data(10_000), data(24_000)));
+        assert_eq!(f.tcb.cc.cwnd(), 14_000);
+        f
+    }
+    /// An ACK-only segment of `ack` carrying `blocks`.
+    fn sack_ack(&mut self, now: Instant, ack: SeqNum, blocks: &[(SeqNum, SeqNum)]) -> Reaction {
+        let raw: Vec<(u32, u32)> = blocks.iter().map(|(l, r)| (l.0, r.0)).collect();
+        let mut o = [0; 40];
+        let n = tcp_options::write_sack(&mut o, &raw);
+        let seg = Segment {
+            src: self.addrs.1,
+            dst: self.addrs.0,
+            seq: PEER_ISN.wrapping_add(1),
+            ack,
+            flags: TcpFlags::ACK,
+            wnd: BIG,
+            options: &o[..n],
+            payload: &[],
+        };
+        self.tcb.on_segment(&seg, now, &mut self.h)
+    }
+    /// The peer receives the segment at data offset `k·1000` (cumulative ACK `cum`) and
+    /// answers with SACK blocks; returns what that draws.
+    fn peer_gets(
+        &mut self,
+        now: Instant,
+        got: &mut RangeSet<u32>,
+        k: u32,
+        cum: u32,
+    ) -> Vec<(SentMeta, Vec<u8>)> {
+        got.insert(k * 1000..(k + 1) * 1000);
+        got.remove(0..cum);
+        let b = blocks_after(got, k * 1000);
+        assert_eq!(self.sack_ack(now, data(cum), &b), Reaction::None);
+        self.drain(now)
+    }
+}
+
+/// Segments 10, 13 and 16 of one window are lost. With SACK, all three are retransmitted
+/// within the RTT in which the loss is detected, gated by pipe < cwnd = ssthresh (RFC 6675
+/// §5); the retransmissions' ACKs end recovery one RTT later. Twin without SACK below.
+#[test]
+fn sack_repairs_three_holes_in_one_rtt() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    let mut sent = Vec::new();
+    for k in [11, 12] {
+        assert!(f.peer_gets(tm(30), &mut got, k, 10_000).is_empty(), "{k}");
+    }
+    assert!(!f.tcb.sack.in_recovery());
+    // Third duplicate ACK (DupThresh): fast retransmit of HighACK + 1; cwnd = ssthresh =
+    // FlightSize / 2 (Reno), with no RFC 5681 inflation.
+    let segs = f.peer_gets(tm(30), &mut got, 14, 10_000);
+    assert_eq!(seq_lens(&segs), [(data(10_000), 1000)]);
+    assert!(f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.cc.cwnd(), 7000);
+    assert_eq!(f.tcb.rtt_timed, None, "Karn");
+    sent.extend(segs);
+    // pipe stays at or above cwnd until enough has been SACKed: 15, 17, 18 draw nothing.
+    for k in [15, 17, 18] {
+        assert!(f.peer_gets(tm(30), &mut got, k, 10_000).is_empty(), "{k}");
+    }
+    // 19: 13 and 16 are now lost (more than 2·SMSS SACKed above each); both go.
+    let segs = f.peer_gets(tm(30), &mut got, 19, 10_000);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(13_000), 1000), (data(16_000), 1000)]
+    );
+    assert_eq!(segs[0].1, bytes[13_000..14_000]);
+    assert_eq!(segs[1].1, bytes[16_000..17_000]);
+    sent.extend(segs);
+    // Every further SACKed segment leaves the network: one new segment each (rule 2).
+    for k in 20..24 {
+        let segs = f.peer_gets(tm(30), &mut got, k, 10_000);
+        assert_eq!(seq_lens(&segs), [(data(k * 1000 + 4000), 1000)], "{k}");
+        sent.extend(segs);
+    }
+    let rxt: Vec<SeqNum> = sent
+        .iter()
+        .map(|(m, _)| m.seq)
+        .filter(|s| s.lt(data(24_000)))
+        .collect();
+    assert_eq!(rxt, [data(10_000), data(13_000), data(16_000)]);
+    // One RTT later the retransmissions arrive; the third ACK covers RecoveryPoint (24000)
+    // and the new data: recovery ends with cwnd = ssthresh.
+    f.peer_gets(tm(50), &mut got, 10, 13_000);
+    f.peer_gets(tm(50), &mut got, 13, 16_000);
+    assert!(f.tcb.sack.in_recovery());
+    assert_eq!(f.sack_ack(tm(50), data(28_000), &[]), Reaction::None);
+    assert!(!f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.cc.cwnd(), 7000);
+    // Congestion avoidance from here: on_ack again.
+    f.drain(tm(50));
+    f.ack(tm(60), data(29_000), BIG);
+    f.ack(tm(60), data(35_000), BIG);
+    assert_eq!(f.tcb.cc.cwnd(), 8000);
+}
+
+/// The twin of `sack_repairs_three_holes_in_one_rtt` without SACK: NewReno retransmits one
+/// hole per RTT (the third duplicate ACK, then one per partial ACK).
+#[test]
+fn newreno_twin_repairs_one_hole_per_rtt() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(false, &bytes);
+    let mut rxt = Vec::new();
+    for _ in [11, 12, 14, 15, 17, 18, 19, 20, 21, 22, 23] {
+        f.ack(tm(30), data(10_000), BIG);
+        rxt.extend(
+            f.drain(tm(30))
+                .into_iter()
+                .filter(|(m, _)| m.seq.lt(data(24_000))),
+        );
+    }
+    assert_eq!(
+        seq_lens(&rxt),
+        [(data(10_000), 1000)],
+        "first RTT: one hole"
+    );
+    f.ack(tm(50), data(13_000), BIG);
+    let segs = f.drain(tm(50));
+    assert_eq!(segs[0].0.seq, data(13_000), "second RTT: the next");
+    f.ack(tm(70), data(16_000), BIG);
+    let segs = f.drain(tm(70));
+    assert_eq!(segs[0].0.seq, data(16_000), "third RTT: the last");
+}
+
+/// An RTO during SACK recovery ends it, expunges the scoreboard (RFC 2018 §8) and holds
+/// off a new recovery until SND.UNA reaches HighData at the RTO (RFC 6675 §5.1); the
+/// go-back then skips what is SACKed after the RTO ("filling in").
+#[test]
+fn sack_rto_during_recovery() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    for k in [11, 12, 14] {
+        f.peer_gets(tm(30), &mut got, k, 10_000);
+    }
+    assert!(f.tcb.sack.in_recovery());
+    let rto = f.tcb.poll_send_at().unwrap();
+    assert_eq!(f.timeout(rto), Reaction::None);
+    assert!(!f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.sack.sacked_in(0, u64::MAX), 0, "expunged");
+    assert!(f.tcb.sent.iter().all(|r| !r.sacked));
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(seq_lens(&f.drain(rto)), [(data(10_000), 1000)]);
+    // The peer still holds 11–12 and 14 (and gets 15): cumulative ACK to 13000, SACK of
+    // 14000–16000. Slow start resends 13 and then 16, skipping the SACKed 14–15.
+    got.insert(15_000..16_000);
+    let segs = f.peer_gets(rto, &mut got, 10, 13_000);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(13_000), 1000), (data(16_000), 1000)]
+    );
+    assert_eq!(segs[1].1, bytes[16_000..17_000]);
+    // Newly SACKing ACKs below the RTO's RecoveryPoint start no recovery.
+    for k in [17, 18, 19, 20] {
+        assert!(f.peer_gets(rto, &mut got, k, 13_000).is_empty(), "{k}");
+    }
+    assert!(!f.tcb.sack.in_recovery());
+}
+
+/// SACKed data stays in the send buffer until it is cumulatively acknowledged (RFC 2018
+/// §8, RFC 6675 §4 Update()): a receiver that reneged gets it again after the RTO.
+#[test]
+fn sack_reneging_safe() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    for k in [11, 12] {
+        f.peer_gets(tm(30), &mut got, k, 10_000);
+    }
+    let rto = f.tcb.poll_send_at().unwrap();
+    f.timeout(rto);
+    assert_eq!(seq_lens(&f.drain(rto)), [(data(10_000), 1000)]);
+    // The peer reneged on 11–12: cumulative ACK 11000, no SACK. 11 and 12 go again.
+    assert_eq!(f.sack_ack(rto, data(11_000), &[]), Reaction::None);
+    let segs = f.drain(rto);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(11_000), 1000), (data(12_000), 1000)]
+    );
+    assert_eq!(segs[0].1, bytes[11_000..12_000]);
+    assert_eq!(segs[1].1, bytes[12_000..13_000]);
+}
+
+/// The ACK's sample comes from the most recently sent record it newly delivers, cumulatively
+/// or by SACK (draft-ietf-ccwg-bbr-06 §4.1.2.3: "for each newly SACKed or ACKed packet");
+/// a record SACKed by an earlier ACK was delivered then and gives nothing later.
+#[test]
+fn sack_sample_from_newest_newly_delivered_record() {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.tcb.set_nodelay(true);
+    for k in 0..3 {
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(tm(10 * k)).len(), 1);
+    }
+    // A (0 ms) delivered, B (10 ms) missing, C (20 ms) SACKed: C is the newest.
+    f.sack_ack(tm(50), data(1000), &[(data(2000), data(3000))]);
+    // B arrives: C was delivered before, so B (10 ms) gives the sample.
+    f.ack(tm(60), data(3000), BIG);
+    let rtts: Vec<_> = samples.lock().unwrap().iter().map(|a| a.rtt).collect();
+    assert_eq!(
+        rtts,
+        [
+            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(50))
+        ]
+    );
 }
