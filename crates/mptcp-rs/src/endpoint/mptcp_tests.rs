@@ -387,7 +387,7 @@ fn token_collision_regenerates_key_and_time_wait_reserves_token() {
         peer_fin.wrapping_add(1)
     );
     ep.handle_timeout(Instant::from_nanos(2));
-    assert_eq!(ep.conns[&a].tcb.state(), TcpState::TimeWait);
+    assert_eq!(ep.conns[&a].subflows[0].tcb.state(), TcpState::TimeWait);
     assert_eq!(
         ep.poll_event(),
         None,
@@ -738,7 +738,7 @@ fn conflicting_mapping_resets_only_after_tcp_validity() {
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
     assert_eq!(ep.poll_event(), None);
-    assert_eq!(ep.conns[&h].tcb.state(), TcpState::Closed);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
 
@@ -753,7 +753,7 @@ fn unmapped_byte_bound_resets_subflow() {
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
     assert_eq!(ep.poll_event(), None);
-    assert_eq!(ep.conns[&h].tcb.state(), TcpState::Closed);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
 
@@ -804,11 +804,12 @@ fn initial_mpc_and_equivalent_dss_deliver_once() {
 fn ack32_promotion_releases_connection_store_only_with_tcp_ack() {
     let (mut ep, h, bytes, _) = connected_with_capacity(64);
     let syn = packet::parse(&bytes).unwrap();
-    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    let c = ep.conns.get_mut(&h).unwrap();
+    let d = c.hooks.data.as_mut().unwrap();
     // Install a wrapped send origin before any application data.
     d.send = crate::mptcp::data::SendStore::new(u64::MAX - 1, 4);
     assert_eq!(d.send.write(b"abcd"), 4);
-    assert!(d.send.assign(&mut d.tx, u64::MAX - 1, 4));
+    assert!(d.send.assign(&mut c.subflows[0].mp.tx, u64::MAX - 1, 4));
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert_eq!(packet::parse(&bytes).unwrap().payload, b"abcd");
     let mut opts = [0; 40];
@@ -1710,10 +1711,7 @@ fn reinjection_respects_zero_tcp_window_and_deduplicates_live_copy() {
     let at = ep.poll_timeout().unwrap();
     ep.handle_timeout(at);
     assert!(ep.poll_transmit(at, &mut [0; 1500]).is_none());
-    assert_eq!(
-        ep.conns[&h].hooks.data.as_ref().unwrap().tx.assigned_end(),
-        5
-    );
+    assert_eq!(ep.conns[&h].subflows[0].mp.tx.assigned_end(), 5);
     ack.wnd = 1234;
     let mut bytes = [0; 1500];
     let n = packet::build(&ack, 0, &mut bytes).unwrap();
@@ -1726,10 +1724,7 @@ fn reinjection_respects_zero_tcp_window_and_deduplicates_live_copy() {
     ep.handle_timeout(at);
     let retrans = transmit(&mut ep, at);
     assert_eq!(packet::parse(&retrans).unwrap().seq, retry.seq);
-    assert_eq!(
-        ep.conns[&h].hooks.data.as_ref().unwrap().tx.assigned_end(),
-        9
-    );
+    assert_eq!(ep.conns[&h].subflows[0].mp.tx.assigned_end(), 9);
 }
 
 #[test]
@@ -1738,17 +1733,21 @@ fn infinite_receive_mapping_tracks_ssn_wrap() {
     let (mut ep, h, syn, dsn) = connected_with_capacity(64);
     let syn = packet::parse(&syn).unwrap();
     input(&mut ep, &peer_data(&syn, 5001, &mapping(1, dsn, 0), &[]));
-    let hooks = &mut ep.conns.get_mut(&h).unwrap().hooks;
+    let c = ep.conns.get_mut(&h).unwrap();
+    let hooks = &mut crate::mptcp::SubflowHooks {
+        conn: &mut c.hooks,
+        sf: &mut c.subflows[0].mp,
+    };
     // Skip stored payload while simulating bounded successive TCP receipt advances.
     for offset in [0x7000_0000u64, 0xe000_0000, 0x1_5000_0000] {
         let next = dsn.wrapping_add(offset);
-        let recv = &mut hooks.data.as_mut().unwrap().recv;
+        let recv = &mut hooks.conn.data.as_mut().unwrap().recv;
         recv.next = next;
         recv.right_edge = next.wrapping_add(64);
         hooks.receipt_advanced((offset as u32).wrapping_add(1));
         let ssn = (offset as u32).wrapping_add(1);
         assert_eq!(hooks.receive_data(ssn, ssn, b"x"), vec![0..1]);
-        assert_eq!(hooks.read(&mut [0; 1]), 1);
+        assert_eq!(hooks.conn.read(&mut [0; 1]), 1);
     }
 }
 
@@ -1765,16 +1764,7 @@ fn corrected_data_ack_confirms_already_tcp_acked_mapping() {
         let mut ack = peer_data(&syn, 5001, &invalid, &[]);
         ack.ack = sent.seq.wrapping_add(3);
         input(&mut ep, &ack);
-        assert!(
-            ep.conns[&h]
-                .hooks
-                .data
-                .as_ref()
-                .unwrap()
-                .tx
-                .mapping(1)
-                .is_none()
-        );
+        assert!(ep.conns[&h].subflows[0].mp.tx.mapping(1).is_none());
         let valid = data_ack(head.wrapping_add(3));
         ack.options = &valid;
         if !corrected {

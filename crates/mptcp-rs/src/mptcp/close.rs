@@ -1,5 +1,5 @@
 //! Connection sequence-space closure, independent of TCP subflow state.
-use super::{ConnectionHooks, data::TxMaps};
+use super::{ConnectionHooks, SubflowHooks, data::TxMaps};
 use crate::tcp::{SendBuf, Tcb};
 use crate::time::Instant;
 use crate::wire::{
@@ -54,15 +54,28 @@ impl ConnectionHooks {
             .as_ref()
             .is_some_and(|d| !d.fallback && !d.close.closed)
     }
+    pub fn close(&mut self) -> bool {
+        if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
+            d.close.local.get_or_insert(d.send.end);
+            true
+        } else {
+            self.data
+                .as_ref()
+                .is_some_and(|d| d.send.next != d.send.end)
+        }
+    }
+}
+
+impl SubflowHooks<'_> {
     pub fn update_close(&mut self, tcb: &Tcb, now: Instant) -> Option<crate::tcp::CloseReason> {
-        let d = self.data.as_mut().filter(|d| !d.fallback)?;
+        let d = self.conn.data.as_mut().filter(|d| !d.fallback)?;
         if d.close.closed {
             return None;
         }
-        let reason = if self.fast_closed {
+        let reason = if self.conn.fast_closed {
             Some(crate::tcp::CloseReason::Reset)
         } else if tcb.state() == crate::tcp::TcpState::Closed {
-            d.tx = TxMaps::new(d.tx.assigned_end(), 1024);
+            self.sf.tx = TxMaps::new(self.sf.tx.assigned_end(), 1024);
             d.recovery_at = None;
             d.reinject = false;
             d.close.at = None;
@@ -83,19 +96,9 @@ impl ConnectionHooks {
         }
         reason
     }
-    pub fn close(&mut self) -> bool {
-        if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
-            d.close.local.get_or_insert(d.send.end);
-            true
-        } else {
-            self.data
-                .as_ref()
-                .is_some_and(|d| d.send.next != d.send.end)
-        }
-    }
     pub fn on_transmitted(&mut self, seg: &Segment<'_>, now: Instant, rto: Duration) {
-        if let Some(d) = &mut self.data {
-            d.final_mapping = None;
+        if let Some(d) = &mut self.conn.data {
+            self.sf.final_mapping = None;
             for opt in walk(seg.options) {
                 if let Ok(TcpOpt::Mptcp(raw)) = opt {
                     if let Ok(MptcpOption::Dss(v)) = mptcp::parse(raw) {

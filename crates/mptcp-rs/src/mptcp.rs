@@ -1,8 +1,11 @@
 //! Single-subflow MPTCP negotiation, data transfer, recovery and closure.
 mod close;
 pub(crate) mod data;
+mod subflow;
 use crate::crypto::key_token_idsn;
-use data::{RecvAssembler, RxMaps, SendStore, TxMaps, promote32};
+use data::{RecvAssembler, SendStore, promote32};
+pub use subflow::SubflowId;
+pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
 
 use crate::tcp::{ConnectConfig, PlainHooks, SegmentHooks, SendBuf, Tcb};
 use crate::time::Instant;
@@ -19,35 +22,21 @@ pub(crate) struct ConnectionHooks {
     pub data: Option<DataState>,
     recv_cap: usize,
     send_cap: usize,
-    // None: malformed/invalid; Some(false): valid options without DATA_ACK.
-    // Current ACK coverage is retained after TCP releases a mapping.
-    valid_data_ack: Option<bool>,
     pub fallback_event: bool,
     fast_closed: bool,
-    ack_now: bool,
-    capable_ack_due: bool,
 }
 
+/// Connection-level MPTCP data state; absent for plain TCP and before MP_CAPABLE completes.
 pub(crate) struct DataState {
     pub recv: RecvAssembler,
     close: close::Close,
     pub send: SendStore,
-    pub tx: TxMaps,
-    rx: RxMaps,
-    unmapped: usize,
-    reset: bool,
     pub sanity_failures: u64,
     recovery_head: Option<u64>,
     recovery_at: Option<Instant>,
     recovery_interval: Duration,
     reinject: bool,
-    dss_confirmed: bool,
     fallback: bool,
-    final_mapping: Option<mptcp::Mapping>,
-    rx_infinite: Option<(u32, u64)>,
-    tcp_acked_dsn: u64,
-    local_isn: crate::SeqNum,
-    tcp_acked_ssn: Option<u32>,
 }
 
 impl ConnectionHooks {
@@ -58,11 +47,8 @@ impl ConnectionHooks {
             data: None,
             recv_cap: cfg.recv_buffer as usize,
             send_cap: cfg.send_buffer as usize,
-            valid_data_ack: None,
             fallback_event: false,
             fast_closed: false,
-            ack_now: false,
-            capable_ack_due: false,
         }
     }
     pub fn recovery_deadline(&self) -> Option<Instant> {
@@ -73,8 +59,26 @@ impl ConnectionHooks {
                 .min()
         })
     }
+    pub fn write(&mut self, bytes: &[u8]) -> usize {
+        self.data
+            .as_mut()
+            .map_or_else(|| self.plain.write(bytes), |d| d.send.write(bytes))
+    }
+    pub fn read(&mut self, out: &mut [u8]) -> usize {
+        match &mut self.data {
+            Some(d) => d.recv.read(out),
+            None => self.plain.read(out),
+        }
+    }
+    pub fn has_unread(&self) -> bool {
+        self.data
+            .as_ref()
+            .map_or_else(|| self.plain.has_unread(), |d| d.recv.has_unread())
+    }
+}
+impl SubflowHooks<'_> {
     pub fn update_recovery(&mut self, tcb: &Tcb, now: Instant) {
-        let Some(d) = &mut self.data else {
+        let Some(d) = &mut self.conn.data else {
             return;
         };
         if tcb.state() == crate::tcp::TcpState::Closed {
@@ -97,7 +101,7 @@ impl ConnectionHooks {
             d.recovery_interval = tcb.retransmission_timeout();
             d.reinject = false;
         }
-        if head.is_none() || d.tx.uncovered_len(d.send.una, 1) == 0 {
+        if head.is_none() || self.sf.tx.uncovered_len(d.send.una, 1) == 0 {
             d.recovery_at = None;
             d.reinject = false;
         } else if !d.reinject {
@@ -113,12 +117,13 @@ impl ConnectionHooks {
         self.update_recovery(tcb, now);
         // Preserve the third ACK and replies to repeated SYN/ACKs before
         // requesting a separate DATA_FIN ACK. An idle peer need not send DSS first.
-        self.capable_ack_due = tcb.ack_pending()
+        self.sf.capable_ack_due = tcb.ack_pending()
             && self
+                .conn
                 .negotiation
                 .as_ref()
                 .is_some_and(|m| m.state == State::PreConfirmed);
-        if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
+        if let Some(d) = self.conn.data.as_mut().filter(|d| !d.fallback) {
             if d.close.acked {
                 tcb.close();
             }
@@ -143,17 +148,13 @@ impl ConnectionHooks {
                 tcb.request_ack();
             }
         }
-        if std::mem::take(&mut self.ack_now) {
+        if std::mem::take(&mut self.sf.ack_now) {
             tcb.request_ack();
         }
-        if self
-            .data
-            .as_ref()
-            .is_some_and(|d| d.final_mapping.is_some())
-        {
+        if self.conn.data.is_some() && self.sf.final_mapping.is_some() {
             tcb.request_ack();
         }
-        let demand = match (&self.negotiation, &self.data) {
+        let demand = match (&self.conn.negotiation, &self.conn.data) {
             (Some(m), Some(d)) => {
                 (d.send.next != d.send.end || d.reinject)
                     && (tcb.peer_window_closed()
@@ -176,27 +177,30 @@ impl ConnectionHooks {
         if tcb.state() != crate::tcp::TcpState::Established
             && !(tcb.state() == crate::tcp::TcpState::CloseWait
                 && self
+                    .conn
                     .data
                     .as_ref()
                     .is_some_and(|d| d.fallback || d.recv.has_fin()))
         {
             return false;
         }
-        if let Some(d) = &self.data {
+        if let Some(d) = &self.conn.data {
             if d.reinject {
                 let head = d.send.una;
-                let len =
-                    d.tx.uncovered_len(head, d.send.run_len(head))
-                        .min(d.send.next.wrapping_sub(head) as usize)
-                        .min(u16::MAX as usize - usize::from(d.close.local.is_some()));
+                let len = self
+                    .sf
+                    .tx
+                    .uncovered_len(head, d.send.run_len(head))
+                    .min(d.send.next.wrapping_sub(head) as usize)
+                    .min(u16::MAX as usize - usize::from(d.close.local.is_some()));
                 let len = tcb
                     .send_budget(now, len, len, true, self.data_option_len(), self)
                     .bytes();
-                let d = self.data.as_mut().unwrap();
-                if d.send.assign(&mut d.tx, head, len) {
+                let d = self.conn.data.as_mut().unwrap();
+                if d.send.assign(&mut self.sf.tx, head, len) {
                     d.reinject = false;
                     if d.close.local == Some(head.wrapping_add(len as u64)) {
-                        d.tx.attach_fin();
+                        self.sf.tx.attach_fin();
                         d.close.attached = true;
                     }
                     return true;
@@ -217,48 +221,32 @@ impl ConnectionHooks {
         if len == 0 {
             return false;
         }
-        let d = self.data.as_mut().unwrap();
-        if !d.send.assign(&mut d.tx, d.send.next, len) {
+        let d = self.conn.data.as_mut().unwrap();
+        if !d.send.assign(&mut self.sf.tx, d.send.next, len) {
             return false;
         }
         if d.close.local == Some(d.send.next)
             && len < u16::MAX as usize
-            && !(self.negotiation.as_ref().unwrap().state == State::PreConfirmed
-                && d.tx.assigned_end().wrapping_sub(len as u32) == 1)
+            && !(self.conn.negotiation.as_ref().unwrap().state == State::PreConfirmed
+                && self.sf.tx.assigned_end().wrapping_sub(len as u32) == 1)
         {
-            d.tx.attach_fin();
+            self.sf.tx.attach_fin();
             d.close.attached = true;
         }
         true
     }
     fn candidate_len(&self) -> usize {
-        self.data.as_ref().map_or(0, |d| {
+        self.conn.data.as_ref().map_or(0, |d| {
             d.send
                 .run_len(d.send.next)
                 .min(self.unassigned_len())
                 .min(u16::MAX as usize - usize::from(d.close.local.is_some()))
         })
     }
-    pub fn write(&mut self, bytes: &[u8]) -> usize {
-        self.data
-            .as_mut()
-            .map_or_else(|| self.plain.write(bytes), |d| d.send.write(bytes))
-    }
-    pub fn read(&mut self, out: &mut [u8]) -> usize {
-        match &mut self.data {
-            Some(d) => d.recv.read(out),
-            None => self.plain.read(out),
-        }
-    }
-    pub fn has_unread(&self) -> bool {
-        self.data
-            .as_ref()
-            .map_or_else(|| self.plain.has_unread(), |d| d.recv.has_unread())
-    }
 }
-impl SendBuf for ConnectionHooks {
+impl SendBuf for SubflowHooks<'_> {
     fn unassigned_len(&self) -> usize {
-        match (&self.data, &self.negotiation) {
+        match (&self.conn.data, &self.conn.negotiation) {
             (Some(d), Some(m)) => {
                 (d.send.end.wrapping_sub(d.send.next) as usize).min(if d.fallback {
                     usize::MAX
@@ -271,67 +259,72 @@ impl SendBuf for ConnectionHooks {
     }
 
     fn segment_limit(&self, ssn: u32) -> usize {
-        self.data
-            .as_ref()
-            .map_or(usize::MAX, |d| d.tx.segment_limit(ssn))
+        if self.conn.data.is_some() {
+            self.sf.tx.segment_limit(ssn)
+        } else {
+            usize::MAX
+        }
     }
     fn is_reinjection(&self, ssn: u32) -> bool {
-        self.data.as_ref().is_some_and(|d| d.tx.is_reinjection(ssn))
+        self.conn.data.is_some() && self.sf.tx.is_reinjection(ssn)
     }
     fn peek_with<R>(&self, ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        match &self.data {
-            Some(d) => d.tx.peek_with(ssn, max, f),
-            None => self.plain.peek_with(ssn, max, f),
+        if self.conn.data.is_some() {
+            self.sf.tx.peek_with(ssn, max, f)
+        } else {
+            self.conn.plain.peek_with(ssn, max, f)
         }
     }
     fn assigned_end(&self) -> u32 {
-        self.data
-            .as_ref()
-            .map_or_else(|| self.plain.assigned_end(), |d| d.tx.assigned_end())
+        if self.conn.data.is_some() {
+            self.sf.tx.assigned_end()
+        } else {
+            self.conn.plain.assigned_end()
+        }
     }
     fn mark_acked(&mut self, ssn: u32) {
-        match &mut self.data {
+        match &mut self.conn.data {
             Some(d) => {
-                if let Some(dsn) = d.tx.acked_dsn(ssn) {
-                    d.tcp_acked_dsn = dsn;
-                    d.tcp_acked_ssn = Some(ssn);
-                    if !d.fallback && !d.dss_confirmed {
-                        match self.valid_data_ack {
-                            Some(true) => d.dss_confirmed = true,
+                if let Some(dsn) = self.sf.tx.acked_dsn(ssn) {
+                    self.sf.tcp_acked_dsn = dsn;
+                    self.sf.tcp_acked_ssn = Some(ssn);
+                    if !d.fallback && !self.sf.dss_confirmed {
+                        match self.sf.valid_data_ack {
+                            Some(true) => self.sf.dss_confirmed = true,
                             Some(false) => {
-                                d.fall_back(self.negotiation.as_mut().unwrap());
-                                self.fallback_event = true;
+                                d.fall_back(self.sf, self.conn.negotiation.as_mut().unwrap());
+                                self.conn.fallback_event = true;
                             }
                             None => {}
                         }
                     }
                 }
-                d.tx.mark_acked(ssn);
+                self.sf.tx.mark_acked(ssn);
                 if d.fallback {
-                    d.send.ack(d.tcp_acked_dsn);
+                    d.send.ack(self.sf.tcp_acked_dsn);
                 }
             }
-            None => self.plain.mark_acked(ssn),
+            None => self.conn.plain.mark_acked(ssn),
         }
     }
 }
-impl SegmentHooks for ConnectionHooks {
+impl SegmentHooks for SubflowHooks<'_> {
     fn data_option_len(&self) -> usize {
-        if self.data.as_ref().is_some_and(|d| !d.fallback) {
+        if self.conn.data.as_ref().is_some_and(|d| !d.fallback) {
             28
         } else {
             0
         }
     }
     fn data_options_for(&mut self, ssn: u32, out: &mut [u8]) -> usize {
-        let (Some(m), Some(d)) = (&self.negotiation, &self.data) else {
+        let (Some(m), Some(d)) = (&self.conn.negotiation, &self.conn.data) else {
             return self.options_for(TcpFlags::ACK, out);
         };
         if d.fallback {
             return self.options_for(TcpFlags::ACK, out);
         }
-        let mapping = d.tx.mapping(ssn).expect("payload has mapping");
-        let data_fin = d.tx.data_fin(ssn);
+        let mapping = self.sf.tx.mapping(ssn).expect("payload has mapping");
+        let data_fin = self.sf.tx.data_fin(ssn);
         let option = if m.state == State::PreConfirmed && mapping.ssn == 1 {
             MptcpOption::Capable(MpCapable {
                 version: 1,
@@ -354,25 +347,29 @@ impl SegmentHooks for ConnectionHooks {
         padded
     }
     fn window_offer(&self, scale: u8, mss: u16) -> Option<u16> {
-        self.data.as_ref().map(|d| d.recv.window_offer(scale, mss))
+        self.conn
+            .data
+            .as_ref()
+            .map(|d| d.recv.window_offer(scale, mss))
     }
     fn window_sent(&mut self, field: u16, scale: u8) {
-        if let Some(d) = &mut self.data {
+        if let Some(d) = &mut self.conn.data {
             d.recv.window_sent(field, scale);
         }
     }
     fn window_update_due(&self, scale: u8, mss: u16) -> bool {
-        self.data
+        self.conn
+            .data
             .as_ref()
             .is_some_and(|d| d.recv.window_update_due(scale, mss))
     }
     fn duplicate_ack_allowed(&self, seg: &Segment<'_>) -> bool {
-        self.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
+        self.conn.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
     }
 
     fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
-        if let (Some(m), Some(d)) = (&self.negotiation, &mut self.data) {
-            if let Some(mapping) = d.final_mapping {
+        if let (Some(m), Some(d)) = (&self.conn.negotiation, &mut self.conn.data) {
+            if let Some(mapping) = self.sf.final_mapping {
                 let n = mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
                         data_fin: false,
@@ -389,7 +386,7 @@ impl SegmentHooks for ConnectionHooks {
             if d.fallback {
                 return 0;
             }
-            if d.close.due && !self.capable_ack_due && flags.contains(TcpFlags::ACK) {
+            if d.close.due && !self.sf.capable_ack_due && flags.contains(TcpFlags::ACK) {
                 let n = mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
                         data_fin: true,
@@ -420,12 +417,13 @@ impl SegmentHooks for ConnectionHooks {
                 .expect("DSS ACK fits");
             }
         }
-        self.negotiation
+        self.conn
+            .negotiation
             .as_mut()
             .map_or(0, |m| m.options_for(flags, out))
     }
     fn on_valid_segment(&mut self, seg: &Segment<'_>) {
-        self.valid_data_ack = None;
+        self.sf.valid_data_ack = None;
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose) = (None, None, None);
         for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
@@ -448,65 +446,65 @@ impl SegmentHooks for ConnectionHooks {
                 _ => {}
             }
         }
-        self.valid_data_ack = if dss.is_some_and(|v| v.data_ack.is_some()) {
+        self.sf.valid_data_ack = if dss.is_some_and(|v| v.data_ack.is_some()) {
             None
         } else {
             Some(false)
         };
-        let Some(m) = &mut self.negotiation else {
+        let Some(m) = &mut self.conn.negotiation else {
             return;
         };
         if fastclose == Some(m.local_key)
             && matches!(m.state, State::PreConfirmed | State::Confirmed)
             && (seg.flags.contains(TcpFlags::ACK) || seg.flags.contains(TcpFlags::RST))
         {
-            self.fast_closed = true;
+            self.conn.fast_closed = true;
             return;
         }
-        m.on_valid_segment(seg);
-        if self.data.is_none() && matches!(m.state, State::PreConfirmed | State::Confirmed) {
-            let mut send = SendStore::new(m.local_idsn.wrapping_add(1), self.send_cap);
+        m.on_valid_segment(seg, &mut self.sf.peer_scale);
+        if self.conn.data.is_none() && matches!(m.state, State::PreConfirmed | State::Confirmed) {
+            let mut send = SendStore::new(m.local_idsn.wrapping_add(1), self.conn.send_cap);
             // Writes during SYN-SENT were queued before knowing whether MPC succeeds.
             let mut ssn = 1;
             while let Some(n) = self
+                .conn
                 .plain
-                .peek_with(ssn, self.send_cap, |bytes| send.write(bytes))
+                .peek_with(ssn, self.conn.send_cap, |bytes| send.write(bytes))
             {
                 debug_assert!(n > 0);
                 ssn = ssn.wrapping_add(n as u32);
-                self.plain.mark_acked(ssn);
+                self.conn.plain.mark_acked(ssn);
             }
-            self.data = Some(DataState {
-                recv: RecvAssembler::new(m.peer_idsn.unwrap().wrapping_add(1), self.recv_cap, 64),
+            self.conn.data = Some(DataState {
+                recv: RecvAssembler::new(
+                    m.peer_idsn.unwrap().wrapping_add(1),
+                    self.conn.recv_cap,
+                    64,
+                ),
                 send,
                 close: close::Close::default(),
-                tx: TxMaps::new(1, 1024),
-                rx: RxMaps::new(1024),
-                unmapped: 0,
-                reset: false,
                 sanity_failures: 0,
                 recovery_head: None,
                 recovery_at: None,
                 recovery_interval: Duration::from_secs(1),
                 reinject: false,
-                dss_confirmed: false,
                 fallback: false,
-                final_mapping: None,
-                rx_infinite: None,
-                tcp_acked_dsn: m.local_idsn.wrapping_add(1),
-                local_isn: seg.ack.wrapping_add(u32::MAX),
-                tcp_acked_ssn: None,
             });
+            self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
+            self.sf.local_isn = seg.ack.wrapping_add(u32::MAX);
         }
         if seg.flags.contains(TcpFlags::SYN) {
-            if let Some(d) = &mut self.data {
-                d.recv.right_edge = d.recv.next.wrapping_add(self.recv_cap.min(65535) as u64);
+            if let Some(d) = &mut self.conn.data {
+                d.recv.right_edge = d
+                    .recv
+                    .next
+                    .wrapping_add(self.conn.recv_cap.min(65535) as u64);
             }
         }
         if seg.flags.contains(TcpFlags::SYN) || seg.flags.contains(TcpFlags::RST) {
             return;
         }
-        let Some(d) = &mut self.data else {
+        let Some(d) = &mut self.conn.data else {
             return;
         };
         if d.fallback {
@@ -516,14 +514,15 @@ impl SegmentHooks for ConnectionHooks {
             if let Some(len) = c.data_len {
                 if c.sender_key != m.peer_key
                     || c.receiver_key != Some(m.local_key)
-                    || !d
+                    || !self
+                        .sf
                         .rx
                         .install(1, m.peer_idsn.unwrap().wrapping_add(1), u32::from(len))
                 {
-                    d.reset = true;
+                    self.sf.reset = true;
                     return;
                 }
-                d.unmapped = 0;
+                self.sf.unmapped = 0;
             }
         }
         if let Some(v) = dss {
@@ -540,21 +539,21 @@ impl SegmentHooks for ConnectionHooks {
                     return;
                 }
                 if mapping.data_len == 0 {
-                    d.fall_back(m);
-                    d.rx_infinite = Some((mapping.ssn, dsn));
-                    d.send.ack(d.tcp_acked_dsn);
-                    self.fallback_event = true;
+                    d.fall_back(self.sf, m);
+                    self.sf.rx_infinite = Some((mapping.ssn, dsn));
+                    d.send.ack(self.sf.tcp_acked_dsn);
+                    self.conn.fallback_event = true;
                     return;
                 }
                 let len = u32::from(mapping.data_len).saturating_sub(u32::from(v.data_fin));
-                if len > 0 && !d.rx.install(mapping.ssn, dsn, len) {
-                    d.reset = true;
+                if len > 0 && !self.sf.rx.install(mapping.ssn, dsn, len) {
+                    self.sf.reset = true;
                     return;
                 }
                 if v.data_fin && d.recv.finish(dsn.wrapping_add(u64::from(len))) {
-                    self.ack_now = true;
+                    self.sf.ack_now = true;
                 }
-                d.unmapped = 0;
+                self.sf.unmapped = 0;
             }
             if let Some(ack) = v.data_ack {
                 let ack = match ack {
@@ -571,16 +570,18 @@ impl SegmentHooks for ConnectionHooks {
                         d.close.at = None;
                         d.close.due = false;
                     }
-                    self.valid_data_ack = Some(true);
+                    self.sf.valid_data_ack = Some(true);
                     // A corrected DATA_ACK can arrive after TCP has released the mapping.
                     // Keep its ACK coverage independently of the live TxMaps entries;
                     // stale/SYN-only TCP ACKs cannot confirm the data path.
-                    if d.tcp_acked_ssn
-                        .is_some_and(|ssn| seg.ack.ge(d.local_isn.wrapping_add(ssn)))
+                    if self
+                        .sf
+                        .tcp_acked_ssn
+                        .is_some_and(|ssn| seg.ack.ge(self.sf.local_isn.wrapping_add(ssn)))
                     {
-                        d.dss_confirmed = true;
+                        self.sf.dss_confirmed = true;
                     }
-                    let edge = ack.wrapping_add(u64::from(seg.wnd) << m.peer_scale);
+                    let edge = ack.wrapping_add(u64::from(seg.wnd) << self.sf.peer_scale);
                     if m.send_right_edge
                         .is_none_or(|old| edge.wrapping_sub(old) as i64 > 0)
                     {
@@ -591,14 +592,16 @@ impl SegmentHooks for ConnectionHooks {
         }
         // A current duplicate TCP ACK still covers our data even when an earlier
         // malformed DATA_ACK let TCP release the live mapping without confirmation.
-        if !d.dss_confirmed
-            && self.valid_data_ack == Some(false)
-            && d.tcp_acked_ssn
-                .is_some_and(|ssn| seg.ack.ge(d.local_isn.wrapping_add(ssn)))
+        if !self.sf.dss_confirmed
+            && self.sf.valid_data_ack == Some(false)
+            && self
+                .sf
+                .tcp_acked_ssn
+                .is_some_and(|ssn| seg.ack.ge(self.sf.local_isn.wrapping_add(ssn)))
         {
-            d.fall_back(m);
-            d.send.ack(d.tcp_acked_dsn);
-            self.fallback_event = true;
+            d.fall_back(self.sf, m);
+            d.send.ack(self.sf.tcp_acked_dsn);
+            self.conn.fallback_event = true;
         }
     }
 
@@ -607,18 +610,18 @@ impl SegmentHooks for ConnectionHooks {
             Ok(TcpOpt::Mptcp(raw)) if matches!(mptcp::parse(raw), Ok(MptcpOption::FastClose { .. }))))
     }
     fn delegates_data(&self) -> bool {
-        self.data.is_some()
+        self.conn.data.is_some()
     }
     fn reset_requested(&self) -> bool {
-        self.fast_closed || self.data.as_ref().is_some_and(|d| d.reset)
+        self.conn.fast_closed || (self.conn.data.is_some() && self.sf.reset)
     }
     fn receipt_advanced(&mut self, ssn: u32) {
-        if let Some(d) = &mut self.data {
-            if let Some((base, dsn)) = &mut d.rx_infinite {
+        if self.conn.data.is_some() {
+            if let Some((base, dsn)) = &mut self.sf.rx_infinite {
                 *dsn = dsn.wrapping_add_signed(ssn.wrapping_sub(*base) as i32 as i64);
                 *base = ssn;
             }
-            d.rx.ack(ssn);
+            self.sf.rx.ack(ssn);
         }
     }
     fn receive_data(
@@ -627,20 +630,20 @@ impl SegmentHooks for ConnectionHooks {
         tcp_ack: u32,
         bytes: &[u8],
     ) -> Vec<std::ops::Range<usize>> {
-        let d = self.data.as_mut().unwrap();
+        let d = self.conn.data.as_mut().unwrap();
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
             let pos = ssn.wrapping_add(at as u32);
             let translated = if d.fallback {
-                d.rx_infinite.map(|(ssn, dsn)| {
+                self.sf.rx_infinite.map(|(ssn, dsn)| {
                     (
                         dsn.wrapping_add_signed(pos.wrapping_sub(ssn) as i32 as i64),
                         bytes.len() - at,
                     )
                 })
             } else {
-                d.rx.translate(pos)
+                self.sf.rx.translate(pos)
             };
             if let Some((dsn, len)) = translated {
                 let len = len.min(bytes.len() - at);
@@ -662,10 +665,10 @@ impl SegmentHooks for ConnectionHooks {
                 at += len;
             } else {
                 // Unmapped bytes are never retained, but count against the reset bound.
-                let len = d.rx.unmapped_run(pos, bytes.len() - at);
-                d.unmapped = d.unmapped.saturating_add(len);
-                if d.unmapped > self.recv_cap {
-                    d.reset = true;
+                let len = self.sf.rx.unmapped_run(pos, bytes.len() - at);
+                self.sf.unmapped = self.sf.unmapped.saturating_add(len);
+                if self.sf.unmapped > self.conn.recv_cap {
+                    self.sf.reset = true;
                     return Vec::new();
                 }
                 accepted.push(at..at + len);
@@ -676,24 +679,25 @@ impl SegmentHooks for ConnectionHooks {
     }
 
     fn accept_payload(&mut self, ssn: u32, data: &[u8]) {
-        self.plain.accept_payload(ssn, data);
+        self.conn.plain.accept_payload(ssn, data);
     }
     fn recv_window(&self) -> u32 {
-        self.data
+        self.conn
+            .data
             .as_ref()
-            .map_or_else(|| self.plain.recv_window(), |d| d.recv.free() as u32)
+            .map_or_else(|| self.conn.plain.recv_window(), |d| d.recv.free() as u32)
     }
 }
 
 impl DataState {
-    fn fall_back(&mut self, m: &mut Negotiation) {
+    fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation) {
         self.fallback = true;
         self.close = close::Close::default();
         m.state = State::FellBack;
         self.recovery_at = None;
         self.reinject = false;
-        self.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
-        self.final_mapping = Some(mptcp::Mapping {
+        sf.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
+        sf.final_mapping = Some(mptcp::Mapping {
             dsn: mptcp::Dsn::Dsn64(m.local_idsn.wrapping_add(1)),
             ssn: 1,
             data_len: 0,
@@ -719,7 +723,6 @@ pub(crate) struct Negotiation {
     pub local_idsn: u64,
     pub send_right_edge: Option<u64>,
     syns_sent: u8,
-    peer_scale: u8,
     connected_pending: bool,
 }
 
@@ -735,12 +738,11 @@ impl Negotiation {
             peer_idsn: None,
             peer_key: None,
             syns_sent: 0,
-            peer_scale: 0,
             connected_pending: false,
         }
     }
 
-    fn on_valid_segment(&mut self, seg: &Segment<'_>) {
+    fn on_valid_segment(&mut self, seg: &Segment<'_>, peer_scale: &mut u8) {
         if !self.connected_pending
             && self.state == State::PreConfirmed
             && seg.flags.contains(TcpFlags::ACK)
@@ -794,7 +796,7 @@ impl Negotiation {
                 _ => {}
             }
         }
-        self.peer_scale = walk(seg.options)
+        *peer_scale = walk(seg.options)
             .filter_map(|o| match o {
                 Ok(TcpOpt::WindowScale(s)) => Some(s.min(14)),
                 _ => None,

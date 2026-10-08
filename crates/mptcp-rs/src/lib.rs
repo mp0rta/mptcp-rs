@@ -11,6 +11,7 @@ pub mod wire;
 
 pub use connection::{Connection, ReadError, WriteError};
 pub use endpoint::{ConnectError, ConnectionHandle, Endpoint, Event};
+pub use mptcp::SubflowId;
 pub use seq::SeqNum;
 pub use tcp::{CloseReason, ConnectConfig};
 pub use time::Instant;

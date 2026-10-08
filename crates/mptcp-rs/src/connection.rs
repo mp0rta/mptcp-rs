@@ -1,8 +1,9 @@
-//! One TCP or MPTCP connection as the application sees it: a `Tcb` plus its buffers.
+//! One TCP or MPTCP connection as the application sees it: its subflows plus its buffers.
 
 use std::net::SocketAddr;
 
-use crate::tcp::{Tcb, TcpState};
+use crate::mptcp::Subflow;
+use crate::tcp::TcpState;
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
@@ -21,10 +22,9 @@ pub enum ReadError {
 }
 
 pub struct Connection {
-    pub(crate) tcb: Tcb,
+    /// The initial subflow is `subflows[0]`.
+    pub(crate) subflows: Vec<Subflow>,
     pub(crate) hooks: ConnectionHooks,
-    pub(crate) local: SocketAddr,
-    pub(crate) remote: SocketAddr,
     pub(crate) closed_by_app: bool,
     pub(crate) reset: bool,
     /// Closed and out of the demux table, kept only until the application has read the
@@ -33,9 +33,19 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// The initial subflow's local address.
+    pub fn local(&self) -> SocketAddr {
+        self.subflows[0].local
+    }
+
+    /// The initial subflow's remote address.
+    pub fn remote(&self) -> SocketAddr {
+        self.subflows[0].remote
+    }
+
     /// Queues `data` for sending; may accept less than `data.len()` (send buffer full), even 0.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        let closed = self.tcb.state() == TcpState::Closed && !self.hooks.retained();
+        let closed = self.subflows[0].tcb.state() == TcpState::Closed && !self.hooks.retained();
         if self.closed_by_app || self.reset || closed {
             return Err(WriteError::Closed);
         }
@@ -51,7 +61,7 @@ impl Connection {
         if self.reset {
             return Err(ReadError::Reset);
         }
-        let eof = self.hooks.eof(self.tcb.fin_received());
+        let eof = self.hooks.eof(self.subflows[0].tcb.fin_received());
         match self.hooks.read(buf) {
             0 if eof => Ok(0),
             0 => Err(ReadError::WouldBlock),
@@ -71,10 +81,10 @@ impl Connection {
         if self.hooks.close() {
             return;
         }
-        self.tcb.close();
+        self.subflows[0].tcb.close();
     }
 
     pub fn set_nodelay(&mut self, nodelay: bool) {
-        self.tcb.set_nodelay(nodelay);
+        self.subflows[0].tcb.set_nodelay(nodelay);
     }
 }

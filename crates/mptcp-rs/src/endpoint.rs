@@ -10,6 +10,7 @@ use crate::Instant;
 use crate::SeqNum;
 use crate::connection::{Connection, ConnectionHooks};
 use crate::crypto::IsnGenerator;
+use crate::mptcp::{Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState};
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
 
@@ -53,8 +54,8 @@ pub struct Endpoint<R: CryptoRng> {
     rng: R,
     isn: IsnGenerator,
     conns: BTreeMap<ConnectionHandle, Connection>,
-    /// (local, remote) → handle (a BTreeMap: no OS-seeded hasher in the core). Closed and TIME-WAIT TCBs stay until `handle_timeout`.
-    demux: BTreeMap<(SocketAddr, SocketAddr), ConnectionHandle>,
+    /// (local, remote) → (handle, subflow) (a BTreeMap: no OS-seeded hasher in the core). Closed and TIME-WAIT TCBs stay until `handle_timeout`.
+    demux: BTreeMap<(SocketAddr, SocketAddr), (ConnectionHandle, SubflowId)>,
     next_handle: u64,
     /// Round-robin cursor for `poll_transmit`.
     cursor: u64,
@@ -115,14 +116,19 @@ impl<R: CryptoRng> Endpoint<R> {
         let isn = self.isn.isn(now, local, remote);
         let h = ConnectionHandle(self.next_handle);
         self.next_handle += 1;
-        self.demux.insert((local, remote), h);
+        self.demux.insert((local, remote), (h, SubflowId(0)));
         self.conns.insert(
             h,
             Connection {
-                tcb: Tcb::new_active(&cfg, local, remote, isn, now),
+                subflows: vec![Subflow {
+                    id: SubflowId(0),
+                    tcb: Tcb::new_active(&cfg, local, remote, isn, now),
+                    local,
+                    remote,
+                    state: SubflowState::Active,
+                    mp: SubflowMp::new(),
+                }],
                 hooks: ConnectionHooks::new(&cfg),
-                local,
-                remote,
                 closed_by_app: false,
                 reset: false,
                 detached: false,
@@ -173,19 +179,26 @@ impl<R: CryptoRng> Endpoint<R> {
         let Ok(seg) = packet::parse(ip_packet) else {
             return;
         };
-        let Some(&h) = self.demux.get(&(seg.dst, seg.src)) else {
+        let Some(&(h, id)) = self.demux.get(&(seg.dst, seg.src)) else {
             self.queue_rst(&seg);
             return;
         };
         let Some(c) = self.conns.get_mut(&h) else {
             return;
         };
-        match c.tcb.on_segment(&seg, now, &mut c.hooks) {
+        let Some(sf) = c.subflows.iter_mut().find(|sf| sf.id == id) else {
+            return;
+        };
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
+        match sf.tcb.on_segment(&seg, now, &mut hk) {
             Reaction::None => {}
-            r => Self::push_event(&mut self.events, c, h, r),
+            r => Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r),
         }
-        c.hooks.update_recovery(&c.tcb, now);
-        Self::update_close(&mut self.events, c, h, now);
+        hk.update_recovery(&sf.tcb, now);
+        Self::update_close(&mut self.events, &mut hk, &sf.tcb, &mut c.reset, h, now);
         if std::mem::take(&mut c.hooks.fallback_event) {
             self.events.push_back((h, Event::FellBack));
         }
@@ -193,35 +206,38 @@ impl<R: CryptoRng> Endpoint<R> {
 
     fn update_close(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
-        c: &mut Connection,
+        hk: &mut SubflowHooks<'_>,
+        tcb: &Tcb,
+        reset: &mut bool,
         h: ConnectionHandle,
         now: Instant,
     ) {
-        if let Some(reason) = c.hooks.update_close(&c.tcb, now) {
-            c.reset |= reason != CloseReason::Normal;
+        if let Some(reason) = hk.update_close(tcb, now) {
+            *reset |= reason != CloseReason::Normal;
             events.push_back((h, Event::Closed { reason }));
         }
     }
 
     fn push_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
-        c: &mut Connection,
+        hooks: &ConnectionHooks,
+        reset: &mut bool,
         h: ConnectionHandle,
         r: Reaction,
     ) {
         match r {
             Reaction::None => {}
             Reaction::Established => {
-                if c.hooks.negotiation.is_some() {
+                if hooks.negotiation.is_some() {
                     return;
                 }
                 events.push_back((h, Event::Connected { mptcp: false }));
             }
             Reaction::Closed(reason) => {
-                if c.hooks.active() {
+                if hooks.active() {
                     return;
                 }
-                c.reset |= reason == CloseReason::Reset;
+                *reset |= reason == CloseReason::Reset;
                 events.push_back((h, Event::Closed { reason }));
             }
         }
@@ -279,49 +295,54 @@ impl<R: CryptoRng> Endpoint<R> {
         // Round robin from the cursor, then wrap around; no allocation.
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
             for (h, c) in self.conns.range_mut(bounds) {
-                // An MPTCP third ACK must remain due until it can be emitted.
-                if c.hooks.negotiation.is_some() && buf.len() < c.tcb.mtu() {
-                    continue;
-                }
-                c.hooks.prepare_send(&mut c.tcb, now);
-                if c.closed_by_app && !c.hooks.close() {
-                    c.tcb.close();
-                }
-                let sent = c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch);
-                let sent = sent.or_else(|| {
-                    if c.hooks.assign(&c.tcb, now) {
-                        c.tcb.poll_send(now, &mut c.hooks, &mut self.scratch)
-                    } else {
-                        None
+                for sf in &mut c.subflows {
+                    let mut hk = SubflowHooks {
+                        conn: &mut c.hooks,
+                        sf: &mut sf.mp,
+                    };
+                    // An MPTCP third ACK must remain due until it can be emitted.
+                    if hk.conn.negotiation.is_some() && buf.len() < sf.tcb.mtu() {
+                        continue;
                     }
-                });
-                if sent.is_none() {
-                    continue;
-                }
-                self.cursor = h.0 + 1;
-                let w = &self.scratch;
-                let seg = Segment {
-                    src: c.local,
-                    dst: c.remote,
-                    seq: w.seq,
-                    ack: w.ack,
-                    flags: w.flags,
-                    wnd: w.wnd,
-                    options: w.options(),
-                    payload: &w.payload,
-                };
-                if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                    c.hooks
-                        .on_transmitted(&seg, now, c.tcb.retransmission_timeout());
-                    if let Some(mptcp) = c
-                        .hooks
-                        .negotiation
-                        .as_mut()
-                        .and_then(|m| m.on_transmitted(w.flags))
-                    {
-                        self.events.push_back((*h, Event::Connected { mptcp }));
+                    hk.prepare_send(&mut sf.tcb, now);
+                    if c.closed_by_app && !hk.conn.close() {
+                        sf.tcb.close();
                     }
-                    return Some(n);
+                    let sent = sf.tcb.poll_send(now, &mut hk, &mut self.scratch);
+                    let sent = sent.or_else(|| {
+                        if hk.assign(&sf.tcb, now) {
+                            sf.tcb.poll_send(now, &mut hk, &mut self.scratch)
+                        } else {
+                            None
+                        }
+                    });
+                    if sent.is_none() {
+                        continue;
+                    }
+                    self.cursor = h.0 + 1;
+                    let w = &self.scratch;
+                    let seg = Segment {
+                        src: sf.local,
+                        dst: sf.remote,
+                        seq: w.seq,
+                        ack: w.ack,
+                        flags: w.flags,
+                        wnd: w.wnd,
+                        options: w.options(),
+                        payload: &w.payload,
+                    };
+                    if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
+                        hk.on_transmitted(&seg, now, sf.tcb.retransmission_timeout());
+                        if let Some(mptcp) = hk
+                            .conn
+                            .negotiation
+                            .as_mut()
+                            .and_then(|m| m.on_transmitted(w.flags))
+                        {
+                            self.events.push_back((*h, Event::Connected { mptcp }));
+                        }
+                        return Some(n);
+                    }
                 }
             }
         }
@@ -341,9 +362,13 @@ impl<R: CryptoRng> Endpoint<R> {
             .values()
             .filter(|c| !c.detached)
             .filter_map(|c| {
-                let at = c.tcb.poll_send_at();
-                at.filter(|_| !c.hooks.retained() || c.tcb.state() != TcpState::Closed)
-                    .into_iter()
+                c.subflows
+                    .iter()
+                    .filter_map(|sf| {
+                        sf.tcb
+                            .poll_send_at()
+                            .filter(|_| !c.hooks.retained() || sf.tcb.state() != TcpState::Closed)
+                    })
                     .chain(c.hooks.recovery_deadline())
                     .min()
             })
@@ -354,24 +379,35 @@ impl<R: CryptoRng> Endpoint<R> {
     /// its `Closed(Normal)` there), then frees the TCBs that are `Closed`.
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
-            c.hooks.update_recovery(&c.tcb, now);
-            if c.tcb.poll_send_at().is_some_and(|t| t <= now) {
-                let r = c.tcb.on_timeout(now, &mut c.hooks);
-                Self::push_event(&mut self.events, c, h, r);
+            for sf in &mut c.subflows {
+                let mut hk = SubflowHooks {
+                    conn: &mut c.hooks,
+                    sf: &mut sf.mp,
+                };
+                hk.update_recovery(&sf.tcb, now);
+                if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
+                    let r = sf.tcb.on_timeout(now, &mut hk);
+                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r);
+                }
+                Self::update_close(&mut self.events, &mut hk, &sf.tcb, &mut c.reset, h, now);
             }
-            Self::update_close(&mut self.events, c, h, now);
         }
         let demux = &mut self.demux;
         self.conns.retain(|&h, c| {
-            if c.hooks.retained() || c.tcb.reset_pending() {
+            if c.hooks.retained() || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
                 return true;
             }
-            if c.tcb.state() != TcpState::Closed {
+            if c.subflows
+                .iter()
+                .any(|sf| sf.tcb.state() != TcpState::Closed)
+            {
                 return true;
             }
-            let key = (c.local, c.remote);
-            if demux.get(&key) == Some(&h) {
-                demux.remove(&key);
+            for sf in &c.subflows {
+                let key = (sf.local, sf.remote);
+                if demux.get(&key) == Some(&(h, sf.id)) {
+                    demux.remove(&key);
+                }
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && c.hooks.has_unread();
