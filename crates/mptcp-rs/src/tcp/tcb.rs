@@ -632,13 +632,16 @@ impl Tcb {
     pub(crate) fn retransmission_timeout(&self) -> Duration {
         self.rtt.rto()
     }
+    /// RTO from SRTT and RTTVAR alone (RFC 6298 §2), ignoring any backoff; `None` before the
+    /// first RTT sample.
+    pub(crate) fn base_rto(&self) -> Option<Duration> {
+        self.rtt.base_rto()
+    }
     /// Smoothed RTT; `None` before the first sample.
     pub(crate) fn srtt(&self) -> Option<Duration> {
         self.rtt.srtt()
     }
     /// Consecutive RTO expirations since SND.UNA last advanced (0 after an advance).
-    /// Read by stale detection (M2 stale/reinjection task).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rto_streak(&self) -> u32 {
         self.rto_streak
     }

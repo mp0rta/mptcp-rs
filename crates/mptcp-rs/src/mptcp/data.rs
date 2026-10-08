@@ -261,6 +261,14 @@ impl TxMaps {
             .find(|m| dsn.wrapping_sub(m.dsn) < m.len as u64)
             .map(|m| m.dsn.wrapping_add(m.len as u64))
     }
+    /// `(dsn, len)` of every un-subflow-ACKed mapping, in SSN order.
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.maps.iter().map(|m| (m.dsn, m.len as u64))
+    }
+    /// Drops every mapping (the subflow is torn down); `assigned_end` is kept.
+    pub fn clear(&mut self) {
+        self.maps.clear();
+    }
     /// Every mapping slot is taken: `SendStore::assign` fails until a TCP ACK frees one.
     pub fn is_full(&self) -> bool {
         self.maps.len() >= self.cap

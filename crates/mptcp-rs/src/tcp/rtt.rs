@@ -34,6 +34,12 @@ impl RttEstimator {
         self.srtt
     }
 
+    /// SRTT + max(G, 4·RTTVAR) within the §2.4 / §2.5 bounds, without §5.5 backoff; `None`
+    /// before the first sample.
+    pub(crate) fn base_rto(&self) -> Option<Duration> {
+        (self.srtt).map(|srtt| (srtt + (self.rttvar * 4).max(G)).clamp(MIN_RTO, MAX_RTO))
+    }
+
     /// §2.2 / §2.3 with alpha = 1/8, beta = 1/4, K = 4; then §2.4 / §2.5 bounds.
     pub(crate) fn sample(&mut self, r: Duration) {
         let srtt = match self.srtt {
@@ -47,7 +53,7 @@ impl RttEstimator {
             }
         };
         self.srtt = Some(srtt);
-        self.rto = (srtt + (self.rttvar * 4).max(G)).clamp(MIN_RTO, MAX_RTO);
+        self.rto = self.base_rto().unwrap();
     }
 
     /// §5.5: RTO ← RTO · 2, capped at 60 s.
@@ -97,6 +103,7 @@ mod tests {
             e.backoff();
         }
         assert_eq!(e.rto(), MAX_RTO);
+        assert_eq!(e.base_rto(), Some(MIN_RTO), "backoff leaves the base RTO");
         // A new sample collapses the backed-off value.
         e.sample(ms(10));
         assert_eq!(e.rto(), MIN_RTO);

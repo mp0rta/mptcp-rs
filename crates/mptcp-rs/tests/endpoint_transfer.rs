@@ -47,7 +47,10 @@ fn run(v6: bool, len: usize, seed: u64, loss: u32, reorder: u32) -> Outcome {
                 Event::FellBack => panic!("plain connection fell back"),
                 Event::Connected { .. } => connected = true,
                 Event::Closed { reason } => closed.push(reason),
-                Event::SubflowUp { .. } | Event::SubflowDown { .. } => panic!("no joins"),
+                Event::SubflowUp { .. }
+                | Event::SubflowDown { .. }
+                | Event::SubflowStale { .. }
+                | Event::SubflowRecovered { .. } => panic!("plain TCP has no subflow events"),
             }
         }
         if let Some(c) = ep.connection(h) {

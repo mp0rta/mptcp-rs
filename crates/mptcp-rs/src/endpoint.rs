@@ -39,10 +39,20 @@ pub enum Event {
         subflow: SubflowId,
     },
     /// A joined subflow ended (`Reset`: refused or reset, also a queued join that can no
-    /// longer start; `Timeout`: R2; `Normal`: FIN exchange). The connection carries on.
+    /// longer start; `Timeout`: R2; `Normal`: FIN exchange). The connection carries on; data
+    /// the subflow had in flight is resent on the others.
     SubflowDown {
         subflow: SubflowId,
         reason: CloseReason,
+    },
+    /// A subflow's retransmission timer expired R1 = 3 times in a row: it gets no new data,
+    /// and data it had in flight is resent on the other subflows.
+    SubflowStale {
+        subflow: SubflowId,
+    },
+    /// A Stale subflow's data was acknowledged again: it carries data again.
+    SubflowRecovered {
+        subflow: SubflowId,
     },
 }
 
@@ -377,6 +387,14 @@ impl<R: CryptoRng> Endpoint<R> {
             sf: &mut sf.mp,
         };
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
+        if let Some(e) = c.update_health(i) {
+            self.events.push_back((h, e));
+        }
+        let sf = &mut c.subflows[i];
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
         if hk.sf.join.is_some() {
             let joining = hk.sf.joining();
             let view = (sf.id, &mut sf.state, &sf.tcb);
@@ -646,6 +664,20 @@ impl<R: CryptoRng> Endpoint<R> {
                     if r == Reaction::None && sf.tcb.state() != TcpState::Closed {
                         r = j.on_timeout(&mut sf.tcb, now, c.cfg.r2_data);
                     }
+                    // A joined subflow ended at R2 is reset, so that the peer frees it too.
+                    if r == Reaction::Closed(CloseReason::Timeout) && !sf.tcb.reset_pending() {
+                        sf.tcb.abort(CloseReason::Timeout, now);
+                    }
+                }
+                if let Some(e) = c.update_health(i) {
+                    self.events.push_back((h, e));
+                }
+                let sf = &mut c.subflows[i];
+                let mut hk = SubflowHooks {
+                    conn: &mut c.hooks,
+                    sf: &mut sf.mp,
+                };
+                if let Some(j) = &hk.sf.join {
                     let joining = j.joining();
                     let view = (sf.id, &mut sf.state, &sf.tcb);
                     Self::subflow_event(&mut self.events, h, view, joining, r);

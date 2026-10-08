@@ -7,10 +7,14 @@ mod subflow;
 use crate::crypto::key_token_idsn;
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
 pub(crate) use join::Join;
-use sched::{MinRtt, Payload, Pending, Plan, ReinjectQueue, Scheduler, SubflowSnapshot};
+use sched::{
+    HealthEvent, HealthVerdict, MinRtt, Payload, Pending, Plan, ReinjectQueue, Scheduler,
+    SubflowSnapshot,
+};
 pub use subflow::SubflowId;
 pub(crate) use subflow::{Subflow, SubflowHooks, SubflowMp, SubflowState};
 
+use crate::Event;
 use crate::connection::Connection;
 use crate::tcp::rtt::INITIAL_RTO;
 
@@ -223,19 +227,26 @@ impl Connection {
     /// is DATA_ACKed, and the data-retransmission timer while the head of the send queue is
     /// subflow-ACKed but not DATA_ACKed: no Active subflow holds a live copy covering it. On
     /// expiry the uncovered head run — stopping before a live copy on any Active subflow — is
-    /// queued for reinjection. Timers use the largest RTO among the subflows that may carry
-    /// data; with none (all Joining or closed) nothing is evaluated.
+    /// queued for reinjection. With no subflow that may carry data (all Joining or closed)
+    /// nothing is evaluated. Timers use the largest un-backed-off RTO (RFC 6298 §2) among the
+    /// Active subflows with an RTT sample, `INITIAL_RTO` when none has one: a backed-off RTO
+    /// of a lossy subflow must not stretch recovery of what the healthy one carried.
     pub(crate) fn update_recovery(&mut self, now: Instant) {
         let Some(d) = &mut self.hooks.data else {
             return;
         };
-        let Some(rto) = (self.subflows.iter())
-            .filter(|sf| sf.state != SubflowState::Joining && sf.tcb.state() != TcpState::Closed)
-            .map(|sf| sf.tcb.retransmission_timeout())
-            .max()
-        else {
+        if !(self.subflows.iter())
+            .any(|sf| sf.state != SubflowState::Joining && sf.tcb.state() != TcpState::Closed)
+        {
             return;
-        };
+        }
+        // ponytail: one RTO for the connection, so recovery of data on a fast path still waits
+        // for the slow path's RTO; use the head subflow's RTO if that matters.
+        let rto = (self.subflows.iter())
+            .filter(|sf| sf.is(SubflowState::Active))
+            .filter_map(|sf| sf.tcb.base_rto())
+            .max()
+            .unwrap_or(INITIAL_RTO);
         if !d.fallback
             && d.close.sent
             && !d.close.acked
@@ -264,6 +275,65 @@ impl Connection {
                 d.recovery_at = None;
                 d.recovery_interval = (d.recovery_interval * 2).min(Duration::from_secs(60));
             }
+        }
+    }
+
+    /// Subflow health and teardown (spec §4 rule 3), after every input or timeout on subflow
+    /// `i`. A TCB that ended (R2, RST either way, MP_JOIN give-up) queues the DSN ranges of its
+    /// un-subflow-ACKed mappings for reinjection, minus the parts a copy on an Active subflow
+    /// covers, and drops them. A bare peer FIN makes it Closing. Otherwise a change of its
+    /// `rto_streak` is a `HealthEvent` (`RtoFired` for a new nonzero value, `Progress` for a
+    /// drop to 0) for `Scheduler::on_health`: Stale moves an Active subflow to Stale and
+    /// queues its ranges the same way (its mappings stay: the `Tcb` keeps retransmitting
+    /// them); Keep on `Progress` moves a Stale one back to Active. Nothing after fallback.
+    pub(crate) fn update_health(&mut self, i: usize) -> Option<Event> {
+        let d = self.hooks.data.as_ref().filter(|d| !d.fallback)?;
+        let sf = &mut self.subflows[i];
+        let subflow = sf.id;
+        if sf.tcb.state() == TcpState::Closed {
+            self.reinject_ranges(i);
+            self.subflows[i].mp.tx.clear();
+            return None;
+        }
+        if sf.tcb.fin_received() && !d.recv.has_fin() && sf.state != SubflowState::Joining {
+            sf.state = SubflowState::Closing;
+        }
+        if !matches!(sf.state, SubflowState::Active | SubflowState::Stale) {
+            return None;
+        }
+        let n = sf.tcb.rto_streak();
+        if n == std::mem::replace(&mut sf.mp.rto_seen, n) {
+            return None;
+        }
+        let ev = if n == 0 {
+            HealthEvent::Progress { subflow }
+        } else {
+            HealthEvent::RtoFired { subflow, n }
+        };
+        // The snapshots of the latest scheduling step.
+        let verdict = self.hooks.scheduler.on_health(&ev, &self.hooks.snapshots);
+        let sf = &mut self.subflows[i];
+        match (ev, verdict, sf.state) {
+            (HealthEvent::RtoFired { .. }, HealthVerdict::Stale, SubflowState::Active) => {
+                sf.state = SubflowState::Stale;
+                self.reinject_ranges(i);
+                Some(Event::SubflowStale { subflow })
+            }
+            (HealthEvent::Progress { .. }, HealthVerdict::Keep, SubflowState::Stale) => {
+                sf.state = SubflowState::Active;
+                Some(Event::SubflowRecovered { subflow })
+            }
+            _ => None,
+        }
+    }
+
+    /// Queues subflow `i`'s un-subflow-ACKed DSN ranges for reinjection, except where a live
+    /// copy on an Active subflow covers them (dedup at insertion; `i` itself is not Active).
+    fn reinject_ranges(&mut self, i: usize) {
+        let d = self.hooks.data.as_mut().unwrap();
+        let maps = active_maps(&self.subflows);
+        for (dsn, len) in self.subflows[i].mp.tx.ranges() {
+            d.reinject.insert_uncovered(dsn, len, maps.clone());
         }
     }
 

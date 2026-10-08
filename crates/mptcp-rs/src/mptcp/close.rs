@@ -1,6 +1,6 @@
 //! Connection sequence-space closure, independent of TCP subflow state.
-use super::{ConnectionHooks, SubflowHooks, data::TxMaps};
-use crate::tcp::{SendBuf, Tcb};
+use super::{ConnectionHooks, SubflowHooks};
+use crate::tcp::Tcb;
 use crate::time::Instant;
 use crate::wire::{
     mptcp::{self, MptcpOption},
@@ -81,7 +81,7 @@ impl SubflowHooks<'_> {
         let reason = if self.conn.fast_closed {
             Some(crate::tcp::CloseReason::Reset)
         } else if tcb.state() == crate::tcp::TcpState::Closed {
-            self.sf.tx = TxMaps::new(self.sf.tx.assigned_end(), 1024);
+            // `Connection::update_health` has queued its mappings for reinjection.
             if !last {
                 // Another subflow is open: the connection carries on, no no-subflow wait.
                 d.close.no_subflow_at = None;

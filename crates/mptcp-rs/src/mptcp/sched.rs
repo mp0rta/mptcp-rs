@@ -46,8 +46,7 @@ pub(crate) enum Plan {
     Idle,
 }
 
-/// Read by stale detection (M2 stale/reinjection task).
-#[allow(dead_code)]
+/// A health fact about one subflow (spec §4 rule 3), from its `rto_streak`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HealthEvent {
     RtoFired { subflow: SubflowId, n: u32 },
@@ -67,8 +66,6 @@ pub(crate) trait Scheduler: Send {
     /// Called before any segment is built, when some Active subflow has a nonzero budget.
     fn plan(&mut self, now: Instant, pending: &Pending<'_>, subflows: &[SubflowSnapshot]) -> Plan;
     /// Judges a health fact; the connection applies the verdict.
-    /// Called by stale detection (M2 stale/reinjection task).
-    #[allow(dead_code)]
     fn on_health(&mut self, ev: &HealthEvent, subflows: &[SubflowSnapshot]) -> HealthVerdict;
     /// The connection installed a mapping of `bytes` octets from this scheduler's plan.
     fn on_assigned(&mut self, _subflow: SubflowId, _bytes: u32, _reinject: bool) {}
@@ -168,8 +165,6 @@ impl ReinjectQueue {
     }
     /// Queues the parts of `[dsn, dsn + len)` that no un-subflow-ACKed mapping in `maps` (the
     /// Active subflows') covers: a copy already in flight is not duplicated.
-    /// Used at insertion points beyond rule 5's uncovered head run (M2 stale/teardown task).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert_uncovered<'a>(
         &mut self,
         dsn: u64,

@@ -878,11 +878,15 @@ fn sample_flags(b: bool) -> Vec<bool> {
 /// A peer behind one path per subflow: it takes every data segment at once and answers it
 /// `rtt` later at both levels (the TCP ACK of its subflow, the contiguous DATA_ACK) with
 /// window field 65535. A `strip`ped path's ACKs carry no option and its data is not placed (no
-/// mapping reaches the peer); a path we reset is ignored afterwards.
+/// mapping reaches the peer); a `drop`ped path loses everything both ways (answers due on it
+/// are lost when they fall due); a path we reset is ignored afterwards. A copy of octets it
+/// already holds must match them and counts in `dups`.
 struct Peer {
     syns: Vec<Segment<'static>>,
     rtts: Vec<Duration>,
     strip: Vec<bool>,
+    drop: Vec<bool>,
+    dups: usize,
     reset: Vec<bool>,
     next: Vec<SeqNum>,
     head: u64,
@@ -900,6 +904,8 @@ impl Peer {
             syns: paths.iter().map(|p| p.0.clone()).collect(),
             rtts: paths.iter().map(|p| Duration::from_millis(p.1)).collect(),
             strip: vec![false; paths.len()],
+            drop: vec![false; paths.len()],
+            dups: 0,
             reset: vec![false; paths.len()],
             next: paths.iter().map(|p| p.0.seq.wrapping_add(1)).collect(),
             head,
@@ -920,6 +926,9 @@ impl Peer {
             return;
         };
         self.sent.push((i, seg.clone()));
+        if self.drop[i] {
+            return;
+        }
         self.reset[i] |= seg.flags.contains(TcpFlags::RST);
         if self.reset[i] || seg.payload.is_empty() {
             return;
@@ -931,7 +940,11 @@ impl Peer {
             let (dsn, _) = dsn_of(&seg, self.syns[i].seq).expect("mapped");
             self.log.push((now, i, dsn));
             for (k, &b) in seg.payload.iter().enumerate() {
-                self.got[(dsn - self.head) as usize + k] = Some(b);
+                let slot = &mut self.got[(dsn - self.head) as usize + k];
+                if let Some(old) = slot.replace(b) {
+                    assert_eq!(old, b, "a copy of DSN {} differs", dsn + k as u64);
+                    self.dups += 1;
+                }
             }
         }
         let dack = self.dack();
@@ -960,7 +973,7 @@ impl Peer {
             self.acks.sort_by_key(|a| a.0);
             while self.acks.first().is_some_and(|a| a.0 <= now) {
                 let (_, i, ack, dack) = self.acks.remove(0);
-                if self.reset[i] {
+                if self.reset[i] || self.drop[i] {
                     continue;
                 }
                 if self.strip[i] {
@@ -1317,6 +1330,9 @@ fn joined_subflow_stripping_resets_only_it() {
         !peer.sent.iter().any(|(_, s)| infinite_mapping(s)),
         "no infinite mapping"
     );
+    // Subflow 1's first stripped ACK resets it; what it had in flight goes out on subflow 0
+    // at that moment, not after a rule-5 timeout.
+    assert_eq!(moved_at(&peer, 1, 0), Some(now + Duration::from_millis(10)));
 }
 
 #[test]
@@ -1637,4 +1653,343 @@ fn read_window_update_on_lowest_rtt_subflow_with_largest_mss() {
     let update = leak(out[0].clone());
     assert_eq!(update.src, jsyn.src, "on the lowest-RTT subflow");
     assert!(update.wnd > 0);
+}
+
+// M2 Task 6: health, Stale and reinjection on subflow loss.
+
+/// Two Reno subflows with RTT samples (subflow 0: 30 ms, subflow 1: 10 ms) and subflow 1's
+/// data R2 `r2`; the peer models both paths for `n` octets from the head, written by the
+/// test. Returns the time the samples end, the head and the data.
+fn two_paths_primed(
+    r2: Duration,
+    n: usize,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    Vec<u8>,
+) {
+    let (mut ep, h, syn, _) = confirmed_cc(reno);
+    ep.conns.get_mut(&h).unwrap().cfg.r2_data = r2;
+    ep.cc = Some(reno);
+    let (_, jsyn) = joined(&mut ep, h, ms(10), JOIN_IP, 1500, 7);
+    let (t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    events(&mut ep);
+    let head = una(&ep, h);
+    let data = (0..n).map(|i| (i % 251) as u8).collect();
+    (
+        ep,
+        h,
+        Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]),
+        t,
+        head,
+        data,
+    )
+}
+/// The earliest time the peer placed, from path `to`, an octet first sent on path `from`.
+fn moved_at(peer: &Peer, from: usize, to: usize) -> Option<Instant> {
+    let sent: Vec<(u64, u64)> = (peer.sent.iter())
+        .filter(|(i, s)| *i == from && !s.payload.is_empty())
+        .map(|(_, s)| {
+            let (dsn, _) = dsn_of(s, peer.syns[from].seq).unwrap();
+            (dsn, s.payload.len() as u64)
+        })
+        .collect();
+    (peer.log.iter())
+        .filter(|l| l.1 == to && sent.iter().any(|&(d, n)| l.2.wrapping_sub(d) < n))
+        .map(|l| l.0)
+        .min()
+}
+fn count(ev: &[Event], e: Event) -> usize {
+    ev.iter().filter(|&&x| x == e).count()
+}
+const STALE1: Event = Event::SubflowStale {
+    subflow: SubflowId(1),
+};
+const R100: Duration = Duration::from_secs(100);
+
+#[test]
+fn blackholed_subflow_goes_stale_and_data_reinjected() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(R100, n);
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    // RTOs (1 s minimum) at t + 1, 3 and 7 s; the third makes subflow 1 Stale.
+    let now = peer.run(&mut ep, h, t, t + Duration::from_millis(6999));
+    let mut ev = events(&mut ep);
+    assert_eq!(count(&ev, STALE1), 0, "{ev:?}");
+    assert!(una(&ep, h) < head + n as u64, "subflow 1 holds a hole");
+    assert_eq!(moved_at(&peer, 1, 0), None);
+    let now = peer.run(&mut ep, h, now, t + Duration::from_secs(30));
+    ev.extend(events(&mut ep));
+    assert_eq!(ev, vec![STALE1], "Stale once, nothing else");
+    assert_eq!(ep.conns[&h].subflows[1].state, SubflowState::Stale);
+    assert_eq!(
+        moved_at(&peer, 1, 0),
+        Some(t + Duration::from_secs(7)),
+        "re-sent on subflow 0 at the third RTO"
+    );
+    assert!(now < t + Duration::from_secs(8));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data, "byte-exact");
+    assert_eq!(peer.dups, 0, "no octet reached the peer twice");
+}
+
+#[test]
+fn stale_subflow_recovers_on_progress() {
+    let (n1, n) = (200_000, 400_000);
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(R100, n);
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data[..n1]), Ok(n1));
+    let now = peer.run(&mut ep, h, t, t + Duration::from_millis(7500));
+    assert_eq!(events(&mut ep), vec![STALE1]);
+    assert_eq!(
+        una(&ep, h),
+        head + n1 as u64,
+        "the first part went via subflow 0"
+    );
+    // Traffic restored: subflow 1's own retransmission at t + 15 s (RTO 8 s) gets through.
+    peer.drop[1] = false;
+    let now = peer.run(&mut ep, h, now, t + Duration::from_secs(16));
+    let recovered = Event::SubflowRecovered {
+        subflow: SubflowId(1),
+    };
+    assert_eq!(events(&mut ep), vec![recovered]);
+    assert_eq!(ep.conns[&h].subflows[1].state, SubflowState::Active);
+    assert!(
+        peer.dups > 0,
+        "its copies of re-sent data arrived as duplicates"
+    );
+    // Scheduled again: the lowest-RTT subflow takes the first new mapping.
+    assert_eq!(ep.connection(h).unwrap().write(&data[n1..]), Ok(n - n1));
+    peer.run(&mut ep, h, now, t + Duration::from_secs(60));
+    assert_eq!(peer.received(), data, "byte-exact, no corruption");
+    let first = (peer.log.iter()).find(|l| l.2 >= head + n1 as u64).unwrap();
+    assert_eq!(first.1, 1, "new data on subflow 1 again");
+    assert!(events(&mut ep).is_empty());
+}
+
+#[test]
+fn r2_teardown_reinjects() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(Duration::from_secs(3), n);
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let r2 = t + Duration::from_secs(3);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    let ev = events(&mut ep);
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Timeout,
+    };
+    assert_eq!(ev, vec![down], "R2 before R1: no Stale");
+    let rst = |p: &(usize, Segment)| p.0 == 1 && p.1.flags.contains(TcpFlags::RST);
+    assert!(peer.sent.iter().any(rst), "subflow 1 reset");
+    assert_eq!(
+        moved_at(&peer, 1, 0),
+        Some(r2),
+        "re-sent on subflow 0 at R2, before any rule-5 timer"
+    );
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+}
+
+#[test]
+fn both_subflows_stale_bounded() {
+    // Review Focus 4.
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(R100, n);
+    peer.drop = vec![true, true];
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let bounded = |ep: &Endpoint<ChaCha20Rng>| {
+        let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+        let queued = d.reinject.total_len();
+        assert!(queued <= d.send.next - d.send.una, "{queued} queued");
+    };
+    let mut buf = [0; 1500];
+    let mut now = t;
+    let mut steps = 0;
+    while now < t + Duration::from_secs(30) {
+        // Every pass ends: `poll_transmit` returns `None` within a few calls.
+        let mut calls = 0;
+        while let Some(k) = ep.poll_transmit(now, &mut buf) {
+            peer.take(now, leak(buf[..k].to_vec()));
+            calls += 1;
+            assert!(calls < 64, "poll_transmit spins at {now:?}");
+        }
+        bounded(&ep);
+        let next = ep.poll_timeout().expect("a timer runs");
+        assert!(next > now || steps == 0, "timer stuck at {now:?}");
+        now = next;
+        ep.handle_timeout(now);
+        bounded(&ep);
+        steps += 1;
+        assert!(steps < 200, "too many wake-ups");
+    }
+    let ev = events(&mut ep);
+    let stale0 = Event::SubflowStale {
+        subflow: SubflowId(0),
+    };
+    assert_eq!((count(&ev, stale0), count(&ev, STALE1)), (1, 1), "{ev:?}");
+    // Path 0 returns: the transfer completes.
+    peer.drop[0] = false;
+    peer.run(&mut ep, h, now, t + Duration::from_secs(120));
+    bounded(&ep);
+    let recovered = Event::SubflowRecovered {
+        subflow: SubflowId(0),
+    };
+    assert!(events(&mut ep).contains(&recovered));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+}
+
+#[test]
+fn reinjection_dedup_against_inflight_copy() {
+    let (mut ep, h, peer, t, head, _) = two_paths_primed(R100, 0);
+    let (syn, jsyn) = (&peer.syns[0], &peer.syns[1]);
+    // Two segments on the 10 ms subflow 1, lost; it goes Stale at t + 7 s and both ranges are
+    // re-sent on subflow 0, where the copies are still in flight ...
+    ep.connection(h).unwrap().write(&[1; 2 * 1432]).unwrap();
+    assert_eq!(data_on(&drain(&mut ep, t), jsyn).len(), 2);
+    let stale = t + Duration::from_secs(7);
+    let copies = data_on(
+        &drain_until(&mut ep, t, stale + Duration::from_millis(1)),
+        syn,
+    );
+    assert_eq!(events(&mut ep), vec![STALE1]);
+    let dsns: Vec<_> = (copies.iter())
+        .map(|s| (dsn_of(s, syn.seq).unwrap().0, s.payload.len()))
+        .collect();
+    assert_eq!(dsns, [(head, 1432), (head + 1432, 1432)]);
+    assert_eq!(queue_first(&ep, h), None);
+    // ... when the peer resets subflow 1: its teardown queues nothing.
+    let rst = Segment {
+        flags: TcpFlags::RST | TcpFlags::ACK,
+        ..peer_data(jsyn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &rst, stale + Duration::from_millis(1));
+    assert!(events(&mut ep).contains(&Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Reset
+    }));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_eq!(d.reinject.total_len(), 0, "not queued twice");
+}
+
+#[test]
+fn joined_subflow_stripping_via_dup_ack_resets_only_it() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    let n = 20_000;
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    pin(&mut ep, h, Some(SubflowId(1)));
+    let now = ms(20);
+    let first = drain(&mut ep, now);
+    let segs = data_on(&first, &jsyn);
+    assert!(segs.len() > 1 && data_on(&first, &syn).is_empty());
+    pin(&mut ep, h, None);
+    // The first segment is TCP-ACKed with a DATA_ACK that releases nothing (beyond SND.NXT) ...
+    let t1 = now + Duration::from_millis(10);
+    peer_ack(&mut ep, &jsyn, t1, end(&segs[0]), head + (1 << 40), 65535);
+    // ... then a duplicate ACK without any MPTCP option: the path strips options.
+    let dup = Segment {
+        ack: end(&segs[0]),
+        wnd: 65535,
+        ..peer_data(&jsyn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &dup, t1);
+    let out = drain(&mut ep, t1);
+    let ev = events(&mut ep);
+    assert!(ev.contains(&Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Reset
+    }));
+    assert!(!ev.contains(&Event::FellBack), "{ev:?}");
+    assert_eq!(state(&ep, h), State::Confirmed);
+    let all: Vec<_> = out.iter().map(|p| leak(p.clone())).collect();
+    assert!(
+        all.iter()
+            .any(|s| s.src == jsyn.src && s.flags.contains(TcpFlags::RST))
+    );
+    assert!(!all.iter().any(infinite_mapping), "no infinite mapping");
+    // Subflow 1's in-flight data goes out on subflow 0 at once, without an RTO wait.
+    let (dsn1, _) = dsn_of(&segs[1], jsyn.seq).unwrap();
+    assert!(
+        (data_on(&out, &syn).iter()).any(|s| dsn_of(s, syn.seq).unwrap().0 == dsn1),
+        "reinjected at the reset"
+    );
+    let mut peer = Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]);
+    peer.reset[1] = true;
+    for s in all {
+        peer.take(t1, s);
+    }
+    peer.run(&mut ep, h, t1, t1 + Duration::from_secs(30));
+    assert_eq!(
+        una(&ep, h),
+        head + n as u64,
+        "the transfer continues on subflow 0"
+    );
+    assert_eq!(peer.received(), data);
+    assert!(!events(&mut ep).contains(&Event::FellBack));
+}
+
+#[test]
+fn rule5_uses_unbacked_off_rto_of_healthy_subflow() {
+    // Carried ruling R15.
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    let head = una(&ep, h);
+    // B on subflow 1: the peer gets it and DATA_ACKs it on subflow 0; subflow 1's ACKs are lost.
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().write(&[1; 100]).unwrap();
+    assert_eq!(data_on(&drain(&mut ep, t), &jsyn).len(), 1);
+    peer_ack(
+        &mut ep,
+        &syn,
+        t + Duration::from_millis(10),
+        una0,
+        head + 100,
+        65535,
+    );
+    // Two RTOs on subflow 1 (t + 1 s, t + 3 s): backed off to 4 s, still Active.
+    let t2 = t + Duration::from_millis(3500);
+    drain_until(&mut ep, t, t2);
+    let sf1 = &ep.conns[&h].subflows[1];
+    assert_eq!(sf1.tcb.retransmission_timeout(), Duration::from_secs(4));
+    assert!(sf1.is(SubflowState::Active));
+    // A on subflow 0, subflow-ACKed without DATA_ACK: the rule-5 timer runs on the largest
+    // un-backed-off RTO (1 s on both), not subflow 1's 4 s.
+    pin(&mut ep, h, Some(SubflowId(0)));
+    ep.connection(h).unwrap().write(&[2; 100]).unwrap();
+    let a = data_on(&drain(&mut ep, t2), &syn).pop().unwrap();
+    let t3 = t2 + Duration::from_millis(10);
+    peer_ack(&mut ep, &syn, t3, end(&a), head + 100, 65535);
+    let due = t3 + Duration::from_secs(1);
+    assert_eq!(ep.conns[&h].hooks.recovery_deadline(), Some(due));
+    ep.handle_timeout(due);
+    assert_eq!(queue_first(&ep, h), Some((head + 100, 100)));
+}
+
+#[test]
+fn bare_fin_makes_subflow_closing_without_reinjection() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let fin = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ..peer_data(&jsyn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &fin, ms(20));
+    assert_eq!(ep.conns[&h].subflows[1].state, SubflowState::Closing);
+    ep.connection(h).unwrap().write(&[3; 5000]).unwrap();
+    let out = drain(&mut ep, ms(20));
+    assert!(
+        data_on(&out, &jsyn).is_empty(),
+        "no new data on a Closing subflow"
+    );
+    assert!(!data_on(&out, &syn).is_empty());
+    assert_eq!(queue_first(&ep, h), None);
 }

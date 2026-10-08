@@ -18,11 +18,10 @@ pub(crate) enum SubflowState {
     /// MP_JOIN not complete: no data, not usable by the scheduler.
     Joining,
     Active,
-    /// Used by stale-path detection (M2 stale/reinjection task).
-    #[allow(dead_code)]
+    /// `on_health` judged it Stale: no new data or reinjections, its own TCP retransmissions
+    /// go on; Active again on a `Progress` judged Keep.
     Stale,
-    /// Used by per-subflow close (M2 close/fallback task).
-    #[allow(dead_code)]
+    /// The peer retired it with a bare FIN: no new data or reinjections.
     Closing,
 }
 
@@ -77,6 +76,8 @@ pub(crate) struct SubflowMp {
     pub fin_carrier: bool,
     /// ... and has zero-window probe demand (spec §3).
     pub probe: bool,
+    /// The `Tcb::rto_streak` last turned into a `HealthEvent`.
+    pub rto_seen: u32,
 }
 
 impl SubflowMp {
@@ -101,6 +102,7 @@ impl SubflowMp {
             window_owner: false,
             fin_carrier: false,
             probe: false,
+            rto_seen: 0,
         }
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.

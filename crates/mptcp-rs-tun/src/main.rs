@@ -303,7 +303,10 @@ impl State {
         while let Some((_, ev)) = ep.poll_event() {
             match ev {
                 Event::FellBack => eprintln!("event: FellBack"),
-                Event::SubflowUp { .. } | Event::SubflowDown { .. } => {}
+                Event::SubflowUp { .. }
+                | Event::SubflowDown { .. }
+                | Event::SubflowStale { .. }
+                | Event::SubflowRecovered { .. } => {}
                 Event::Connected { mptcp } => {
                     eprintln!("event: Connected mptcp={mptcp}");
                     self.connected = true;
