@@ -2,64 +2,55 @@
 
 Portable, RFC 8684-compatible, Sans-I/O Multipath TCP implementation in Rust.
 
-This is a userspace implementation of the MPTCP protocol itself, not a helper
-for creating kernel MPTCP sockets. The core library is sans-I/O; a Linux TUN
-adapter provides the first network integration. The initial role is client only,
-with Linux kernel TCP/MPTCP as the interoperability peer.
+It implements the MPTCP protocol itself in userspace; it is not a helper for
+creating kernel MPTCP sockets. The `mptcp-rs` crate (0.0.1) is the core library.
+A Linux TUN adapter (`mptcp-rs-tun`, not published) provides the first network
+integration, with Linux kernel TCP/MPTCP as the interoperability peer.
 
-The `mptcp-rs` crate (0.0.1) is the core library: client role only, at milestone M2
-(two paths). Path management, the server role and several options are still
-missing (see the roadmap), and a blackholed path can stall the connection for
-several seconds (see the known limitation below).
+0.0.1 is client only, at milestone M2 (two paths). Path management, the server
+role and several options are still missing (see the roadmap), and a blackholed
+path can stall the connection for several seconds (see the known limitation).
 
 ## Status
 
-M0 is merged. The plain TCP engine, MPTCP option codec, crypto helpers and TUN
-adapter are implemented. Single-subflow MPTCP v1 is implemented, including DSS,
-DATA_ACK, connection recovery, shared windows, DATA_FIN and TCP fallback. M2 adds
-MP_JOIN, a second subflow, the MinRTT scheduler with reinjection, stale-subflow
-detection and a static per-subflow MTU. The sender now uses pacing, CUBIC with
-HyStart++ and SACK-based loss recovery (RFC 6675); receiver SACK/DSACK is also
-implemented.
+M0–M2 are merged: the plain TCP engine, MPTCP option codec, crypto helpers and
+TUN adapter; single-subflow MPTCP v1 (DSS, DATA_ACK, connection recovery, shared
+windows, DATA_FIN, TCP fallback); and MP_JOIN with a second subflow, the MinRTT
+scheduler with reinjection, stale-subflow detection and a static per-subflow MTU.
+The sender uses CUBIC with HyStart++, pacing and SACK-based loss recovery
+(RFC 6675); the receiver sends SACK/DSACK.
 
-The final M0 code passed 180 tests, both fuzz targets for 10 minutes each, and
-64 MiB transfers in each direction against Linux TCP with byte-exact delivery,
-FIN/FIN close and no RST. Clippy, formatting and the Rust 1.85 build also passed.
-These are local results; GitHub Actions reports CI results separately.
+Local validation (GitHub Actions reports CI separately), each with both fuzz
+targets for 10 minutes:
 
-M1 local validation passed 256 tests and both fuzz targets for 10 minutes each.
-All six Linux scenarios below passed: plain TCP, normal MPTCP, both option
-stripping cases, and both directions of zero-window recovery after losing a
-reopening update. The DATA_FIN checker also rejects a deliberately shifted DSN.
+- M0: 180 tests, clippy, formatting and the Rust 1.85 build; 64 MiB each way
+  against Linux TCP, byte-exact, FIN/FIN close, no RST.
+- M1: 256 tests; the six Linux scenarios below, including both option-stripping
+  cases and zero-window recovery after a lost reopening update. The DATA_FIN
+  checker rejects a deliberately shifted DSN.
+- M2, final build b34d749: 421 tests; the six M1 scenarios and the per-path MTU
+  case (path B at 1280 octets); two-path goodput medians of 354.9 Mbit/s
+  client-to-server (gate 338.5) and 350.4 server-to-client (gate 340.1); all four
+  1 GiB blackhole cases, with the failed subflow reported stale client-to-server.
 
-M2 local validation passed, all on the final build at commit b34d749: 421 tests,
-both fuzz targets for 10 minutes each, the six M1 scenarios, the per-path MTU
-case (path B at 1280 octets), single-path goodput within 5 % of the reference,
-two-path goodput in both directions (client-to-server median 354.9 Mbit/s
-against a gate of 338.5; server-to-client 350.4 over three and over six runs
-against 340.1), and all four 1 GiB blackhole cases, including the stale report
-for the failed subflow in the client-to-server cases.
-
-Known limitation (M2): if one path blackholes while data is outstanding on it,
-the healthy path can stall for up to about R1 = 3 RTOs (about 7 s in the
-interop profile). That lasts until the subflow is declared stale and its data
-reinjected, because the connection is blocked behind that data. Opportunistic
-retransmission on the healthy path is planned.
+Known limitation (M2): if a path blackholes with data outstanding on it, the
+healthy path stalls until that subflow is declared stale (R1 = 3 RTOs, about 7 s
+in the interop profile) and its data is reinjected. Opportunistic retransmission
+on the healthy path is planned.
 
 ## Roadmap
 
 | Milestone | Scope | Acceptance gate |
 |---|---|---|
 | **M0 — plain TCP foundation (merged)** | MPTCP option codec, crypto helpers, plain TCP engine and TUN adapter | Unit tests; each fuzz target runs 10 minutes locally and 60 seconds in CI without a crash or out-of-bounds access; 64 MiB each way against Linux TCP through TUN, byte-exact, followed by FIN/FIN close with no RST in the pcap. |
-| **M1 — single-subflow MPTCP** | MP_CAPABLE, DSS, DATA_ACK, shared windows, DATA_FIN/close, control queue including connection-level data retransmission, handshake and post-handshake fallback using an infinite mapping, and MP_FASTCLOSE receive | 64 MiB each way against Linux MPTCP, byte-exact; both DATA_FINs acknowledged by DATA_ACK, subflow FIN/FIN close, no RST and server EOF; Wireshark decodes MPTCP v1. Stripping SYN options yields plain TCP with no MPTCP options after the SYN. Stripping data options yields `FellBack`, exactly one DSS with DLL=0, intact payload and clean close. |
-| **M2 — two paths (implemented; gates passed locally)** | MP_JOIN, two subflows, MinRTT scheduler and reinjection | On asymmetric paths, test each direction separately for 30 seconds over three runs: median goodput at least 1.2× the better single path. During a 1 GiB transfer in each direction, blackhole either path for 15 seconds: transfer completes byte-exact without an application error. For client-to-server transfers, the client also reports the failed subflow as stale. |
+| **M1 — single-subflow MPTCP (merged)** | MP_CAPABLE, DSS, DATA_ACK, shared windows, DATA_FIN/close, control queue including connection-level data retransmission, handshake and post-handshake fallback using an infinite mapping, and MP_FASTCLOSE receive | 64 MiB each way against Linux MPTCP, byte-exact; both DATA_FINs acknowledged by DATA_ACK, subflow FIN/FIN close, no RST and server EOF; Wireshark decodes MPTCP v1. Stripping SYN options yields plain TCP with no MPTCP options after the SYN. Stripping data options yields `FellBack`, exactly one DSS with DLL=0, intact payload and clean close. |
+| **M2 — two paths (merged)** | MP_JOIN, two subflows, MinRTT scheduler and reinjection | On asymmetric paths, test each direction separately for 30 seconds over three runs: median goodput at least 1.2× the better single path. During a 1 GiB transfer in each direction, blackhole either path for 15 seconds: transfer completes byte-exact without an application error. For client-to-server transfers, the client also reports the failed subflow as stale. |
 | **M3 — path management** | ADD_ADDR/REMOVE_ADDR, MP_PRIO/backup, MP_TCPRST, MP_FASTCLOSE send and MPTCP checksums | Per-feature interoperability tests. |
 | **M4 — remaining protocol features** | MP_FAIL, 32-bit DSN transmission and server role | Library-to-library tests. |
 
-TCP performance work proceeds in parallel after M1: CUBIC, sender SACK recovery,
-RACK-TLP, timestamps, pacing and BBR. Receiver SACK/DSACK was brought forward
-into M0; reordering throughput remains a known issue, and the final version
-still needs WAN retesting. M0 has no throughput threshold.
+TCP performance work continues alongside: RACK-TLP, timestamps and BBR (CUBIC,
+pacing and SACK recovery are done). Reordering throughput and WAN testing remain
+open.
 
 Async runtime integration, `no_std`, mqvpn integration and coupled congestion
 control are deferred.
@@ -96,10 +87,6 @@ pcaps, application logs, rule counters and the checker result. The zero-window
 cases pause application reads for eight seconds with small receive buffers while
 packet processing continues, drop the first reopening update, and require a
 subsequent probe and DATA_ACK/window response before bulk traffic resumes.
-
-The client deadline is 900 seconds (harness: 910). Post-handshake fallback currently
-waits for the 500 ms sender SWS override at short storage-chunk boundaries, making
-that scenario much slower than ordinary MPTCP; M1 has no throughput gate.
 
 To repeat the negative DATA_FIN checker test on a successful normal MPTCP capture:
 `python3 tests/interop/check_fin_mutation.py artifacts/interop/m1/RUN_DIRECTORY`.
