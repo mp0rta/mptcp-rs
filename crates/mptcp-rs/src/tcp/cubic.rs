@@ -43,6 +43,8 @@ pub(crate) struct Cubic {
     /// HyStart++, for the initial slow start only (RFC 9406 §4.3 SHOULD); `None` once it is
     /// over, or to run RFC 5681 slow start throughout.
     hystart: Option<HyStart>,
+    /// An RTO fired and no ACK has advanced SND.UNA since: the next RTO is a repeated one.
+    rto_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +72,7 @@ impl Cubic {
             epoch: None,
             srtt: None,
             hystart: Some(HyStart::new()),
+            rto_pending: false,
         }
     }
 
@@ -161,6 +164,7 @@ impl CongestionControl for Cubic {
             cwnd_limited,
             ..
         } = *ack;
+        self.rto_pending = false;
         let grow = cwnd_limited && !app_limited;
         if let Some(r) = rtt {
             self.srtt = Some(self.srtt.map_or(r, |s| s * 7 / 8 + r / 8));
@@ -212,8 +216,10 @@ impl CongestionControl for Cubic {
         // Fig. 5 note's cwnd variant; §5.8 already keeps cwnd from outgrowing the flight).
         // FlightSize counts SACKed octets: at an RTO that ends a long SACK recovery it can be
         // many times the cwnd that overflowed the path, and ssthresh must not rise above it.
-        // A repeated RTO (cwnd still at the loss window) holds ssthresh (RFC 5681 §3.1).
-        if ev == CongestionEvent::FastRetransmit || self.cwnd > smss {
+        // A repeated RTO (no ACK advanced SND.UNA since the last one) holds ssthresh
+        // (RFC 5681 §3.1); a first RTO at a one-SMSS window (lost SYN, idle restart) does not.
+        let repeated = ev == CongestionEvent::Rto && std::mem::take(&mut self.rto_pending);
+        if !repeated {
             let base = u64::from(in_flight.min(self.cwnd()));
             self.ssthresh = ((base * BETA.0 / BETA.1) as u32).max(2 * self.smss);
         }
@@ -233,9 +239,10 @@ impl CongestionControl for Cubic {
             CongestionEvent::Rto => {
                 // A repeated RTO finds cwnd already at the loss window: no reduction, so
                 // cwnd_prior (the cwnd "just before cwnd was reduced") is kept.
-                if self.cwnd > smss {
+                if !repeated {
                     self.cwnd_prior = self.cwnd;
                 }
+                self.rto_pending = true;
                 self.plan_from_start = true;
                 // RFC 5681 §3.1: LW = 1 SMSS.
                 self.cwnd = smss;
@@ -244,6 +251,8 @@ impl CongestionControl for Cubic {
     }
 
     fn on_recovery_ack(&mut self, ack: RecoveryAck) {
+        // A partial or full ACK advances SND.UNA.
+        self.rto_pending &= ack == RecoveryAck::Duplicate;
         self.cwnd = f64::from(recovery_window(self.cwnd(), self.ssthresh, self.smss, ack));
     }
 
@@ -622,6 +631,32 @@ mod tests {
         // A repeated RTO (cwnd still at the loss window) holds it, not 2·SMSS.
         c.on_congestion(CongestionEvent::Rto, 300_000, T0);
         assert_eq!((c.cwnd(), c.ssthresh), (SMSS, 49_000));
+    }
+
+    #[test]
+    fn cubic_first_rto_at_one_smss_reduces_ssthresh() {
+        // A lost SYN makes IW one SMSS (RFC 5681 §3.1): the first data RTO still sets ssthresh
+        // (RFC 9438 §4.8), it is not a repeated one.
+        let mut c = Cubic::new();
+        c.init(SMSS, true);
+        assert_eq!(c.cwnd(), SMSS);
+        c.on_congestion(CongestionEvent::Rto, SMSS, T0);
+        assert_eq!((c.cwnd(), c.ssthresh), (SMSS, 2 * SMSS));
+        // An idle restart to that IW, then an RTO: reduced too, not held.
+        let mut c = Cubic::new();
+        c.init(SMSS, true);
+        while c.cwnd() < 20_000 {
+            c.on_ack(&ack(SMSS, None, 0, T0));
+        }
+        c.on_congestion(CongestionEvent::Rto, 20_000, T0);
+        assert_eq!(c.ssthresh, 14_000);
+        while c.cwnd() < 10_000 {
+            c.on_ack(&ack(SMSS, None, 0, T0));
+        }
+        c.on_idle_restart();
+        assert_eq!(c.cwnd(), SMSS);
+        c.on_congestion(CongestionEvent::Rto, 10_000, T0);
+        assert_eq!(c.ssthresh, 2 * SMSS);
     }
 
     #[test]
