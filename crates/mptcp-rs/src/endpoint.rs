@@ -32,7 +32,8 @@ pub enum Event {
     },
     /// The connection continues as plain TCP on one subflow; every other one was reset (no
     /// `SubflowDown` for them). It ends the per-subflow events: a Stale survivor becomes
-    /// Active again without `SubflowRecovered`.
+    /// Active again without `SubflowRecovered`, and a survivor whose join completed on the
+    /// same segment without `SubflowUp`.
     FellBack,
     Closed {
         reason: CloseReason,

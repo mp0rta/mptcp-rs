@@ -2288,6 +2288,33 @@ fn infinite_mapping_with_join_keeps_one_subflow() {
     );
 }
 
+/// The infinite mapping arrives on the ACK that completes the join (the fourth ACK, nothing
+/// outstanding on subflow 0): the survivor is promoted to Active before it becomes
+/// `subflows[0]`, with `FellBack` and no `SubflowUp`, and carries later writes.
+#[test]
+fn infinite_mapping_on_join_confirming_ack_survivor_sends() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (_, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    let ack = from(&drain(&mut ep, ms(20)), JOIN_IP)
+        .pop()
+        .expect("third ACK");
+    assert_third_ack(&ep, h, &jsyn, &ack);
+    let head = una(&ep, h);
+    peer_infinite_mapping(&mut ep, &jsyn, ms(30));
+    assert_eq!(events(&mut ep), vec![Event::FellBack]);
+    assert_eq!(ep.conns[&h].subflows[0].state, SubflowState::Active);
+    let out = drain(&mut ep, ms(30));
+    assert!(rst_from(&out, &syn), "the other subflow is reset");
+    let n = 5000;
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let first = out.into_iter().map(leak).collect();
+    let (got, _) = fallen_back_peer(&mut ep, h, &jsyn, ms(30), head, n, first);
+    assert_eq!(got, data, "the survivor carries the writes");
+}
+
 #[test]
 fn infinite_mapping_with_join_after_nonzero_prefix() {
     let (mut ep, h, syn, jsyn) = two_paths(reno, reno);

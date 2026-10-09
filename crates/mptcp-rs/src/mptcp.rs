@@ -374,8 +374,8 @@ impl Connection {
     /// freed, ever carried data whose DSN end is above `send.una` (ruling R17: conservative,
     /// it may have been dropped after a subflow ACK, RFC 8684 L1531–1534; MP_FAIL, M4, is the
     /// precise mechanism): that data may be undeliverable, so `i` is reset too and the caller
-    /// closes with `FallbackDataLoss`. The survivor's own data never counts; a Stale survivor
-    /// becomes Active.
+    /// closes with `FallbackDataLoss`. The survivor's own data never counts; a Stale survivor,
+    /// or one whose join completed in this input, becomes Active (no `SubflowUp`: `FellBack`).
     pub(crate) fn on_fallback(&mut self, i: usize, now: Instant) -> bool {
         let d = self.hooks.data.as_mut().unwrap();
         let others = (self.subflows.iter().enumerate())
@@ -388,8 +388,13 @@ impl Connection {
         d.settling = false;
         d.release(self.subflows[i].mp.tcp_acked_dsn);
         // Health no longer applies after fallback: a Stale survivor carries the data again.
-        if self.subflows[i].state == SubflowState::Stale {
-            self.subflows[i].state = SubflowState::Active;
+        // So does one whose join this input completed: as `subflows[0]` it never reaches
+        // `Endpoint::subflow_event`, which would make it Active.
+        let sf = &mut self.subflows[i];
+        if sf.state == SubflowState::Stale
+            || (sf.state == SubflowState::Joining && !sf.mp.joining())
+        {
+            sf.state = SubflowState::Active;
         }
         self.abort_all(now, (!lost).then_some(i));
         for (_, sf) in (self.subflows.iter_mut().enumerate()).filter(|&(j, _)| j != i) {
