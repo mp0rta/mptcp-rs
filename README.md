@@ -25,14 +25,14 @@ All six Linux scenarios below passed: plain TCP, normal MPTCP, both option
 stripping cases, and both directions of zero-window recovery after losing a
 reopening update. The DATA_FIN checker also rejects a deliberately shifted DSN.
 
-M2 local validation passed: 405 tests, both fuzz targets for 10 minutes each,
-the six M1 scenarios, the per-path MTU case (path B at 1280 octets),
-single-path goodput within 5 % of the reference, two-path goodput in both
-directions (client-to-server median 355.0 Mbit/s against a gate of 338.5;
-server-to-client 350.4 over three and over six runs against 340.2), and all
-four 1 GiB blackhole cases, including the stale report for the failed subflow
-in the client-to-server cases. Details are in the local note
-`docs/superpowers/notes/2026-10-09-m2-verification.md`.
+M2 local validation passed, all on the build at commit 32df3ba: 405 tests,
+both fuzz targets for 10 minutes each, the six M1 scenarios, the per-path MTU
+case (path B at 1280 octets), single-path goodput within 5 % of the reference,
+two-path goodput in both directions (client-to-server median 355.0 Mbit/s
+against a gate of 338.5; server-to-client 350.4 over three and over six runs
+against 340.2), and all four 1 GiB blackhole cases, including the stale report
+for the failed subflow in the client-to-server cases. Details are in the local
+note `docs/superpowers/notes/2026-10-09-m2-verification.md`.
 
 ## Roadmap
 
