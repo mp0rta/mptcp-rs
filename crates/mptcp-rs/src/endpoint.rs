@@ -426,7 +426,7 @@ impl<R: CryptoRng> Endpoint<R> {
         if i != 0 {
             let joining = hk.sf.joining();
             let view = (sf.id, &mut sf.state, &sf.tcb);
-            Self::subflow_event(&mut self.events, h, view, joining, r);
+            Self::subflow_event(&mut self.events, hk.conn, h, view, joining, r);
         } else if r != Reaction::None {
             Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
         }
@@ -488,10 +488,12 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
-    /// The events of a subflow other than `subflows[0]`: `SubflowDown` when its TCB ends, else
-    /// `SubflowUp` once its join completes (`joining` false), which also makes it Active.
+    /// The events of a subflow other than `subflows[0]`: `SubflowDown` when its TCB ends
+    /// (not for an MP_FASTCLOSE reset), else `SubflowUp` once its join completes (`joining`
+    /// false), which also makes it Active.
     fn subflow_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
+        hooks: &ConnectionHooks,
         h: ConnectionHandle,
         (subflow, state, tcb): (SubflowId, &mut SubflowState, &Tcb),
         joining: bool,
@@ -504,7 +506,9 @@ impl<R: CryptoRng> Endpoint<R> {
             _ => None,
         };
         if let Some(reason) = reason {
-            events.push_back((h, Event::SubflowDown { subflow, reason }));
+            if !hooks.fast_closed {
+                events.push_back((h, Event::SubflowDown { subflow, reason }));
+            }
         } else if *state == SubflowState::Joining && !joining {
             *state = SubflowState::Active;
             events.push_back((h, Event::SubflowUp { subflow }));
@@ -754,7 +758,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 if i != 0 {
                     let joining = hk.sf.joining();
                     let view = (sf.id, &mut sf.state, &sf.tcb);
-                    Self::subflow_event(&mut self.events, h, view, joining, r);
+                    Self::subflow_event(&mut self.events, hk.conn, h, view, joining, r);
                 } else {
                     Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
                 }

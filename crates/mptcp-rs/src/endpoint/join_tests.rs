@@ -2210,6 +2210,27 @@ fn fastclose_resets_all_subflows() {
     assert!(ep.demux.is_empty());
 }
 
+/// MP_FASTCLOSE on the joined subflow: the same single `Closed { Reset }` as on subflow 0.
+#[test]
+fn fastclose_on_joined_subflow_resets_all_subflows() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let mut opts = [0; 40];
+    let n = mptcp::encode(
+        &MptcpOption::FastClose {
+            receiver_key: local_key(&ep, h),
+        },
+        &mut opts,
+    )
+    .unwrap();
+    input_at(&mut ep, &peer_data(&jsyn, 5001, &opts[..n], &[]), ms(20));
+    let reset = Event::Closed {
+        reason: CloseReason::Reset,
+    };
+    assert_eq!(events(&mut ep), vec![reset]);
+    let out = drain(&mut ep, ms(20));
+    assert!(rst_from(&out, &syn) && rst_from(&out, &jsyn));
+}
+
 /// The peer resets the initial subflow while subflow 1 lives: `SubflowDown` for it, and the
 /// transfer goes on byte-exact on subflow 1.
 #[test]
