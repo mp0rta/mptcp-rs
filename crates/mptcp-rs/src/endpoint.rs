@@ -393,7 +393,6 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             return;
         }
-        c.mark_passed_over(now);
         let last = !others_open(&c.subflows, i);
         let sf = &mut c.subflows[i];
         let mut hk = SubflowHooks {
@@ -706,7 +705,6 @@ impl<R: CryptoRng> Endpoint<R> {
     /// are `Closed`: ended joined subflows with their ports, and connections.
     pub fn handle_timeout(&mut self, now: Instant) {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
-            c.mark_passed_over(now);
             c.update_recovery(now);
             for i in 0..c.subflows.len() {
                 let last = !others_open(&c.subflows, i);

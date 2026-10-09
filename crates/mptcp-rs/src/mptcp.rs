@@ -506,12 +506,14 @@ impl Connection {
         installed
     }
 
-    /// App-limited evaluation point: at the end of a pass, and before an input reaches the
-    /// connection (for drivers that interleave one `poll_transmit` per input). Every subflow
-    /// passed over since the last evaluation is marked `NotScheduled`, unless data is queued
-    /// but the connection-level window admits none of it: receiver-limited is not app-limited
-    /// (draft-ietf-ccwg-bbr-06 §4.1.1.3.1), and the flags are dropped.
-    pub(crate) fn mark_passed_over(&mut self, now: Instant) {
+    /// App-limited evaluation point, at the end of a pass only. Every subflow passed over
+    /// since the last evaluation is marked `NotScheduled`, unless data is queued but the
+    /// connection-level window admits none of it: receiver-limited is not app-limited
+    /// (draft-ietf-ccwg-bbr-06 §4.1.1.3.1), and the flags are dropped. A pass interrupted by
+    /// an input (a driver that polls once per input) is not evaluated: MinRTT fills a
+    /// passed-over subflow in a later step, and marking it mid-pass froze its CUBIC cwnd
+    /// (RFC 9438 §5.8 gate) for as long as a faster subflow kept getting budget.
+    fn mark_passed_over(&mut self, now: Instant) {
         if !self.subflows.iter().any(|sf| sf.mp.offered_unused) {
             return;
         }

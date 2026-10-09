@@ -1501,10 +1501,14 @@ fn unchosen_subflow_marked_while_other_sends() {
     assert!(b.contains(&true), "{b:?}");
 }
 
+/// A pass interrupted by an input is not over: a subflow passed over in its last step may be
+/// filled in the next one (MinRTT moves on once A's budget is spent), so nothing is marked
+/// mid-pass. Marking there froze path B's CUBIC cwnd under the TUN client (Task 9c).
 #[test]
-fn interrupted_pass_marks_only_passed_over_subflow() {
+fn interrupted_pass_marks_no_subflow() {
     for pinned in [true, false] {
-        let (mut ep, h, syn, _, _, _) = two_paths_queued(recording, recording_b, 1 << 20);
+        clear_samples();
+        let (mut ep, h, syn, jsyn, _, _) = two_paths_queued(recording, recording_b, 1 << 20);
         let (_, rogue) = install_probe(&mut ep, h);
         *rogue.lock().unwrap() = pinned.then_some(Rogue::Pin(SubflowId(0)));
         let mut now = ms(20);
@@ -1526,10 +1530,20 @@ fn interrupted_pass_marks_only_passed_over_subflow() {
             );
             let c = &ep.conns[&h];
             assert_eq!(c.subflows[0].tcb.app_limited(), None, "A, step {i}");
-            if pinned {
-                let b = c.subflows[1].tcb.app_limited();
-                assert_eq!(b, Some(AppLimited::NotScheduled), "B, step {i}");
-            }
+            assert_eq!(c.subflows[1].tcb.app_limited(), None, "B, step {i}");
+            assert!(c.subflows[1].mp.offered_unused, "B passed over, step {i}");
+        }
+        // The pass runs to its end: MinRTT fills B once A's cwnd is full, so B's sends and
+        // their ACK samples are not app-limited; pinned to A, B is passed over at the end.
+        let out = drain(&mut ep, now);
+        let b = ep.conns[&h].subflows[1].tcb.app_limited();
+        if pinned {
+            assert_eq!(b, Some(AppLimited::NotScheduled));
+        } else {
+            assert_eq!(b, None);
+            ack_all(&mut ep, &jsyn, &out, now + Duration::from_millis(30));
+            let b = sample_flags(true);
+            assert!(!b.is_empty() && b.iter().all(|&f| !f), "{b:?}");
         }
     }
 }
