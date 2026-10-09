@@ -277,7 +277,8 @@ pub struct Tcb {
     /// Cumulative octets acknowledged (draft-ietf-ccwg-bbr-06 §4.1.2.1.1 C.delivered).
     delivered: u64,
     /// The app-limited interval (C.app_limited): data sent while it is set is marked, and the
-    /// ACK that makes `delivered` pass it clears it (§4.1.2.3 GenerateRateSample).
+    /// ACK that makes `delivered` pass it clears it (§4.1.2.3 GenerateRateSample), and so does
+    /// an RTO (`on_timeout_data`).
     app_limited_until: Option<u64>,
     /// Why the interval was last (re)started; cleared with it, or once new data goes out.
     app_limited: Option<AppLimited>,
@@ -1515,6 +1516,19 @@ impl Tcb {
             self.cc
                 .on_congestion(CongestionEvent::Rto, self.in_flight(), now);
             self.recovery.on_rto(self.snd_max);
+            // The RTO ends the app-limited interval. Its end, `delivered` + in-flight when it was
+            // marked, assumed that flight would be delivered at the rate it was sent at. Now all of
+            // it is presumed lost and resent from cwnd = 1 SMSS (CheckIfApplicationLimited,
+            // draft-ietf-ccwg-bbr-06 §4.1.2.4, would not mark: lost_out > retrans_out). Kept, it
+            // marks every go-back resend, and RFC 9438 §5.8 then holds cwnd at 1 SMSS until the
+            // whole pre-RTO flight is ACKed, one segment per RTT. The draft clears C.app_limited
+            // only by delivery; that freeze only happens with a CC that gates growth on the flag.
+            // SACK and fast recovery keep the mark: there cwnd stays at ssthresh, so the interval
+            // drains at the recovery's rate. Records sent before the RTO keep their flag. A resend
+            // replaces its record (on_data_sent), and an ACK samples the newest record it covers,
+            // so only an ACK that delivers no post-RTO resend is still marked.
+            self.app_limited_until = None;
+            self.app_limited = None;
             if self.sack_permitted {
                 self.sack.rto(self.abs(self.snd_max));
                 for r in &mut self.sent {

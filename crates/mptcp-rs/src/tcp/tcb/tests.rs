@@ -3304,16 +3304,61 @@ fn app_limited_resume_from_zero_in_flight() {
     assert_eq!(flags_of(&samples), [true, false]);
 }
 
+/// TestCc with SACK, MSS 1000: a retransmission inside an app-limited interval that is not
+/// an RTO's. Segment 0 of 0–9 is lost: fast retransmit (RecoveryPoint 10000). 10–19 go out
+/// in recovery, then the sender is marked app-limited;
+/// the SACK of 11 has NextSeg resend 10 (rule 3) inside the interval, while 12–19 keep
+/// their original, unmarked records. The cumulative ACK of RecoveryPoint ends recovery
+/// without a sample, so the next ACK is the first to reach `on_ack`.
+fn sack_resend_after_mark() -> (Fixture, Samples) {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.write(&pattern(10_000));
+    assert_eq!(f.drain(t(0)).len(), 10);
+    // The peer holds `got` above a cumulative ACK stuck at 0 (`peer_gets` needs cum > 0).
+    let mut got = RangeSet::new();
+    let mut gets = |f: &mut Fixture, now, k: u32| {
+        got.insert(k * 1000..(k + 1) * 1000);
+        f.sack_ack(now, data(0), &blocks_after(&got, k * 1000));
+        f.drain(now)
+    };
+    for k in 1..=2 {
+        assert!(gets(&mut f, tm(10), k).is_empty(), "{k}");
+    }
+    let segs = gets(&mut f, tm(10), 3);
+    assert_eq!(seq_lens(&segs), [(data(0), 1000)], "fast retransmit");
+    for k in 4..=9 {
+        assert!(gets(&mut f, tm(10), k).is_empty(), "{k}");
+    }
+    f.write(&pattern(10_000));
+    assert_eq!(f.drain(tm(10)).len(), 10, "new data in recovery");
+    let s10 = |f: &Fixture| *f.tcb.sent.iter().find(|r| r.end == data(11_000)).unwrap();
+    assert!(!s10(&f).app_limited);
+    f.mark(tm(10), AppLimited::NoData);
+    assert!(f.tcb.app_limited_until.is_some());
+    let segs = gets(&mut f, tm(20), 11);
+    assert_eq!(seq_lens(&segs), [(data(10_000), 1000)], "NextSeg");
+    assert!(s10(&f).resent);
+    // 0's retransmission arrives: SND.UNA reaches RecoveryPoint and recovery ends.
+    f.sack_ack(tm(30), data(10_000), &[(data(11_000), data(12_000))]);
+    assert!(!f.tcb.sack.in_recovery());
+    assert!(samples.lock().unwrap().is_empty());
+    (f, samples)
+}
+
 #[test]
 fn retransmission_rerecords_app_limited() {
-    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
-    f.write(&pattern(SEG as usize));
-    assert_eq!(f.drain(t(0)).len(), 1);
-    assert!(!f.tcb.sent[0].app_limited);
-    f.mark(t(0), AppLimited::NoData);
-    assert_eq!(f.timeout(t(1)), Reaction::None);
-    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), SEG)]);
-    f.ack(tm(1010), data(SEG), BIG);
+    let (mut f, samples) = sack_resend_after_mark();
+    f.ack(tm(40), data(12_000), BIG);
     let s = samples.lock().unwrap()[0];
     assert!(s.app_limited, "the retransmission was sent marked");
     assert_eq!(s.rtt, None, "Karn");
@@ -3321,24 +3366,52 @@ fn retransmission_rerecords_app_limited() {
 
 #[test]
 fn sample_uses_newest_transmission_not_highest_seq() {
-    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
-    f.write(&pattern(2 * SEG as usize));
-    assert_eq!(f.drain(t(0)).len(), 2);
-    f.mark(t(0), AppLimited::NoData);
-    assert_eq!(f.timeout(t(1)), Reaction::None);
-    // Only S1 is resent (marked, newest) before the ACK covering S1 and S2 arrives.
-    assert_eq!(f.send(t(1)).map(|m| (m.seq, m.len)), Some((data(0), SEG)));
-    f.ack(tm(1010), data(2 * SEG), BIG);
+    let (mut f, samples) = sack_resend_after_mark();
+    // The ACK covers 10's retransmission (marked, newest) and 12–19's original transmissions.
+    f.ack(tm(40), data(20_000), BIG);
     let s = samples.lock().unwrap()[0];
     assert!(
         s.app_limited,
-        "S1's retransmission, not S2's original transmission"
+        "10's retransmission, not 19's original transmission"
     );
     assert_eq!(
         s.rtt, None,
         "the newest transmission is a retransmission (Karn)"
     );
     assert!(f.tcb.sent.is_empty());
+}
+
+/// An RTO ends the app-limited interval: the go-back resends are cwnd-limited at 1 SMSS,
+/// so their samples are not app-limited and CUBIC's slow start grows (m2-goodput c2s
+/// bimodal: a mark from before the RTO froze cwnd at 1 SMSS for 6 s).
+#[test]
+fn rto_clears_app_limited_marker() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), SEG)]);
+    assert!(!f.tcb.sent[0].app_limited);
+    f.ack(tm(1010), data(SEG), BIG);
+    assert_eq!(flags_of(&samples), [false]);
+
+    // CUBIC, IW 4000: three segments leave room for a fourth, so the sender is marked.
+    let mut f = cubic_fixture(BIG);
+    f.write(&pattern(3000));
+    assert_eq!(f.drain(t(0)).len(), 3);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(3000));
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), 1000)]);
+    f.ack(tm(1010), data(1000), BIG);
+    assert_eq!(f.tcb.cc.cwnd(), 2000, "slow start after the RTO");
+    assert_eq!(
+        seq_lens(&f.drain(tm(1010))),
+        [(data(1000), 1000), (data(2000), 1000)]
+    );
 }
 
 #[test]
