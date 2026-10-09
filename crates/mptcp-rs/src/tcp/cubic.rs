@@ -208,8 +208,15 @@ impl CongestionControl for Cubic {
         let smss = f64::from(self.smss);
         self.hystart = None;
         self.epoch = None;
-        // Fig. 5: ssthresh = max(flight_size·β_cubic, 2·SMSS).
-        self.ssthresh = ((u64::from(in_flight) * BETA.0 / BETA.1) as u32).max(2 * self.smss);
+        // Fig. 5: ssthresh = max(flight_size·β_cubic, 2·SMSS), flight_size capped at cwnd (the
+        // Fig. 5 note's cwnd variant; §5.8 already keeps cwnd from outgrowing the flight).
+        // FlightSize counts SACKed octets: at an RTO that ends a long SACK recovery it can be
+        // many times the cwnd that overflowed the path, and ssthresh must not rise above it.
+        // A repeated RTO (cwnd still at the loss window) holds ssthresh (RFC 5681 §3.1).
+        if ev == CongestionEvent::FastRetransmit || self.cwnd > smss {
+            let base = u64::from(in_flight.min(self.cwnd()));
+            self.ssthresh = ((base * BETA.0 / BETA.1) as u32).max(2 * self.smss);
+        }
         match ev {
             CongestionEvent::FastRetransmit => {
                 // §4.7: W_max = cwnd·(1 + β_cubic)/2 when below the last W_max.
@@ -596,6 +603,25 @@ mod tests {
         let ep = c.epoch.unwrap();
         assert_eq!((ep.k, c.w_max, ep.start), (0.0, 70_000.0, at(ms(5))));
         assert_eq!(c.cwnd(), 70_007, "W_est = 70 000 + α·1000·1000/70 000");
+    }
+
+    #[test]
+    fn cubic_ssthresh_capped_at_cwnd() {
+        // A loss right after a SACK recovery at cwnd = 70 000: its FlightSize still counts the
+        // octets SACKed in it and sent past them, here 100 000.
+        let mut c = after_loss();
+        c.on_congestion(CongestionEvent::FastRetransmit, 100_000, T0);
+        assert_eq!((c.cwnd(), c.ssthresh), (52_000, 49_000));
+        // An RTO ending a SACK recovery that ran at cwnd = 70 000 while its retransmission was
+        // lost: FlightSize (SND.MAX − SND.UNA) also counts the octets SACKed meanwhile, here
+        // 300 000. ssthresh comes from cwnd: 0.7 · 300 000 would put the slow start after the
+        // go-back three times past the window that just overflowed the path.
+        let mut c = after_loss();
+        c.on_congestion(CongestionEvent::Rto, 300_000, T0);
+        assert_eq!((c.cwnd(), c.ssthresh), (SMSS, 49_000));
+        // A repeated RTO (cwnd still at the loss window) holds it, not 2·SMSS.
+        c.on_congestion(CongestionEvent::Rto, 300_000, T0);
+        assert_eq!((c.cwnd(), c.ssthresh), (SMSS, 49_000));
     }
 
     #[test]
