@@ -34,6 +34,12 @@ against 340.2), and all four 1 GiB blackhole cases, including the stale report
 for the failed subflow in the client-to-server cases. Details are in the local
 note `docs/superpowers/notes/2026-10-09-m2-verification.md`.
 
+Known limitation (M2): if one path blackholes while data is outstanding on it,
+the healthy path can stall for up to about R1 = 3 RTOs (about 7 s in the
+interop profile). That lasts until the subflow is declared stale and its data
+reinjected, because the connection is blocked behind that data. Opportunistic
+retransmission on the healthy path is planned.
+
 ## Roadmap
 
 | Milestone | Scope | Acceptance gate |
