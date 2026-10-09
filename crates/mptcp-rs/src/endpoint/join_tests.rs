@@ -2787,6 +2787,50 @@ fn window_update_on_stale_only_subflow() {
     assert!(out[0].payload.is_empty() && out[0].wnd > 0);
 }
 
+/// Slots: the initial subflow Closed, B still Joining (third ACK unacknowledged), C Active.
+/// C fills the 32 KiB receive buffer (zero window); a read just after B's third-ACK retry
+/// fell due reopens it. B's MP_JOIN ACK, sent first, carries no DATA_ACK, so it must not
+/// count as the connection-level window update: C still sends one (spec §5.4).
+#[test]
+fn join_ack_does_not_consume_window_update() {
+    let (mut ep, h, syn, dsn) = connected_scaled_cc(32768, Some(reno));
+    open_window(&mut ep, &syn, h);
+    let (_, bsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &bsyn, 7, None);
+    synack(&mut ep, &bsyn, &opts, ms(20));
+    from(&drain(&mut ep, ms(20)), JOIN_IP)
+        .pop()
+        .expect("third ACK");
+    let (_, csyn) = joined(&mut ep, h, ms(20), "10.0.2.1", 1500, 7);
+    input_at(&mut ep, &rst_on(&syn), ms(30));
+    for k in 0..32u32 {
+        let opts = mapping(1 + k * 1024, dsn + u64::from(k) * 1024, 1024);
+        let payload = [k as u8; 1024];
+        let seg = peer_data(&csyn, 5001 + k * 1024, &opts, &payload);
+        input_at(&mut ep, &seg, ms(40));
+    }
+    let acks = on(&drain(&mut ep, ms(40)), &csyn);
+    assert_eq!(
+        acks.last().map(|s| (dack(s), s.wnd)),
+        Some((dsn + 32768, 0))
+    );
+    let t = ms(20) + Duration::from_secs(1);
+    ep.handle_timeout(t);
+    let mut buf = vec![0; 32768];
+    assert_eq!(ep.connection(h).unwrap().read(&mut buf), Ok(32768));
+    let out = drain(&mut ep, t);
+    let b = on(&out, &bsyn);
+    assert!(
+        matches!(mp_join(&b[0]).0, MpJoin::Ack { .. }),
+        "B's retry first"
+    );
+    let update = on(&out, &csyn);
+    assert!(
+        update.iter().any(|s| s.wnd > 0 && dack(s) == dsn + 32768),
+        "C's window update: {update:?}"
+    );
+}
+
 #[test]
 fn read_window_update_after_subflow_fin_goes_on_other_subflow() {
     let (mut ep, h, syn, dsn) = connected_scaled_cc(8192, Some(reno));

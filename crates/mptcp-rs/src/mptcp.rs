@@ -829,8 +829,10 @@ impl SegmentHooks for SubflowHooks<'_> {
             .as_ref()
             .map(|d| d.recv.window_offer(scale, mss))
     }
+    /// A joining subflow's ACK carries no DATA_ACK, so the peer cannot take its window at
+    /// connection level (RFC 8684 §3.3.2): it is not the connection's advertisement.
     fn window_sent(&mut self, field: u16, scale: u8) {
-        if let Some(d) = &mut self.conn.data {
+        if let Some(d) = self.conn.data.as_mut().filter(|_| !self.sf.joining()) {
             d.recv.window_sent(field, scale);
         }
     }
