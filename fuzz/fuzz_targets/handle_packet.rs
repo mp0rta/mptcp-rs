@@ -53,10 +53,12 @@ fuzz_target!(|data: &[u8]| {
     ep.handle_packet(now, &buf[..n]);
     let third = drain(&mut ep, now);
     assert_eq!(ep.poll_event(), Some((h, Event::Connected { mptcp })));
+    // The joined subflow's (ISS, local, remote) when mode bit 2 asks for a join (MPTCP only).
+    let mut join = None;
     if mptcp {
         use mptcp_rs::wire::{
-            mptcp::{self, DataAck, Dss, MptcpOption},
-            tcp_options::{TcpOpt, walk},
+            mptcp::{self, DataAck, Dss, MpJoin, MptcpOption},
+            tcp_options::{self, TcpOpt, walk},
         };
         let ack = parse(&third[0]).unwrap();
         let key = walk(ack.options)
@@ -88,6 +90,64 @@ fuzz_target!(|data: &[u8]| {
         let n = build(&confirmed, 0, &mut buf).unwrap();
         ep.handle_packet(now, &buf[..n]);
         drain(&mut ep, now);
+        if data.first().is_some_and(|b| b & 4 != 0) {
+            // Join prefix: MP_JOIN SYN from 10.0.8.2, the peer's SYN/ACK (HMAC-B, MSS 1200,
+            // WS 7), our third ACK (HMAC-A) and the peer's fourth ACK -> SubflowUp.
+            const PEER_NONCE: u32 = 0xb1b2_b3b4;
+            let peer_key = 0x0102_0304_0506_0708;
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 8, 2));
+            let id = ep.add_subflow(now, h, ip, 1500).unwrap();
+            let pkts = drain(&mut ep, now);
+            let mut segs = pkts.iter().map(|p| parse(p).unwrap());
+            let jsyn = segs.find(|s| s.src.ip() == ip).expect("join SYN");
+            let nonce = walk(jsyn.options)
+                .find_map(|o| match o {
+                    Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw).ok()? {
+                        MptcpOption::Join(MpJoin::Syn { nonce, .. }) => Some(nonce),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap();
+            let mac = mptcp_rs::crypto::join_hmac(peer_key, key, PEER_NONCE, nonce);
+            let mut o = [0; 40];
+            let mut n = mptcp::encode(
+                &MptcpOption::Join(MpJoin::SynAck {
+                    backup: false,
+                    addr_id: 5,
+                    hmac64: u64::from_be_bytes(mac[..8].try_into().unwrap()),
+                    nonce: PEER_NONCE,
+                }),
+                &mut o,
+            )
+            .unwrap();
+            n += tcp_options::write_mss(&mut o[n..], 1200);
+            n += tcp_options::write_ws(&mut o[n..], 7);
+            let jsynack = Segment {
+                src: jsyn.dst,
+                dst: jsyn.src,
+                seq: mptcp_rs::SeqNum(5000),
+                ack: jsyn.seq.wrapping_add(1),
+                flags: TcpFlags::SYN | TcpFlags::ACK,
+                wnd: 65535,
+                options: &o[..n],
+                payload: &[],
+            };
+            let n = build(&jsynack, 0, &mut buf).unwrap();
+            ep.handle_packet(now, &buf[..n]);
+            drain(&mut ep, now);
+            let fourth = Segment {
+                seq: mptcp_rs::SeqNum(5001),
+                flags: TcpFlags::ACK,
+                options: &options[..len],
+                ..jsynack
+            };
+            let n = build(&fourth, 0, &mut buf).unwrap();
+            ep.handle_packet(now, &buf[..n]);
+            drain(&mut ep, now);
+            assert_eq!(ep.poll_event(), Some((h, Event::SubflowUp { subflow: id })));
+            join = Some((jsyn.seq, jsyn.src, jsyn.dst));
+        }
     }
 
     let Some((&mode, rest)) = data.split_first() else {
@@ -102,8 +162,8 @@ fuzz_target!(|data: &[u8]| {
         // Structured mode: the input is a list of segments for the established
         // 4-tuple, built with valid checksums and sequence numbers near the
         // connection's, with data in flight.
-        let (rcv0, snd0) = (5000u32.wrapping_add(1), syn.seq.0.wrapping_add(1));
-        let (src, dst) = (syn.dst, syn.src);
+        // Bit 7 of the flags byte picks the joined subflow's 4-tuple when there is one.
+        let initial = (syn.seq, syn.src, syn.dst);
         ep.connection(h).unwrap().write(&[0xab; 4000]).unwrap();
         drain(&mut ep, t);
         let mut rest = rest;
@@ -118,6 +178,9 @@ fuzz_target!(|data: &[u8]| {
             let (opts, r) = r.split_at(olen);
             let (payload, r) = r.split_at(plen);
             rest = r;
+            let on_join = d[4] & 0x80 != 0;
+            let (iss, dst, src) = join.filter(|_| on_join).unwrap_or(initial);
+            let (rcv0, snd0) = (5001u32, iss.0.wrapping_add(1));
             let seg = Segment {
                 src,
                 dst,

@@ -67,12 +67,17 @@ impl Tun {
             events: libc::POLLIN,
             revents: 0,
         };
-        // Round up so a sub-millisecond timeout does not spin.
-        let ms = timeout.map_or(-1, |d| {
-            d.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+        // Nanosecond timeout: a pacing release is often well under a millisecond away, and
+        // poll(2)'s whole milliseconds would hold every paced segment for at least 1 ms.
+        let ts = timeout.map(|d| libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as libc::c_long,
         });
-        // SAFETY: one valid pollfd.
-        let r = unsafe { libc::poll(&mut p, 1, ms) };
+        let tp = ts
+            .as_ref()
+            .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        // SAFETY: one valid pollfd; `tp` is null or points at `ts`, alive for the call.
+        let r = unsafe { libc::ppoll(&mut p, 1, tp, std::ptr::null()) };
         if r < 0 {
             let e = io::Error::last_os_error();
             return if e.kind() == io::ErrorKind::Interrupted {

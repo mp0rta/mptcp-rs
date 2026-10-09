@@ -15,7 +15,7 @@ def mutate(cmd, **kwargs):
 
 subprocess.check_output = mutate
 directory = sys.argv[1]
-sys.argv = ["tests/interop/check.py", "m1", directory, "67108864"]
+sys.argv = ["tests/interop/check.py", "m1", directory, "67108864", "67108864"]
 try:
     runpy.run_path(sys.argv[0], run_name="__main__")
 except AssertionError as error:

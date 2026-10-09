@@ -1,6 +1,7 @@
-//! NewReno loss recovery on cumulative ACKs (RFC 6582, on RFC 5681 §3.2). An internal module
-//! with no trait: SACK / RACK-TLP replace it behind one when SACK arrives (spec §3). The window
-//! arithmetic is the congestion controller's (`CongestionControl::on_recovery_ack`).
+//! NewReno loss recovery on cumulative ACKs (RFC 6582, on RFC 5681 §3.2), for a connection
+//! without SACK; `super::sack` (RFC 6675) is used when both SYNs carried SACK-Permitted. Both
+//! are internal modules without a trait. The window arithmetic is the congestion controller's
+//! (`CongestionControl::on_recovery_ack`).
 
 use crate::seq::SeqNum;
 

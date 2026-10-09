@@ -6,13 +6,20 @@ a Linux TUN adapter provides the first network integration.
 Theinitial role is client only, with Linux kernel TCP/MPTCP as the interoperability
 peer.
 
+The `mptcp-rs` crate (0.0.1) is that library: client role only, at milestone M2
+(two paths). Path management, the server role and several options are still
+missing (see the roadmap), and a blackholed path can stall the connection for
+several seconds (see the known limitation below).
+
 ## Status
 
 M0 is merged. The plain TCP engine, MPTCP option codec, crypto helpers and TUN
 adapter are implemented. Single-subflow MPTCP v1 is implemented, including DSS,
-DATA_ACK, connection recovery, shared windows, DATA_FIN and TCP fallback. Receiver
-SACK/DSACK is also implemented; the sender still uses Reno/NewReno. Multiple
-subflows remain planned.
+DATA_ACK, connection recovery, shared windows, DATA_FIN and TCP fallback. M2 adds
+MP_JOIN, a second subflow, the MinRTT scheduler with reinjection, stale-subflow
+detection and a static per-subflow MTU. The sender now uses pacing, CUBIC with
+HyStart++ and SACK-based loss recovery (RFC 6675); receiver SACK/DSACK is also
+implemented.
 
 The final M0 code passed 180 tests, both fuzz targets for 10 minutes each, and
 64 MiB transfers in each direction against Linux TCP with byte-exact delivery,
@@ -24,13 +31,27 @@ All six Linux scenarios below passed: plain TCP, normal MPTCP, both option
 stripping cases, and both directions of zero-window recovery after losing a
 reopening update. The DATA_FIN checker also rejects a deliberately shifted DSN.
 
+M2 local validation passed, all on the final build at commit b34d749: 421 tests,
+both fuzz targets for 10 minutes each, the six M1 scenarios, the per-path MTU
+case (path B at 1280 octets), single-path goodput within 5 % of the reference,
+two-path goodput in both directions (client-to-server median 354.9 Mbit/s
+against a gate of 338.5; server-to-client 350.4 over three and over six runs
+against 340.1), and all four 1 GiB blackhole cases, including the stale report
+for the failed subflow in the client-to-server cases.
+
+Known limitation (M2): if one path blackholes while data is outstanding on it,
+the healthy path can stall for up to about R1 = 3 RTOs (about 7 s in the
+interop profile). That lasts until the subflow is declared stale and its data
+reinjected, because the connection is blocked behind that data. Opportunistic
+retransmission on the healthy path is planned.
+
 ## Roadmap
 
 | Milestone | Scope | Acceptance gate |
 |---|---|---|
 | **M0 — plain TCP foundation (merged)** | MPTCP option codec, crypto helpers, plain TCP engine and TUN adapter | Unit tests; each fuzz target runs 10 minutes locally and 60 seconds in CI without a crash or out-of-bounds access; 64 MiB each way against Linux TCP through TUN, byte-exact, followed by FIN/FIN close with no RST in the pcap. |
 | **M1 — single-subflow MPTCP** | MP_CAPABLE, DSS, DATA_ACK, shared windows, DATA_FIN/close, control queue including connection-level data retransmission, handshake and post-handshake fallback using an infinite mapping, and MP_FASTCLOSE receive | 64 MiB each way against Linux MPTCP, byte-exact; both DATA_FINs acknowledged by DATA_ACK, subflow FIN/FIN close, no RST and server EOF; Wireshark decodes MPTCP v1. Stripping SYN options yields plain TCP with no MPTCP options after the SYN. Stripping data options yields `FellBack`, exactly one DSS with DLL=0, intact payload and clean close. |
-| **M2 — two paths** | MP_JOIN, two subflows, MinRTT scheduler and reinjection | On asymmetric paths, test each direction separately for 30 seconds over three runs: median goodput at least 1.2× the better single path. During a 256 MiB transfer in each direction, blackhole either path for 15 seconds: transfer completes byte-exact without an application error. For client-to-server transfers, the client also reports the failed subflow as stale. |
+| **M2 — two paths (implemented; gates passed locally)** | MP_JOIN, two subflows, MinRTT scheduler and reinjection | On asymmetric paths, test each direction separately for 30 seconds over three runs: median goodput at least 1.2× the better single path. During a 1 GiB transfer in each direction, blackhole either path for 15 seconds: transfer completes byte-exact without an application error. For client-to-server transfers, the client also reports the failed subflow as stale. |
 | **M3 — path management** | ADD_ADDR/REMOVE_ADDR, MP_PRIO/backup, MP_TCPRST, MP_FASTCLOSE send and MPTCP checksums | Per-feature interoperability tests. |
 | **M4 — remaining protocol features** | MP_FAIL, 32-bit DSN transmission and server role | Library-to-library tests. |
 

@@ -1,4 +1,5 @@
-//! Congestion control: the one swappable trait in M0–M2 (spec §3).
+//! Congestion control: the one swappable trait in M0–M2 (spec §3). CUBIC (`super::cubic`) is
+//! the default; Reno stays for tests that pin its arithmetic.
 
 use std::fmt;
 use std::time::Duration;
@@ -9,6 +10,41 @@ use crate::time::Instant;
 pub enum CongestionEvent {
     FastRetransmit,
     Rto,
+}
+
+/// What one ACK that advanced SND.UNA outside fast recovery measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckSample {
+    /// Octets newly acknowledged.
+    pub acked: u32,
+    /// The time since the most recently sent segment this ACK covers was sent, unless that
+    /// transmission was a retransmission (Karn).
+    pub rtt: Option<Duration>,
+    /// SND.MAX − SND.UNA *after* this ACK moved SND.UNA (octets still outstanding).
+    pub in_flight: u32,
+    pub now: Instant,
+    /// Cumulative octets this subflow has had acknowledged.
+    pub delivered: u64,
+    /// The acknowledged data was sent inside an app-limited interval: the most recently sent
+    /// segment this ACK covers carried the mark (draft-ietf-ccwg-bbr-06 §4.1.2.3,
+    /// RS.is_app_limited). Its delivery says nothing about path capacity.
+    pub app_limited: bool,
+    /// Everything this ACK covers was outstanding when the sender filled cwnd: a data
+    /// transmission left less than one SMSS of cwnd unused (RFC 7661 §3, "cwnd-limited: A TCP
+    /// flow that has sent the maximum number of segments permitted by the cwnd"). Otherwise
+    /// the flow sent less than cwnd allowed — limited by the application or by the receiver's
+    /// window, both application-limited in RFC 9438 §5.8. Separate from `app_limited`, which
+    /// does not count receiver-limited periods (draft-ietf-ccwg-bbr-06 §4.1.1.3.1).
+    pub cwnd_limited: bool,
+}
+
+/// Why a sender with room in cwnd and in the peer's window sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppLimited {
+    /// No data was queued.
+    NoData,
+    /// Data was queued, and this sender was offered it and given none.
+    NotScheduled,
 }
 
 /// An ACK during fast recovery (RFC 6582 §3.2); the recovery module classifies it.
@@ -26,17 +62,21 @@ pub trait CongestionControl: Send {
     /// Called once when the connection reaches ESTABLISHED, with the effective send MSS;
     /// `syn_lost` is true if our SYN was retransmitted (RFC 5681 §3.1: IW is then one segment).
     fn init(&mut self, _smss: u32, _syn_lost: bool) {}
-    /// Called when an ACK advances SND.UNA outside fast recovery. `acked` is the number of
-    /// octets newly acknowledged; `rtt` is the RTT sample this ACK produced, if any;
-    /// `in_flight` is SND.MAX − SND.UNA *after* this ACK moved SND.UNA (octets still
-    /// outstanding).
-    fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, now: Instant);
+    /// Called when an ACK advances SND.UNA outside fast recovery (with SACK: outside RFC 6675
+    /// loss recovery).
+    fn on_ack(&mut self, ack: &AckSample);
     /// `in_flight` is FlightSize (RFC 5681): SND.MAX − SND.UNA at the event, before any
     /// retransmission it triggers. `FastRetransmit` starts fast recovery.
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, now: Instant);
     /// Called in place of `on_ack` for every ACK between `on_congestion(FastRetransmit)` and
     /// the full ACK (or an RTO) that ends fast recovery: the window inflation and deflation of
     /// RFC 5681 §3.2 / RFC 6582 §3.2 belong to the controller.
+    ///
+    /// With SACK (RFC 6675) the `Tcb` instead calls `on_recovery_ack(Full { in_flight })` once,
+    /// right after `on_congestion(FastRetransmit, in_flight)`: FlightSize ≥ ssthresh, so this
+    /// is cwnd = ssthresh (§5 (4.2)). No other recovery or `on_ack` call follows until the ACK
+    /// that ends recovery, which itself reaches neither; meanwhile the `Tcb` sends while
+    /// cwnd − pipe ≥ SMSS (§5 (C)).
     fn on_recovery_ack(&mut self, ack: RecoveryAck);
     /// Called before new data goes out after the sender sat idle for more than one RTO with
     /// nothing outstanding (RFC 5681 §4.1): cwnd is set to no more than the restart window.
@@ -46,6 +86,10 @@ pub trait CongestionControl: Send {
     /// Side-effect-free window after an idle restart.
     fn restart_cwnd(&self) -> u32 {
         self.cwnd()
+    }
+    /// Pacing rate in octets per second; `None` sends unpaced (as fast as cwnd allows).
+    fn pacing_rate(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -64,7 +108,7 @@ pub(crate) struct Unbounded;
 
 #[cfg(test)]
 impl CongestionControl for Unbounded {
-    fn on_ack(&mut self, _: u32, _: Option<Duration>, _: u32, _: Instant) {}
+    fn on_ack(&mut self, _: &AckSample) {}
     fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
     fn on_recovery_ack(&mut self, _: RecoveryAck) {}
     fn cwnd(&self) -> u32 {
@@ -72,8 +116,35 @@ impl CongestionControl for Unbounded {
     }
 }
 
-/// Reno (RFC 5681 §3.1–3.2) with the NewReno window rules of RFC 6582 §3.2.
+/// IW per RFC 5681 §3.1, or one segment after a lost SYN.
+pub(crate) fn initial_window(smss: u32, syn_lost: bool) -> u32 {
+    let segs = match smss {
+        _ if syn_lost => 1,
+        0..=1095 => 4,
+        1096..=2190 => 3,
+        _ => 2,
+    };
+    segs * smss
+}
+
+/// The fast recovery window rules: RFC 5681 §3.2 step 4 and RFC 6582 §3.2 step 3; the full
+/// ACK takes option (1), min(ssthresh, max(FlightSize, SMSS) + SMSS), which needs no burst
+/// mitigation.
+pub(crate) fn recovery_window(cwnd: u32, ssthresh: u32, smss: u32, ack: RecoveryAck) -> u32 {
+    match ack {
+        RecoveryAck::Duplicate => cwnd.saturating_add(smss),
+        RecoveryAck::Partial { acked } => {
+            let back = if acked >= smss { smss } else { 0 };
+            cwnd.saturating_sub(acked) + back
+        }
+        RecoveryAck::Full { in_flight } => ssthresh.min(in_flight.max(smss).saturating_add(smss)),
+    }
+}
+
+/// Reno (RFC 5681 §3.1–3.2) with the NewReno window rules of RFC 6582 §3.2. Not the default;
+/// kept for tests that pin its arithmetic.
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Reno {
     smss: u32,
     /// The initial window, from `init`; the restart window of RFC 5681 §4.1 is min(iw, cwnd).
@@ -84,6 +155,7 @@ pub(crate) struct Reno {
     ca_acked: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Reno {
     pub(crate) fn new() -> Self {
         Self {
@@ -108,16 +180,9 @@ impl CongestionControl for Reno {
         self.cwnd.min(self.iw)
     }
 
-    /// IW per RFC 5681 §3.1, or one segment after a lost SYN.
     fn init(&mut self, smss: u32, syn_lost: bool) {
         self.smss = smss;
-        let segs = match smss {
-            _ if syn_lost => 1,
-            0..=1095 => 4,
-            1096..=2190 => 3,
-            _ => 2,
-        };
-        self.iw = segs * smss;
+        self.iw = initial_window(smss, syn_lost);
         self.cwnd = self.iw;
     }
 
@@ -128,7 +193,8 @@ impl CongestionControl for Reno {
 
     /// Slow start below ssthresh (eq. 2); congestion avoidance by byte counting otherwise,
     /// the RECOMMENDED method: + SMSS once a cwnd of octets has been acknowledged.
-    fn on_ack(&mut self, acked: u32, _: Option<Duration>, _: u32, _: Instant) {
+    fn on_ack(&mut self, ack: &AckSample) {
+        let acked = ack.acked;
         if self.cwnd < self.ssthresh {
             self.cwnd = self.cwnd.saturating_add(acked.min(self.smss));
             return;
@@ -152,19 +218,8 @@ impl CongestionControl for Reno {
         };
     }
 
-    /// RFC 5681 §3.2 step 4 and RFC 6582 §3.2 step 3; the full ACK takes option (1),
-    /// min(ssthresh, max(FlightSize, SMSS) + SMSS), which needs no burst mitigation.
     fn on_recovery_ack(&mut self, ack: RecoveryAck) {
-        self.cwnd = match ack {
-            RecoveryAck::Duplicate => self.cwnd.saturating_add(self.smss),
-            RecoveryAck::Partial { acked } => {
-                let back = if acked >= self.smss { self.smss } else { 0 };
-                self.cwnd.saturating_sub(acked) + back
-            }
-            RecoveryAck::Full { in_flight } => self
-                .ssthresh
-                .min(in_flight.max(self.smss).saturating_add(self.smss)),
-        };
+        self.cwnd = recovery_window(self.cwnd, self.ssthresh, self.smss, ack);
     }
 
     fn cwnd(&self) -> u32 {
@@ -179,6 +234,18 @@ mod tests {
     const SMSS: u32 = 1000;
     const T0: Instant = Instant::from_nanos(0);
 
+    fn sample(acked: u32) -> AckSample {
+        AckSample {
+            acked,
+            rtt: None,
+            in_flight: 0,
+            now: T0,
+            delivered: 0,
+            app_limited: false,
+            cwnd_limited: true,
+        }
+    }
+
     fn reno() -> Reno {
         let mut r = Reno::new();
         r.init(SMSS, false);
@@ -191,7 +258,7 @@ mod tests {
         r.on_idle_restart();
         assert_eq!(r.cwnd(), 4 * SMSS, "cwnd at IW stays");
         for _ in 0..10 {
-            r.on_ack(SMSS, None, 0, T0);
+            r.on_ack(&sample(SMSS));
         }
         assert_eq!(r.cwnd(), 14 * SMSS);
         r.on_idle_restart();
@@ -230,38 +297,38 @@ mod tests {
         let mut r = reno();
         assert_eq!(r.cwnd(), 4 * SMSS);
         // Slow start: cwnd += min(N, SMSS) per ACK (eq. 2).
-        r.on_ack(1000, None, 0, T0);
+        r.on_ack(&sample(1000));
         assert_eq!(r.cwnd(), 5000);
-        r.on_ack(400, None, 0, T0);
+        r.on_ack(&sample(400));
         assert_eq!(r.cwnd(), 5400);
-        r.on_ack(3000, None, 0, T0);
+        r.on_ack(&sample(3000));
         assert_eq!(r.cwnd(), 6400);
         // ssthresh = max(FlightSize / 2, 2·SMSS) = 8000, cwnd = 1 SMSS.
         r.on_congestion(CongestionEvent::Rto, 16_000, T0);
         assert_eq!((r.cwnd(), r.ssthresh), (1000, 8000));
         for segs in 2..=8 {
-            r.on_ack(1000, None, 0, T0);
+            r.on_ack(&sample(1000));
             assert_eq!(r.cwnd(), segs * SMSS, "slow start up to ssthresh");
         }
         // Congestion avoidance by byte counting: + SMSS once a cwnd of octets is acknowledged,
         // i.e. one SMSS per RTT.
         for _ in 0..7 {
-            r.on_ack(1000, None, 0, T0);
+            r.on_ack(&sample(1000));
             assert_eq!(r.cwnd(), 8000);
         }
-        r.on_ack(1000, None, 0, T0);
+        r.on_ack(&sample(1000));
         assert_eq!(r.cwnd(), 9000);
         // Delayed ACKs (2 SMSS each) still grow it by one SMSS per window, not per ACK.
         for _ in 0..4 {
-            r.on_ack(2000, None, 0, T0);
+            r.on_ack(&sample(2000));
             assert_eq!(r.cwnd(), 9000);
         }
-        r.on_ack(2000, None, 0, T0);
+        r.on_ack(&sample(2000));
         assert_eq!(r.cwnd(), 10_000);
         // A stretch ACK of three windows still adds at most one SMSS.
-        r.on_ack(30_000, None, 0, T0);
+        r.on_ack(&sample(30_000));
         assert_eq!(r.cwnd(), 11_000);
-        r.on_ack(1000, None, 0, T0);
+        r.on_ack(&sample(1000));
         assert_eq!(r.cwnd(), 11_000);
     }
 
@@ -296,7 +363,7 @@ mod tests {
         r.on_recovery_ack(RecoveryAck::Full { in_flight: 2000 });
         assert_eq!(r.cwnd(), 3000);
         // Back in slow start below ssthresh.
-        r.on_ack(1000, None, 0, T0);
+        r.on_ack(&sample(1000));
         assert_eq!(r.cwnd(), 4000);
         let mut r = reno();
         r.on_congestion(CongestionEvent::FastRetransmit, 10_000, T0);

@@ -16,6 +16,12 @@ jobs:
       - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # CC / scheduler boundary (invariants 2-3): one `run` per check, since bash -e does not
+      # stop on a failing `!` command.
+      - name: tcp/ never names the scheduler
+        run: "! grep -rnE 'crate::mptcp|sched|Scheduler|SubflowSnapshot' --exclude=tests.rs crates/mptcp-rs/src/tcp/"
+      - name: the scheduler never reaches Tcb or CC
+        run: "! grep -nE 'use crate::tcp::(Tcb|cc|CongestionControl)' crates/mptcp-rs/src/mptcp/sched.rs"
   msrv:
     runs-on: ubuntu-latest
     steps:

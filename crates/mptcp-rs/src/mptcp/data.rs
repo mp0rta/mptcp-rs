@@ -55,19 +55,25 @@ mod tests {
     }
 
     #[test]
-    fn receive_pressure_evicts_highest_without_losing_unread() {
+    fn receive_pressure_holds_promised_data_and_delivers_it_on_read() {
         let mut r = RecvAssembler::new(100, 4, 2);
         r.right_edge = 110; // rounding or earlier advertisement can promise more than free memory
         assert_eq!(r.accept(106, b"xy"), (Outcome::Stored, 2));
         assert_eq!(r.accept(104, b"zz"), (Outcome::Stored, 2));
-        assert_eq!(r.accept(102, b"qq"), (Outcome::Discarded, 2));
+        assert_eq!(r.accept(102, b"cd"), (Outcome::Stored, 2));
         assert_eq!(r.accept(100, b"abcd"), (Outcome::Stored, 4));
-        assert_eq!(r.next, 104);
-        assert_eq!(r.accept(104, b"ef"), (Outcome::Discarded, 2));
+        assert_eq!(r.next, 104); // DATA_ACK stops at the memory edge
+        assert_eq!(r.accept(104, b"ef"), (Outcome::Duplicate, 2));
+        assert!(!r.window_update_due(0, 536));
         let mut out = [0; 4];
         assert_eq!(r.read(&mut out), 4);
         assert_eq!(&out, b"abcd");
-        assert_eq!(r.accept(104, b"ef"), (Outcome::Stored, 2));
+        assert_eq!(r.next, 108);
+        assert!(r.window_update_due(0, 536)); // the new DATA_ACK goes out at once
+        r.window_sent(r.window_offer(0, 536), 0);
+        assert!(!r.window_update_due(0, 536));
+        assert_eq!(r.read(&mut out), 4);
+        assert_eq!(&out, b"zzxy");
     }
 
     #[test]
@@ -137,34 +143,45 @@ impl SendStore {
         }
         n
     }
+    /// Stored octets from `dsn` to the end. Chunks are contiguous in DSN space, so a mapping
+    /// may span application writes: a write boundary is not a mapping or segment boundary.
     pub fn run_len(&self, dsn: u64) -> usize {
-        self.chunks
-            .iter()
-            .find_map(|c| {
-                let off = dsn.wrapping_sub(c.dsn) as usize;
-                (off < c.len()).then(|| c.len() - off)
-            })
-            .unwrap_or(0)
+        let off = dsn.wrapping_sub(self.una);
+        let len = self.end.wrapping_sub(self.una);
+        if off < len { (len - off) as usize } else { 0 }
     }
     /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
     pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
-        if len == 0 || len > u16::MAX as usize || maps.maps.len() >= maps.cap {
+        if len == 0 || len > u16::MAX as usize || maps.is_full() {
             return false;
         }
         // New assignments are contiguous; reinjections cover previously assigned DSNs only.
         if dsn != self.next && (self.next.wrapping_sub(dsn) as i64) < len as i64 {
             return false;
         }
-        let Some(c) = self
-            .chunks
-            .iter()
-            .find(|c| dsn.wrapping_sub(c.dsn) < c.len() as u64)
-        else {
+        if len > self.run_len(dsn) {
             return false;
-        };
-        let off = dsn.wrapping_sub(c.dsn) as usize;
-        if len > c.len() - off {
-            return false;
+        }
+        let end = dsn.wrapping_add(len as u64);
+        let mut pieces = VecDeque::new();
+        let mut at = dsn;
+        for c in &self.chunks {
+            let off = at.wrapping_sub(c.dsn);
+            if off >= c.len() as u64 {
+                continue;
+            }
+            let off = off as usize;
+            let n = (c.len() - off).min(end.wrapping_sub(at) as usize);
+            pieces.push_back(Chunk {
+                dsn: at,
+                bytes: c.bytes.clone(),
+                start: c.start + off,
+                end: c.start + off + n,
+            });
+            at = at.wrapping_add(n as u64);
+            if at == end {
+                break;
+            }
         }
         maps.maps.push_back(TxMap {
             ssn: maps.end,
@@ -176,12 +193,9 @@ impl SendStore {
             },
             reinjected: dsn != self.next,
             data_fin: false,
-            chunk: Chunk {
-                dsn,
-                bytes: c.bytes.clone(),
-                start: c.start + off,
-                end: c.start + off + len,
-            },
+            dsn,
+            len,
+            pieces,
         });
         maps.end = maps.end.wrapping_add(len as u32);
         if dsn == self.next {
@@ -215,7 +229,15 @@ struct TxMap {
     mapping: crate::wire::mptcp::Mapping,
     reinjected: bool,
     data_fin: bool,
-    chunk: Chunk,
+    /// First unacknowledged DSN and octet count; `pieces` hold exactly these octets.
+    dsn: u64,
+    len: usize,
+    pieces: VecDeque<Chunk>,
+}
+impl TxMap {
+    fn covers(&self, ssn: u32) -> bool {
+        (ssn.wrapping_sub(self.ssn) as usize) < self.len
+    }
 }
 pub(crate) struct TxMaps {
     maps: VecDeque<TxMap>,
@@ -228,19 +250,34 @@ impl TxMaps {
             .iter()
             .filter_map(|m| {
                 let n = ack.wrapping_sub(m.ssn) as i32;
-                (n > 0).then(|| {
-                    m.chunk
-                        .dsn
-                        .wrapping_add((n as usize).min(m.chunk.len()) as u64)
-                })
+                (n > 0).then(|| m.dsn.wrapping_add((n as usize).min(m.len) as u64))
             })
             .next_back()
+    }
+    /// End DSN of an un-subflow-ACKed mapping covering `dsn`, if any.
+    pub fn covering_end(&self, dsn: u64) -> Option<u64> {
+        self.maps
+            .iter()
+            .find(|m| dsn.wrapping_sub(m.dsn) < m.len as u64)
+            .map(|m| m.dsn.wrapping_add(m.len as u64))
+    }
+    /// `(dsn, len)` of every un-subflow-ACKed mapping, in SSN order.
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.maps.iter().map(|m| (m.dsn, m.len as u64))
+    }
+    /// Drops every mapping (the subflow is torn down); `assigned_end` is kept.
+    pub fn clear(&mut self) {
+        self.maps.clear();
+    }
+    /// Every mapping slot is taken: `SendStore::assign` fails until a TCP ACK frees one.
+    pub fn is_full(&self) -> bool {
+        self.maps.len() >= self.cap
     }
     /// Prefix without a live TCP copy, clipped at the next active mapping.
     pub fn uncovered_len(&self, dsn: u64, max: usize) -> usize {
         self.maps.iter().fold(max, |len, m| {
-            let off = m.chunk.dsn.wrapping_sub(dsn) as i64;
-            if off <= 0 && off + m.chunk.len() as i64 > 0 {
+            let off = m.dsn.wrapping_sub(dsn) as i64;
+            if off <= 0 && off + m.len as i64 > 0 {
                 0
             } else if off > 0 {
                 len.min(off as usize)
@@ -257,15 +294,10 @@ impl TxMaps {
         }
     }
     pub fn data_fin(&self, ssn: u32) -> bool {
-        self.maps
-            .iter()
-            .any(|m| m.data_fin && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+        self.maps.iter().any(|m| m.data_fin && m.covers(ssn))
     }
     pub fn mapping(&self, ssn: u32) -> Option<crate::wire::mptcp::Mapping> {
-        self.maps
-            .iter()
-            .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
-            .map(|m| m.mapping)
+        self.maps.iter().find(|m| m.covers(ssn)).map(|m| m.mapping)
     }
     pub fn new(end: u32, cap: usize) -> Self {
         Self {
@@ -276,23 +308,29 @@ impl TxMaps {
     }
 }
 impl SendBuf for TxMaps {
+    /// Octets from `ssn` to the end of its mapping: a segment never spans two mappings.
     fn segment_limit(&self, ssn: u32) -> usize {
-        self.peek_with(ssn, usize::MAX, |b| b.len()).unwrap_or(0)
-    }
-    fn is_reinjection(&self, ssn: u32) -> bool {
         self.maps
             .iter()
-            .any(|m| m.reinjected && (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())
+            .find(|m| m.covers(ssn))
+            .map_or(0, |m| m.len - ssn.wrapping_sub(m.ssn) as usize)
     }
+    fn is_reinjection(&self, ssn: u32) -> bool {
+        self.maps.iter().any(|m| m.reinjected && m.covers(ssn))
+    }
+    /// The run from `ssn` to the end of its stored piece; a segment may take several runs.
     fn peek_with<R>(&self, ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        let m = self
-            .maps
-            .iter()
-            .find(|m| (ssn.wrapping_sub(m.ssn) as usize) < m.chunk.len())?;
-        let start = m.chunk.start + ssn.wrapping_sub(m.ssn) as usize;
-        Some(f(
-            &m.chunk.bytes[start..m.chunk.end.min(start.saturating_add(max))]
-        ))
+        let m = self.maps.iter().find(|m| m.covers(ssn))?;
+        let mut off = ssn.wrapping_sub(m.ssn) as usize;
+        let c = m.pieces.iter().find(|c| {
+            let inside = off < c.len();
+            if !inside {
+                off -= c.len();
+            }
+            inside
+        })?;
+        let start = c.start + off;
+        Some(f(&c.bytes[start..c.end.min(start.saturating_add(max))]))
     }
     fn assigned_end(&self) -> u32 {
         self.end
@@ -303,12 +341,22 @@ impl SendBuf for TxMaps {
             if n <= 0 {
                 break;
             }
-            if n as usize >= m.chunk.len() {
+            if n as usize >= m.len {
                 self.maps.pop_front();
             } else {
                 m.ssn = ack;
-                m.chunk.dsn = m.chunk.dsn.wrapping_add(n as u64);
-                m.chunk.start += n as usize;
+                m.dsn = m.dsn.wrapping_add(n as u64);
+                m.len -= n as usize;
+                let mut n = n as usize;
+                while let Some(c) = m.pieces.front_mut() {
+                    if n < c.len() {
+                        c.start += n;
+                        c.dsn = c.dsn.wrapping_add(n as u64);
+                        break;
+                    }
+                    n -= c.len();
+                    m.pieces.pop_front();
+                }
                 break;
             }
         }
@@ -326,6 +374,21 @@ struct Piece {
     dsn: u64,
     bytes: VecDeque<u8>,
 }
+/// DSN reassembly. Every octet inside the advertised window `[next, right_edge)` is stored
+/// (only the range cap can refuse it), but at most `cap` octets are delivered in order: `next`
+/// (the DATA_ACK) stops at the memory edge `base + cap`, where `base` is the first unread DSN,
+/// and held octets above it are delivered as reads make room.
+///
+/// Bound: stored octets lie in `[base, right_edge)`, so memory above `cap` is at most the
+/// advertised overshoot `right_edge − (base + cap)`, at most `right_edge − next`. That
+/// window never exceeds `ceil(cap / 2^scale) · 2^scale`: a fresh offer is at most
+/// `floor(cap / 2^scale)` units, a re-advertisement rounds an older window up from a later
+/// `next` (RFC 8684 must-not-shrink), and `next` only moves forward. So memory stays below
+/// `2·cap + 2^scale`. The rounding creeps the edge by less than 2^scale per DATA_ACK that
+/// moved `next`, and only until `next` reaches the memory edge: with the application not
+/// reading and full segments of L octets the overshoot is about `cap · (−L mod 2^scale) / L`
+/// (L 1436: −1436 mod 2^scale is 100 at scale 7 and 9, so about 7 %, 1.1 MiB at the 16 MiB /
+/// scale 9 default); approaching the worst case needs segments shorter than 2^scale.
 pub(crate) struct RecvAssembler {
     pub next: u64,
     pub right_edge: u64,
@@ -334,6 +397,8 @@ pub(crate) struct RecvAssembler {
     cap: usize,
     range_cap: usize,
     fin: Option<u64>,
+    /// A read moved `next` over held octets; the new DATA_ACK is not advertised yet.
+    read_advanced: bool,
 }
 impl RecvAssembler {
     pub fn new(head: u64, cap: usize, range_cap: usize) -> Self {
@@ -345,6 +410,7 @@ impl RecvAssembler {
             cap,
             range_cap,
             fin: None,
+            read_advanced: false,
         }
     }
     pub fn has_fin(&self) -> bool {
@@ -389,6 +455,7 @@ impl RecvAssembler {
             .min(65535) as u16
     }
     pub fn window_sent(&mut self, field: u16, scale: u8) {
+        self.read_advanced = false;
         let edge = self.next.wrapping_add(u64::from(field) << scale);
         if edge.wrapping_sub(self.right_edge) as i64 > 0 {
             self.right_edge = edge;
@@ -397,11 +464,15 @@ impl RecvAssembler {
     pub fn window_update_due(&self, scale: u8, mss: u16) -> bool {
         let remaining = self.right_edge.wrapping_sub(self.next) as i64;
         let offer = i64::from(self.window_offer(scale, mss)) << scale;
-        self.free() as i64 - remaining >= (self.cap / 2).min(usize::from(mss)) as i64
-            && offer > remaining
+        // Held octets the peer has sent are DATA_ACKed at once: nothing else would announce it.
+        self.read_advanced
+            || self.free() as i64 - remaining >= (self.cap / 2).min(usize::from(mss)) as i64
+                && offer > remaining
     }
     pub fn free(&self) -> usize {
-        self.cap - self.ready.len() - self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>()
+        self.cap.saturating_sub(
+            self.ready.len() + self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>(),
+        )
     }
     pub fn has_unread(&self) -> bool {
         !self.ready.is_empty()
@@ -411,7 +482,29 @@ impl RecvAssembler {
         for (a, b) in out.iter_mut().zip(self.ready.drain(..n)) {
             *a = b;
         }
+        if self.deliver() {
+            self.read_advanced = true;
+            self.advance_fin();
+        }
         n
+    }
+    /// Moves the piece at `next` into `ready`, up to the memory edge. Returns whether `next` moved.
+    fn deliver(&mut self) -> bool {
+        let before = self.next;
+        if self.pieces.first().is_some_and(|p| p.dsn == self.next) {
+            let room = self.cap - self.ready.len();
+            let p = &mut self.pieces[0];
+            let n = p.bytes.len().min(room);
+            if n == p.bytes.len() {
+                let mut p = self.pieces.remove(0);
+                self.ready.append(&mut p.bytes);
+            } else {
+                self.ready.extend(p.bytes.drain(..n));
+                p.dsn = p.dsn.wrapping_add(n as u64);
+            }
+            self.next = self.next.wrapping_add(n as u64);
+        }
+        self.next != before
     }
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
@@ -450,14 +543,10 @@ impl RecvAssembler {
             );
         }
         let acknowledged = (hi - off) as usize;
-        // The in-order prefix always makes progress unless unread bytes fill the cap.
-        // Any in-window suffix discarded here is still TCP-acknowledged.
-        let hi = if lo == 0 {
-            hi.min(if tcp {
-                self.free()
-            } else {
-                self.cap - self.ready.len()
-            } as i64)
+        // MPTCP: in-window data always fits memory (see the bound above). Fallback keeps the
+        // TCP rule: what does not fit `cap` is not TCP-acknowledged, so the peer retransmits it.
+        let hi = if lo == 0 && tcp {
+            hi.min(self.free() as i64)
         } else {
             hi
         };
@@ -465,7 +554,7 @@ impl RecvAssembler {
             return (Outcome::Discarded, acknowledged);
         }
         // ponytail: scan at most range_cap pieces; use a range tree if that cap grows.
-        let gaps = loop {
+        let gaps = {
             let mut gaps = Vec::new();
             let mut at = lo;
             for p in &self.pieces {
@@ -507,12 +596,11 @@ impl RecvAssembler {
                 }
                 last = last.max(r.end);
             }
-            if needed <= self.free() && count <= self.range_cap {
-                break gaps;
-            }
-            if tcp || lo != 0 || self.pieces.pop().is_none() {
+            // The range at `next` is not counted, so the MPTCP head is never refused.
+            if count > self.range_cap || tcp && needed > self.free() {
                 return (Outcome::Discarded, acknowledged);
             }
+            gaps
         };
         for g in gaps {
             self.pieces.push(Piece {
@@ -544,11 +632,7 @@ impl RecvAssembler {
                 i += 1;
             }
         }
-        if self.pieces.first().is_some_and(|p| p.dsn == self.next) {
-            let mut p = self.pieces.remove(0);
-            self.next = self.next.wrapping_add(p.bytes.len() as u64);
-            self.ready.append(&mut p.bytes);
-        }
+        self.deliver();
         (Outcome::Stored, acknowledged)
     }
 }
@@ -626,14 +710,14 @@ impl RxMaps {
 mod pressure_tests {
     use super::*;
     #[test]
-    fn head_evicts_ranges_even_when_only_metadata_is_full() {
+    fn head_is_accepted_when_the_range_cap_is_full() {
         let mut r = RecvAssembler::new(0, 8, 1);
         r.accept(6, b"x");
         assert_eq!(r.accept(0, b"a"), (Outcome::Stored, 1));
         assert_eq!(r.next, 1);
     }
     #[test]
-    fn head_trims_to_available_space_without_evicting_unread() {
+    fn head_is_delivered_up_to_the_memory_edge_and_the_rest_held() {
         let mut r = RecvAssembler::new(0, 4, 4);
         r.right_edge = 20;
         r.accept(0, b"ab");
@@ -644,7 +728,7 @@ mod pressure_tests {
         assert_eq!(&out, b"abcd");
     }
     #[test]
-    fn evicted_overlap_is_replaced_to_admit_head() {
+    fn head_fills_holes_beyond_memory_without_eviction() {
         let mut r = RecvAssembler::new(0, 8, 4);
         r.right_edge = 20;
         r.accept(4, b"ef");
@@ -698,6 +782,48 @@ mod signed_boundary_tests {
                 assert_eq!(recv.next, head);
                 assert_eq!(recv.free(), 8);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod overshoot_tests {
+    use super::*;
+
+    /// A long flood with segments of 1..=3·2^scale octets (shorter than 2^scale is the worst
+    /// case: each DATA_ACK then creeps the rounded edge) and rare small reads.
+    #[test]
+    fn memory_above_cap_stays_within_the_advertised_overshoot() {
+        for scale in [1u8, 3, 7] {
+            let (cap, unit) = (70_000usize, 1u64 << scale);
+            let bound = (cap as u64).div_ceil(unit) * unit;
+            let mut r = RecvAssembler::new(1000, cap, 64);
+            let (mut snd, mut read_to, mut seed, mut worst) = (1000u64, 1000u64, 1u64, 0);
+            for i in 0..300_000u64 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let len = ((seed >> 33) % (3 * unit) + 1).min(r.right_edge - snd);
+                if len > 0 {
+                    let data: Vec<u8> = (snd..snd + len).map(|d| d as u8).collect();
+                    assert_eq!(r.accept(snd, &data), (Outcome::Stored, len as usize));
+                    snd += len;
+                }
+                let field = r.window_offer(scale, 1460);
+                r.window_sent(field, scale);
+                let stored = r.ready.len() + r.pieces.iter().map(|p| p.bytes.len()).sum::<usize>();
+                let base = r.next - r.ready.len() as u64;
+                assert!(stored as u64 <= r.right_edge - base);
+                assert!((stored.saturating_sub(cap) as u64) <= bound);
+                worst = worst.max(stored.saturating_sub(cap));
+                if i % 5000 == 4999 || len == 0 {
+                    let mut out = vec![0; if len == 0 { 4096 } else { 3 }];
+                    let n = r.read(&mut out);
+                    assert!(out[..n].iter().zip(read_to..).all(|(&b, d)| b == d as u8));
+                    read_to += n as u64;
+                }
+            }
+            assert!(worst > 0, "scale {scale}: the flood never passed the cap");
         }
     }
 }

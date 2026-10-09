@@ -1,6 +1,7 @@
 use super::*;
-use crate::tcp::cc::{CongestionEvent, RecoveryAck, Unbounded};
+use crate::tcp::cc::{CongestionEvent, RecoveryAck, Reno, Unbounded};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
+use rangemap::RangeSet;
 use std::sync::{Arc, Mutex};
 
 const ISN: SeqNum = SeqNum(0x1000);
@@ -197,7 +198,7 @@ fn syn_carries_mss_and_ws() {
             parsed(f.out.options()),
             vec![
                 TcpOpt::Mss(mss),
-                TcpOpt::WindowScale(7),
+                TcpOpt::WindowScale(9),
                 TcpOpt::SackPermitted
             ]
         );
@@ -273,7 +274,7 @@ fn peer_ws_above_14_clamped() {
         Reaction::Established
     );
     assert_eq!(f.tcb.snd_shift, 14);
-    assert_eq!(f.tcb.rcv_shift, 7);
+    assert_eq!(f.tcb.rcv_shift, 9);
 }
 
 #[test]
@@ -520,8 +521,9 @@ fn rto_retransmits_with_backoff_and_karn() {
     assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
     assert_eq!(f.timeout(tm(999)), Reaction::None);
     assert!(f.drain(tm(999)).is_empty());
-    for (at, next) in [(1, 3), (3, 7)] {
+    for (streak, (at, next)) in [(1, 3), (3, 7)].into_iter().enumerate() {
         assert_eq!(f.timeout(t(at)), Reaction::None);
+        assert_eq!(f.tcb.rto_streak(), streak as u32 + 1);
         let segs = f.drain(t(at));
         assert_eq!(segs.len(), 1, "retransmission at {at} s");
         assert_eq!((segs[0].0.seq, segs[0].0.len), (data(0), 500));
@@ -530,7 +532,8 @@ fn rto_retransmits_with_backoff_and_karn() {
     }
     // The ACK covers a retransmitted segment: no RTT sample, RTO stays backed off.
     assert_eq!(f.ack(tm(3100), data(500), 10 * MSS), Reaction::None);
-    assert_eq!(f.tcb.rtt.srtt(), None);
+    assert_eq!(f.tcb.rto_streak(), 0, "SND.UNA advanced");
+    assert_eq!(f.tcb.srtt(), None);
     assert_eq!(f.tcb.rtt.rto(), Duration::from_secs(4));
     assert_eq!(f.tcb.poll_send_at(), None);
     // A fresh segment is timed and its ACK yields a sample, collapsing the RTO.
@@ -741,8 +744,12 @@ impl CongestionControl for Recording {
     fn init(&mut self, smss: u32, _: bool) {
         self.0.lock().unwrap().init = Some(smss);
     }
-    fn on_ack(&mut self, acked: u32, rtt: Option<Duration>, in_flight: u32, _: Instant) {
-        self.0.lock().unwrap().acks.push((acked, rtt, in_flight));
+    fn on_ack(&mut self, a: &AckSample) {
+        self.0
+            .lock()
+            .unwrap()
+            .acks
+            .push((a.acked, a.rtt, a.in_flight));
     }
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
         self.0.lock().unwrap().events.push((ev, in_flight));
@@ -783,6 +790,34 @@ fn cc_gates_sending_and_sees_acks_and_rto() {
     // Go-back from SND.UNA within this CC's fixed 2-segment window.
     let segs = f.drain(tm(1100));
     assert_eq!(seq_lens(&segs), [(data(1000), 1000), (data(2000), 1000)]);
+}
+
+#[test]
+fn cc_gets_an_rtt_sample_per_ack_except_after_a_retransmission() {
+    let log = Arc::new(Mutex::new(CcLog::default()));
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let mut f = Fixture::with(cfg, Box::new(Recording(log.clone())), h);
+    f.establish(10 * MSS);
+    f.write(&pattern(5000));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.ack(tm(100), data(1000), 10 * MSS);
+    assert_eq!(f.drain(tm(100)).len(), 1);
+    // Segment 1 was not the RTO's timed segment, but the CC still gets its sample.
+    f.ack(tm(150), data(2000), 10 * MSS);
+    assert_eq!(f.drain(tm(150)).len(), 1);
+    // The RTO resends segments 2 and 3 (Karn): their ACK carries no sample, ...
+    assert_eq!(f.timeout(tm(1150)), Reaction::None);
+    assert_eq!(f.drain(tm(1150)).len(), 2);
+    f.ack(tm(1200), data(4000), 10 * MSS);
+    assert_eq!(f.drain(tm(1200)).len(), 1);
+    // ... but new data sent after them does.
+    f.ack(tm(1250), data(5000), 10 * MSS);
+    let rtts: Vec<_> = log.lock().unwrap().acks.iter().map(|a| a.1).collect();
+    assert_eq!(
+        rtts,
+        [Some(100), Some(150), None, Some(50)].map(|r| r.map(Duration::from_millis))
+    );
 }
 
 /// A send buffer whose runs are at most 7 octets, as at many internal buffer boundaries.
@@ -1314,7 +1349,7 @@ fn wraparound_transfer() {
 #[test]
 fn no_memory_means_not_acked() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     assert_eq!(f.tcb.rcv_shift, 7);
     let p = pattern(BUF as usize + 24);
     // The app does not read: two in-order segments leave 1000 B of free memory. The window
@@ -1492,7 +1527,7 @@ fn ooo_range_cap() {
 #[test]
 fn full_memory_advertises_zero_window_and_reopens() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     let p = pattern(BUF as usize + 2000);
     let fill = BUF - 1000;
     f.data_in(t(0), 0, &p[..2_000_000]);
@@ -1583,7 +1618,7 @@ fn text_processed_when_ack_is_old() {
 /// edge to a scale-aligned point inside the memory.
 fn reading_receiver(mss: u16) {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::unbounded(ConnectConfig::default());
+    let mut f = Fixture::unbounded(rx_cfg(BUF));
     f.synack(65535, &opts(Some(mss), Some(0)));
     assert_eq!(f.acks(t(0)).len(), 1);
     assert_eq!((f.tcb.rcv_shift, f.tcb.eff_mss), (7, mss));
@@ -1637,7 +1672,7 @@ fn reads_move_the_edge_aligned_within_one_unit() {
 #[test]
 fn rounding_alone_draws_no_window_update() {
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::established(ConnectConfig::default(), 10 * MSS);
+    let mut f = Fixture::established(rx_cfg(BUF), 10 * MSS);
     let p = pattern(BUF as usize);
     let fill = BUF - 1000;
     f.data_in(t(0), 0, &p[..2_000_000]);
@@ -1655,7 +1690,7 @@ fn rounding_alone_draws_no_window_update() {
 fn sws_edge_never_moves_left() {
     // eff_mss 64 puts the SWS threshold (64) below the scale unit (128).
     const BUF: u32 = 4 << 20;
-    let mut f = Fixture::unbounded(ConnectConfig::default());
+    let mut f = Fixture::unbounded(rx_cfg(BUF));
     f.synack(65535, &opts(Some(64), Some(0)));
     assert_eq!(f.acks(t(0)).len(), 1);
     let p = pattern(BUF as usize);
@@ -1719,9 +1754,64 @@ impl Fixture {
     }
 }
 
+/// The default controller against a modeled bottleneck: base RTT 20 ms, 2500 segments/s (BDP
+/// 50 segments of MSS) and a 100-segment drop-tail queue, as base-a's ratios (queue = 2·BDP).
+/// Every segment is ACKed on arrival, so the RTT the sender sees rises with the queue once
+/// cwnd passes the BDP. Standard slow start doubles on until the queue overflows near
+/// 2·(BDP + queue); the default must leave slow start (an ACK of one SMSS growing cwnd by
+/// less than one SMSS) well before that, and before the queue would drop anything. (HyStart++
+/// leaves into CSS here, at cwnd 106 segments; CSS's five rounds at 1.25× per round still pass
+/// BDP + queue later, at a quarter of the slow start rate.)
+#[test]
+fn default_cc_leaves_slow_start_before_queue_overflow() {
+    const BDP: u32 = 50;
+    const QUEUE: u32 = 100;
+    let base = Duration::from_millis(20);
+    let service = Duration::from_micros(400);
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    f.synack(BIG, &opts(Some(MSS), Some(7)));
+    f.write(&pattern(2 << 20));
+    let mut link_free = t(0);
+    let mut acks = std::collections::VecDeque::new();
+    let mut max_queue = 0;
+    let mut send = |f: &mut Fixture, now: Instant, acks: &mut std::collections::VecDeque<_>| {
+        for (m, _) in f.drain(now) {
+            if m.len == 0 {
+                continue;
+            }
+            let queued = (link_free.max(now) - now).as_nanos() / service.as_nanos();
+            max_queue = max_queue.max(queued as u32);
+            link_free = link_free.max(now) + service;
+            acks.push_back((link_free + base, m.seq.wrapping_add(m.len)));
+        }
+    };
+    send(&mut f, t(0), &mut acks);
+    let limit = (2 * (BDP + QUEUE)) * u32::from(MSS);
+    let exit = loop {
+        let (at, ack) = acks.pop_front().expect("ACK-clocked");
+        let before = f.tcb.cc.cwnd();
+        assert_eq!(f.ack(at, ack, BIG), Reaction::None);
+        let grew = f.tcb.cc.cwnd() - before;
+        if grew < u32::from(MSS) {
+            break Some(before);
+        }
+        if f.tcb.cc.cwnd() >= limit {
+            break None;
+        }
+        send(&mut f, at, &mut acks);
+    };
+    let exit = exit.expect("slow start ran on to 2·(BDP + queue)");
+    assert!(
+        exit < (BDP + QUEUE) * u32::from(MSS),
+        "left slow start at cwnd {exit}"
+    );
+    assert!(max_queue < QUEUE, "queue reached {max_queue}");
+}
+
 #[test]
 fn initial_window_is_rfc5681() {
-    // new_active uses Reno: IW = 3 segments for SMSS 1460, 4 for 1000, 2 for 2200.
+    // The default CC (CUBIC) takes RFC 5681 IW: 3 segments for SMSS 1460, 4 for 1000, 2 for
+    // 2200.
     for (mtu, mss, segs) in [(1500, 1460, 3), (1500, 1000, 4), (9000, 2200, 2)] {
         let cfg = ConnectConfig {
             mtu,
@@ -2289,7 +2379,7 @@ fn time_wait_acks_retransmitted_fin_and_restarts() {
     assert!(f.read_all().is_empty());
     f.seg_in(t(131), 1, TcpFlags::SYN | TcpFlags::ACK, &[]);
     assert_eq!(f.ack_nos(t(131)), vec![pdata(1)]);
-    f.data_in(t(132), 8 << 20, &[1; 10]);
+    f.data_in(t(132), 32 << 20, &[1; 10]);
     assert_eq!(f.ack_nos(t(132)), vec![pdata(1)]);
     assert_eq!(f.tcb.poll_send_at(), Some(t(181)));
     assert_eq!(f.timeout(t(180)), Reaction::None);
@@ -2649,9 +2739,12 @@ fn synack_fin_closes_receive_side() {
     }
 }
 
-/// Reno grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s.
+/// Reno grown past IW by a 60 kB transfer that is fully acknowledged, at t = 0.5 s. Reno:
+/// the restart window is sent at once, which a pacing controller would spread out.
 fn grown_idle_fixture() -> Fixture {
-    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
     assert_eq!(
         f.synack(65535, &opts(Some(MSS), Some(0))),
         Reaction::Established
@@ -2767,14 +2860,19 @@ fn protocol_options_and_sacks_reduce_payload_budget() {
 
 #[test]
 fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
-    use crate::mptcp::{ConnectionHooks, Negotiation};
+    use crate::mptcp::{ConnectionHooks, Negotiation, SubflowHooks, SubflowMp};
     use crate::wire::mptcp::{self, CAP_H, Dsn, Dss, Mapping, MpCapable, MptcpOption};
     let cfg = ConnectConfig {
         recv_buffer: 16,
         ..ConnectConfig::default()
     };
-    let mut h = ConnectionHooks::new(&cfg);
-    h.negotiation = Some(Negotiation::new(1));
+    let mut conn = ConnectionHooks::new(&cfg);
+    conn.negotiation = Some(Negotiation::new(1));
+    let mut sf = SubflowMp::new();
+    let h = SubflowHooks {
+        conn: &mut conn,
+        sf: &mut sf,
+    };
     let mut f = Fixture::with(cfg, Box::new(Unbounded), h);
     let mut options = [0; 40];
     let n = mptcp::encode(
@@ -2791,13 +2889,14 @@ fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
     .unwrap();
     assert_eq!(f.synack(100, &options[..n]), Reaction::Established);
     f.send(t(0));
-    f.h.negotiation
+    f.h.conn
+        .negotiation
         .as_mut()
         .unwrap()
         .on_transmitted(TcpFlags::ACK);
     f.tcb.rcv_ssn = u64::from(u32::MAX) - 1;
     f.tcb.rcv_nxt = PEER_ISN.wrapping_add(u32::MAX - 1);
-    let recv = &mut f.h.data.as_mut().unwrap().recv;
+    let recv = &mut f.h.conn.data.as_mut().unwrap().recv;
     recv.next = u64::MAX - 1;
     recv.right_edge = 8;
     for (ssn, dsn, data) in [
@@ -2833,9 +2932,9 @@ fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
     }
     assert_eq!(f.tcb.rcv_ssn, u64::from(u32::MAX) + 3);
     assert_eq!(f.tcb.rcv_nxt, PEER_ISN.wrapping_add(2));
-    assert_eq!(f.h.data.as_ref().unwrap().recv.next, 2);
+    assert_eq!(f.h.conn.data.as_ref().unwrap().recv.next, 2);
     let mut out = [0; 4];
-    assert_eq!(f.h.read(&mut out), 4);
+    assert_eq!(f.h.conn.read(&mut out), 4);
     assert_eq!(&out, b"abcd");
 }
 
@@ -2885,4 +2984,944 @@ fn assignment_budget_obeys_nagle_windows_and_reinjection() {
         f.tcb.send_budget(t(0), 100, 100, false, 1000, &f.h).bytes(),
         0
     );
+}
+
+// ---- Pacing gate, release timer and app-limited marking (M2 Task 3b) ----
+
+/// Fixed cwnd and, if `rate` is set, a fixed pacing rate; records every ACK sample.
+struct TestCc {
+    rate: Option<u64>,
+    cwnd: u32,
+    samples: Samples,
+}
+type Samples = Arc<Mutex<Vec<AckSample>>>;
+
+impl CongestionControl for TestCc {
+    fn on_ack(&mut self, a: &AckSample) {
+        self.samples.lock().unwrap().push(*a);
+    }
+    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
+    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+    fn pacing_rate(&self) -> Option<u64> {
+        self.rate
+    }
+}
+
+/// Segment payload with peer MSS 1460.
+const SEG: u32 = 1460;
+/// One segment per 10 ms.
+const RATE: u64 = 146_000;
+const BIG_CWND: u32 = 64 << 10;
+
+impl Fixture {
+    /// ESTABLISHED at t(0) with `TestCc`, peer MSS 1460, shift 0 and window `wnd`.
+    fn test_cc(rate: Option<u64>, cwnd: u32, wnd: u16) -> (Self, Samples) {
+        Self::test_cc_ws(rate, cwnd, wnd, 0)
+    }
+    /// As `test_cc` with peer window shift `ws`; the SYN/ACK window `wnd` is unscaled.
+    fn test_cc_ws(rate: Option<u64>, cwnd: u32, wnd: u16, ws: u8) -> (Self, Samples) {
+        let samples = Samples::default();
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let cc = TestCc {
+            rate,
+            cwnd,
+            samples: samples.clone(),
+        };
+        let mut f = Fixture::with(cfg, Box::new(cc), h);
+        assert_eq!(
+            f.synack(wnd, &opts(Some(1460), Some(ws))),
+            Reaction::Established
+        );
+        assert_eq!(f.send(t(0)).unwrap().flags, TcpFlags::ACK);
+        (f, samples)
+    }
+    fn mark(&mut self, now: Instant, reason: AppLimited) {
+        self.tcb.mark_unused_opportunity(now, reason, &self.h);
+    }
+}
+
+fn flags_of(samples: &Samples) -> Vec<bool> {
+    samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.app_limited)
+        .collect()
+}
+
+#[test]
+fn pacing_blocks_budget_before_release() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(seq_lens(&f.drain(t(0))), [(data(0), SEG)]);
+    let release = tm(10);
+    let budget = |f: &Fixture, now, reinject| {
+        let n = 10 * SEG as usize;
+        f.tcb.send_budget(now, n, n, reinject, 0, &f.h)
+    };
+    for now in [t(0), tm(5), t(0) + Duration::from_nanos(9_999_999)] {
+        assert_eq!(budget(&f, now, false), SendBudget::default(), "{now:?}");
+        assert_eq!(budget(&f, now, true), SendBudget::default(), "{now:?}");
+    }
+    // At the release: one quantum (here the 2-segment floor), whatever cwnd and the window
+    // would allow.
+    for reinject in [false, true] {
+        let b = budget(&f, release, reinject);
+        assert_eq!((b.seg_payload, b.full_segments, b.bytes()), (1460, 2, 2920));
+    }
+}
+
+#[test]
+fn pacing_release_time_in_poll_send_at() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(5 * SEG as usize));
+    assert_eq!(
+        f.drain(t(0)).len(),
+        2,
+        "one quantum (the 2-segment floor) per release"
+    );
+    // ACKed at once: nothing in flight, no ACK expected, no RTO.
+    assert_eq!(f.ack(tm(1), data(2 * SEG), BIG), Reaction::None);
+    assert!(f.drain(tm(1)).is_empty());
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(20)));
+    assert_eq!(
+        seq_lens(&f.drain(tm(20))),
+        [(data(2 * SEG), SEG), (data(3 * SEG), SEG)]
+    );
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(40)));
+}
+
+#[test]
+fn pacing_deadline_consumed_when_blocked_otherwise() {
+    // (a) cwnd full: cwnd is one segment. (b) The peer window closes.
+    for cwnd_full in [true, false] {
+        let cwnd = if cwnd_full { SEG } else { BIG_CWND };
+        let (mut f, _) = Fixture::test_cc(Some(RATE), cwnd, if cwnd_full { BIG } else { 1460 });
+        f.write(&pattern(2 * SEG as usize));
+        assert_eq!(f.drain(t(0)).len(), 1);
+        if !cwnd_full {
+            assert_eq!(f.ack(tm(1), data(SEG), 0), Reaction::None);
+            assert!(f.drain(tm(1)).is_empty());
+            assert!(f.tcb.peer_window_closed());
+        }
+        let release = tm(10);
+        assert_eq!(f.tcb.poll_send_at(), Some(release), "cwnd_full {cwnd_full}");
+        assert_eq!(f.timeout(release), Reaction::None);
+        let next = f.tcb.poll_send_at().expect("RTO or persist");
+        assert!(next > release, "cwnd_full {cwnd_full}: {next:?}");
+        for _ in 0..3 {
+            assert!(f.drain(release).is_empty());
+            assert_eq!(f.tcb.poll_send_at(), Some(next), "fires once");
+        }
+    }
+}
+
+#[test]
+fn pacing_does_not_delay_acks() {
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(3 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2, "one quantum");
+    // Out-of-order data: ACKed at once although data sending waits for the release.
+    let r = f.seg_ack(tm(1), 10, data(0), TcpFlags::ACK, b"x");
+    assert_eq!(r, Reaction::None);
+    let segs = f.drain(tm(1));
+    assert_eq!(segs.len(), 1);
+    assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
+    assert_eq!(f.out.ack, pdata(0));
+}
+
+#[test]
+fn retransmission_is_paced() {
+    // One segment per 2 s: the RTO at 1 s comes before the release.
+    let (mut f, _) = Fixture::test_cc(Some(730), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    assert_eq!(
+        f.tcb.poll_send_at(),
+        Some(t(1)),
+        "nothing unsent: the RTO only"
+    );
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert!(f.drain(t(1)).is_empty(), "the retransmission waits");
+    assert_eq!(f.tcb.poll_send_at(), Some(t(2)));
+    assert_eq!(f.timeout(t(2)), Reaction::None);
+    assert_eq!(seq_lens(&f.drain(t(2))), [(data(0), SEG)]);
+}
+
+// ---- Send quantum (M2 Task 4b, ruling R13): clamp(rate × 1 ms, 2 segments, 64 KiB) ----
+
+/// Paced at `rate` with a 1 MiB cwnd and a 1 MiB peer window (shift 4).
+fn quantum_fixture(rate: u64) -> Fixture {
+    let (mut f, _) = Fixture::test_cc_ws(Some(rate), 1 << 20, BIG, 4);
+    f.ack(t(0), data(0), BIG);
+    f
+}
+
+#[test]
+fn paced_budget_at_release_is_the_quantum() {
+    // 146 octets per ms: the 2-segment floor. 14 600: ten segments. 146 000: the 64 KiB cap
+    // (44 segments of 1460, not 100).
+    for (rate, segs) in [(146_000, 2), (14_600_000, 10), (146_000_000, 44)] {
+        let f = quantum_fixture(rate);
+        let n = 200 * SEG as usize;
+        let b = f.tcb.send_budget(t(0), n, n, false, 0, &f.h);
+        assert_eq!(
+            (b.seg_payload, b.full_segments),
+            (1460, segs),
+            "rate {rate}"
+        );
+    }
+}
+
+#[test]
+fn paced_burst_then_release_after_bytes_over_rate() {
+    // One quantum (10 segments, 100 µs each at 14.6 MB/s) per release.
+    let mut f = quantum_fixture(14_600_000);
+    f.write(&pattern(30 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 10);
+    // 14 600 octets / 14.6 MB/s = 1 ms after the burst started.
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(1)));
+    assert!(f.drain(t(0) + Duration::from_nanos(999_999)).is_empty());
+    let b = f.tcb.send_budget(
+        t(0) + Duration::from_nanos(999_999),
+        1460,
+        1460,
+        true,
+        0,
+        &f.h,
+    );
+    assert_eq!(
+        b.bytes(),
+        0,
+        "nothing before the release, reinjection included"
+    );
+    assert_eq!(f.drain(tm(1)).len(), 10);
+    assert_eq!(f.tcb.poll_send_at(), Some(tm(2)));
+}
+
+#[test]
+fn reno_unpaced_unchanged() {
+    // Reno never paces, also after RTT samples: the ramp sends two segments per ACK at once.
+    // CUBIC paces from its first RTT sample (M2 Task 4b), so Reno alone pins the unpaced path.
+    let f = Fixture::reno_ramp(&pattern(20_000));
+    assert_eq!(f.tcb.cc.pacing_rate(), None);
+}
+
+#[test]
+fn default_cc_paces_after_first_rtt_sample() {
+    let mut f = cubic_fixture(BIG);
+    f.write(&pattern(20_000));
+    // No RTT sample yet: the IW goes out at once.
+    assert_eq!(f.drain(t(0)).len(), 4);
+    // The ACK of two segments at 10 ms: srtt 10 ms, cwnd 6000, slow start ratio 2:
+    // 1 200 000 octets/s. A release sends one quantum, here the floor of two 1000-octet
+    // segments, and the next release follows 2000 octets / rate = 2 × 833 333 ns later.
+    f.ack(tm(10), data(2000), BIG);
+    assert_eq!(f.tcb.cc.pacing_rate(), Some(1_200_000));
+    let gap = Duration::from_nanos(2 * 833_333);
+    let mut release = tm(10);
+    for k in 0..2u32 {
+        let at = data(4000 + 2000 * k);
+        assert_eq!(
+            seq_lens(&f.drain(release)),
+            [(at, 1000), (at.wrapping_add(1000), 1000)],
+            "release {k}"
+        );
+        release = release + gap;
+        if k == 1 {
+            break;
+        }
+        assert_eq!(f.tcb.poll_send_at(), Some(release));
+        let before = tm(10) + (gap - Duration::from_nanos(1));
+        assert!(f.drain(before).is_empty());
+        // While data waits for the release, an out-of-order segment is ACKed at once.
+        f.seg_ack(before, 10, data(2000), TcpFlags::ACK, b"x");
+        let segs = f.drain(before);
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].0.len, segs[0].0.flags), (0, TcpFlags::ACK));
+        assert_eq!(f.tcb.poll_send_at(), Some(release));
+    }
+    // cwnd full (6000 outstanding): the release fires once and sends nothing.
+    assert_eq!(f.tcb.poll_send_at(), Some(release));
+    assert!(f.drain(release).is_empty());
+}
+
+#[test]
+fn app_limited_flag_recorded_at_send() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(2 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(2 * u64::from(SEG)));
+    assert_eq!(f.tcb.app_limited(), Some(AppLimited::NoData));
+    f.write(&pattern(2 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2);
+    assert_eq!(
+        f.tcb.app_limited(),
+        None,
+        "data went out: the reason clears"
+    );
+    for k in 1..=2 {
+        f.ack(tm(10 * u64::from(k)), data(k * SEG), BIG);
+    }
+    assert_eq!(
+        f.tcb.app_limited_until,
+        Some(2 * u64::from(SEG)),
+        "delivered == marker"
+    );
+    f.ack(tm(30), data(3 * SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None, "delivered > marker");
+    f.ack(tm(40), data(4 * SEG), BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(40)).len(), 1);
+    f.ack(tm(50), data(5 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [false, false, true, true, false]);
+    let delivered: Vec<u64> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.delivered)
+        .collect();
+    assert_eq!(delivered, [1, 2, 3, 4, 5].map(|k| k * u64::from(SEG)));
+}
+
+#[test]
+fn app_limited_resume_from_zero_in_flight() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(0));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(10), data(SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(10)).len(), 1);
+    f.ack(tm(20), data(2 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [true, false]);
+}
+
+/// TestCc with SACK, MSS 1000: a retransmission inside an app-limited interval that is not
+/// an RTO's. Segment 0 of 0–9 is lost: fast retransmit (RecoveryPoint 10000). 10–19 go out
+/// in recovery, then the sender is marked app-limited;
+/// the SACK of 11 has NextSeg resend 10 (rule 3) inside the interval, while 12–19 keep
+/// their original, unmarked records. The cumulative ACK of RecoveryPoint ends recovery
+/// without a sample, so the next ACK is the first to reach `on_ack`.
+fn sack_resend_after_mark() -> (Fixture, Samples) {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.write(&pattern(10_000));
+    assert_eq!(f.drain(t(0)).len(), 10);
+    // The peer holds `got` above a cumulative ACK stuck at 0 (`peer_gets` needs cum > 0).
+    let mut got = RangeSet::new();
+    let mut gets = |f: &mut Fixture, now, k: u32| {
+        got.insert(k * 1000..(k + 1) * 1000);
+        f.sack_ack(now, data(0), &blocks_after(&got, k * 1000));
+        f.drain(now)
+    };
+    for k in 1..=2 {
+        assert!(gets(&mut f, tm(10), k).is_empty(), "{k}");
+    }
+    let segs = gets(&mut f, tm(10), 3);
+    assert_eq!(seq_lens(&segs), [(data(0), 1000)], "fast retransmit");
+    for k in 4..=9 {
+        assert!(gets(&mut f, tm(10), k).is_empty(), "{k}");
+    }
+    f.write(&pattern(10_000));
+    assert_eq!(f.drain(tm(10)).len(), 10, "new data in recovery");
+    let s10 = |f: &Fixture| *f.tcb.sent.iter().find(|r| r.end == data(11_000)).unwrap();
+    assert!(!s10(&f).app_limited);
+    f.mark(tm(10), AppLimited::NoData);
+    assert!(f.tcb.app_limited_until.is_some());
+    let segs = gets(&mut f, tm(20), 11);
+    assert_eq!(seq_lens(&segs), [(data(10_000), 1000)], "NextSeg");
+    assert!(s10(&f).resent);
+    // 0's retransmission arrives: SND.UNA reaches RecoveryPoint and recovery ends.
+    f.sack_ack(tm(30), data(10_000), &[(data(11_000), data(12_000))]);
+    assert!(!f.tcb.sack.in_recovery());
+    assert!(samples.lock().unwrap().is_empty());
+    (f, samples)
+}
+
+#[test]
+fn retransmission_rerecords_app_limited() {
+    let (mut f, samples) = sack_resend_after_mark();
+    f.ack(tm(40), data(12_000), BIG);
+    let s = samples.lock().unwrap()[0];
+    assert!(s.app_limited, "the retransmission was sent marked");
+    assert_eq!(s.rtt, None, "Karn");
+}
+
+#[test]
+fn sample_uses_newest_transmission_not_highest_seq() {
+    let (mut f, samples) = sack_resend_after_mark();
+    // The ACK covers 10's retransmission (marked, newest) and 12–19's original transmissions.
+    f.ack(tm(40), data(20_000), BIG);
+    let s = samples.lock().unwrap()[0];
+    assert!(
+        s.app_limited,
+        "10's retransmission, not 19's original transmission"
+    );
+    assert_eq!(
+        s.rtt, None,
+        "the newest transmission is a retransmission (Karn)"
+    );
+    assert!(f.tcb.sent.is_empty());
+}
+
+/// An RTO ends the app-limited interval: the go-back resends are cwnd-limited at 1 SMSS,
+/// so their samples are not app-limited and CUBIC's slow start grows (m2-goodput c2s
+/// bimodal: a mark from before the RTO froze cwnd at 1 SMSS for 6 s).
+#[test]
+fn rto_clears_app_limited_marker() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), SEG)]);
+    assert!(!f.tcb.sent[0].app_limited);
+    f.ack(tm(1010), data(SEG), BIG);
+    assert_eq!(flags_of(&samples), [false]);
+
+    // CUBIC, IW 4000: three segments leave room for a fourth, so the sender is marked.
+    let mut f = cubic_fixture(BIG);
+    f.write(&pattern(3000));
+    assert_eq!(f.drain(t(0)).len(), 3);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(3000));
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(seq_lens(&f.drain(t(1))), [(data(0), 1000)]);
+    f.ack(tm(1010), data(1000), BIG);
+    assert_eq!(f.tcb.cc.cwnd(), 2000, "slow start after the RTO");
+    assert_eq!(
+        seq_lens(&f.drain(tm(1010))),
+        [(data(1000), 1000), (data(2000), 1000)]
+    );
+}
+
+#[test]
+fn no_mark_without_room() {
+    // cwnd full.
+    let (mut f, _) = Fixture::test_cc(None, SEG, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.mark(t(0), AppLimited::NoData);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    // Peer window closed.
+    let (mut f, _) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(1), data(SEG), 0);
+    f.mark(tm(1), AppLimited::NoData);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+    // Pacing-blocked with assigned data pending: it has something to send.
+    let (mut f, _) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(3 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 2, "one quantum");
+    f.mark(t(0), AppLimited::NotScheduled);
+    assert_eq!((f.tcb.app_limited(), f.tcb.app_limited_until), (None, None));
+}
+
+#[test]
+fn drained_paced_sender_marked_before_next_burst() {
+    let (mut f, samples) = Fixture::test_cc(Some(RATE), BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(1), data(SEG), BIG);
+    assert!(f.drain(tm(1)).is_empty());
+    assert_eq!(
+        f.tcb.poll_send_at(),
+        None,
+        "nothing to send: the release is no timer"
+    );
+    // The pending release (10 ms) does not keep the sender from being app-limited.
+    f.mark(tm(1), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited(), Some(AppLimited::NoData));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(100)).len(), 1);
+    assert!(f.tcb.sent.back().unwrap().app_limited);
+    f.ack(tm(110), data(2 * SEG), BIG);
+    assert_eq!(flags_of(&samples), [false, true]);
+}
+
+#[test]
+fn marker_refreshed_on_repeated_app_limited() {
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, BIG);
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 1);
+    f.ack(tm(10), data(SEG), BIG);
+    f.mark(tm(10), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(u64::from(SEG)));
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(10)).len(), 1);
+    // The pass ends again with room and no data: delivered + in_flight.
+    f.mark(tm(10), AppLimited::NoData);
+    assert_eq!(f.tcb.app_limited_until, Some(2 * u64::from(SEG)));
+    f.ack(tm(20), data(2 * SEG), BIG);
+    assert_eq!(
+        f.tcb.app_limited_until,
+        Some(2 * u64::from(SEG)),
+        "not cleared early"
+    );
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(20)).len(), 1);
+    assert!(f.tcb.sent.back().unwrap().app_limited);
+    f.ack(tm(30), data(3 * SEG), BIG);
+    assert_eq!(f.tcb.app_limited_until, None);
+    assert_eq!(flags_of(&samples), [false, true, true]);
+}
+
+// ---- cwnd-limited (RFC 9438 §5.8, RFC 7661 §3): fix round 1 ----
+
+/// The default CC (CUBIC), MSS 1000 (IW 4000), peer window `wnd`, ESTABLISHED at t(0).
+fn cubic_fixture(wnd: u16) -> Fixture {
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    assert_eq!(
+        f.synack(wnd, &opts(Some(MSS), Some(0))),
+        Reaction::Established
+    );
+    f.send(t(0)).unwrap();
+    assert_eq!(f.tcb.cc.cwnd(), 4000);
+    f
+}
+
+#[test]
+fn cubic_rwnd_limited_does_not_grow_cwnd() {
+    // A 2000-octet peer window below IW: the flow never fills cwnd.
+    let mut f = cubic_fixture(2000);
+    f.write(&pattern(200_000));
+    for round in 1..=50 {
+        let now = tm(10 * round);
+        assert!(!f.drain(now).is_empty());
+        // The second segment of the window at CUBIC's pacing release (625 µs here).
+        f.drain(now + Duration::from_millis(1));
+        let ack = f.tcb.snd_max;
+        f.ack(now + Duration::from_millis(5), ack, 2000);
+    }
+    assert!(f.tcb.snd_una.gt(data(90_000)), "the transfer runs");
+    assert_eq!(f.tcb.cc.cwnd(), 4000, "receiver-limited: no growth");
+}
+
+#[test]
+fn cubic_app_limited_with_data_outstanding_does_not_grow_cwnd() {
+    // The application writes one segment per 10 ms; one segment is always outstanding.
+    let mut f = cubic_fixture(BIG);
+    for round in 0..50u32 {
+        let now = tm(10 * u64::from(round));
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(now).len(), 1);
+        if round > 0 {
+            f.ack(now + Duration::from_millis(1), data(1000 * round), BIG);
+        }
+    }
+    assert_eq!(f.tcb.cc.cwnd(), 4000, "application-limited: no growth");
+}
+
+#[test]
+fn cwnd_limited_marks_acks_of_a_full_window() {
+    // cwnd 4 segments: the burst fills it, so every ACK of it is cwnd-limited, also when the
+    // ACKs come in one batch before anything more is sent.
+    let (mut f, samples) = Fixture::test_cc(None, 4 * SEG, BIG);
+    f.write(&pattern(8 * SEG as usize));
+    assert_eq!(f.drain(t(0)).len(), 4);
+    for k in 1..=4 {
+        f.ack(tm(10), data(k * SEG), BIG);
+    }
+    let lim: Vec<bool> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.cwnd_limited)
+        .collect();
+    assert_eq!(lim, [true; 4]);
+    // The rest (4 segments) leaves cwnd full again; ACKed, the queue is empty.
+    assert_eq!(f.drain(tm(10)).len(), 4);
+    f.ack(tm(20), data(8 * SEG), BIG);
+    // One segment with cwnd unused: not cwnd-limited.
+    f.write(&pattern(SEG as usize));
+    assert_eq!(f.drain(tm(20)).len(), 1);
+    f.ack(tm(30), data(9 * SEG), BIG);
+    let lim: Vec<bool> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|a| a.cwnd_limited)
+        .collect();
+    assert_eq!(lim, [true, true, true, true, true, false]);
+    // Receiver-limited: the peer window holds 2 segments of a 64 KiB cwnd.
+    let (mut f, samples) = Fixture::test_cc(None, BIG_CWND, 2 * 1460);
+    f.write(&pattern(8 * SEG as usize));
+    for k in 1..=4 {
+        assert_eq!(f.drain(tm(10 * u64::from(k))).len(), 2);
+        f.ack(tm(10 * u64::from(k) + 5), data(2 * k * SEG), 2 * 1460);
+    }
+    let s = samples.lock().unwrap();
+    assert_eq!(s.len(), 4);
+    assert!(s.iter().all(|a| !a.cwnd_limited && !a.app_limited), "{s:?}");
+}
+
+// ---- SACK-based loss recovery (RFC 6675), M2 Task 8b ----
+
+/// MSS, WS 0 and SACK-Permitted: the peer's SYN/ACK options of a SACK connection.
+fn sack_opts() -> Vec<u8> {
+    let mut o = opts(Some(MSS), Some(0));
+    let mut b = [0; 4];
+    let n = tcp_options::write_sack_permitted(&mut b);
+    o.extend_from_slice(&b[..n]);
+    o
+}
+
+/// The SACK blocks of a receiver holding `got` (data offsets above its cumulative ACK) just
+/// after receiving the segment at `latest`: the block holding it first (RFC 2018 §4), then
+/// the others from the highest, at most four.
+fn blocks_after(got: &RangeSet<u32>, latest: u32) -> Vec<(SeqNum, SeqNum)> {
+    let first = got.get(&latest).cloned();
+    first
+        .clone()
+        .into_iter()
+        .chain(
+            got.iter()
+                .rev()
+                .filter(|r| Some(*r) != first.as_ref())
+                .cloned(),
+        )
+        .take(4)
+        .map(|r| (data(r.start), data(r.end)))
+        .collect()
+}
+
+impl Fixture {
+    /// ESTABLISHED at t(0) with `Reno` (SMSS = MSS = 1000), peer window `BIG`, SACK
+    /// negotiated if `sack`; `bytes` written, the IW sent, then segments 0–9 ACKed one by
+    /// one at 1..10 ms, each ACK opening two more. Leaves segments 10–23 outstanding
+    /// (SND.UNA = data(10000), SND.MAX = data(24000)) with cwnd 14 segments.
+    fn ramp(sack: bool, bytes: &[u8]) -> Self {
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(Reno::new()), h);
+        let o = if sack {
+            sack_opts()
+        } else {
+            opts(Some(MSS), Some(0))
+        };
+        assert_eq!(f.synack(BIG, &o), Reaction::Established);
+        assert_eq!(f.tcb.sack_permitted, sack);
+        f.drain(t(0));
+        f.write(bytes);
+        assert_eq!(f.drain(t(0)).len(), 4, "IW");
+        for k in 1..=10 {
+            f.ack(tm(k), data(k as u32 * 1000), BIG);
+            assert_eq!(f.drain(tm(k)).len(), 2, "slow start");
+        }
+        assert_eq!((f.tcb.snd_una, f.tcb.snd_max), (data(10_000), data(24_000)));
+        assert_eq!(f.tcb.cc.cwnd(), 14_000);
+        f
+    }
+    /// An ACK-only segment of `ack` carrying `blocks`.
+    fn sack_ack(&mut self, now: Instant, ack: SeqNum, blocks: &[(SeqNum, SeqNum)]) -> Reaction {
+        let raw: Vec<(u32, u32)> = blocks.iter().map(|(l, r)| (l.0, r.0)).collect();
+        let mut o = [0; 40];
+        let n = tcp_options::write_sack(&mut o, &raw);
+        let seg = Segment {
+            src: self.addrs.1,
+            dst: self.addrs.0,
+            seq: PEER_ISN.wrapping_add(1),
+            ack,
+            flags: TcpFlags::ACK,
+            wnd: BIG,
+            options: &o[..n],
+            payload: &[],
+        };
+        self.tcb.on_segment(&seg, now, &mut self.h)
+    }
+    /// The peer receives the segment at data offset `k·1000` (cumulative ACK `cum`) and
+    /// answers with SACK blocks; returns what that draws.
+    fn peer_gets(
+        &mut self,
+        now: Instant,
+        got: &mut RangeSet<u32>,
+        k: u32,
+        cum: u32,
+    ) -> Vec<(SentMeta, Vec<u8>)> {
+        got.insert(k * 1000..(k + 1) * 1000);
+        got.remove(0..cum);
+        let b = blocks_after(got, k * 1000);
+        assert_eq!(self.sack_ack(now, data(cum), &b), Reaction::None);
+        self.drain(now)
+    }
+}
+
+/// Segments 10, 13 and 16 of one window are lost. With SACK, all three are retransmitted
+/// within the RTT in which the loss is detected, gated by pipe < cwnd = ssthresh (RFC 6675
+/// §5); the retransmissions' ACKs end recovery one RTT later. Twin without SACK below.
+#[test]
+fn sack_repairs_three_holes_in_one_rtt() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    let mut sent = Vec::new();
+    for k in [11, 12] {
+        assert!(f.peer_gets(tm(30), &mut got, k, 10_000).is_empty(), "{k}");
+    }
+    assert!(!f.tcb.sack.in_recovery());
+    // Third duplicate ACK (DupThresh): fast retransmit of HighACK + 1; cwnd = ssthresh =
+    // FlightSize / 2 (Reno), with no RFC 5681 inflation.
+    let segs = f.peer_gets(tm(30), &mut got, 14, 10_000);
+    assert_eq!(seq_lens(&segs), [(data(10_000), 1000)]);
+    assert!(f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.cc.cwnd(), 7000);
+    assert_eq!(f.tcb.rtt_timed, None, "Karn");
+    sent.extend(segs);
+    // pipe stays at or above cwnd until enough has been SACKed: 15, 17, 18 draw nothing.
+    for k in [15, 17, 18] {
+        assert!(f.peer_gets(tm(30), &mut got, k, 10_000).is_empty(), "{k}");
+    }
+    // 19: 13 and 16 are now lost (more than 2·SMSS SACKed above each); both go.
+    let segs = f.peer_gets(tm(30), &mut got, 19, 10_000);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(13_000), 1000), (data(16_000), 1000)]
+    );
+    assert_eq!(segs[0].1, bytes[13_000..14_000]);
+    assert_eq!(segs[1].1, bytes[16_000..17_000]);
+    sent.extend(segs);
+    // Every further SACKed segment leaves the network: one new segment each (rule 2).
+    for k in 20..24 {
+        let segs = f.peer_gets(tm(30), &mut got, k, 10_000);
+        assert_eq!(seq_lens(&segs), [(data(k * 1000 + 4000), 1000)], "{k}");
+        sent.extend(segs);
+    }
+    let rxt: Vec<SeqNum> = sent
+        .iter()
+        .map(|(m, _)| m.seq)
+        .filter(|s| s.lt(data(24_000)))
+        .collect();
+    assert_eq!(rxt, [data(10_000), data(13_000), data(16_000)]);
+    // One RTT later the retransmissions arrive; the third ACK covers RecoveryPoint (24000)
+    // and the new data: recovery ends with cwnd = ssthresh.
+    f.peer_gets(tm(50), &mut got, 10, 13_000);
+    f.peer_gets(tm(50), &mut got, 13, 16_000);
+    assert!(f.tcb.sack.in_recovery());
+    assert_eq!(f.sack_ack(tm(50), data(28_000), &[]), Reaction::None);
+    assert!(!f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.cc.cwnd(), 7000);
+    // Congestion avoidance from here: on_ack again.
+    f.drain(tm(50));
+    f.ack(tm(60), data(29_000), BIG);
+    f.ack(tm(60), data(35_000), BIG);
+    assert_eq!(f.tcb.cc.cwnd(), 8000);
+}
+
+/// The twin of `sack_repairs_three_holes_in_one_rtt` without SACK: NewReno retransmits one
+/// hole per RTT (the third duplicate ACK, then one per partial ACK).
+#[test]
+fn newreno_twin_repairs_one_hole_per_rtt() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(false, &bytes);
+    let mut rxt = Vec::new();
+    for _ in [11, 12, 14, 15, 17, 18, 19, 20, 21, 22, 23] {
+        f.ack(tm(30), data(10_000), BIG);
+        rxt.extend(
+            f.drain(tm(30))
+                .into_iter()
+                .filter(|(m, _)| m.seq.lt(data(24_000))),
+        );
+    }
+    assert_eq!(
+        seq_lens(&rxt),
+        [(data(10_000), 1000)],
+        "first RTT: one hole"
+    );
+    f.ack(tm(50), data(13_000), BIG);
+    let segs = f.drain(tm(50));
+    assert_eq!(segs[0].0.seq, data(13_000), "second RTT: the next");
+    f.ack(tm(70), data(16_000), BIG);
+    let segs = f.drain(tm(70));
+    assert_eq!(segs[0].0.seq, data(16_000), "third RTT: the last");
+}
+
+/// An RTO during SACK recovery ends it, expunges the scoreboard (RFC 2018 §8) and holds
+/// off a new recovery until SND.UNA reaches HighData at the RTO (RFC 6675 §5.1); the
+/// go-back then skips what is SACKed after the RTO ("filling in").
+#[test]
+fn sack_rto_during_recovery() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    for k in [11, 12, 14] {
+        f.peer_gets(tm(30), &mut got, k, 10_000);
+    }
+    assert!(f.tcb.sack.in_recovery());
+    let rto = f.tcb.poll_send_at().unwrap();
+    assert_eq!(f.timeout(rto), Reaction::None);
+    assert!(!f.tcb.sack.in_recovery());
+    assert_eq!(f.tcb.sack.sacked_in(0, u64::MAX), 0, "expunged");
+    assert!(f.tcb.sent.iter().all(|r| !r.sacked));
+    assert_eq!(f.tcb.cc.cwnd(), 1000);
+    assert_eq!(seq_lens(&f.drain(rto)), [(data(10_000), 1000)]);
+    // The peer still holds 11–12 and 14 (and gets 15): cumulative ACK to 13000, SACK of
+    // 14000–16000. Slow start resends 13 and then 16, skipping the SACKed 14–15.
+    got.insert(15_000..16_000);
+    let segs = f.peer_gets(rto, &mut got, 10, 13_000);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(13_000), 1000), (data(16_000), 1000)]
+    );
+    assert_eq!(segs[1].1, bytes[16_000..17_000]);
+    // Newly SACKing ACKs below the RTO's RecoveryPoint start no recovery.
+    for k in [17, 18, 19, 20] {
+        assert!(f.peer_gets(rto, &mut got, k, 13_000).is_empty(), "{k}");
+    }
+    assert!(!f.tcb.sack.in_recovery());
+}
+
+/// SACKed data stays in the send buffer until it is cumulatively acknowledged (RFC 2018
+/// §8, RFC 6675 §4 Update()): a receiver that reneged gets it again after the RTO.
+#[test]
+fn sack_reneging_safe() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut got = RangeSet::new();
+    for k in [11, 12] {
+        f.peer_gets(tm(30), &mut got, k, 10_000);
+    }
+    let rto = f.tcb.poll_send_at().unwrap();
+    f.timeout(rto);
+    assert_eq!(seq_lens(&f.drain(rto)), [(data(10_000), 1000)]);
+    // The peer reneged on 11–12: cumulative ACK 11000, no SACK. 11 and 12 go again.
+    assert_eq!(f.sack_ack(rto, data(11_000), &[]), Reaction::None);
+    let segs = f.drain(rto);
+    assert_eq!(
+        seq_lens(&segs),
+        [(data(11_000), 1000), (data(12_000), 1000)]
+    );
+    assert_eq!(segs[0].1, bytes[11_000..12_000]);
+    assert_eq!(segs[1].1, bytes[12_000..13_000]);
+}
+
+/// The ACK's sample comes from the most recently sent record it newly delivers, cumulatively
+/// or by SACK (draft-ietf-ccwg-bbr-06 §4.1.2.3: "for each newly SACKed or ACKed packet");
+/// a record SACKed by an earlier ACK was delivered then and gives nothing later.
+#[test]
+fn sack_sample_from_newest_newly_delivered_record() {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.tcb.set_nodelay(true);
+    for k in 0..3 {
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(tm(10 * k)).len(), 1);
+    }
+    // A (0 ms) delivered, B (10 ms) missing, C (20 ms) SACKed: C is the newest.
+    f.sack_ack(tm(50), data(1000), &[(data(2000), data(3000))]);
+    // B arrives: C was delivered before, so B (10 ms) gives the sample.
+    f.ack(tm(60), data(3000), BIG);
+    let rtts: Vec<_> = samples.lock().unwrap().iter().map(|a| a.rtt).collect();
+    assert_eq!(
+        rtts,
+        [
+            Some(Duration::from_millis(30)),
+            Some(Duration::from_millis(50))
+        ]
+    );
+}
+
+/// A D-SACK block below the ACK's own cumulative point (RFC 2883) is not new SACK
+/// information: the ACK that advances SND.UNA past it counts no duplicate ACK, so two
+/// newly SACKing ACKs after it stay below DupThresh.
+#[test]
+fn dsack_below_new_ack_is_no_dup_ack() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let dsack = [(data(11_000), data(12_000))];
+    assert_eq!(f.sack_ack(tm(30), data(12_000), &dsack), Reaction::None);
+    assert_eq!(f.tcb.sack.sacked_in(0, u64::MAX), 0);
+    f.drain(tm(30));
+    for k in [14, 16] {
+        let b = [(data(k * 1000), data(k * 1000 + 1000))];
+        f.sack_ack(tm(31), data(12_000), &b);
+    }
+    assert!(!f.tcb.sack.in_recovery(), "two duplicate ACKs, not three");
+}
+
+/// The same ACK's RTT sample and app-limited flag come from the newest record it
+/// cumulatively acknowledges, not from the D-SACKed one.
+#[test]
+fn dsack_below_new_ack_sample_from_newest_record() {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.tcb.set_nodelay(true);
+    for k in 0..3 {
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(tm(10 * k)).len(), 1);
+    }
+    // A (0 ms), B (10 ms) and C (20 ms) all ACKed; B also D-SACKed.
+    f.sack_ack(tm(50), data(3000), &[(data(1000), data(2000))]);
+    let rtts: Vec<_> = samples.lock().unwrap().iter().map(|a| a.rtt).collect();
+    assert_eq!(rtts, [Some(Duration::from_millis(30))]);
+}
+
+/// A hostile receiver SACKing every other octet cannot grow the scoreboard past
+/// `MAX_SACK_RANGES`; the transfer still completes on cumulative ACKs.
+#[test]
+fn hostile_alternating_sack_bounded() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut now = tm(30);
+    let mut l = 10_001;
+    while l + 8 < 24_000 {
+        let b: Vec<_> = (0..4)
+            .map(|k| (data(l + 2 * k), data(l + 2 * k + 1)))
+            .collect();
+        f.sack_ack(now, data(10_000), &b);
+        assert!(f.tcb.sack.ranges() <= crate::tcp::sack::MAX_SACK_RANGES);
+        f.drain(now);
+        l += 8;
+    }
+    assert_eq!(f.tcb.sack.ranges(), crate::tcp::sack::MAX_SACK_RANGES);
+    for _ in 0..10_000 {
+        if f.tcb.snd_una == data(40_000) {
+            return;
+        }
+        now = now + Duration::from_millis(10);
+        f.drain(now);
+        let max = f.tcb.snd_max;
+        f.ack(now, max, BIG);
+        if let Some(at) = f.tcb.poll_send_at().filter(|&at| at <= now) {
+            f.timeout(at);
+        }
+    }
+    panic!("transfer stalled at {:?}", f.tcb.snd_una);
 }

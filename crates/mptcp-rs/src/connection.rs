@@ -1,8 +1,9 @@
-//! One TCP or MPTCP connection as the application sees it: a `Tcb` plus its buffers.
+//! One TCP or MPTCP connection as the application sees it: its subflows plus its buffers.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use crate::tcp::{Tcb, TcpState};
+use crate::mptcp::{Subflow, SubflowId};
+use crate::tcp::{ConnectConfig, TcpState};
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
@@ -21,21 +22,48 @@ pub enum ReadError {
 }
 
 pub struct Connection {
-    pub(crate) tcb: Tcb,
+    /// The initial subflow is `subflows[0]`; after a fallback, the subflow that carries the
+    /// connection as plain TCP is.
+    pub(crate) subflows: Vec<Subflow>,
     pub(crate) hooks: ConnectionHooks,
-    pub(crate) local: SocketAddr,
-    pub(crate) remote: SocketAddr,
     pub(crate) closed_by_app: bool,
     pub(crate) reset: bool,
     /// Closed and out of the demux table, kept only until the application has read the
     /// remaining data (no timers, no packets).
     pub(crate) detached: bool,
+    /// The configuration subflows are opened with (each with its own MTU).
+    pub(crate) cfg: ConnectConfig,
+    /// `set_nodelay`, applied to every subflow, joined ones included.
+    pub(crate) nodelay: bool,
+    /// Joins waiting for the connection to be Confirmed (RFC 8684 L884–887).
+    pub(crate) queued_joins: Vec<QueuedJoin>,
+    /// The next subflow ID; IDs are never reused within a connection.
+    pub(crate) next_subflow: u8,
+    /// Local IPs by address ID: the initial one is 0 (spec §5.6).
+    pub(crate) addr_ids: Vec<IpAddr>,
+}
+
+/// An `add_subflow` made before the connection was Confirmed.
+pub(crate) struct QueuedJoin {
+    pub id: SubflowId,
+    pub local: IpAddr,
+    pub mtu: u16,
 }
 
 impl Connection {
+    /// The initial subflow's local address (after a fallback: the surviving subflow's).
+    pub fn local(&self) -> SocketAddr {
+        self.subflows[0].local
+    }
+
+    /// The initial subflow's remote address (after a fallback: the surviving subflow's).
+    pub fn remote(&self) -> SocketAddr {
+        self.subflows[0].remote
+    }
+
     /// Queues `data` for sending; may accept less than `data.len()` (send buffer full), even 0.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        let closed = self.tcb.state() == TcpState::Closed && !self.hooks.retained();
+        let closed = self.subflows[0].tcb.state() == TcpState::Closed && !self.hooks.retained();
         if self.closed_by_app || self.reset || closed {
             return Err(WriteError::Closed);
         }
@@ -51,7 +79,7 @@ impl Connection {
         if self.reset {
             return Err(ReadError::Reset);
         }
-        let eof = self.hooks.eof(self.tcb.fin_received());
+        let eof = self.hooks.eof(self.subflows[0].tcb.fin_received());
         match self.hooks.read(buf) {
             0 if eof => Ok(0),
             0 => Err(ReadError::WouldBlock),
@@ -71,10 +99,15 @@ impl Connection {
         if self.hooks.close() {
             return;
         }
-        self.tcb.close();
+        self.subflows[0].tcb.close();
     }
 
+    /// Switches Nagle off (`true`) or on (`false`, the default) on every subflow, including
+    /// those joined later.
     pub fn set_nodelay(&mut self, nodelay: bool) {
-        self.tcb.set_nodelay(nodelay);
+        self.nodelay = nodelay;
+        for sf in &mut self.subflows {
+            sf.tcb.set_nodelay(nodelay);
+        }
     }
 }

@@ -17,7 +17,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES --expect BYTES [--pause-read-ms MS]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--join IP [--join-mtu N]]...";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -38,13 +38,20 @@ struct Args {
     local: IpAddr,
     remote: SocketAddr,
     send: u64,
-    expect: u64,
+    /// Timed sending: write the pattern for this long after `Connected`, then close.
+    send_secs: Option<Duration>,
+    /// `None` = `--expect any`: verify the pattern until EOF.
+    expect: Option<u64>,
+    /// `--join IP [--join-mtu N]`: extra subflows from these local addresses, with that MTU.
+    joins: Vec<(IpAddr, u16)>,
 }
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let (mut tun, mut local, mut remote, mut send, mut expect) = (None, None, None, None, None);
+    let mut send_secs = None;
     let mut mode = None;
     let mut pause_read = Duration::ZERO;
+    let mut joins = Vec::new();
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -60,7 +67,19 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             "--local" => local = v.parse().ok(),
             "--remote" => remote = v.parse().ok(),
             "--send" => send = v.parse().ok(),
-            "--expect" => expect = v.parse().ok(),
+            // The TUN device's MTU, which the initial subflow also uses.
+            "--join" => joins.push((v.parse().ok()?, ConnectConfig::default().mtu)),
+            "--join-mtu" => joins.last_mut()?.1 = v.parse().ok()?,
+            "--send-secs" => {
+                send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
+            }
+            "--expect" => {
+                expect = Some(if v == "any" {
+                    None
+                } else {
+                    Some(v.parse().ok()?)
+                })
+            }
             _ => return None,
         }
     }
@@ -70,8 +89,14 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         tun: tun?,
         local: local?,
         remote: remote?,
-        send: send?,
+        send: match (send, send_secs) {
+            (Some(n), None) => n,
+            (None, Some(_)) => 0,
+            _ => return None,
+        },
+        send_secs,
         expect: expect?,
+        joins,
     })
 }
 
@@ -103,6 +128,12 @@ fn run(a: Args) -> Result<String, String> {
     };
     let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
         .map_err(|e| format!("connect: {e:?}"))?;
+    // Queued until the connection is Confirmed, then started at the next poll.
+    for &(ip, mtu) in &a.joins {
+        let id = (ep.add_subflow(now(start), h, ip, mtu))
+            .map_err(|e| format!("add_subflow {ip}: {e:?}"))?;
+        eprintln!("join: {id:?} local {ip} mtu {mtu}");
+    }
 
     let mut pkt = vec![0u8; 65535];
     let mut rbuf = vec![0u8; 65536];
@@ -139,13 +170,17 @@ fn run(a: Args) -> Result<String, String> {
             ep.handle_timeout(t);
         }
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
-        st.events(&mut ep, &a)?;
+        st.events(&mut ep, &a, start.elapsed())?;
 
         // After a normal close the connection is gone unless data is still unread.
         if st.drives(ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
-            while !st.closing && st.sent < a.send {
-                let n = (a.send - st.sent).min(65536) as usize;
+            while !st.closing && !st.send_done(&a, start.elapsed()) {
+                let n = if a.send_secs.is_some() {
+                    65536
+                } else {
+                    (a.send - st.sent).min(65536) as usize
+                };
                 match conn.write(&pat[(st.sent % 251) as usize..][..n]) {
                     Ok(0) => break,
                     Ok(w) => st.sent += w as u64,
@@ -157,12 +192,15 @@ fn run(a: Args) -> Result<String, String> {
                 match conn.read(&mut rbuf) {
                     Ok(0) => st.eof = true,
                     Ok(n) => {
-                        if st.verified + n as u64 > a.expect
+                        if a.expect.is_some_and(|e| st.verified + n as u64 > e)
                             || !verify_pattern(st.verified, &rbuf[..n])
                         {
                             return Err(format!("verification mismatch at byte {}", st.verified));
                         }
                         st.verified += n as u64;
+                        let t = start.elapsed();
+                        st.first_rx.get_or_insert(t);
+                        st.last_rx = t;
                         if resume_read.is_none() && !a.pause_read.is_zero() {
                             resume_read = Some(start.elapsed() + a.pause_read);
                             eprintln!("read paused at {} bytes", st.verified);
@@ -173,18 +211,15 @@ fn run(a: Args) -> Result<String, String> {
                     Err(ReadError::Reset) => return Err("connection reset by peer".into()),
                 }
             }
-            if st.eof && st.verified < a.expect {
-                return Err(format!(
-                    "premature EOF after {} of {} bytes",
-                    st.verified, a.expect
-                ));
+            if let Some(e) = a.expect.filter(|e| st.eof && st.verified < *e) {
+                return Err(format!("premature EOF after {} of {e} bytes", st.verified));
             }
-            if !st.closing && st.sent == a.send && st.verified == a.expect {
+            if !st.closing && st.send_done(&a, start.elapsed()) && st.recv_done(&a) {
                 conn.close();
                 st.closing = true;
             }
         }
-        st.events(&mut ep, &a)?;
+        st.events(&mut ep, &a, start.elapsed())?;
 
         // Drain before returning: the final ACK of the active close must go out.
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
@@ -193,6 +228,15 @@ fn run(a: Args) -> Result<String, String> {
         if st.done {
             if !st.eof {
                 return Err("closed before EOF".into());
+            }
+            if let Some(f) = st.first_rx {
+                // Receiver-side goodput: first to last received byte.
+                let secs = (st.last_rx - f).as_secs_f64();
+                let mbps = st.verified as f64 * 8.0 / secs.max(1e-9) / 1e6;
+                println!(
+                    "goodput: {} bytes in {secs:.3} s = {mbps:.1} Mbit/s",
+                    st.verified
+                );
             }
             return Ok(format!(
                 "ok: sent {} bytes, verified {} bytes, eof=true",
@@ -233,6 +277,10 @@ struct State {
     sent: u64,
     verified: u64,
     connected: bool,
+    connected_at: Option<Duration>,
+    send_stop: bool,
+    first_rx: Option<Duration>,
+    last_rx: Duration,
     closing: bool,
     eof: bool,
     done: bool,
@@ -245,17 +293,55 @@ impl State {
         self.connected && (!self.done || conn_present)
     }
 
-    fn events(&mut self, ep: &mut Endpoint<ChaCha20Rng>, a: &Args) -> Result<(), String> {
+    /// All bytes are written: the fixed count, or the `--send-secs` deadline has passed.
+    fn send_done(&mut self, a: &Args, now: Duration) -> bool {
+        if let (Some(d), Some(c)) = (a.send_secs, self.connected_at) {
+            self.send_stop |= now >= c + d;
+        }
+        match a.send_secs {
+            Some(_) => self.send_stop,
+            None => self.sent == a.send,
+        }
+    }
+
+    /// Everything expected has arrived: the fixed count, or EOF for `--expect any`.
+    fn recv_done(&self, a: &Args) -> bool {
+        a.expect.map_or(self.eof, |e| self.verified == e)
+    }
+
+    fn events(
+        &mut self,
+        ep: &mut Endpoint<ChaCha20Rng>,
+        a: &Args,
+        now: Duration,
+    ) -> Result<(), String> {
+        // Subflow events carry the time since `Connected` (the harness's blackhole clock).
+        let at = |c: Option<Duration>| c.map_or(0.0, |c| (now - c).as_secs_f64());
         while let Some((_, ev)) = ep.poll_event() {
+            let t = at(self.connected_at);
             match ev {
                 Event::FellBack => eprintln!("event: FellBack"),
+                Event::SubflowUp { subflow } => eprintln!("event: SubflowUp {subflow:?} +{t:.3}s"),
+                Event::SubflowDown { subflow, reason } => {
+                    eprintln!("event: SubflowDown {subflow:?} {reason:?} +{t:.3}s")
+                }
+                Event::SubflowStale { subflow } => {
+                    eprintln!("event: SubflowStale {subflow:?} +{t:.3}s")
+                }
+                Event::SubflowRecovered { subflow } => {
+                    eprintln!("event: SubflowRecovered {subflow:?} +{t:.3}s")
+                }
                 Event::Connected { mptcp } => {
                     eprintln!("event: Connected mptcp={mptcp}");
                     self.connected = true;
+                    self.connected_at = Some(now);
                 }
                 Event::Closed {
                     reason: CloseReason::Normal,
-                } if self.closing && self.sent == a.send && self.verified == a.expect => {
+                } if self.closing
+                    && self.recv_done(a)
+                    && (a.send_secs.is_some() || self.sent == a.send) =>
+                {
                     eprintln!("event: Closed Normal");
                     self.done = true;
                 }
@@ -319,6 +405,29 @@ mod tests {
         assert!(parse_args(v(&format!("{ok} --mode other"))).is_none());
         assert!(parse_args(v("--tun t0")).is_none());
         assert!(parse_args(v("--bogus 1")).is_none());
+        let timed = "--mode mptcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --expect any";
+        let a = parse_args(v(&format!("{timed} --send-secs 30"))).unwrap();
+        assert_eq!(
+            (a.send, a.send_secs, a.expect),
+            (0, Some(Duration::from_secs(30)), None)
+        );
+        assert!(parse_args(v(&format!("{timed} --send-secs 0"))).is_none());
+        assert!(parse_args(v(&format!("{timed} --send 5"))).is_some());
+        assert!(parse_args(v(&format!("{timed} --send 5 --send-secs 3"))).is_none());
+        let a = parse_args(v(&format!(
+            "{timed} --send 5 --join 10.0.8.2 --join-mtu 1280 --join 10.0.7.2"
+        )))
+        .unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(a.joins, [(ip("10.0.8.2"), 1280), (ip("10.0.7.2"), 1500)]);
+        assert!(parse_args(v(&format!("{timed} --send 5 --join-mtu 1280"))).is_none());
+        assert!(parse_args(v(&format!("{timed} --send 5 --join x"))).is_none());
+        assert!(
+            parse_args(v(
+                "--mode tcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 1"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
