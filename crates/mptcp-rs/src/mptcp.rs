@@ -248,7 +248,8 @@ impl Connection {
     /// Connection-level timers, evaluated once per input and per `poll_transmit` over all
     /// subflows (spec §4 rule 5, §5.5). Arms the DATA_FIN retry once it went out and all data
     /// is DATA_ACKed, and the data-retransmission timer while the head of the send queue is
-    /// subflow-ACKed but not DATA_ACKed: no Active subflow holds a live copy covering it. On
+    /// subflow-ACKed but not DATA_ACKed (no Active subflow holds a live copy covering it) and
+    /// not already queued for reinjection. On
     /// expiry the uncovered head run — stopping before a live copy on any Active subflow — is
     /// queued for reinjection. With no subflow that may carry data (all Joining or closed)
     /// nothing is evaluated and the data-retransmission timer is disarmed. Timers use the largest un-backed-off RTO (RFC 6298 §2) among the
@@ -304,9 +305,14 @@ impl Connection {
             d.recovery_interval = rto;
         }
         let maps = active_maps(&self.subflows);
-        if head.is_none() || maps.clone().any(|m| m.covering_end(d.send.una).is_some()) {
+        // A queued head is the timer's job already done: disarm, or an expiry nothing
+        // consumes keeps `poll_timeout` in the past while no subflow can take the reinjection.
+        if head.is_none()
+            || d.reinject.first().map(|(start, _)| start) == head
+            || maps.clone().any(|m| m.covering_end(d.send.una).is_some())
+        {
             d.recovery_at = None;
-        } else if d.reinject.first().map(|(start, _)| start) != head {
+        } else {
             let at = d.recovery_at.get_or_insert(now + d.recovery_interval);
             if now >= *at {
                 let outstanding = d.send.next.wrapping_sub(d.send.una) as usize;

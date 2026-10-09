@@ -2567,6 +2567,57 @@ fn bare_fin_on_join_confirming_ack_retires_subflow() {
     );
 }
 
+/// The head on subflow 0, whose bare FIN (Closing) arms connection recovery; then subflow 0
+/// is reset, which queues the head for reinjection, while subflow 1's peer window is zero.
+/// The queued head disarms recovery: `poll_timeout` never stays at a past deadline. Once
+/// subflow 1's window opens, the reinjection completes the transfer.
+#[test]
+fn queued_head_disarms_recovery() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, ms(15), jsyn.seq.wrapping_add(1), head, 0);
+    pin(&mut ep, h, Some(SubflowId(0)));
+    ep.connection(h).unwrap().write(&[7; 1000]).unwrap();
+    assert_eq!(data_on(&drain(&mut ep, ms(20)), &syn).len(), 1);
+    pin(&mut ep, h, None);
+    let opts = data_ack(head);
+    let fin = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &fin, ms(25));
+    assert_eq!(ep.conns[&h].subflows[0].state, SubflowState::Closing);
+    let deadline = ep.conns[&h].hooks.recovery_deadline().expect("armed");
+    drain(&mut ep, ms(25));
+    let rst = Segment {
+        flags: TcpFlags::RST | TcpFlags::ACK,
+        ..peer_data(&syn, 5002, &[], &[])
+    };
+    input_at(&mut ep, &rst, ms(30));
+    assert_eq!(queue_first(&ep, h), Some((head, 1000)));
+    assert!(
+        data_on(&drain(&mut ep, ms(30)), &jsyn).is_empty(),
+        "window closed"
+    );
+    let mut t = ms(30);
+    while t <= deadline {
+        t = ep.poll_timeout().expect("subflow 1's persist timer");
+        ep.handle_timeout(t);
+        assert!(
+            data_on(&drain(&mut ep, t), &jsyn).is_empty(),
+            "window closed"
+        );
+        assert!(
+            ep.poll_timeout().is_none_or(|n| n > t),
+            "past deadline at {t:?}"
+        );
+    }
+    peer_ack(&mut ep, &jsyn, t, jsyn.seq.wrapping_add(1), head, 65535);
+    let out = drain(&mut ep, t);
+    ack_all(&mut ep, &jsyn, &out, t + Duration::from_millis(10));
+    assert_eq!(una(&ep, h), head + 1000);
+}
+
 #[test]
 fn last_subflow_lost_then_add_subflow_resumes() {
     let (mut ep, h, syn, _) = confirmed_cc(reno);
