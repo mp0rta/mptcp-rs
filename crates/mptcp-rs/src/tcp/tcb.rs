@@ -825,7 +825,7 @@ impl Tcb {
         };
         (self.data_len(start, self.snd_max) > 0).then_some(start)
     }
-    /// A scheduler penalty (M3 spec §2.5): `CongestionEvent::Penalized` with FlightSize, unless
+    /// A multipath penalty (M3 spec §2.5): `CongestionEvent::Penalized` with FlightSize, unless
     /// loss recovery or an RTO backoff (an RTO since SND.UNA last advanced) already decreased
     /// cwnd. Returns whether it applied.
     pub(crate) fn penalize(&mut self, now: Instant) -> bool {

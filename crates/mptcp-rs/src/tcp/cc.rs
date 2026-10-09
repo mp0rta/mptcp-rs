@@ -10,7 +10,7 @@ use crate::time::Instant;
 pub enum CongestionEvent {
     FastRetransmit,
     Rto,
-    /// An MPTCP scheduler penalty (M3 spec §2.5): this subflow's outstanding data blocks the
+    /// A multipath penalty (M3 spec §2.5): this subflow's outstanding data blocks the
     /// connection. The loss-response decrease without a recovery episode or retransmission;
     /// it never raises cwnd.
     Penalized,
