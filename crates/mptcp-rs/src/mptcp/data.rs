@@ -128,8 +128,7 @@ impl SendStore {
     }
     pub fn write(&mut self, data: &[u8]) -> usize {
         self.allocations.retain(|(p, _)| p.strong_count() > 0);
-        let used: usize = self.allocations.iter().map(|(_, n)| n).sum();
-        let n = data.len().min(self.cap.saturating_sub(used));
+        let n = data.len().min(self.writable());
         if n > 0 {
             let bytes: Arc<Vec<u8>> = Arc::new(data[..n].to_vec());
             self.allocations.push((Arc::downgrade(&bytes), n));
@@ -142,6 +141,15 @@ impl SendStore {
             self.end = self.end.wrapping_add(n as u64);
         }
         n
+    }
+    /// The octets `write` would accept now: an allocation counts until neither the store nor
+    /// any mapping holds its octets.
+    pub fn writable(&self) -> usize {
+        let live = self
+            .allocations
+            .iter()
+            .filter(|(p, _)| p.strong_count() > 0);
+        self.cap.saturating_sub(live.map(|(_, n)| n).sum())
     }
     /// Stored octets from `dsn` to the end. Chunks are contiguous in DSN space, so a mapping
     /// may span application writes: a write boundary is not a mapping or segment boundary.
@@ -260,6 +268,10 @@ impl TxMaps {
             .iter()
             .find(|m| dsn.wrapping_sub(m.dsn) < m.len as u64)
             .map(|m| m.dsn.wrapping_add(m.len as u64))
+    }
+    /// An un-subflow-ACKed mapping that is not a copy (reinjection) covers `dsn`.
+    pub fn original_covers(&self, dsn: u64) -> bool {
+        (self.maps.iter()).any(|m| !m.reinjected && dsn.wrapping_sub(m.dsn) < m.len as u64)
     }
     /// `(dsn, len)` of every un-subflow-ACKed mapping, in SSN order.
     pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {

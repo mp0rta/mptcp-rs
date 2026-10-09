@@ -89,6 +89,11 @@ pub(crate) struct SubflowMp {
     pub probe: bool,
     /// The `Tcb::rto_streak` last turned into a `HealthEvent`.
     pub rto_seen: u32,
+    /// When a penalty last applied (M3 §2.5: at most one per srtt).
+    pub penalized_at: Option<Instant>,
+    /// An eligible target of the opportunistic candidate: pending demand like a queued
+    /// reinjection (`Connection::select_control`).
+    pub opp_demand: bool,
     /// Reset deadline while both DATA_FINs are DATA_ACKed and this subflow still holds TCP
     /// data (`Connection::update_recovery`).
     pub strand_at: Option<Instant>,
@@ -119,6 +124,8 @@ impl SubflowMp {
             fin_carrier: false,
             probe: false,
             rto_seen: 0,
+            penalized_at: None,
+            opp_demand: false,
             strand_at: None,
         }
     }

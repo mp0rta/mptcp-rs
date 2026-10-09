@@ -10,6 +10,10 @@ use crate::time::Instant;
 pub enum CongestionEvent {
     FastRetransmit,
     Rto,
+    /// An MPTCP scheduler penalty (M3 spec §2.5): this subflow's outstanding data blocks the
+    /// connection. The loss-response decrease without a recovery episode or retransmission;
+    /// it never raises cwnd.
+    Penalized,
 }
 
 /// What one ACK that advanced SND.UNA outside fast recovery measured.
@@ -66,7 +70,8 @@ pub trait CongestionControl: Send {
     /// loss recovery).
     fn on_ack(&mut self, ack: &AckSample);
     /// `in_flight` is FlightSize (RFC 5681): SND.MAX − SND.UNA at the event, before any
-    /// retransmission it triggers. `FastRetransmit` starts fast recovery.
+    /// retransmission it triggers. `FastRetransmit` starts fast recovery; `Penalized` starts
+    /// nothing.
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, now: Instant);
     /// Called in place of `on_ack` for every ACK between `on_congestion(FastRetransmit)` and
     /// the full ACK (or an RTO) that ends fast recovery: the window inflation and deflation of
@@ -208,13 +213,15 @@ impl CongestionControl for Reno {
     }
 
     /// RTO: cwnd = LW = 1 SMSS. Fast retransmit: cwnd = ssthresh + 3·SMSS (RFC 5681 §3.2
-    /// step 3). A repeated RTO with SND.UNA unmoved sees the same FlightSize (SND.MAX −
-    /// SND.UNA), so ssthresh is held as §3.1 requires.
+    /// step 3). Penalized: cwnd = ssthresh, never above the old cwnd. A repeated RTO with
+    /// SND.UNA unmoved sees the same FlightSize (SND.MAX − SND.UNA), so ssthresh is held as
+    /// §3.1 requires.
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
         self.reduce(in_flight);
         self.cwnd = match ev {
             CongestionEvent::Rto => self.smss,
             CongestionEvent::FastRetransmit => self.ssthresh.saturating_add(3 * self.smss),
+            CongestionEvent::Penalized => self.ssthresh.min(self.cwnd),
         };
     }
 
@@ -372,5 +379,26 @@ mod tests {
         r.on_congestion(CongestionEvent::FastRetransmit, 10_000, T0);
         r.on_recovery_ack(RecoveryAck::Full { in_flight: 9000 });
         assert_eq!(r.cwnd(), 5000, "capped at ssthresh");
+    }
+
+    #[test]
+    fn reno_penalized_clears_ai_credit() {
+        let mut r = reno();
+        r.on_congestion(CongestionEvent::Rto, 16_000, T0);
+        for _ in 0..14 {
+            r.on_ack(&sample(1000));
+        }
+        // Slow start to ssthresh 8000, then 7000 octets of congestion avoidance credit.
+        assert_eq!((r.cwnd(), r.ssthresh, r.ca_acked), (8000, 8000, 7000));
+        // M3 §2.5: ssthresh = max(FlightSize / 2, 2·SMSS), cwnd = ssthresh, no recovery.
+        r.on_congestion(CongestionEvent::Penalized, 8000, T0);
+        assert_eq!((r.cwnd(), r.ssthresh, r.ca_acked), (4000, 4000, 0));
+        // A whole new cwnd of octets before the next SMSS: the old credit is gone.
+        for _ in 0..3 {
+            r.on_ack(&sample(1000));
+            assert_eq!(r.cwnd(), 4000);
+        }
+        r.on_ack(&sample(1000));
+        assert_eq!(r.cwnd(), 5000);
     }
 }

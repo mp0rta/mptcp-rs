@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use mptcp_rs::{CloseReason, ConnectConfig, Endpoint, Event, Instant, ReadError};
+use mptcp_rs::{CloseReason, ConnectConfig, DebugStats, Endpoint, Event, Instant, ReadError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use tun::Tun;
@@ -175,6 +175,7 @@ fn run(a: Args) -> Result<String, String> {
         // After a normal close the connection is gone unless data is still unread.
         if st.drives(ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
+            st.stats = conn.debug_stats();
             while !st.closing && !st.send_done(&a, start.elapsed()) {
                 let n = if a.send_secs.is_some() {
                     65536
@@ -182,10 +183,20 @@ fn run(a: Args) -> Result<String, String> {
                     (a.send - st.sent).min(65536) as usize
                 };
                 match conn.write(&pat[(st.sent % 251) as usize..][..n]) {
-                    Ok(0) => break,
-                    Ok(w) => st.sent += w as u64,
+                    Ok(0) => {
+                        st.blocked_since.get_or_insert(start.elapsed());
+                        break;
+                    }
+                    Ok(w) => {
+                        st.unblock(start.elapsed());
+                        st.sent += w as u64;
+                    }
                     Err(e) => return Err(format!("write: {e:?}")),
                 }
+            }
+            // The application has nothing more to write: it is no longer blocked.
+            if st.send_done(&a, start.elapsed()) {
+                st.unblock(start.elapsed());
             }
             // Keep verifying after close(): extra bytes from the peer are a mismatch.
             while !st.eof && resume_read.is_none_or(|deadline| start.elapsed() >= deadline) {
@@ -229,6 +240,16 @@ fn run(a: Args) -> Result<String, String> {
             if !st.eof {
                 return Err("closed before EOF".into());
             }
+            st.unblock(start.elapsed());
+            let s = st.stats;
+            println!(
+                "stats: opp_triggers={} opp_episodes={} penalties={} opp_bytes={} app_blocked_ms={}",
+                s.opp_triggers,
+                s.opp_episodes,
+                s.penalties,
+                s.opp_bytes,
+                st.app_blocked.as_millis()
+            );
             if let Some(f) = st.first_rx {
                 // Receiver-side goodput: first to last received byte.
                 let secs = (st.last_rx - f).as_secs_f64();
@@ -284,9 +305,22 @@ struct State {
     closing: bool,
     eof: bool,
     done: bool,
+    /// The connection's counters, as last seen while it existed.
+    stats: DebugStats,
+    /// Since when `write` accepts nothing while the application has data; the longest such
+    /// interval so far.
+    blocked_since: Option<Duration>,
+    app_blocked: Duration,
 }
 
 impl State {
+    /// A write-blocked interval, if one is open, ends at `now`.
+    fn unblock(&mut self, now: Duration) {
+        if let Some(since) = self.blocked_since.take() {
+            self.app_blocked = self.app_blocked.max(now - since);
+        }
+    }
+
     /// Whether this iteration writes, reads and closes. After a normal close the connection is
     /// gone unless data is still unread. EOF only stops the read loop, never the writes.
     fn drives(&self, conn_present: bool) -> bool {

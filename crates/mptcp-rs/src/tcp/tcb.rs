@@ -323,6 +323,8 @@ pub struct Tcb {
     /// Resend one segment at SND.UNA (RTO, fast retransmit, partial ACK).
     retransmit_due: bool,
     probe_due: bool,
+    /// Resend the highest-sequence outstanding segment once (`probe_tail`).
+    tail_probe_due: bool,
     /// SWS override timer expired: send what the window allows.
     sws_override: bool,
 }
@@ -407,6 +409,7 @@ impl Tcb {
             rst_due: None,
             retransmit_due: false,
             probe_due: false,
+            tail_probe_due: false,
             sws_override: false,
         };
         tcb.eff_mss = tcb.eff_mss_for(None);
@@ -768,6 +771,71 @@ impl Tcb {
     pub(crate) fn rto_streak(&self) -> u32 {
         self.rto_streak
     }
+    /// The tail loss probe time for the data up to relative SSN `end` (M3 spec §2.3, after
+    /// RFC 8985 §7.2): once all of it is sent, nothing else waits to be sent, it is not all
+    /// acknowledged and no loss recovery or RTO runs, the last data transmission plus
+    /// PTO = 2·SRTT (the initial RTO before a sample), at most the RTO.
+    pub(crate) fn tail_probe_at(&self, end: u32) -> Option<Instant> {
+        let end = self.iss.wrapping_add(end);
+        let pto = self
+            .rtt
+            .srtt()
+            .map_or(INITIAL_RTO, |s| s * 2)
+            .min(self.rtt.rto());
+        (end.le(self.snd_max)
+            && self.snd_una.lt(end)
+            && self.snd_nxt == self.snd_max
+            && !self.unsent
+            && !self.retransmit_due
+            && self.rto_streak == 0
+            && !self.sack.in_recovery()
+            && !self.recovery.in_recovery())
+        .then_some(self.last_data_sent? + pto)
+    }
+    /// SND.UNA has reached relative SSN `end`.
+    pub(crate) fn acked_to(&self, end: u32) -> bool {
+        self.iss.wrapping_add(end).le(self.snd_una)
+    }
+    /// The later of the last SND.UNA advance and the start of the current flight (the R2 base);
+    /// `None` with nothing outstanding.
+    pub(crate) fn silence_since(&self) -> Option<Instant> {
+        self.r2_since
+    }
+    /// Makes one tail loss probe due (RFC 8985 §7.3, no new data to send): the
+    /// highest-sequence outstanding segment again, regardless of cwnd, without changing cwnd,
+    /// ssthresh or recovery state. Dropped if a retransmission or recovery starts first.
+    pub(crate) fn probe_tail(&mut self) {
+        self.tail_probe_due = true;
+    }
+    /// Start of the tail probe's segment, while one is due and still applies.
+    fn tail_probe_seq(&self) -> Option<SeqNum> {
+        if !self.tail_probe_due
+            || self.retransmit_due
+            || self.snd_nxt != self.snd_max
+            || self.sack.in_recovery()
+            || self.recovery.in_recovery()
+        {
+            return None;
+        }
+        let start = (self.sent.len().checked_sub(2)).map_or(self.snd_una, |i| self.sent[i].end);
+        let start = if start.lt(self.snd_una) {
+            self.snd_una
+        } else {
+            start
+        };
+        (self.data_len(start, self.snd_max) > 0).then_some(start)
+    }
+    /// A scheduler penalty (M3 spec §2.5): `CongestionEvent::Penalized` with FlightSize, unless
+    /// loss recovery or an RTO backoff (an RTO since SND.UNA last advanced) already decreased
+    /// cwnd. Returns whether it applied.
+    pub(crate) fn penalize(&mut self, now: Instant) -> bool {
+        if self.rto_streak > 0 || self.sack.in_recovery() || self.recovery.in_recovery() {
+            return false;
+        }
+        self.cc
+            .on_congestion(CongestionEvent::Penalized, self.in_flight(), now);
+        true
+    }
     #[cfg(test)]
     pub(crate) fn set_r2_data(&mut self, r2: Duration) {
         self.cfg.r2_data = r2;
@@ -885,7 +953,7 @@ impl Tcb {
             let seq = if self.retransmit_due {
                 self.snd_una
             } else {
-                rxt.map_or(self.snd_nxt, |r| r.0)
+                (self.tail_probe_seq()).unwrap_or_else(|| rxt.map_or(self.snd_nxt, |r| r.0))
             };
             let ssn = self.rel(seq);
             let has_data =
@@ -1598,6 +1666,15 @@ impl Tcb {
             }
             return Some(meta);
         }
+        if let Some(seq) = self.tail_probe_seq() {
+            self.tail_probe_due = false;
+            let len = self.data_len(seq, self.snd_max).min(mss);
+            let meta = self.write_data(seq, len, false, now, h, out)?;
+            self.rtt_timed = None;
+            self.on_data_sent(seq, &meta, now, true);
+            return Some(meta);
+        }
+        self.tail_probe_due = false;
         let idle = in_flight == 0;
 
         // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is

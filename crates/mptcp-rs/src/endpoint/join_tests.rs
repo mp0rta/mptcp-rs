@@ -883,12 +883,17 @@ fn sample_flags(b: bool) -> Vec<bool> {
 /// window field 65535. A `strip`ped path's ACKs carry no option and its data is not placed (no
 /// mapping reaches the peer); a `drop`ped path loses everything both ways (answers due on it
 /// are lost when they fall due); a path we reset is ignored afterwards. A copy of octets it
-/// already holds must match them and counts in `dups`.
+/// already holds must match them and counts in `dups`. A `lose` entry `(path, dsn, acked)`
+/// loses the next data segment starting at `dsn` on that path once: entirely, or (`acked`)
+/// after the peer's TCP took it, which the peer then ACKs without placing it. `feed` is what
+/// the application still writes, as the store takes it.
 struct Peer {
     syns: Vec<Segment<'static>>,
     rtts: Vec<Duration>,
     strip: Vec<bool>,
     drop: Vec<bool>,
+    lose: Vec<(usize, u64, bool)>,
+    feed: Vec<u8>,
     dups: usize,
     reset: Vec<bool>,
     next: Vec<SeqNum>,
@@ -908,6 +913,8 @@ impl Peer {
             rtts: paths.iter().map(|p| Duration::from_millis(p.1)).collect(),
             strip: vec![false; paths.len()],
             drop: vec![false; paths.len()],
+            lose: Vec::new(),
+            feed: Vec::new(),
             dups: 0,
             reset: vec![false; paths.len()],
             next: paths.iter().map(|p| p.0.seq.wrapping_add(1)).collect(),
@@ -936,10 +943,16 @@ impl Peer {
         if self.reset[i] || seg.payload.is_empty() {
             return;
         }
+        let dsn = dsn_of(&seg, self.syns[i].seq).map(|(dsn, _)| dsn);
+        let lost = (self.lose.iter()).position(|&(p, d, _)| p == i && Some(d) == dsn);
+        let acked_only = lost.is_some_and(|k| self.lose.remove(k).2);
+        if lost.is_some() && !acked_only {
+            return;
+        }
         if end(&seg).gt(self.next[i]) {
             self.next[i] = end(&seg);
         }
-        if !self.strip[i] {
+        if !self.strip[i] && !acked_only {
             let (dsn, _) = dsn_of(&seg, self.syns[i].seq).expect("mapped");
             self.log.push((now, i, dsn));
             for (k, &b) in seg.payload.iter().enumerate() {
@@ -962,6 +975,10 @@ impl Peer {
         until: Instant,
     ) -> Instant {
         for _ in 0..1_000_000 {
+            if !self.feed.is_empty() {
+                let n = ep.connection(h).unwrap().write(&self.feed).unwrap();
+                self.feed.drain(..n);
+            }
             for p in drain(ep, now) {
                 self.take(now, leak(p));
             }
@@ -1057,14 +1074,26 @@ fn connection_window_uses_receiving_subflow_scale() {
     ep.connection(h).unwrap().write(&[5; 1000 + 2864]).unwrap();
     let sent =
         |out: Vec<Vec<u8>>| -> usize { out.iter().map(|p| leak(p.clone()).payload.len()).sum() };
+    let out = drain(&mut ep, ms(20));
+    let dsns = |syn: &Segment| {
+        data_on(&out, syn)
+            .iter()
+            .map(|s| dsn_of(s, syn.seq).unwrap())
+            .collect::<Vec<_>>()
+    };
+    // Capped at the right edge; with data waiting beyond it, the run at the head is also
+    // copied to the other subflow (M3 §2.2 window branch).
     assert_eq!(
-        sent(drain(&mut ep, ms(20))),
-        1000,
+        [dsns(&syn), dsns(&jsyn)].concat(),
+        [(head, 1000), (head, 1000)],
         "capped at the right edge"
     );
+    assert_eq!(sent(out), 2000);
     peer_ack(&mut ep, &syn, ms(30), syn.seq.wrapping_add(1), head, 1000);
     assert_eq!(edge(&ep, h), Some(head + 128_000), "subflow 0's scale 7");
-    assert_eq!(sent(drain(&mut ep, ms(30))), 2864);
+    // Subflow 0 was penalized for the copy (M3 §2.5): Reno cwnd 4380 → 2920, 1000 in flight.
+    assert_eq!(sent(drain(&mut ep, ms(30))), 1432);
+    assert_eq!(ep.connection(h).unwrap().debug_stats().penalties, 1);
 }
 
 #[test]
@@ -3378,4 +3407,951 @@ fn per_subflow_mtu_bound_with_sack_blocks() {
         peer_ack(&mut ep, s, ms(20), end(last), head, 1000);
         drain(&mut ep, ms(20));
     }
+}
+
+// M3 Task 1: opportunistic retransmission and penalization (M3 spec §2). Subflow 0 is path B
+// (30 ms), the one that blackholes; subflow 1 is path A (10 ms).
+
+thread_local! {
+    /// `Penalized` events per subflow, counted by `Counting` controllers.
+    static PENALIZED: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0, 0]) };
+}
+/// Fixed cwnd, paced at `rate` if set; counts `Penalized` for subflow `path`.
+struct Counting {
+    path: usize,
+    cwnd: u32,
+    rate: Option<u64>,
+}
+impl CongestionControl for Counting {
+    fn on_ack(&mut self, _: &AckSample) {}
+    fn on_congestion(&mut self, ev: CongestionEvent, _: u32, _: Instant) {
+        if ev == CongestionEvent::Penalized {
+            PENALIZED.with(|p| {
+                let mut n = p.get();
+                n[self.path] += 1;
+                p.set(n);
+            });
+        }
+    }
+    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
+    fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+    fn pacing_rate(&self) -> Option<u64> {
+        self.rate
+    }
+}
+const SEG: usize = 1432;
+/// B: room for exactly its two-segment run at the head.
+fn cc_b() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 0,
+        cwnd: 2 * SEG as u32,
+        rate: None,
+    })
+}
+fn cc_a() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 1,
+        cwnd: 64 << 10,
+        rate: None,
+    })
+}
+/// A with four segments of cwnd: several A RTTs to assign a 32-segment store.
+fn cc_a_small() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 1,
+        cwnd: 4 * SEG as u32,
+        rate: None,
+    })
+}
+fn cc_a_paced() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 1,
+        cwnd: 64 << 10,
+        rate: Some(RATE),
+    })
+}
+fn penalized() -> [u32; 2] {
+    PENALIZED.with(|p| p.get())
+}
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+fn stats(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> crate::DebugStats {
+    ep.connection(h).unwrap().debug_stats()
+}
+fn writable(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> usize {
+    ep.conns[&h].hooks.data.as_ref().unwrap().send.writable()
+}
+/// `hol_rtt` with B's RTT 30 ms and A's 10 ms.
+fn hol(
+    b: fn() -> Box<dyn CongestionControl>,
+    a: fn() -> Box<dyn CongestionControl>,
+    cap: usize,
+    n: usize,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    SeqNum,
+) {
+    hol_rtt(b, a, cap, n, 30, 10)
+}
+/// Both paths primed (B's RTT `rtt_b` ms, A's `rtt_a` ms) with controllers `b` and `a`, a send
+/// store of `cap` octets, and a peer expecting `n` octets. Returns B's SND.UNA too.
+fn hol_rtt(
+    b: fn() -> Box<dyn CongestionControl>,
+    a: fn() -> Box<dyn CongestionControl>,
+    cap: usize,
+    n: usize,
+    rtt_b: u64,
+    rtt_a: u64,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    SeqNum,
+) {
+    PENALIZED.with(|p| p.set([0, 0]));
+    let (mut ep, h, syn, _) = confirmed_cc(b);
+    ep.cc = Some(a);
+    let (_, jsyn) = joined(&mut ep, h, ms(10), JOIN_IP, 1500, 7);
+    let (t, una_b) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), rtt_b);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, rtt_a);
+    events(&mut ep);
+    let head = una(&ep, h);
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    d.send = crate::mptcp::data::SendStore::new(head, cap);
+    let peer = Peer::new(head, n, &[(&syn, rtt_b), (&jsyn, rtt_a)]);
+    (ep, h, peer, t, head, una_b)
+}
+/// B's two-segment run at the head of `data`, sent at `t` (the peer takes it), then the rest
+/// of `data` written under MinRTT; returns how much of the rest the store took.
+fn b_holds_head(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    peer: &mut Peer,
+    t: Instant,
+    data: &[u8],
+) -> usize {
+    pin(ep, h, Some(SubflowId(0)));
+    assert_eq!(
+        ep.connection(h).unwrap().write(&data[..2 * SEG]),
+        Ok(2 * SEG)
+    );
+    let out = data_on(&drain(ep, t), &peer.syns[0]);
+    assert_eq!(out.len(), 2);
+    for seg in out {
+        peer.take(t, seg);
+    }
+    pin(ep, h, None);
+    ep.connection(h).unwrap().write(&data[2 * SEG..]).unwrap()
+}
+/// Placements on path A of octets in B's run `[head, head + 2·SEG)`: time and DSN.
+fn copies(peer: &Peer, head: u64) -> Vec<(Instant, u64)> {
+    (peer.log.iter())
+        .filter(|l| l.1 == 1 && l.2.wrapping_sub(head) < 2 * SEG as u64)
+        .map(|l| (l.0, l.2))
+        .collect()
+}
+
+#[test]
+fn opp_copy_on_a_when_store_full() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    assert_eq!(b_holds_head(&mut ep, h, &mut peer, t, &data), cap - 2 * SEG);
+    assert_eq!(writable(&ep, h), 0);
+    let done = peer.run(&mut ep, h, t, t + Duration::from_millis(500));
+    assert_eq!(una(&ep, h), head + cap as u64, "DATA_ACK past the old head");
+    assert_eq!(peer.received(), data);
+    let last_new = (peer.log.iter())
+        .filter(|l| l.1 == 1 && l.2 >= head + 2 * SEG as u64)
+        .map(|l| l.0)
+        .max()
+        .unwrap();
+    let copied = moved_at(&peer, 0, 1).expect("B's run copied on A");
+    assert!(
+        copied <= last_new + Duration::from_millis(10),
+        "within one A RTT"
+    );
+    assert_eq!(copies(&peer, head).len(), 2, "the whole run, once");
+    assert!(done < t + Duration::from_millis(100));
+    assert_eq!(penalized(), [1, 0], "B penalized once");
+    let s = stats(&mut ep, h);
+    let s = (s.opp_triggers, s.opp_episodes, s.penalties, s.opp_bytes);
+    assert_eq!(s, (1, 1, 1, 2 * SEG as u64));
+}
+
+#[test]
+fn opp_no_trigger_while_new_assignable() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, _, _) = hol(cc_b, cc_a_small, cap, cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(cap));
+    assert_eq!(writable(&ep, h), 0, "the store is full");
+    peer.run(&mut ep, h, t, t + Duration::from_millis(35));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_ne!(d.send.next, d.send.end, "unassigned data waits");
+    assert_eq!(moved_at(&peer, 0, 1), None);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_triggers, s.opp_episodes, s.penalties), (0, 0, 0));
+    assert_eq!(penalized(), [0, 0]);
+}
+
+#[test]
+fn opp_no_penalty_sole_usable_path() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, una_b) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    // B's window closes: B holds the head but is not usable.
+    let syn = peer.syns[0].clone();
+    peer_ack(&mut ep, &syn, t, una_b, head, 0);
+    assert!(ep.conns[&h].subflows[0].tcb.peer_window_closed());
+    peer.run(&mut ep, h, t, t + Duration::from_millis(500));
+    assert_eq!(peer.received(), data);
+    assert!(moved_at(&peer, 0, 1).is_some(), "copied on A");
+    assert_eq!(penalized(), [0, 0]);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_episodes, s.penalties), (1, 0));
+}
+
+#[test]
+fn opp_trigger_survives_partial_data_ack() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a_small, cap, cap);
+    let data = pattern(cap);
+    // B's first segment reaches the peer, its TCP ACKs are lost; the second is lost.
+    pin(&mut ep, h, Some(SubflowId(0)));
+    ep.connection(h).unwrap().write(&data[..2 * SEG]).unwrap();
+    let out = data_on(&drain(&mut ep, t), &peer.syns[0]);
+    peer.take(t, out[0].clone());
+    peer.drop[0] = true;
+    peer.take(t, out[1].clone());
+    pin(&mut ep, h, None);
+    ep.connection(h).unwrap().write(&data[2 * SEG..]).unwrap();
+    let now = peer.run(&mut ep, h, t, t + Duration::from_millis(15));
+    let half = head + SEG as u64;
+    assert_eq!(una(&ep, h), half, "DATA_ACK advanced halfway");
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert!(d.send.end - d.send.una < cap as u64);
+    assert_eq!(writable(&ep, h), 0, "B's mapping keeps its allocation");
+    peer.run(&mut ep, h, now, t + Duration::from_millis(500));
+    assert_eq!(peer.received(), data);
+    let dsns: Vec<u64> = copies(&peer, head).iter().map(|c| c.1).collect();
+    assert_eq!(dsns, [half], "the copy starts at send.una");
+    assert_eq!(stats(&mut ep, h).opp_episodes, 1);
+}
+
+#[test]
+fn opp_lost_copy_recovered_by_target_tcp() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    // The copy is lost, and so is its tail probe.
+    let tail = head + SEG as u64;
+    peer.lose = vec![(1, head, false), (1, tail, false), (1, tail, false)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    let done = peer.run(&mut ep, h, t, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    assert!(peer.lose.is_empty(), "the copy was lost");
+    let on_a = |dsn| {
+        (peer.sent.iter())
+            .filter(|(i, s)| *i == 1 && dsn_of(s, peer.syns[1].seq).map(|d| d.0) == Some(dsn))
+            .count()
+    };
+    assert_eq!(on_a(head), 2, "the copy and A's own TCP retransmission");
+    assert_eq!(
+        on_a(tail),
+        3,
+        "the copy, the tail probe and the retransmission"
+    );
+    assert_eq!(stats(&mut ep, h).opp_episodes, 1, "no second episode");
+    assert!(done > t + Duration::from_secs(1) && done < t + Duration::from_millis(1100));
+}
+
+#[test]
+fn opp_tcp_acked_not_data_acked_repaired() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    peer.lose = vec![(1, head, true), (1, head + SEG as u64, true)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    // The copy (installed at t) was TCP-ACKed at t + 10 ms and dropped by the receiver: head
+    // repair (M3 §2.7 H1) copies the run again 2·srtt of A later, not at the episode deadline.
+    assert_eq!(moved_at(&peer, 0, 1), Some(t + Duration::from_millis(30)));
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_episodes, s.opp_repairs), (1, 1));
+}
+
+#[test]
+fn opp_partial_data_ack_into_copy_repaired() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    let half = head + SEG as u64;
+    peer.lose = vec![(1, half, true)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    // DATA_ACK moved into the copy [head, head + 2·SEG) at t + 10 ms, whose TCP ACK covers both
+    // segments: the new head is armed at once and repaired 2·srtt of A later (M3 §2.7).
+    let c = copies(&peer, head);
+    assert_eq!(c, [(t, head), (t + Duration::from_millis(30), half)]);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_episodes, s.opp_repairs), (1, 1));
+}
+
+#[test]
+fn opp_pacing_blocked_target_sent_at_release() {
+    let cap = 6 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a_paced, cap, cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(cap));
+    // A's four segments go out in paced bursts; no input arrives.
+    let mut bursts = vec![(t, data_on(&drain(&mut ep, t), &peer.syns[1]).len())];
+    let all_assigned = |ep: &Endpoint<ChaCha20Rng>| {
+        let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+        d.send.next == d.send.end
+    };
+    while !all_assigned(&ep) {
+        let at = ep.poll_timeout().unwrap();
+        ep.handle_timeout(at);
+        bursts.push((at, data_on(&drain(&mut ep, at), &peer.syns[1]).len()));
+    }
+    assert_eq!(bursts.iter().map(|b| b.1).sum::<usize>(), 4);
+    let gap = bursts[1].0 - bursts[0].0;
+    let last = bursts.last().unwrap().0;
+    // The candidate exists now, A is pacing blocked: the release time is kept.
+    assert_eq!(ep.poll_timeout(), Some(last + gap));
+    ep.handle_timeout(last + gap);
+    let out = data_on(&drain(&mut ep, last + gap), &peer.syns[1]);
+    assert_eq!(
+        dsn_of(&out[0], peer.syns[1].seq).unwrap().0,
+        head,
+        "the copy"
+    );
+}
+
+#[test]
+fn opp_install_respects_fin_dsn_end_slot_cap() {
+    // (1) The run carries the DATA_FIN: the copy maps it too (DLL + 1). (2) A's DSN high-water
+    // mark covers the copy.
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, 2 * SEG, 2 * SEG);
+    peer.drop[0] = true;
+    pin(&mut ep, h, Some(SubflowId(0)));
+    ep.connection(h).unwrap().write(&pattern(2 * SEG)).unwrap();
+    ep.connection(h).unwrap().close();
+    let b = data_on(&drain(&mut ep, t), &peer.syns[0]);
+    assert!(
+        b.iter()
+            .all(|s| dss_map(s).unwrap().2 == 2 * SEG as u16 + 1 && data_fin(s))
+    );
+    pin(&mut ep, h, None);
+    assert_eq!(ep.conns[&h].subflows[1].mp.dsn_end, Some(head));
+    let a = data_on(&drain(&mut ep, t), &peer.syns[1]);
+    assert_eq!(a.len(), 2);
+    for s in &a {
+        let (_, dsn, dll) = dss_map(s).unwrap();
+        assert_eq!((dsn, dll, data_fin(s)), (head, 2 * SEG as u16 + 1, true));
+    }
+    assert_eq!(
+        ep.conns[&h].subflows[1].mp.dsn_end,
+        Some(head + 2 * SEG as u64)
+    );
+    // (3) A has all 1024 mapping slots taken: no target, nothing installed.
+    let cap = 2 * SEG + 1024;
+    let (mut ep, h, mut peer, t, _, _) = hol(cc_b, cc_a, cap, cap);
+    peer.drop[0] = true;
+    let data = pattern(cap);
+    b_holds_head(&mut ep, h, &mut peer, t, &data[..2 * SEG]);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().set_nodelay(true);
+    for b in &data[2 * SEG..] {
+        ep.connection(h).unwrap().write(&[*b]).unwrap();
+        assert_eq!(data_on(&drain(&mut ep, t), &peer.syns[1]).len(), 1);
+    }
+    pin(&mut ep, h, None);
+    assert!(ep.conns[&h].subflows[1].mp.tx.is_full());
+    assert_eq!(writable(&ep, h), 0);
+    assert!(drain(&mut ep, t).is_empty(), "nothing installed");
+    assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
+    assert_eq!(stats(&mut ep, h).opp_episodes, 0);
+}
+
+#[test]
+fn opp_tail_no_trigger() {
+    let n = 22 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, 16 << 20, n);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(n));
+    peer.run(&mut ep, h, t, t + Duration::from_millis(900));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_eq!(
+        (d.send.next, d.send.una),
+        (d.send.end, head),
+        "idle, B's hole"
+    );
+    assert!(writable(&ep, h) > 0);
+    assert_eq!(moved_at(&peer, 0, 1), None);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_triggers, s.opp_episodes, s.penalties), (0, 0, 0));
+}
+
+#[test]
+fn opp_window_boundary_tail_no_trigger() {
+    let n = 22 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, 16 << 20, n);
+    peer.drop[0] = true;
+    set_edge(&mut ep, h, head + n as u64);
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(n));
+    // No ACK arrives: the edge stays where all data ends.
+    let out = drain_until(&mut ep, t, t + Duration::from_millis(900));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_eq!(
+        (d.send.next, d.send.end),
+        (head + n as u64, head + n as u64)
+    );
+    assert_eq!(edge(&ep, h), Some(head + n as u64));
+    assert!(writable(&ep, h) > 0);
+    let copy =
+        |s: &Segment| dsn_of(s, peer.syns[1].seq).is_some_and(|d| d.0 < head + 2 * SEG as u64);
+    assert!(!data_on(&out, &peer.syns[1]).iter().any(copy));
+    assert_eq!(stats(&mut ep, h).opp_triggers, 0);
+}
+
+#[test]
+fn penalty_rate_limited_and_skipped_in_recovery() {
+    let (mut ep, h, mut peer, t, head, una_b) = hol(cc_b, cc_a, 1 << 20, 4 * SEG);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(2 * SEG));
+    let srtt = ep.conns[&h].subflows[0].tcb.srtt().unwrap();
+    let blocked = |ep: &mut Endpoint<ChaCha20Rng>, at: Instant| {
+        ep.conns.get_mut(&h).unwrap().head_blocked(0, at);
+        penalized()[0]
+    };
+    assert_eq!(blocked(&mut ep, t), 1);
+    assert_eq!(
+        blocked(&mut ep, t + (srtt - Duration::from_nanos(1))),
+        1,
+        "once per srtt"
+    );
+    assert_eq!(blocked(&mut ep, t + srtt), 2);
+    // Loss recovery: three duplicate ACKs on B.
+    let syn = peer.syns[0].clone();
+    let t2 = t + 3 * srtt;
+    for _ in 0..3 {
+        peer_ack(&mut ep, &syn, t2, una_b, head, 65535);
+    }
+    drain(&mut ep, t2);
+    assert_eq!(blocked(&mut ep, t2), 2, "in fast recovery");
+    // RTO backoff.
+    let (mut ep, h, mut peer, t, ..) = hol(cc_b, cc_a, 1 << 20, 4 * SEG);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(2 * SEG));
+    let t3 = t + Duration::from_millis(1500);
+    drain_until(&mut ep, t, t3);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.rto_streak(), 1);
+    assert_eq!(blocked(&mut ep, t3), 0, "in RTO backoff");
+    assert_eq!(stats(&mut ep, h).penalties, 0);
+}
+
+/// Data segments sent on `path` whose mapping starts at `dsn`, lost ones included.
+fn sent_at_dsn(peer: &Peer, path: usize, dsn: u64) -> usize {
+    (peer.sent.iter())
+        .filter(|(i, s)| *i == path && dsn_of(s, peer.syns[path].seq).map(|d| d.0) == Some(dsn))
+        .count()
+}
+
+#[test]
+fn opp_copy_tail_loss_probed() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    let tail = head + SEG as u64;
+    // Only the copy's last segment is lost, and nothing follows it on A.
+    peer.lose = vec![(1, tail, false)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    let done = peer.run(&mut ep, h, t, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    let srtt = ep.conns[&h].subflows[1].tcb.srtt().unwrap();
+    assert_eq!(srtt, Duration::from_millis(10));
+    // The probe resends the tail at the copy's last transmission + 2·srtt.
+    assert_eq!(copies(&peer, head), [(t, head), (t + 2 * srtt, tail)]);
+    assert_eq!(sent_at_dsn(&peer, 1, tail), 2);
+    assert!(
+        done <= t + 3 * srtt,
+        "DATA_ACK past the old head long before A's RTO"
+    );
+    assert_eq!(stats(&mut ep, h).opp_episodes, 1);
+}
+
+#[test]
+fn opp_tail_probe_once_and_disarmed_on_ack() {
+    // The tail and its probe are lost: no second probe; A's RTO recovers it.
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    let tail = head + SEG as u64;
+    peer.lose = vec![(1, tail, false), (1, tail, false)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    let now = peer.run(&mut ep, h, t, t + Duration::from_millis(900));
+    assert_eq!(sent_at_dsn(&peer, 1, tail), 2, "the copy and one probe");
+    assert!(ep.conns[&h].opp.as_ref().is_some_and(|e| e.probed));
+    peer.run(&mut ep, h, now, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    assert_eq!(
+        sent_at_dsn(&peer, 1, tail),
+        3,
+        "then A's RTO retransmission"
+    );
+    // The copy is ACKed within the PTO: no probe at all.
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
+    let tail = head + SEG as u64;
+    assert_eq!(
+        (sent_at_dsn(&peer, 1, head), sent_at_dsn(&peer, 1, tail)),
+        (1, 1)
+    );
+    // A's ACK covers the copy but DATA_ACK does not (the receiver dropped it): the episode
+    // runs on, its probe is disarmed.
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    peer.drop[0] = true;
+    peer.lose = vec![(1, head, true), (1, head + SEG as u64, true)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    peer.run(&mut ep, h, t, t + Duration::from_millis(15));
+    assert!(ep.conns[&h].opp.is_some());
+    assert_eq!(ep.conns[&h].opp_probe_at(), None);
+}
+
+// M3 §2.7: head repair (H1) and bounded lookahead (H2).
+
+fn ms_d(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+/// Like `cc_a_paced`, slower: a two-segment release every 25 ms.
+fn cc_a_paced_25() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 1,
+        cwnd: 64 << 10,
+        rate: Some(RATE * 4 / 5),
+    })
+}
+fn cc_b_big() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 0,
+        cwnd: 64 << 10,
+        rate: None,
+    })
+}
+/// Writes `data` pinned to subflow `sf` and hands what it sends at `t` to the peer.
+fn pinned(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    peer: &mut Peer,
+    t: Instant,
+    sf: u8,
+    data: &[u8],
+) {
+    pin(ep, h, Some(SubflowId(sf)));
+    assert_eq!(ep.connection(h).unwrap().write(data), Ok(data.len()));
+    for seg in data_on(&drain(ep, t), &peer.syns[usize::from(sf)].clone()) {
+        peer.take(t, seg);
+    }
+    pin(ep, h, None);
+}
+/// A six-segment store: the head run on A, TCP-ACKed but dropped by the receiver (the head
+/// becomes uncovered at t + 10 ms); then B's run (blackholed); then A's run, sent at the next
+/// poll. Controller `a` on A.
+fn uncovered_head(
+    a: fn() -> Box<dyn CongestionControl>,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    Vec<u8>,
+) {
+    uncovered_head_of(a, 2)
+}
+/// `uncovered_head` with a head run of `segs` segments.
+fn uncovered_head_of(
+    a: fn() -> Box<dyn CongestionControl>,
+    segs: usize,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    Vec<u8>,
+) {
+    let cap = (segs + 4) * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    peer.lose = (0..segs)
+        .map(|i| (1, head + (i * SEG) as u64, true))
+        .collect();
+    pinned(&mut ep, h, &mut peer, t, 1, &data[..segs * SEG]);
+    pinned(&mut ep, h, &mut peer, t, 0, &data[segs * SEG..][..2 * SEG]);
+    let rest = ep.connection(h).unwrap().write(&data[(segs + 2) * SEG..]);
+    assert_eq!(rest, Ok(2 * SEG));
+    (ep, h, peer, t, head, data)
+}
+/// `k` runs of two segments each on B (blackholed), each followed by two on A, all sent
+/// `idle` after priming; the store holds exactly them. With `feed` the application then keeps
+/// it full with as much again (`Peer::feed`). B's RTT is `rtt_b` ms, A's 10 ms. Run `i` of B
+/// starts at `head + 4·SEG·i`. The peer's `lose` entries, from the head DSN, apply from the
+/// start: the episode's first copy goes out with the last run.
+fn b_runs(
+    k: usize,
+    rtt_b: u64,
+    idle: Duration,
+    feed: bool,
+    lose: fn(u64) -> Vec<(usize, u64, bool)>,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Peer,
+    Instant,
+    u64,
+    Vec<u8>,
+) {
+    let cap = 4 * k * SEG;
+    let n = if feed { 2 * cap } else { cap };
+    let (mut ep, h, mut peer, t, head, _) = hol_rtt(cc_b_big, cc_a, cap, n, rtt_b, 10);
+    let t = t + idle;
+    let data = pattern(n);
+    peer.feed = data[cap..].to_vec();
+    peer.lose = lose(head);
+    peer.drop[0] = true;
+    for i in 0..k {
+        pinned(&mut ep, h, &mut peer, t, 0, &data[4 * i * SEG..][..2 * SEG]);
+        pinned(
+            &mut ep,
+            h,
+            &mut peer,
+            t,
+            1,
+            &data[(4 * i + 2) * SEG..][..2 * SEG],
+        );
+    }
+    (ep, h, peer, t, head, data)
+}
+fn run_dsn(head: u64, i: usize) -> u64 {
+    head + (4 * i * SEG) as u64
+}
+
+#[test]
+fn repair_uncovered_head_fires_without_input() {
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head(cc_a);
+    peer.run(&mut ep, h, t, t + ms_d(15));
+    // A's ACK at t + 10 ms covers the head without DATA_ACK: no live mapping covers it.
+    assert_eq!(una(&ep, h), head);
+    let due = t + ms_d(30);
+    assert_eq!(ep.poll_timeout(), Some(due), "2·srtt of A after the ACK");
+    ep.handle_timeout(due);
+    let out = data_on(&drain(&mut ep, due), &peer.syns[1]);
+    assert_eq!(
+        dsn_of(&out[0], peer.syns[1].seq).unwrap().0,
+        head,
+        "repair sent"
+    );
+    assert_eq!(una(&ep, h), head, "no DATA_ACK progress yet");
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_repairs, s.opp_episodes, s.penalties), (1, 0, 0));
+}
+
+#[test]
+fn repair_due_with_zero_budget_sent_at_release() {
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head(cc_a_paced_25);
+    // A's last run goes out at the next release, t + 25 ms: from then the connection is
+    // blocked and the head uncovered, so the repair is due at t + 45 ms, before A's next
+    // release at t + 50 ms.
+    peer.run(&mut ep, h, t, t + ms_d(47));
+    let last = (peer.log.iter())
+        .filter(|l| l.1 == 1)
+        .map(|l| l.0)
+        .max()
+        .unwrap();
+    assert_eq!(last, t + ms_d(25));
+    assert_eq!(sent_at_dsn(&peer, 1, head), 1, "not yet repaired");
+    assert_eq!(
+        ep.poll_timeout(),
+        Some(t + ms_d(50)),
+        "no past deadline, the release"
+    );
+    peer.run(&mut ep, h, t + ms_d(47), t + ms_d(55));
+    assert_eq!(copies(&peer, head).first(), Some(&(t + ms_d(50), head)));
+}
+
+#[test]
+fn repair_one_install_until_tcp_ack() {
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head(cc_a);
+    // The repair goes out at t + 30 ms; its TCP ACK arrives at t + 40 ms.
+    peer.run(&mut ep, h, t, t + ms_d(39));
+    for k in 0..5 {
+        let now = t + ms_d(31 + k);
+        ep.handle_timeout(now);
+        drain(&mut ep, now);
+    }
+    assert_eq!(
+        sent_at_dsn(&peer, 1, head),
+        2,
+        "the original and one repair"
+    );
+    assert_eq!(stats(&mut ep, h).opp_repairs, 1);
+    peer.run(&mut ep, h, t + ms_d(39), t + ms_d(100));
+    assert_eq!(
+        una(&ep, h),
+        head + 2 * SEG as u64,
+        "the repaired head is DATA_ACKed"
+    );
+    assert_eq!(stats(&mut ep, h).opp_repairs, 1);
+    // A three-segment repair at t + 30 ms: the first is delivered, the second TCP-ACKed but
+    // dropped, the third lost. The new head is uncovered, but its copy is still
+    // TCP-unacknowledged: no repair until the tail probe (t + 50 ms) gets the whole copy
+    // ACKed at t + 60 ms; the next repair goes 2·srtt later.
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head_of(cc_a, 3);
+    let (second, third) = (head + SEG as u64, head + 2 * SEG as u64);
+    peer.lose.extend([(1, second, true), (1, third, false)]);
+    peer.run(&mut ep, h, t, t + ms_d(85));
+    let at = |dsn| {
+        let on_a = peer.log.iter().filter(|l| l.1 == 1 && l.2 == dsn);
+        on_a.map(|l| l.0).collect::<Vec<_>>()
+    };
+    assert_eq!(at(head), [t + ms_d(30)]);
+    assert_eq!(
+        at(second),
+        [t + ms_d(80)],
+        "repaired only after the whole copy is ACKed"
+    );
+    assert_eq!(stats(&mut ep, h).opp_repairs, 2);
+}
+
+#[test]
+fn repair_probe_without_episode() {
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head(cc_a);
+    // The repair's tail is lost too, and nothing follows it on A.
+    let tail = head + SEG as u64;
+    peer.lose.push((1, tail, false));
+    peer.run(&mut ep, h, t, t + ms_d(100));
+    assert_eq!(
+        una(&ep, h),
+        head + 2 * SEG as u64,
+        "the repaired head is DATA_ACKed"
+    );
+    assert!(ep.conns[&h].opp.is_none(), "no episode");
+    // The repair at t + 30 ms, its tail probe 2·srtt later.
+    assert_eq!(
+        copies(&peer, head),
+        [(t + ms_d(30), head), (t + ms_d(50), tail)]
+    );
+}
+
+#[test]
+fn repair_precedes_later_queued_reinjections() {
+    let (mut ep, h, mut peer, t, head, _) = uncovered_head(cc_a);
+    peer.run(&mut ep, h, t, t + ms_d(29));
+    // S is Stale: its range after the head is queued for reinjection (rule 3).
+    let c = ep.conns.get_mut(&h).unwrap();
+    c.subflows[0].state = SubflowState::Stale;
+    let due = t + ms_d(30);
+    ep.handle_timeout(due);
+    queue_reinject(&mut ep, h, head + 2 * SEG as u64, 2 * SEG as u64);
+    let out = data_on(&drain(&mut ep, due), &peer.syns[1]);
+    let dsns: Vec<u64> = (out.iter())
+        .map(|s| dsn_of(s, peer.syns[1].seq).unwrap().0)
+        .collect();
+    assert_eq!(dsns[0], head, "the repair first: {dsns:?}");
+    assert!(
+        dsns.contains(&(head + 2 * SEG as u64)),
+        "then the reinjection"
+    );
+}
+
+#[test]
+fn repair_target_not_s_when_s_fastest() {
+    // B (S) is the 10 ms path, A the 30 ms one.
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol_rtt(cc_b, cc_a, cap, cap, 10, 30);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    peer.lose = vec![(1, head, true), (1, head + SEG as u64, true)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(1));
+    assert_eq!(peer.received(), data);
+    // The copy on A is TCP-ACKed at t + 30 ms and dropped. S's silence deadline (2·srtt_S =
+    // 20 ms) has started a lookahead, which copies the head again on A as soon as A's copy is
+    // no longer live; the repair clock (2·srtt of A, t + 90 ms) is never needed. Every copy
+    // goes on A, none on the faster S.
+    assert_eq!(moved_at(&peer, 0, 1), Some(t + ms_d(30)));
+    assert_eq!(sent_at_dsn(&peer, 0, head), 1, "nothing more on S");
+    assert_eq!(sent_at_dsn(&peer, 1, head), 2);
+    assert_eq!(stats(&mut ep, h).lookaheads, 1);
+}
+
+#[test]
+fn repair_partial_discard_with_unacked_lookahead_tail() {
+    // B (S) at 1 ms: its silence deadline expires at t + 2 ms, so the lookahead copies runs 1
+    // and 2 behind the episode's copy of run 0.
+    let (mut ep, h, mut peer, t, head, data) = b_runs(3, 1, Duration::ZERO, false, |head| {
+        // Run 0's copy loses its second segment at the data level; the lookahead's last
+        // segment is lost and stays TCP-unacknowledged.
+        let tail = run_dsn(head, 2) + SEG as u64;
+        vec![(1, head + SEG as u64, true), (1, tail, false)]
+    });
+    let half = head + SEG as u64;
+    peer.run(&mut ep, h, t, t + Duration::from_secs(10));
+    assert_eq!(peer.received(), data);
+    assert_eq!(stats(&mut ep, h).lookaheads, 1);
+    // DATA_ACK reaches `half` at t + 10 ms: repaired 2·srtt of A later all the same.
+    let c: Vec<_> = copies(&peer, head)
+        .into_iter()
+        .filter(|c| c.1 == half)
+        .collect();
+    assert_eq!(c, [(t + ms_d(30), half)]);
+}
+
+#[test]
+fn repair_each_round_never_recopies_lookahead() {
+    let k = 6;
+    let (mut ep, h, mut peer, t, head, data) = b_runs(k, 30, Duration::ZERO, false, |head| {
+        // Every copy of the head is TCP-ACKed and dropped, four times.
+        vec![(1, head, true); 4]
+    });
+    peer.run(&mut ep, h, t, t + Duration::from_secs(10));
+    assert_eq!(peer.received(), data);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_repairs, s.lookaheads), (4, 1));
+    assert_eq!(
+        sent_at_dsn(&peer, 1, head),
+        5,
+        "the copy and a repair each round"
+    );
+    for i in 1..k {
+        assert_eq!(
+            sent_at_dsn(&peer, 1, run_dsn(head, i)),
+            1,
+            "run {i} copied once"
+        );
+    }
+}
+
+#[test]
+fn lookahead_waits_for_silence_and_starts_without_input() {
+    // Healthy asymmetric paths: a small store, A's cwnd four segments, so B carries data and
+    // holds the head often; B ACKs within 2·srtt, so no lookahead ever starts.
+    let (cap, n) = (16 * SEG, 150 * SEG);
+    let (mut ep, h, mut peer, t, _, _) = hol(cc_b_big, cc_a_small, cap, n);
+    let data = pattern(n);
+    peer.feed = data.clone();
+    peer.run(&mut ep, h, t, t + Duration::from_secs(10));
+    assert_eq!(peer.received(), data);
+    let s = stats(&mut ep, h);
+    assert!(s.opp_triggers > 0, "the head was blocked on B: {s:?}");
+    assert_eq!(s.lookaheads, 0);
+    // B blackholed: S's silence deadline is its first transmission + 2·srtt.
+    let k = 8;
+    let (mut ep, h, mut peer, t, head, _) = b_runs(k, 30, Duration::ZERO, true, |_| Vec::new());
+    peer.run(&mut ep, h, t, t + ms_d(55));
+    assert_eq!(stats(&mut ep, h).lookaheads, 0);
+    let at = t + ms_d(60);
+    assert_eq!(ep.conns[&h].silence_deadline(), Some((at, SubflowId(0))));
+    // No input: the deadline alone starts the lookahead. A's cwnd is full, so its copies
+    // leave with A's next ACKs.
+    ep.handle_timeout(at);
+    for s in drain(&mut ep, at) {
+        peer.take(at, leak(s));
+    }
+    assert_eq!(stats(&mut ep, h).lookaheads, 1);
+    peer.run(&mut ep, h, at, at + ms_d(20));
+    for i in [k - 2, k - 1] {
+        assert_eq!(
+            sent_at_dsn(&peer, 1, run_dsn(head, i)),
+            1,
+            "run {i} copied once"
+        );
+    }
+}
+
+#[test]
+fn lookahead_idle_then_new_flight_counts_from_flight() {
+    // B's last ACK was 500 ms before the flight starts: silence counts from the flight.
+    let (mut ep, h, mut peer, t, _, _) = b_runs(8, 30, ms_d(500), true, |_| Vec::new());
+    peer.run(&mut ep, h, t, t + ms_d(55));
+    assert_eq!(stats(&mut ep, h).lookaheads, 0);
+    assert_eq!(
+        ep.conns[&h].silence_deadline(),
+        Some((t + ms_d(60), SubflowId(0)))
+    );
+}
+
+#[test]
+fn lookahead_no_expired_deadline_or_second_batch() {
+    let (mut ep, h, mut peer, t, _, _) = b_runs(8, 30, Duration::ZERO, true, |_| Vec::new());
+    peer.run(&mut ep, h, t, t + ms_d(55));
+    let at = t + ms_d(60);
+    ep.handle_timeout(at);
+    drain(&mut ep, at);
+    assert_eq!(stats(&mut ep, h).lookaheads, 1);
+    // Repeated polls without input while DATA_ACK stays below the old boundary.
+    for now in [at, at, at + ms_d(1), at + ms_d(5)] {
+        assert!(
+            ep.poll_timeout().is_none_or(|d| d > now),
+            "expired deadline at {now:?}"
+        );
+        assert_eq!(ep.conns[&h].silence_deadline(), None);
+        ep.handle_timeout(now);
+        assert!(data_on(&drain(&mut ep, now), &peer.syns[1]).is_empty());
+        assert_eq!(stats(&mut ep, h).lookaheads, 1, "no second batch");
+    }
+}
+
+#[test]
+fn repair_and_episode_probe_share_one_tail_probe() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    let tail = head + SEG as u64;
+    peer.lose = vec![(1, tail, false)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    // The episode copy goes out at t; give the same copy a head-repair probe as well, so both
+    // probe deadlines fall at t + 2·srtt on A.
+    for s in data_on(&drain(&mut ep, t), &peer.syns[1]) {
+        peer.take(t, s);
+    }
+    let c = ep.conns.get_mut(&h).unwrap();
+    let ssn_end = c.opp.as_ref().unwrap().ssn_end;
+    c.repair.probe = Some((SubflowId(1), ssn_end));
+    assert_eq!(c.repair_probe_at(), c.opp_probe_at());
+    peer.run(&mut ep, h, t, t + ms_d(25));
+    assert_eq!(
+        sent_at_dsn(&peer, 1, tail),
+        2,
+        "the copy and a single probe"
+    );
+    let c = &ep.conns[&h];
+    assert!(c.repair.probe.is_none() && c.opp.as_ref().is_none_or(|e| e.probed));
 }

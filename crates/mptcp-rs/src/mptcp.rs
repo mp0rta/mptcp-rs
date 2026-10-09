@@ -2,11 +2,15 @@
 mod close;
 pub(crate) mod data;
 mod join;
+mod opp;
 pub(crate) mod sched;
 mod subflow;
 use crate::crypto::key_token_idsn;
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
 pub(crate) use join::Join;
+use opp::Cand;
+pub use opp::DebugStats;
+pub(crate) use opp::{Episode, Repair};
 use sched::{
     HealthEvent, HealthVerdict, MinRtt, Payload, Pending, Plan, ReinjectQueue, Scheduler,
     SubflowSnapshot,
@@ -50,6 +54,10 @@ pub(crate) struct ConnectionHooks {
     pub rejected_plans: u64,
     /// Validated plans `SendStore::assign` refused; stays 0 by construction.
     pub assign_failures: u64,
+    /// Opportunistic retransmission counters (`Connection::debug_stats`).
+    pub debug: DebugStats,
+    /// The latest scheduling step found an opportunistic candidate.
+    opp_live: bool,
     /// Receiver SWS MSS: the largest effective MSS among Active subflows (spec §5.4); 0 until
     /// the first `Connection::select_control`.
     sws_mss: u16,
@@ -91,6 +99,8 @@ impl ConnectionHooks {
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             rejected_plans: 0,
             assign_failures: 0,
+            debug: DebugStats::default(),
+            opp_live: false,
             sws_mss: 0,
         }
     }
@@ -160,11 +170,29 @@ pub(crate) fn later(old: Option<u64>, end: u64) -> Option<u64> {
     )
 }
 
+/// The snapshot offers a budget for some candidate.
+fn offered(s: &SubflowSnapshot) -> bool {
+    [s.new_budget, s.reinject_budget, s.opp_budget]
+        .iter()
+        .any(|b| b.bytes() > 0)
+}
+
 /// Index of the lowest-`srtt` subflow that passes `f` (the first on ties).
 fn lowest_rtt(subflows: &[Subflow], f: impl Fn(&Subflow) -> bool) -> Option<usize> {
     (0..subflows.len())
         .filter(|&i| f(&subflows[i]))
         .min_by_key(|&i| subflows[i].tcb.srtt().unwrap_or(INITIAL_RTO))
+}
+
+/// The subflow may take a new mapping: data can flow on it and a mapping slot is free.
+fn may_assign(conn: &ConnectionHooks, sf: &SubflowMp, tcb: &Tcb) -> bool {
+    let Some(d) = &conn.data else {
+        return false;
+    };
+    !sf.tx.is_full()
+        && !sf.joining()
+        && (tcb.state() == TcpState::Established
+            || (tcb.state() == TcpState::CloseWait && (d.fallback || d.recv.has_fin())))
 }
 
 /// Spec §4 rule 1: `k × seg_payload` with `1 <= k <= full_segments`, or at most `partial`.
@@ -177,11 +205,14 @@ fn fits(b: SendBudget, bytes: u32) -> bool {
 
 /// Validates a plan against the snapshot it was made from (boundary invariant 5): the named
 /// subflow exists and is Active, `New` fits its New budget, `Reinject` is a prefix of the head
-/// candidate and fits its Reinject budget. Returns the subflow's index.
+/// candidate and fits its Reinject budget, `Opportunistic` is a prefix of the opportunistic
+/// candidate `opp` and fits its opportunistic budget (nonzero only on an eligible target).
+/// Returns the subflow's index.
 pub(crate) fn accept_plan(
     plan: Plan,
     snapshots: &[SubflowSnapshot],
     head: Option<(u64, u32)>,
+    opp: Option<(u64, u32)>,
 ) -> Option<(usize, Payload)> {
     let Plan::Send { subflow, payload } = plan else {
         return None;
@@ -195,6 +226,9 @@ pub(crate) fn accept_plan(
                 head.is_some_and(|(start, c)| start == dsn && len <= c)
                     && fits(s.reinject_budget, len)
             }
+            Payload::Opportunistic { dsn, len } => {
+                opp.is_some_and(|(start, c)| start == dsn && len <= c) && fits(s.opp_budget, len)
+            }
         };
     ok.then_some((i, payload))
 }
@@ -207,9 +241,15 @@ impl Connection {
     /// from our side at once) carries neither. While data waits (unassigned or queued for
     /// reinjection), every Active subflow whose own peer window is zero has probe demand, and
     /// if the connection window is closed so has one more: the lowest-RTT Active one without
-    /// unacknowledged data, else the lowest-RTT Active one. Also refreshes the receiver-SWS
-    /// MSS.
+    /// unacknowledged data, else the lowest-RTT Active one. Every eligible target of the
+    /// opportunistic candidate has demand (M3 §2.2). Also refreshes the receiver-SWS MSS.
     pub(crate) fn select_control(&mut self) {
+        let opp = self.opp_candidate();
+        for k in 0..self.subflows.len() {
+            let t = &self.subflows[k];
+            let demand = opp.is_some_and(|c| self.opp_target(t, c.dsn, c.blocking, !c.repair));
+            self.subflows[k].mp.opp_demand = demand;
+        }
         let (Some(d), Some(m)) = (&self.hooks.data, &self.hooks.negotiation) else {
             return;
         };
@@ -256,6 +296,8 @@ impl Connection {
     /// Active subflows with an RTT sample, `INITIAL_RTO` when none has one: a backed-off RTO
     /// of a lossy subflow must not stretch recovery of what the healthy one carried.
     pub(crate) fn update_recovery(&mut self, now: Instant) {
+        self.update_episode(now);
+        self.update_repair(now);
         let Some(d) = &mut self.hooks.data else {
             return;
         };
@@ -401,6 +443,8 @@ impl Connection {
             .any(|end| end.wrapping_sub(una) as i64 > 0);
         d.reinject.clear();
         d.settling = false;
+        self.opp = None;
+        self.repair = Repair::default();
         d.release(self.subflows[i].mp.tcp_acked_dsn);
         // Health no longer applies after fallback: a Stale survivor carries the data again.
         // So does one whose join this input completed: as `subflows[0]` it never reaches
@@ -449,25 +493,45 @@ impl Connection {
         d.reinject.head(active_maps(&self.subflows), &d.send, fin)
     }
 
-    /// Refills the snapshot buffer: both budgets of every subflow, read-only (`send_budget`).
+    /// Refills the snapshot buffer: every budget of every subflow, read-only (`send_budget`).
     /// A subflow that may not take a mapping now (TCP state, all mapping slots taken, `buf`
-    /// smaller than its MTU) reports zero budgets.
-    pub(crate) fn build_snapshots(&mut self, now: Instant, head: Option<(u64, u32)>, buf: usize) {
+    /// smaller than its MTU) reports zero budgets; one that is not an eligible target of the
+    /// opportunistic candidate `opp` a zero opportunistic budget.
+    pub(crate) fn build_snapshots(
+        &mut self,
+        now: Instant,
+        head: Option<(u64, u32)>,
+        opp: Option<Cand>,
+        buf: usize,
+    ) {
+        // Per subflow: the candidate's prefix that its own live mappings leave uncovered.
+        let mut opp_lens = [0; SUBFLOW_CAP];
+        if let Some(c) = opp {
+            for (k, t) in self.subflows.iter().enumerate().take(SUBFLOW_CAP) {
+                if self.opp_target(t, c.dsn, c.blocking, !c.repair) {
+                    opp_lens[k] = t.mp.tx.uncovered_len(c.dsn, c.len as usize);
+                }
+            }
+        }
         let mut snapshots = std::mem::take(&mut self.hooks.snapshots);
         snapshots.clear();
-        for sf in &mut self.subflows {
+        for (k, sf) in self.subflows.iter_mut().enumerate() {
             let hk = SubflowHooks {
                 conn: &mut self.hooks,
                 sf: &mut sf.mp,
             };
-            let (mut new_budget, mut reinject_budget) = Default::default();
-            if buf >= sf.tcb.mtu() && hk.may_assign(&sf.tcb) {
+            let (mut new_budget, mut reinject_budget, mut opp_budget) = Default::default();
+            if buf >= sf.tcb.mtu() && may_assign(hk.conn, hk.sf, &sf.tcb) {
                 let options = hk.data_option_len();
                 let (bytes, run) = (hk.conn.unassigned_len(), hk.conn.candidate_len());
                 new_budget = sf.tcb.send_budget(now, bytes, run, false, options, &hk);
                 if let Some((_, c)) = head {
                     let c = c as usize;
                     reinject_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
+                }
+                let c = opp_lens.get(k).copied().unwrap_or(0);
+                if c > 0 {
+                    opp_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
                 }
             }
             // A dead subflow (TCB Closed, e.g. a kept `subflows[0]`) is never Active.
@@ -481,6 +545,7 @@ impl Connection {
                 state,
                 new_budget,
                 reinject_budget,
+                opp_budget,
                 srtt: sf.tcb.srtt().unwrap_or(INITIAL_RTO),
                 app_limited: sf.tcb.app_limited(),
             });
@@ -499,6 +564,8 @@ impl Connection {
     pub(crate) fn schedule(&mut self, now: Instant, buf: usize) -> Option<usize> {
         self.hooks.data.as_ref()?;
         let installed = self.schedule_step(now, buf);
+        // A trimmed reinjection queue may leave the head to repair (§2.7 H1).
+        self.update_repair(now);
         // Every subflow offered a budget and given nothing in this step is passed over.
         for (k, (sf, s)) in self
             .subflows
@@ -508,16 +575,14 @@ impl Connection {
         {
             if Some(k) == installed {
                 sf.mp.offered_unused = false;
-            } else if s.state == SubflowState::Active
-                && (s.new_budget.bytes() > 0 || s.reinject_budget.bytes() > 0)
-            {
+            } else if s.state == SubflowState::Active && offered(s) {
                 sf.mp.offered_unused = true;
             }
         }
         if installed.is_none() {
             self.mark_passed_over(now);
             let d = self.hooks.data.as_ref().unwrap();
-            if d.send.next == d.send.end && d.reinject.is_empty() {
+            if d.send.next == d.send.end && d.reinject.is_empty() && !self.hooks.opp_live {
                 for sf in &mut self.subflows {
                     if sf.state == SubflowState::Active {
                         let hk = SubflowHooks {
@@ -563,22 +628,35 @@ impl Connection {
 
     fn schedule_step(&mut self, now: Instant, buf: usize) -> Option<usize> {
         let head = self.reinject_head();
-        self.build_snapshots(now, head, buf);
+        let opp = self.opp_candidate();
+        if opp.is_some() && !self.hooks.opp_live {
+            self.hooks.debug.opp_triggers += 1;
+        }
+        self.hooks.opp_live = opp.is_some();
+        self.build_snapshots(now, head, opp, buf);
         let hooks = &mut self.hooks;
-        if !hooks.snapshots.iter().any(|s| {
-            s.state == SubflowState::Active
-                && (s.new_budget.bytes() > 0 || s.reinject_budget.bytes() > 0)
-        }) {
+        if !(hooks.snapshots.iter()).any(|s| s.state == SubflowState::Active && offered(s)) {
             return None;
         }
         let new_bytes = hooks.unassigned_len() as u64;
-        let reinject = &hooks.data.as_ref().unwrap().reinject;
+        // A due head repair whose target has budget goes before later queued reinjections
+        // (§2.7 H1); the queue itself is unchanged.
+        let repair_first = opp.is_some_and(|c| c.repair)
+            && (hooks.snapshots.iter()).any(|s| s.opp_budget.bytes() > 0);
+        let none = ReinjectQueue::new(0);
+        let (reinject, head) = if repair_first {
+            (&none, None)
+        } else {
+            (&hooks.data.as_ref().unwrap().reinject, head)
+        };
+        let opportunistic = opp.map(|c| (c.dsn, c.len));
         let pending = Pending {
             new_bytes,
             reinject,
+            opportunistic,
         };
         let plan = hooks.scheduler.plan(now, &pending, &hooks.snapshots);
-        let Some((i, payload)) = accept_plan(plan, &hooks.snapshots, head) else {
+        let Some((i, payload)) = accept_plan(plan, &hooks.snapshots, head, opportunistic) else {
             if plan != Plan::Idle {
                 hooks.rejected_plans += 1;
             }
@@ -595,9 +673,12 @@ impl Connection {
         }
         let (bytes, reinject) = match payload {
             Payload::New { bytes } => (bytes, false),
-            Payload::Reinject { len, .. } => (len, true),
+            Payload::Reinject { len, .. } | Payload::Opportunistic { len, .. } => (len, true),
         };
         self.hooks.scheduler.on_assigned(sf.id, bytes, reinject);
+        if let (Payload::Opportunistic { len, .. }, Some(c)) = (payload, opp) {
+            self.opp_installed(i, c, len, now);
+        }
         Some(i)
     }
 }
@@ -648,11 +729,9 @@ impl SubflowHooks<'_> {
             tcb.request_ack();
         }
         tcb.set_probe_demand(self.sf.probe);
-        let reinject = self
-            .conn
-            .data
-            .as_ref()
-            .is_some_and(|d| !d.reinject.is_empty());
+        // An opportunistic candidate this subflow may take is demand like a reinjection.
+        let reinject =
+            self.sf.opp_demand || (self.conn.data.as_ref()).is_some_and(|d| !d.reinject.is_empty());
         tcb.pending_send(
             now,
             self.unassigned_len(),
@@ -662,26 +741,15 @@ impl SubflowHooks<'_> {
             self,
         );
     }
-    /// The subflow may take a new mapping: data can flow on it and a mapping slot is free.
-    fn may_assign(&self, tcb: &Tcb) -> bool {
-        let Some(d) = &self.conn.data else {
-            return false;
-        };
-        !self.sf.tx.is_full()
-            && !self.sf.joining()
-            && (tcb.state() == crate::tcp::TcpState::Established
-                || (tcb.state() == crate::tcp::TcpState::CloseWait
-                    && (d.fallback || d.recv.has_fin())))
-    }
     /// Installs a validated plan's mapping; DATA_FIN rides on the final data mapping.
     fn install(&mut self, payload: Payload) -> bool {
         let d = self.conn.data.as_mut().unwrap();
         let (dsn, len) = match payload {
-            Payload::Reinject { dsn, len } => (dsn, len),
+            Payload::Reinject { dsn, len } | Payload::Opportunistic { dsn, len } => (dsn, len),
             Payload::New { bytes } => (d.send.next, bytes),
         };
         match payload {
-            Payload::Reinject { dsn, len } => {
+            Payload::Reinject { dsn, len } | Payload::Opportunistic { dsn, len } => {
                 let len = len as usize;
                 if !d.send.assign(&mut self.sf.tx, dsn, len) {
                     return false;

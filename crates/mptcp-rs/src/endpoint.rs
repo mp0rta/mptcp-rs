@@ -190,6 +190,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 queued_joins: Vec::new(),
                 next_subflow: 1,
                 addr_ids: vec![initial_ip],
+                opp: None,
+                repair: Default::default(),
             },
         );
         Ok(h)
@@ -713,6 +715,7 @@ impl<R: CryptoRng> Endpoint<R> {
                         tcb.into_iter().chain(join).chain(strand)
                     })
                     .chain(c.hooks.recovery_deadline())
+                    .chain(c.opp_deadline())
                     .min()
             })
             .min()

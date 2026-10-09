@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use crate::mptcp::{Subflow, SubflowId};
+use crate::mptcp::{DebugStats, Episode, Repair, Subflow, SubflowId};
 use crate::tcp::{ConnectConfig, TcpState};
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
@@ -41,6 +41,10 @@ pub struct Connection {
     pub(crate) next_subflow: u8,
     /// Local IPs by address ID: the initial one is 0 (spec §5.6).
     pub(crate) addr_ids: Vec<IpAddr>,
+    /// The opportunistic retransmission episode, if one runs (M3 spec §2.3).
+    pub(crate) opp: Option<Episode>,
+    /// Head repair and bounded lookahead (M3 spec §2.7).
+    pub(crate) repair: Repair,
 }
 
 /// An `add_subflow` made before the connection was Confirmed.
@@ -100,6 +104,12 @@ impl Connection {
             return;
         }
         self.subflows[0].tcb.close();
+    }
+
+    /// Opportunistic retransmission counters, for test drivers; not a stable API.
+    #[doc(hidden)]
+    pub fn debug_stats(&self) -> DebugStats {
+        self.hooks.debug
     }
 
     /// Switches Nagle off (`true`) or on (`false`, the default) on every subflow, including
