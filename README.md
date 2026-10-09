@@ -5,6 +5,11 @@ is sans-I/O; a Linux TUN adapter provides the first network integration. The
 initial role is client only, with Linux kernel TCP/MPTCP as the interoperability
 peer.
 
+The `mptcp-rs` crate (0.0.1) is that library: client role only, at milestone M2
+(two paths). It is not yet suited to production use; path management, the server
+role and several options are still missing (see the roadmap), and a blackholed path
+can stall the connection for several seconds (see the known limitation below).
+
 ## Status
 
 M0 is merged. The plain TCP engine, MPTCP option codec, crypto helpers and TUN
