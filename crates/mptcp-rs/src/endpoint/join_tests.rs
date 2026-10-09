@@ -2232,7 +2232,7 @@ fn fastclose_on_joined_subflow_resets_all_subflows() {
 }
 
 /// The peer resets the initial subflow while subflow 1 lives: `SubflowDown` for it, and the
-/// transfer goes on byte-exact on subflow 1.
+/// transfer goes on byte-exact on subflow 1. The dead subflow's snapshot is not Active.
 #[test]
 fn initial_subflow_rst_is_subflow_down() {
     let n = 50_000;
@@ -2250,6 +2250,11 @@ fn initial_subflow_rst_is_subflow_down() {
     assert_eq!(peer.received(), data);
     assert!(peer.log.iter().all(|l| l.1 == 1), "data only on subflow 1");
     assert!(events(&mut ep).is_empty());
+    let s = ep.conns[&h].snapshots();
+    assert_eq!(
+        (s[0].state, s[1].state),
+        (SubflowState::Closing, SubflowState::Active)
+    );
 }
 
 #[test]

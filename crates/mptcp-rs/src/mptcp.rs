@@ -450,9 +450,15 @@ impl Connection {
                     reinject_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
                 }
             }
+            // A dead subflow (TCB Closed, e.g. a kept `subflows[0]`) is never Active.
+            let state = if sf.tcb.state() == TcpState::Closed {
+                SubflowState::Closing
+            } else {
+                sf.state
+            };
             snapshots.push(SubflowSnapshot {
                 id: sf.id,
-                state: sf.state,
+                state,
                 new_budget,
                 reinject_budget,
                 srtt: sf.tcb.srtt().unwrap_or(INITIAL_RTO),
