@@ -2210,6 +2210,27 @@ fn fastclose_resets_all_subflows() {
     assert!(ep.demux.is_empty());
 }
 
+/// The peer resets the initial subflow while subflow 1 lives: `SubflowDown` for it, and the
+/// transfer goes on byte-exact on subflow 1.
+#[test]
+fn initial_subflow_rst_is_subflow_down() {
+    let n = 50_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(R100, n);
+    input_at(&mut ep, &rst_on(&peer.syns[0]), t);
+    let down = Event::SubflowDown {
+        subflow: SubflowId::INITIAL,
+        reason: CloseReason::Reset,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    peer.reset[0] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+    assert!(peer.log.iter().all(|l| l.1 == 1), "data only on subflow 1");
+    assert!(events(&mut ep).is_empty());
+}
+
 #[test]
 fn infinite_mapping_with_join_keeps_one_subflow() {
     let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
@@ -2555,7 +2576,11 @@ fn initial_subflow_r2_resets_once_joined() {
         Ok(n - 10_000)
     );
     peer.run(&mut ep, h, t, t + Duration::from_secs(30));
-    assert!(events(&mut ep).is_empty(), "R2 before R1: no Stale");
+    let down = Event::SubflowDown {
+        subflow: SubflowId::INITIAL,
+        reason: CloseReason::Timeout,
+    };
+    assert_eq!(events(&mut ep), vec![down], "R2 before R1: no Stale");
     let rst = |p: &(usize, Segment)| p.0 == 0 && p.1.flags.contains(TcpFlags::RST);
     assert!(peer.sent.iter().any(rst), "subflow 0 reset at R2");
     assert_eq!(
@@ -2738,6 +2763,11 @@ fn stranded_subflow_reset_once_both_data_fins_acked() {
     );
     assert_eq!(on1.len(), rst + 1, "nothing on subflow 1 after the RST");
     let ev = events(&mut ep);
+    // Subflow 0's FIN exchange ended first (TIME-WAIT), while subflow 1 was still open.
+    let down0 = Event::SubflowDown {
+        subflow: SubflowId::INITIAL,
+        reason: CloseReason::Normal,
+    };
     let down = Event::SubflowDown {
         subflow: SubflowId(1),
         reason: CloseReason::Reset,
@@ -2745,7 +2775,7 @@ fn stranded_subflow_reset_once_both_data_fins_acked() {
     let closed = Event::Closed {
         reason: CloseReason::Normal,
     };
-    assert_eq!(ev, vec![down, closed]);
+    assert_eq!(ev, vec![down0, down, closed]);
     assert!(
         ep.conns.is_empty(),
         "closed at subflow 0's TIME-WAIT end, not at R2"

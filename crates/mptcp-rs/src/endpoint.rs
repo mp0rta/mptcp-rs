@@ -40,11 +40,12 @@ pub enum Event {
     SubflowUp {
         subflow: SubflowId,
     },
-    /// A joined subflow ended (`Reset`: refused or reset, also a queued join that can no
-    /// longer start, or reset by us at close because it held only DATA_ACKed data; `Timeout`:
-    /// R2; `Normal`: FIN exchange). The connection carries on; data
-    /// the subflow had in flight is resent on the others. Not emitted for the subflows a
-    /// fallback or MP_FASTCLOSE resets.
+    /// A subflow ended (`Reset`: refused or reset, also a queued join that can no longer
+    /// start, or reset by us at close because it held only DATA_ACKed data; `Timeout`: R2;
+    /// `Normal`: FIN exchange). The connection carries on; data the subflow had in flight is
+    /// resent on the others. For the initial subflow (`SubflowId::INITIAL`) only while
+    /// another subflow is open: as the last one, its end starts the no-subflow wait, which
+    /// ends in `Closed`. Not emitted for the subflows a fallback or MP_FASTCLOSE resets.
     SubflowDown {
         subflow: SubflowId,
         reason: CloseReason,
@@ -427,7 +428,7 @@ impl<R: CryptoRng> Endpoint<R> {
             let view = (sf.id, &mut sf.state, &sf.tcb);
             Self::subflow_event(&mut self.events, h, view, joining, r);
         } else if r != Reaction::None {
-            Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r);
+            Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
         }
         Self::update_close(
             &mut self.events,
@@ -510,12 +511,16 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
+    /// The events of `subflows[0]`. With MPTCP active its end is `SubflowDown` while another
+    /// subflow is open (`others_open`) and the connection carries on (not on MP_FASTCLOSE);
+    /// as the last subflow it leads to the no-subflow wait, whose end is `Closed`.
     fn push_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         hooks: &ConnectionHooks,
         reset: &mut bool,
         h: ConnectionHandle,
         r: Reaction,
+        others_open: bool,
     ) {
         match r {
             Reaction::None => {}
@@ -527,6 +532,10 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             Reaction::Closed(reason) => {
                 if hooks.active() {
+                    if others_open && hooks.retained() && !hooks.fast_closed {
+                        let subflow = SubflowId::INITIAL;
+                        events.push_back((h, Event::SubflowDown { subflow, reason }));
+                    }
                     return;
                 }
                 *reset |= reason == CloseReason::Reset;
@@ -747,7 +756,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     let view = (sf.id, &mut sf.state, &sf.tcb);
                     Self::subflow_event(&mut self.events, h, view, joining, r);
                 } else {
-                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r);
+                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
                 }
                 Self::update_close(
                     &mut self.events,

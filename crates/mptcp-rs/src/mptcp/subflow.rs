@@ -14,6 +14,11 @@ use crate::wire::mptcp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubflowId(pub(crate) u8);
 
+impl SubflowId {
+    /// The initial subflow, the one `connect_mptcp` opens.
+    pub const INITIAL: SubflowId = SubflowId(0);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubflowState {
     /// MP_JOIN not complete: no data, not usable by the scheduler.
