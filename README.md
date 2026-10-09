@@ -2,11 +2,12 @@
 
 Portable, RFC 8684-compatible, Sans-I/O Multipath TCP implementation in Rust.
 
-a Linux TUN adapter provides the first network integration. 
-Theinitial role is client only, with Linux kernel TCP/MPTCP as the interoperability
-peer.
+This is a userspace implementation of the MPTCP protocol itself, not a helper
+for creating kernel MPTCP sockets. The core library is sans-I/O; a Linux TUN
+adapter provides the first network integration. The initial role is client only,
+with Linux kernel TCP/MPTCP as the interoperability peer.
 
-The `mptcp-rs` crate (0.0.1) is that library: client role only, at milestone M2
+The `mptcp-rs` crate (0.0.1) is the core library: client role only, at milestone M2
 (two paths). Path management, the server role and several options are still
 missing (see the roadmap), and a blackholed path can stall the connection for
 several seconds (see the known limitation below).

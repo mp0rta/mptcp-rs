@@ -1,5 +1,8 @@
 //! A sans-I/O userspace Multipath TCP v1 (RFC 8684) and TCP client stack.
 //!
+//! It implements the MPTCP protocol itself in userspace; it is not a helper for creating
+//! kernel MPTCP sockets.
+//!
 //! The library does no I/O of its own. The caller feeds it received IP packets and the
 //! current time, drains the IP packets it wants sent, and sleeps until its next timer.
 //! Time ([`Instant`]) and randomness (a [`rand_core::CryptoRng`]) are injected, and the
