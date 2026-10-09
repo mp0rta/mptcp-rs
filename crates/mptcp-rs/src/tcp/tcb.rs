@@ -660,11 +660,13 @@ impl Tcb {
         Some((self.seq_at(r.start), self.seq_at(r.end), r.rescue))
     }
 
-    /// Update() (RFC 6675 §4) with the ACK's SACK blocks inside (SND.UNA, SND.MAX]; marks the
-    /// records wholly inside newly SACKed ranges. Returns the newly SACKed octets and, of the
-    /// records they delivered, the one sent last.
+    /// Update() (RFC 6675 §4) with the ACK's SACK blocks clipped to (SEG.ACK, SND.MAX] (a
+    /// D-SACK block below SEG.ACK, RFC 2883, is nothing new); marks the records wholly inside
+    /// newly SACKed ranges. Returns the newly SACKed octets and, of the records they
+    /// delivered, the one sent last. Runs before SND.UNA advances to SEG.ACK.
     fn sack_update(&mut self, seg: &Segment) -> (u64, Option<SentRecord>) {
         let (una, max, base) = (self.snd_una, self.snd_max, self.delivered);
+        let floor = seg.ack;
         let abs = |s: SeqNum| base.wrapping_add_signed(i64::from(una.distance(s)));
         let blocks = tcp_options::walk(seg.options)
             .map_while(Result::ok)
@@ -676,8 +678,8 @@ impl Tcb {
             .filter_map(|b| {
                 let l = SeqNum(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
                 let r = SeqNum(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
-                let l = if l.lt(una) { una } else { l };
-                (r.gt(una) && r.le(max) && l.lt(r)).then(|| abs(l)..abs(r))
+                let l = if l.lt(floor) { floor } else { l };
+                (r.gt(floor) && r.le(max) && l.lt(r)).then(|| abs(l)..abs(r))
             });
         let sent = &mut self.sent;
         let mut newest: Option<SentRecord> = None;

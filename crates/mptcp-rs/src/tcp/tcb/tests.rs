@@ -3775,3 +3775,47 @@ fn sack_sample_from_newest_newly_delivered_record() {
         ]
     );
 }
+
+/// A D-SACK block below the ACK's own cumulative point (RFC 2883) is not new SACK
+/// information: the ACK that advances SND.UNA past it counts no duplicate ACK, so two
+/// newly SACKing ACKs after it stay below DupThresh.
+#[test]
+fn dsack_below_new_ack_is_no_dup_ack() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let dsack = [(data(11_000), data(12_000))];
+    assert_eq!(f.sack_ack(tm(30), data(12_000), &dsack), Reaction::None);
+    assert_eq!(f.tcb.sack.sacked_in(0, u64::MAX), 0);
+    f.drain(tm(30));
+    for k in [14, 16] {
+        let b = [(data(k * 1000), data(k * 1000 + 1000))];
+        f.sack_ack(tm(31), data(12_000), &b);
+    }
+    assert!(!f.tcb.sack.in_recovery(), "two duplicate ACKs, not three");
+}
+
+/// The same ACK's RTT sample and app-limited flag come from the newest record it
+/// cumulatively acknowledges, not from the D-SACKed one.
+#[test]
+fn dsack_below_new_ack_sample_from_newest_record() {
+    let samples = Samples::default();
+    let cfg = ConnectConfig::default();
+    let h = PlainHooks::new(&cfg);
+    let cc = TestCc {
+        rate: None,
+        cwnd: BIG_CWND,
+        samples: samples.clone(),
+    };
+    let mut f = Fixture::with(cfg, Box::new(cc), h);
+    f.synack(BIG, &sack_opts());
+    f.drain(t(0));
+    f.tcb.set_nodelay(true);
+    for k in 0..3 {
+        f.write(&pattern(1000));
+        assert_eq!(f.drain(tm(10 * k)).len(), 1);
+    }
+    // A (0 ms), B (10 ms) and C (20 ms) all ACKed; B also D-SACKed.
+    f.sack_ack(tm(50), data(3000), &[(data(1000), data(2000))]);
+    let rtts: Vec<_> = samples.lock().unwrap().iter().map(|a| a.rtt).collect();
+    assert_eq!(rtts, [Some(Duration::from_millis(30))]);
+}
