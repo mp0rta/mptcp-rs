@@ -6,9 +6,9 @@ initial role is client only, with Linux kernel TCP/MPTCP as the interoperability
 peer.
 
 The `mptcp-rs` crate (0.0.1) is that library: client role only, at milestone M2
-(two paths). It is not yet suited to production use; path management, the server
-role and several options are still missing (see the roadmap), and a blackholed path
-can stall the connection for several seconds (see the known limitation below).
+(two paths). Path management, the server role and several options are still
+missing (see the roadmap), and a blackholed path can stall the connection for
+several seconds (see the known limitation below).
 
 ## Status
 
@@ -36,8 +36,7 @@ case (path B at 1280 octets), single-path goodput within 5 % of the reference,
 two-path goodput in both directions (client-to-server median 354.9 Mbit/s
 against a gate of 338.5; server-to-client 350.4 over three and over six runs
 against 340.1), and all four 1 GiB blackhole cases, including the stale report
-for the failed subflow in the client-to-server cases. Details are in the local
-note `docs/superpowers/notes/2026-10-09-m2-verification.md`.
+for the failed subflow in the client-to-server cases.
 
 Known limitation (M2): if one path blackholes while data is outstanding on it,
 the healthy path can stall for up to about R1 = 3 RTOs (about 7 s in the
