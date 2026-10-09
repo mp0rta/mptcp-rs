@@ -51,7 +51,11 @@ impl Default for ConnectConfig {
             // 16 MiB (scale 9): two-path s2c needs about 7 MB of span plus held data (rate
             // 350 Mbit/s x max path RTT incl. queueing, Task 9b); 4 and 8 MiB bound it.
             recv_buffer: 16 << 20,
-            send_buffer: 4 << 20,
+            // 16 MiB: the store keeps every octet until DATA_ACK, which follows the slowest
+            // path, so it needs about total rate x max path RTT incl. queueing: two-path c2s
+            // 44.6 MB/s x 0.145-0.18 s = 6.5-8 MB (Task 9c); 4 MiB bound it, 8 MiB leaves no
+            // margin for loss episodes. Memory: at most this many octets per connection.
+            send_buffer: 16 << 20,
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),
         }
