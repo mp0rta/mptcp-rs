@@ -2547,14 +2547,13 @@ fn bare_fin_on_join_confirming_ack_retires_subflow() {
             reason
         }]
     );
-    let mut t = ms(50);
-    let ev = loop {
-        t = ep.poll_timeout().expect("the no-subflow wait");
+    let (ev, t) = loop {
+        let t = ep.poll_timeout().expect("the no-subflow wait");
         ep.handle_timeout(t);
         drain(&mut ep, t);
         let ev = events(&mut ep);
         if !ev.is_empty() {
-            break ev;
+            break (ev, t);
         }
     };
     let reason = CloseReason::Timeout;
