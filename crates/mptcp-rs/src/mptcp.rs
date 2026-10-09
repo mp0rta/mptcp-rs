@@ -251,7 +251,7 @@ impl Connection {
     /// subflow-ACKed but not DATA_ACKed: no Active subflow holds a live copy covering it. On
     /// expiry the uncovered head run — stopping before a live copy on any Active subflow — is
     /// queued for reinjection. With no subflow that may carry data (all Joining or closed)
-    /// nothing is evaluated. Timers use the largest un-backed-off RTO (RFC 6298 §2) among the
+    /// nothing is evaluated and the data-retransmission timer is disarmed. Timers use the largest un-backed-off RTO (RFC 6298 §2) among the
     /// Active subflows with an RTT sample, `INITIAL_RTO` when none has one: a backed-off RTO
     /// of a lossy subflow must not stretch recovery of what the healthy one carried.
     pub(crate) fn update_recovery(&mut self, now: Instant) {
@@ -261,6 +261,10 @@ impl Connection {
         if !(self.subflows.iter())
             .any(|sf| sf.state != SubflowState::Joining && sf.tcb.state() != TcpState::Closed)
         {
+            // Nothing could consume an expiry (`poll_timeout` would stay in the past): disarm;
+            // the head stays, so it rearms once a subflow is up. The DATA_FIN retry needs
+            // nothing: `prepare_send` on `subflows[0]`, never Joining, consumes it.
+            d.recovery_at = None;
             return;
         }
         // ponytail: one RTO for the connection, so recovery of data on a fast path still waits

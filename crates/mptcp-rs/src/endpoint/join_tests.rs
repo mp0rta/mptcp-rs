@@ -2443,6 +2443,69 @@ fn stripping_after_join_history_resets_not_fallback() {
     assert_eq!(ep.poll_timeout(), Some(ms(50) + Duration::from_secs(60)));
 }
 
+/// A connection timer armed on subflow 0 (`arm`, at `ms(20)`), then subflow 0 reset while
+/// the only other subflow is still Joining (its SYN unanswered): `poll_timeout` never stays
+/// at a past deadline (a driver draining due timers would spin). Once the join is up the
+/// joined subflow sends what `resent` finds.
+fn joining_only_disarms(
+    arm: fn(&mut Endpoint<ChaCha20Rng>, ConnectionHandle, &Segment),
+    resent: fn(&[Vec<u8>], &Segment, u64) -> bool,
+) {
+    let (mut ep, h, syn, _) = confirmed_cc(reno);
+    let head = una(&ep, h);
+    let (_, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    arm(&mut ep, h, &syn);
+    let deadline = ep.conns[&h].hooks.recovery_deadline().expect("armed");
+    input_at(&mut ep, &rst_on(&syn), ms(50));
+    let mut t = ms(50);
+    while t <= deadline {
+        t = ep.poll_timeout().expect("the join SYN's timer");
+        ep.handle_timeout(t);
+        drain(&mut ep, t);
+        assert!(
+            ep.poll_timeout().is_none_or(|n| n > t),
+            "past deadline at {t:?}"
+        );
+    }
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, t);
+    from(&drain(&mut ep, t), JOIN_IP).pop().expect("third ACK");
+    peer_ack(&mut ep, &jsyn, t, jsyn.seq.wrapping_add(1), head, 1000);
+    let out = drain_until(&mut ep, t, t + Duration::from_secs(5));
+    assert!(resent(&out, &jsyn, head));
+}
+
+/// Connection recovery (subflow 0 TCP-ACKs 1000 octets without a DATA_ACK): disarmed, as
+/// nothing could consume it, and rearmed once the join is up.
+#[test]
+fn recovery_disarmed_while_only_joining_subflow() {
+    joining_only_disarms(
+        |ep, h, syn| {
+            let head = una(ep, h);
+            ep.connection(h).unwrap().write(&[7; 1000]).unwrap();
+            let a = data_on(&drain(ep, ms(20)), syn);
+            assert_eq!(a.len(), 1);
+            peer_ack(ep, syn, ms(30), end(&a[0]), head, 65535);
+        },
+        |out, jsyn, head| {
+            (data_on(out, jsyn).first()).is_some_and(|s| dsn_of(s, jsyn.seq).unwrap().0 == head)
+        },
+    );
+}
+
+/// The DATA_FIN retry (a standalone DATA_FIN on subflow 0, never DATA_ACKed): `poll_transmit`
+/// consumes it through the dead `subflows[0]`; the DATA_FIN stays due for the join.
+#[test]
+fn data_fin_retry_disarmed_while_only_joining_subflow() {
+    joining_only_disarms(
+        |ep, h, syn| {
+            ep.connection(h).unwrap().close();
+            assert!(on(&drain(ep, ms(20)), syn).iter().any(data_fin));
+        },
+        |out, jsyn, _| on(out, jsyn).iter().any(data_fin),
+    );
+}
+
 #[test]
 fn last_subflow_lost_then_add_subflow_resumes() {
     let (mut ep, h, syn, _) = confirmed_cc(reno);
