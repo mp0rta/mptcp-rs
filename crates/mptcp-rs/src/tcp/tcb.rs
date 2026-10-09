@@ -37,7 +37,16 @@ const MSL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectConfig {
     pub mtu: u16,
+    /// Octets received in order and not yet read, which bounds the window offered. Memory
+    /// can exceed it: MPTCP also holds octets above that point up to the advertised edge
+    /// (below 2·`recv_buffer` + 2^scale, `RecvAssembler`), and the in-order buffer (a
+    /// `VecDeque`, plain TCP and MPTCP alike) keeps its peak capacity until freed.
     pub recv_buffer: u32,
+    /// Octets written and not yet acknowledged (MPTCP: DATA_ACKed). Memory exceeds it: MPTCP
+    /// keeps every `write` call as its own allocation plus bookkeeping, and each `write`
+    /// costs O(live writes), so many small writes into a large buffer cost memory and CPU
+    /// far beyond the octet count (coalescing them is M3); plain TCP's `VecDeque` keeps its
+    /// peak capacity until freed.
     pub send_buffer: u32,
     pub r2_data: Duration,
     /// Used as at least 180 s (RFC 9293 MUST-23).
@@ -54,7 +63,7 @@ impl Default for ConnectConfig {
             // 16 MiB: the store keeps every octet until DATA_ACK, which follows the slowest
             // path, so it needs about total rate x max path RTT incl. queueing: two-path c2s
             // 44.6 MB/s x 0.145-0.18 s = 6.5-8 MB (Task 9c); 4 MiB bound it, 8 MiB leaves no
-            // margin for loss episodes. Memory: at most this many octets per connection.
+            // margin for loss episodes. Octets, not memory: see the field.
             send_buffer: 16 << 20,
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),

@@ -31,7 +31,8 @@ pub enum Event {
         mptcp: bool,
     },
     /// The connection continues as plain TCP on one subflow; every other one was reset (no
-    /// `SubflowDown` for them).
+    /// `SubflowDown` for them). It ends the per-subflow events: a Stale survivor becomes
+    /// Active again without `SubflowRecovered`.
     FellBack,
     Closed {
         reason: CloseReason,

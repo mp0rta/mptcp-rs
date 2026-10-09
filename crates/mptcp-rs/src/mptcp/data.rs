@@ -387,8 +387,8 @@ struct Piece {
 /// `2·cap + 2^scale`. The rounding creeps the edge by less than 2^scale per DATA_ACK that
 /// moved `next`, and only until `next` reaches the memory edge: with the application not
 /// reading and full segments of L octets the overshoot is about `cap · (−L mod 2^scale) / L`
-/// (2% at 4 MiB, scale 7, L 1436); approaching the worst case needs segments shorter than
-/// 2^scale.
+/// (L 1436: −1436 mod 2^scale is 100 at scale 7 and 9, so about 7 %, 1.1 MiB at the 16 MiB /
+/// scale 9 default); approaching the worst case needs segments shorter than 2^scale.
 pub(crate) struct RecvAssembler {
     pub next: u64,
     pub right_edge: u64,
