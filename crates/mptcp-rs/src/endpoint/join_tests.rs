@@ -2184,6 +2184,80 @@ fn close_two_subflows_fin_fin() {
     assert!(ep.conns.is_empty(), "token released");
 }
 
+/// Both DATA_FINs are DATA_ACKed and both subflows send their FIN. The peer answers subflow
+/// `1 - k` at once (TIME-WAIT); subflow `k`'s FIN goes unanswered through R1 = 3 RTOs
+/// (`SubflowStale`), then the peer's ACK+FIN puts it in TIME-WAIT: `SubflowDown { Normal }`
+/// and no `SubflowRecovered` after it (a subflow whose FIN is ACKed carries no data again).
+fn stale_fin_then_time_wait(k: usize) {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, una1) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().close();
+    drain(&mut ep, t);
+    let t = t + Duration::from_millis(10);
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1));
+    let seg = Segment {
+        ack: una1,
+        wnd: 65535,
+        ..peer_data(&jsyn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t);
+    let out = drain(&mut ep, t);
+    let syns = [&syn, &jsyn];
+    let fins: Vec<_> = (syns.iter())
+        .map(|s| {
+            (on(&out, s).into_iter())
+                .find(|s| s.flags.contains(TcpFlags::FIN))
+                .expect("our FIN")
+        })
+        .collect();
+    let opts = data_ack(head + 1);
+    let answer = |ep: &mut Endpoint<ChaCha20Rng>, i: usize, at: Instant| {
+        let seg = Segment {
+            flags: TcpFlags::ACK | TcpFlags::FIN,
+            ack: fins[i].seq.wrapping_add(1),
+            wnd: 65535,
+            ..peer_data(syns[i], 5001, &opts, &[])
+        };
+        input_at(ep, &seg, at);
+    };
+    answer(&mut ep, 1 - k, t);
+    drain(&mut ep, t);
+    events(&mut ep);
+    let id = SubflowId(k as u8);
+    let mut t = t;
+    for _ in 0..10 {
+        if ep.conns[&h].subflows[k].state == SubflowState::Stale {
+            break;
+        }
+        t = ep.poll_timeout().expect("the FIN's RTO");
+        ep.handle_timeout(t);
+        drain(&mut ep, t);
+    }
+    assert_eq!(events(&mut ep), vec![Event::SubflowStale { subflow: id }]);
+    answer(&mut ep, k, t);
+    drain(&mut ep, t);
+    let reason = CloseReason::Normal;
+    assert_eq!(
+        events(&mut ep),
+        vec![Event::SubflowDown {
+            subflow: id,
+            reason
+        }]
+    );
+}
+
+#[test]
+fn stale_joined_subflow_fin_acked_is_not_recovered() {
+    stale_fin_then_time_wait(1);
+}
+
+#[test]
+fn stale_initial_subflow_fin_acked_is_not_recovered() {
+    stale_fin_then_time_wait(0);
+}
+
 #[test]
 fn fastclose_resets_all_subflows() {
     let (mut ep, h, syn, jsyn) = two_paths(reno, reno);

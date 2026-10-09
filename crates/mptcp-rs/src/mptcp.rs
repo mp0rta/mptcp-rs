@@ -332,7 +332,8 @@ impl Connection {
     /// `rto_streak` is a `HealthEvent` (`RtoFired` for a new nonzero value, `Progress` for a
     /// drop to 0) for `Scheduler::on_health`: Stale moves an Active subflow to Stale and
     /// queues its ranges the same way (its mappings stay: the `Tcb` keeps retransmitting
-    /// them); Keep on `Progress` moves a Stale one back to Active. Nothing after fallback.
+    /// them); Keep on `Progress` moves a Stale one back to Active. Nothing after fallback, nor
+    /// once our FIN on the subflow is ACKed.
     pub(crate) fn update_health(&mut self, i: usize) -> Option<Event> {
         let d = self.hooks.data.as_ref().filter(|d| !d.fallback)?;
         let sf = &mut self.subflows[i];
@@ -349,7 +350,11 @@ impl Connection {
             sf.state = SubflowState::Closing;
             sf.tcb.close();
         }
-        if !matches!(sf.state, SubflowState::Active | SubflowState::Stale) {
+        // Our FIN is ACKed (FIN-WAIT-2, TIME-WAIT): it never carries data again, so no health
+        // transition (a `SubflowRecovered` after its `SubflowDown`).
+        if !matches!(sf.state, SubflowState::Active | SubflowState::Stale)
+            || matches!(sf.tcb.state(), TcpState::FinWait2 | TcpState::TimeWait)
+        {
             return None;
         }
         let n = sf.tcb.rto_streak();
