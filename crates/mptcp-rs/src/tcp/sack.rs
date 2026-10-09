@@ -42,6 +42,9 @@ pub(crate) struct Sack {
     sacked_below_rxt: u64,
     /// RescueRxt + 1 (§2), once set in this recovery.
     rescue: Option<u64>,
+    /// Octets of a rule (4) rescue retransmission: above HighRxt, so SetPipe's closed form
+    /// misses them; charged to pipe (§5 (C.4)) until the next ACK's SetPipe (B.2).
+    rescue_charge: u64,
 }
 
 /// What NextSeg() (RFC 6675 §4) asks to retransmit.
@@ -85,6 +88,8 @@ impl Sack {
         blocks: impl Iterator<Item = Range<u64>>,
         mut newly: impl FnMut(Range<u64>),
     ) -> u64 {
+        // Every ACK runs Update first (`Tcb::sack_update`): its SetPipe drops the charge.
+        self.rescue_charge = 0;
         let mut new = 0;
         for b in blocks {
             // ponytail: a full scoreboard ignores further blocks (as if their ACK were lost;
@@ -180,6 +185,7 @@ impl Sack {
         if rescue {
             // Rule (4): RescueRxt = RecoveryPoint; HighRxt is not updated.
             self.rescue = Some(point);
+            self.rescue_charge = end - start;
             return;
         }
         // (4.3): the first retransmission also sets RescueRxt.
@@ -193,7 +199,8 @@ impl Sack {
     }
 
     /// SetPipe() (§4): un-SACKed octets in [`una`, `max`) not lost, plus those at or below
-    /// HighRxt (so a retransmission of an octet not deemed lost counts twice).
+    /// HighRxt (so a retransmission of an octet not deemed lost counts twice), plus a rescue
+    /// sent since the last ACK (§5 (C.4)).
     pub(crate) fn pipe(&self, una: u64, max: u64) -> u64 {
         let lost_end = self.lost_end.clamp(una, max);
         let sacked_below_lost = if self.lost_end > una {
@@ -204,7 +211,7 @@ impl Sack {
         let lost = (lost_end - una) - sacked_below_lost;
         let rxt_end = self.rxt_end.clamp(una, max);
         let rxt = (rxt_end - una) - self.sacked_below_rxt.min(rxt_end - una);
-        (max - una) - self.total - lost + rxt
+        (max - una) - self.total - lost + rxt + self.rescue_charge
     }
 
     /// NextSeg() (§4) during recovery, rules (1)–(4) of at most `smss` octets; `new_data` is
@@ -394,8 +401,13 @@ mod tests {
         s.ack(0, 4000, SMSS);
         let r = s.next_seg(4000, 7000, SMSS, false).unwrap();
         assert_eq!((r.start, r.end, r.rescue), (6000, 7000, true), "rule 4");
+        assert_eq!(s.pipe(4000, 7000), 3000);
         s.on_retransmit(6000, 7000, true);
         assert_eq!(s.rxt_end, 5000, "rule 4 leaves HighRxt");
+        // (C.4): the rescue counts in pipe until the next ACK's SetPipe (B.2) drops it.
+        assert_eq!(s.pipe(4000, 7000), 4000, "rescue charged");
+        s.update(4000, SMSS, std::iter::empty(), |_| {});
+        assert_eq!(s.pipe(4000, 7000), 3000, "next ACK recomputes");
         assert_eq!(s.next_seg(4000, 7000, SMSS, false), None, "one rescue");
         // RecoveryPoint (7000) covered: recovery ends, nothing more.
         assert!(!s.exit_if_covered(6999));
