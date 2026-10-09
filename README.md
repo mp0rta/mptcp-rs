@@ -1,8 +1,9 @@
 # mptcp-rs
 
-A userspace Multipath TCP v1 (RFC 8684) implementation in Rust. The core library
-is sans-I/O; a Linux TUN adapter provides the first network integration. The
-initial role is client only, with Linux kernel TCP/MPTCP as the interoperability
+Portable, RFC 8684-compatible, Sans-I/O Multipath TCP implementation in Rust.
+
+a Linux TUN adapter provides the first network integration. 
+Theinitial role is client only, with Linux kernel TCP/MPTCP as the interoperability
 peer.
 
 ## Status
