@@ -17,6 +17,8 @@ use rangemap::RangeSet;
 
 /// RFC 6675 §2, RFC 5681 §3.2: DupThresh.
 const DUP_THRESH: u32 = 3;
+/// Disjoint SACKed ranges the scoreboard holds at most (`Sack::update`).
+pub(crate) const MAX_SACK_RANGES: usize = 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct Sack {
@@ -68,9 +70,14 @@ impl Sack {
         self.recovery.is_some()
     }
 
-    /// Update() (§4) for the blocks of one ACK, each already clipped to [SND.UNA, SND.MAX).
-    /// `newly` is called for every octet range SACKed for the first time; returns how many
-    /// octets those were.
+    #[cfg(test)]
+    pub(crate) fn ranges(&self) -> usize {
+        self.sacked.len()
+    }
+
+    /// Update() (§4) for the blocks of one ACK, each already clipped to [SND.UNA, SND.MAX),
+    /// while the scoreboard holds fewer than `MAX_SACK_RANGES` ranges. `newly` is called for
+    /// every octet range SACKed for the first time; returns how many octets those were.
     pub(crate) fn update(
         &mut self,
         una: u64,
@@ -80,6 +87,13 @@ impl Sack {
     ) -> u64 {
         let mut new = 0;
         for b in blocks {
+            // ponytail: a full scoreboard ignores further blocks (as if their ACK were lost;
+            // SACK is advisory, RFC 2018 §3) until cumulative ACKs drain it, so a receiver
+            // SACKing every other octet cannot grow it past 1024 ranges; losses then fall to
+            // the RTO. Raise the cap if a real path loses over 1024 segments in one window.
+            if self.sacked.len() >= MAX_SACK_RANGES {
+                break;
+            }
             for g in self.sacked.gaps(&b) {
                 new += g.end - g.start;
                 self.sacked_below_rxt += overlap(&g, una, self.rxt_end);

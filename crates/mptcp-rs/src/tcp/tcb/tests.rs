@@ -3819,3 +3819,36 @@ fn dsack_below_new_ack_sample_from_newest_record() {
     let rtts: Vec<_> = samples.lock().unwrap().iter().map(|a| a.rtt).collect();
     assert_eq!(rtts, [Some(Duration::from_millis(30))]);
 }
+
+/// A hostile receiver SACKing every other octet cannot grow the scoreboard past
+/// `MAX_SACK_RANGES`; the transfer still completes on cumulative ACKs.
+#[test]
+fn hostile_alternating_sack_bounded() {
+    let bytes = pattern(40_000);
+    let mut f = Fixture::ramp(true, &bytes);
+    let mut now = tm(30);
+    let mut l = 10_001;
+    while l + 8 < 24_000 {
+        let b: Vec<_> = (0..4)
+            .map(|k| (data(l + 2 * k), data(l + 2 * k + 1)))
+            .collect();
+        f.sack_ack(now, data(10_000), &b);
+        assert!(f.tcb.sack.ranges() <= crate::tcp::sack::MAX_SACK_RANGES);
+        f.drain(now);
+        l += 8;
+    }
+    assert_eq!(f.tcb.sack.ranges(), crate::tcp::sack::MAX_SACK_RANGES);
+    for _ in 0..10_000 {
+        if f.tcb.snd_una == data(40_000) {
+            return;
+        }
+        now = now + Duration::from_millis(10);
+        f.drain(now);
+        let max = f.tcb.snd_max;
+        f.ack(now, max, BIG);
+        if let Some(at) = f.tcb.poll_send_at().filter(|&at| at <= now) {
+            f.timeout(at);
+        }
+    }
+    panic!("transfer stalled at {:?}", f.tcb.snd_una);
+}
