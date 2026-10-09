@@ -2506,6 +2506,67 @@ fn data_fin_retry_disarmed_while_only_joining_subflow() {
     );
 }
 
+/// The initial subflow is gone and the ACK completing the join carries a bare FIN (no
+/// DATA_FIN): the join is up (`SubflowUp`) and retired at once like any bare FIN (Closing,
+/// our FIN goes out); its FIN exchange ends in `SubflowDown { Normal }`, then the no-subflow
+/// wait runs to `Closed { Timeout }`, with a timer pending all along.
+#[test]
+fn bare_fin_on_join_confirming_ack_retires_subflow() {
+    let (mut ep, h, syn, _) = confirmed_cc(reno);
+    let head = una(&ep, h);
+    let (id, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    from(&drain(&mut ep, ms(20)), JOIN_IP)
+        .pop()
+        .expect("third ACK");
+    input_at(&mut ep, &rst_on(&syn), ms(30));
+    events(&mut ep);
+    let opts = data_ack(head);
+    let fin = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ..peer_data(&jsyn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &fin, ms(40));
+    assert_eq!(events(&mut ep), vec![Event::SubflowUp { subflow: id }]);
+    assert_eq!(ep.conns[&h].subflows[1].state, SubflowState::Closing);
+    let out = on(&drain(&mut ep, ms(40)), &jsyn);
+    let ours = (out.iter())
+        .find(|s| s.flags.contains(TcpFlags::FIN))
+        .expect("our FIN");
+    let ack = Segment {
+        ack: ours.seq.wrapping_add(1),
+        ..peer_data(&jsyn, 5002, &opts, &[])
+    };
+    input_at(&mut ep, &ack, ms(50));
+    let reason = CloseReason::Normal;
+    assert_eq!(
+        events(&mut ep),
+        vec![Event::SubflowDown {
+            subflow: id,
+            reason
+        }]
+    );
+    let mut t = ms(50);
+    let ev = loop {
+        t = ep.poll_timeout().expect("the no-subflow wait");
+        ep.handle_timeout(t);
+        drain(&mut ep, t);
+        let ev = events(&mut ep);
+        if !ev.is_empty() {
+            break ev;
+        }
+    };
+    let reason = CloseReason::Timeout;
+    assert_eq!(
+        (ev, t),
+        (
+            vec![Event::Closed { reason }],
+            ms(50) + Duration::from_secs(60)
+        )
+    );
+}
+
 #[test]
 fn last_subflow_lost_then_add_subflow_resumes() {
     let (mut ep, h, syn, _) = confirmed_cc(reno);

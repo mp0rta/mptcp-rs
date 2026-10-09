@@ -417,6 +417,16 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             i = 0;
         }
+        // Events first: a join this segment completed is Active before `update_health`, so a
+        // bare FIN on the same segment retires it (`SubflowUp`, then the Closing path).
+        let sf = &mut c.subflows[i];
+        if i != 0 {
+            let joining = sf.mp.joining();
+            let view = (sf.id, &mut sf.state, &sf.tcb);
+            Self::subflow_event(&mut self.events, &c.hooks, h, view, joining, r);
+        } else if r != Reaction::None {
+            Self::push_event(&mut self.events, &c.hooks, &mut c.reset, h, r, !last);
+        }
         if let Some(e) = c.update_health(i) {
             self.events.push_back((h, e));
         }
@@ -425,13 +435,6 @@ impl<R: CryptoRng> Endpoint<R> {
             conn: &mut c.hooks,
             sf: &mut sf.mp,
         };
-        if i != 0 {
-            let joining = hk.sf.joining();
-            let view = (sf.id, &mut sf.state, &sf.tcb);
-            Self::subflow_event(&mut self.events, hk.conn, h, view, joining, r);
-        } else if r != Reaction::None {
-            Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
-        }
         Self::update_close(
             &mut self.events,
             &mut hk,
