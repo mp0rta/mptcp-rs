@@ -44,3 +44,37 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+  # M3 Interop Suite against the runner's kernel MPTCP (amendment §5.7). Docker does not pin the
+  # kernel, so the probe step fails loudly when a feature the suite uses is missing.
+  interop-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: probe kernel MPTCP, TUN, netns, netem, ip(6)tables and nstat counters
+        run: |
+          docker build -q -t mptcp-rs-m1-test:local tests/interop
+          docker run --rm --privileged --network none -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash -euxc '
+            uname -r
+            test -c /dev/net/tun
+            ip netns add p
+            test "$(ip netns exec p sysctl -n net.mptcp.enabled)" = 1
+            ip -n p link add v0 type veth peer name v1
+            ip netns exec p tc qdisc add dev v0 root netem rate 20mbit delay 10ms
+            for t in iptables ip6tables; do ip netns exec p $t -A FORWARD -o v0 -j DROP; done
+            ip netns exec p ip tuntap add dev t0 mode tun
+            ip netns exec p nstat -azs >/tmp/nstat.txt
+            for c in $(python3 -c "import sys; sys.path.insert(0, \"tests/interop/suite\"); import cases; print(*{k for c in cases.CASES for k in c[\"expect\"][\"nstat\"]})"); do
+              grep -q "^$c " /tmp/nstat.txt
+            done'
+      - name: decoder unit tests
+        run: docker run --rm -v "$PWD":/w -w /w mptcp-rs-m1-test:local python3 -m unittest tests/interop/suite/test_decode.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p mptcp-rs-tun
+      - run: bash tests/interop/suite/run.sh --runs 1 --ci
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: interop-suite
+          path: artifacts/interop/suite
