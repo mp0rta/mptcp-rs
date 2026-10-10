@@ -40,6 +40,14 @@ pub enum Event {
     /// Active again without `SubflowRecovered`, and a survivor whose join completed on the
     /// same segment without `SubflowUp`.
     FellBack,
+    /// The connection ended. After `Normal`, unread data stays readable (`Connection::close`).
+    /// - `Normal`: the close completed. With MPTCP: both DATA_FINs acknowledged and every
+    ///   subflow closed, so it waits until every subflow has left TIME-WAIT (up to 2·MSL =
+    ///   120 s, also for one retired earlier by `close_subflow`). Plain TCP: the FIN exchange.
+    /// - `Reset`: a RST without MPTCP in use (plain TCP, after a fallback), or MP_FASTCLOSE.
+    /// - `Timeout`: retransmissions gave up without MPTCP in use, or the no-subflow wait ended.
+    /// - `FallbackDataLoss`: see `CloseReason::FallbackDataLoss`.
+    /// - `Aborted`: `Connection::abort`.
     Closed {
         reason: CloseReason,
     },
@@ -49,11 +57,13 @@ pub enum Event {
     },
     /// A subflow ended (`Reset`: refused or reset, also a queued join that can no longer
     /// start, or reset by us at close because it held only DATA_ACKed data; `Timeout`: R2;
-    /// `Normal`: FIN exchange). The connection carries on; data the subflow had in flight is
-    /// resent on the others; if it was the last open subflow, the no-subflow wait starts and
-    /// ends in `Closed` unless `add_subflow` starts a join first. Not emitted for the subflows
-    /// a fallback or MP_FASTCLOSE resets, nor for the initial subflow ending after both
-    /// DATA_FINs. `rst`: the MP_TCPRST of the peer's RST that ended it, if it carried one.
+    /// `Normal`: FIN exchange, reported on entering TIME-WAIT). Data the subflow had in flight
+    /// is resent on the others. If no other subflow is open (TIME-WAIT does not count), the
+    /// connection ends: after both DATA_FINs in `Closed { Normal }`, otherwise the no-subflow
+    /// wait starts and ends in `Closed { Timeout }` unless `add_subflow` starts a join first.
+    /// Not emitted for the subflows a fallback or MP_FASTCLOSE resets, nor for the initial
+    /// subflow ending after both DATA_FINs. `rst`: the MP_TCPRST of the peer's RST that ended
+    /// it, if it carried one.
     SubflowDown {
         subflow: SubflowId,
         reason: CloseReason,
