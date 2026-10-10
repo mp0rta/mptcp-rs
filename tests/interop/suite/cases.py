@@ -15,7 +15,8 @@
   "Closed Normal" itself when the client closes passively, and stops an active closer in
   TIME-WAIT), kernel ("X.Y" minimum, else SKIP), optional aborted ("client" | "server": the case
   ends in that side's abort, so no transfer completes and the runner expects that side's exit),
-  optional reset [client addresses whose subflows end in a client RST, see fin_fin_no_rst]
+  optional reset [client addresses whose subflows end in a client RST, see fin_fin_no_rst],
+  optional refused [client addresses whose joins never come up; the case's own checks judge them]
 - watchdog_s; ci (part of the CI subset)
 
 A barrier is a client event name with an optional subflow number: "Connected", "SubflowUp:1".
@@ -24,14 +25,20 @@ A barrier is a client event name with an optional subflow number: "Connected", "
 
 def fin_fin_no_rst(r):
     """At mtun0: no RST, and every subflow carried a FIN from each end; except that a subflow from
-    a client address in expect["reset"] (`remove-address`) ends in a client RST instead. Every
-    case whose client may be stopped in TIME-WAIT needs this check: it is the proof of the FIN
-    exchange."""
+    a client address in expect["reset"] (`remove-address`) ends in a client RST instead: the
+    address's first subflows, in SYN order, one per listing. A join from an address in
+    expect["refused"] is left to the case's own checks. Every case whose client may be stopped in
+    TIME-WAIT needs this check: it is the proof of the FIN exchange."""
     tun = [g for g in r.segs if g.point == "cli"]
-    reset = set(r.case["expect"].get("reset", ()))
-    for f in {g.flow for g in tun}:
+    reset = list(r.case["expect"].get("reset", ()))
+    refused = set(r.case["expect"].get("refused", ()))
+    for f in sorted({g.flow for g in tun}, key=lambda f: min(g.t for g in tun if g.flow == f)):
         segs = [g for g in tun if g.flow == f]
-        if {a for a, _ in f} & reset:
+        addrs = {a for a, _ in f}
+        if addrs & refused:
+            continue
+        if addrs & set(reset):
+            reset.remove(next(iter(addrs & set(reset))))
             assert any(g.flags & 0x04 and g.direction == "c2s" for g in segs), f"{f}: no client RST"
             continue
         assert not any(g.flags & 0x04 for g in segs), f"{f}: RST present"
@@ -39,13 +46,14 @@ def fin_fin_no_rst(r):
         assert fins == {"c2s", "s2c"}, f"{f}: FIN only {sorted(fins)}"
 
 
-def subflows(*cips):
+def subflows(*cips, refused=()):
     """One subflow from each client address, the first MP_CAPABLE and the rest MP_JOIN, each
-    carrying new data in every direction of the transfer."""
+    carrying new data in every direction of the transfer; and a join from each `refused` address,
+    carrying none."""
     def check(r):
         syns = [g for g in r.segs if g.point == "cli" and g.flags & 0x12 == 0x02]
         got = {g.src: {o["tcp.options.mptcp.subtype"] for o in g.mptcp} for g in syns}
-        assert got == {c: {"1" if i else "0"} for i, c in enumerate(cips)}, f"SYNs {got}"
+        assert got == {c: {"1" if i else "0"} for i, c in enumerate(cips + tuple(refused))}, f"SYNs {got}"
         b = r.case["expect"]["bytes"]
         for d in ["c2s", "s2c"] if b == "bidi" else [b]:
             carriers = {g.src if d == "c2s" else g.dst for g in r.segs if g.direction == d and g.new_bytes}
@@ -549,11 +557,158 @@ def v6_initial_v4_join():
     return case
 
 
+def join_attempts(r, cip):
+    """The join attempts from cip at mtun0, in order: each one's SYNs (retransmissions keep the
+    source port and ISN)."""
+    syns = [g for g in join_syns(r) if g.src == cip]
+    keys = list(dict.fromkeys((g.sport, g.seq) for g in syns))
+    return [[g for g in syns if (g.sport, g.seq) == k] for k in keys]
+
+
+def join_refused(cip, synack, reason=None):
+    """At mtun0: one join attempt from cip, answered by a server RST, after a SYN/ACK if synack; the
+    RST carries MP_TCPRST reason/T0 if reason, else no MPTCP option."""
+    def check(r):
+        tries = join_attempts(r, cip)
+        assert len(tries) == 1, f"{len(tries)} join attempts from {cip}"
+        flow = tries[0][0].flow
+        back = [g for g in r.segs if g.point == "cli" and g.flow == flow and g.direction == "s2c"]
+        assert any(g.flags & 0x12 == 0x12 for g in back) == synack, f"SYN/ACK from the server: {not synack}"
+        rsts = [[(o["tcp.options.mptcp.subtype"], o.get("tcp.options.mptcp.rst_reason"), o.get("tcp.options.mptcp.flag_T.flag"))
+                 for o in g.mptcp] for g in back if g.flags & 0x04]
+        assert rsts == [[("8", reason, "0")] if reason else []], f"server RSTs {rsts}"
+    return check
+
+
+def refused_case(name, script, pm_subflows, cips, refused, events):
+    """The initial subflow and joins by `script` under `limits set subflows pm_subflows`; the joins
+    from `refused` never come up, and the transfer completes on cips' subflows."""
+    case = scripted(name, "subflows", "c2s", script, send_rate="8")
+    case["server"]["pm"] = [f"limits set subflows {pm_subflows} add_addr_accepted 0"]
+    e = case["expect"]
+    e["refused"] = refused
+    e["nstat"]["MPTcpExtMPJoinAckRx"] = len(cips) - 1
+    e["pcap"] = [subflows(*cips, refused=refused), fin_fin_no_rst]
+    e["events"] = ["Connected mptcp=true", *events]
+    return case
+
+
+def join_refused_by_server_limit():
+    """`limits set subflows 0`: Linux takes the join's SYN, answers it and refuses the third ACK
+    with MP_TCPRST 0x03 (probe `refused_join_rst_reason`). The client's own sending (c2s) stays on
+    the initial subflow and completes."""
+    case = refused_case("join-refused-by-server-limit", JOIN, 0, (PRIMARY,), [BACKUP],
+                        ["SubflowDown SubflowId(1) Reset rst=0x03/T0"])
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtMPJoinSynRx=1, MPTcpExtMPJoinRejected=1)
+    e["pcap"] += [join_refused(BACKUP, True, "0x03")]
+    return case
+
+
+THIRD = "10.0.93.2"
+
+
+def pm_limit_one_of_two_joins():
+    """`limits set subflows 1`: of two joins, the second, made once the first is up, is refused;
+    the transfer completes on the initial subflow and the first join."""
+    script = f"{JOIN}\nat SubflowUp:1 +500 join {THIRD} 10.0.1.2:5201"
+    case = refused_case("pm-limit-one-of-two-joins", script, 1, (PRIMARY, BACKUP), [THIRD],
+                        ["SubflowUp SubflowId(1)", "SubflowDown SubflowId(2) Reset rst=0x03/T0"])
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtMPJoinSynRx=2, MPTcpExtMPJoinRejected=1)
+    e["pcap"] += [join_refused(THIRD, True, "0x03")]
+    return case
+
+
+def join_to_closed_port():
+    """A join to a server port nothing listens on: the kernel answers the SYN with a plain RST,
+    which ends the join (`SubflowDown { Reset }`, no MP_TCPRST); Linux's MPTCP never sees it."""
+    case = refused_case("join-to-closed-port", f"at Connected +0 join {BACKUP} 10.0.1.2:5202", 2, (PRIMARY,),
+                        [BACKUP], ["SubflowDown SubflowId(1) Reset rst=none"])
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtMPJoinSynRx=0)
+    e["pcap"] += [join_refused(BACKUP, False)]
+    return case
+
+
+def join_unanswered(cip):
+    """At mtun0: one join attempt from cip, retransmitted with backoff and never answered; it ends
+    at the SYN's R2 (3 min, RFC 9293 MUST-23) with `SubflowDown { Timeout }`."""
+    def check(r):
+        tries = join_attempts(r, cip)
+        assert len(tries) == 1, f"{len(tries)} join attempts from {cip}"
+        syns = tries[0]
+        gaps = [round(b.t - a.t) for a, b in zip(syns, syns[1:])]
+        assert len(syns) >= 6 and gaps == sorted(gaps), f"SYN retransmission gaps {gaps}"
+        assert not any(g.flow == syns[0].flow and g.direction == "s2c" for g in r.segs), "answered"
+        down = [e for e in r.events if e.startswith("SubflowDown SubflowId(1) Timeout")]
+        t = float(down[0].rsplit("+", 1)[1].rstrip("s")) if down else None
+        assert t is not None and 180 <= t < 185, f"join timeout at {t} s after Connected"
+    return check
+
+
+def join_syn_dropped():
+    """Link 2 drops everything from Connected for 185 s; the join from it, made 1 s later, gets no
+    answer and ends at its R2 while the transfer goes on over the initial subflow (1 Mbit/s for
+    190 s). Not in the CI subset: it runs through the 3-minute SYN R2."""
+    case = refused_case("join-syn-dropped", f"at Connected +1000 join {BACKUP} 10.0.1.2:5201", 2, (PRIMARY,),
+                        [BACKUP], ["SubflowDown SubflowId(1) Timeout rst=none"])
+    case["client"].update(send_secs=190, send_rate="1")
+    case["fail"] = [(2, "Connected", 0, 185)]
+    case["expect"]["nstat"].update(MPTcpExtMPJoinSynRx=0)
+    case["expect"]["pcap"] += [join_unanswered(BACKUP)]
+    case.update(watchdog_s=260, ci=False)
+    return case
+
+
+def rejoined(cip, rid):
+    """At mtun0: two join attempts from cip, both MP_JOIN SYNs with address id rid (the IP keeps its
+    id, M3 spec §4.1), the second one carrying new data."""
+    def check(r):
+        tries = join_attempts(r, cip)
+        assert len(tries) == 2, f"{len(tries)} join attempts from {cip}"
+        ids = [{o.get("tcp.options.mptcp.addrid") for o in g.mptcp} for t in tries for g in t]
+        assert all(i == {str(rid)} for i in ids), f"join SYN address ids {ids}"
+        flow = tries[1][0].flow
+        assert sum(g.new_bytes for g in r.segs if g.flow == flow and g.direction == "c2s"), "no new data on the rejoin"
+    return check
+
+
+def remove_addrs(*want):
+    """At mtun0: the client's REMOVE_ADDRs, in order, as (carrier, address id)."""
+    def check(r):
+        rms = [(g.src, o.get("tcp.options.mptcp.addrid")) for g, o in mptcp_with(r, "cli", "c2s", "4")]
+        assert rms == [(c, str(i)) for c, i in want], f"REMOVE_ADDR {rms}"
+    return check
+
+
+def link_down_up_rejoin():
+    """Break-before-make (M3 spec §4.1, §4.3): link 2 goes away (`remove-address`), then link 1, so
+    the initial subflow ends as the last one (`SubflowDown` for it, the no-subflow wait); 1 s after
+    that event the policy rejoins from link 2's IP, which keeps its address id 1, and the transfer
+    completes on the new subflow. REMOVE_ADDR 1 goes on the initial subflow; REMOVE_ADDR 0, with
+    no subflow left to carry it, on the rejoined one."""
+    script = "\n".join([JOIN, f"at SubflowUp:1 +1000 remove-address {BACKUP} label=a",
+                        f"after a +1000 remove-address {PRIMARY}", f"at SubflowDown:0 +1000 join {BACKUP} 10.0.1.2:5201"])
+    case = scripted("link-down-up-rejoin", "re-establishment", "c2s", script, send_secs=7, send_rate="8")
+    e = case["expect"]
+    e["reset"] = [BACKUP, PRIMARY]
+    e["nstat"].update(MPTcpExtMPJoinSynRx=2, MPTcpExtMPJoinAckRx=2, MPTcpExtRmAddr=2, MPTcpExtMPRstRx=2)
+    e["pcap"] += [rejoined(BACKUP, 1), remove_addrs((PRIMARY, 1), (BACKUP, 0))]
+    e["events"] += ["SubflowDown SubflowId(1) Reset rst=none", "SubflowDown SubflowId(0) Reset rst=none",
+                    "SubflowUp SubflowId(2)"]
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
     joins("two-joins", 2, "bidi"),
     refused_join(),
+    join_refused_by_server_limit(),
+    join_syn_dropped(),
+    join_to_closed_port(),
+    pm_limit_one_of_two_joins(),
     client_abort(),
     server_abort(),
     join_backup(),
@@ -571,6 +726,7 @@ CASES = [
     remove_address("client-remove-joined", BACKUP, PRIMARY, 1),
     remove_address("client-remove-id0", PRIMARY, BACKUP, 0),
     make_before_break(),
+    link_down_up_rejoin(),
     signal_join(),
     signal_port_join(),
     signal_unused(),

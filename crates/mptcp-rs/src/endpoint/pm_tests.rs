@@ -1706,6 +1706,29 @@ fn rejoin_after_transmitted_remove_reuses_id() {
     assert_eq!(removes(&later), vec![], "not resent");
 }
 
+/// Break-before-make (M3 spec §4.3): the only subflow is reset with data in flight; the
+/// policy's reaction to its `SubflowDown`, a join from the same IP, carries the transfer to
+/// completion.
+#[test]
+fn reestablish_from_last_subflow_down() {
+    let n = 50_000;
+    let (mut ep, h, syn, _) = confirmed();
+    let head = una(&ep, h);
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let t = ms(10);
+    assert!(!data_on(&drain(&mut ep, t), &syn).is_empty(), "in flight");
+    input_at(&mut ep, &rst_on(&syn), t);
+    assert_eq!(events(&mut ep), vec![initial_down(CloseReason::Reset)]);
+    let (id, jsyn) = joined(&mut ep, h, t, "10.0.0.1", 1500, 7);
+    assert_eq!((id, addr_id(&jsyn)), (SubflowId(1), 0), "the IP keeps id 0");
+    let mut peer = Peer::new(head, n, &[(&jsyn, 10)]);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+    assert_eq!(events(&mut ep), vec![]);
+}
+
 /// Two primed Reno paths, subflow 1 joined to the peer's address id 5; the peer's REMOVE_ADDR
 /// for id 5 arrives on subflow 0. Also returns the time and subflow 1's SND.UNA.
 fn peer_removes_5() -> (

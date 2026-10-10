@@ -429,4 +429,149 @@ mod tests {
         let join = Action::JoinAnnounced("10.0.93.2".parse().unwrap(), addr);
         assert_eq!(sc.due(s(7)), vec![join]);
     }
+
+    /// The driver against a real `Endpoint` (M3 spec §5.3, §6): a Confirmed connection from
+    /// 10.0.0.1 to 10.0.0.2:80 whose only subflow the peer resets with MP_TCPRST (T=`transient`)
+    /// at 100 ms, under `on down-transient rejoin +500`. Steps the driver as `main`'s loop does
+    /// until 10 s and returns each join started (its first MP_JOIN SYN), with its time; the
+    /// reset reached the driver as the initial subflow's `SubflowDown`.
+    fn reset_under_driver(transient: bool) -> Vec<(Duration, SocketAddr, SocketAddr)> {
+        use crate::{Driver, State};
+        use mptcp_rs::wire::mptcp::{self, CAP_H, DataAck, Dss, MpCapable, MptcpOption};
+        use mptcp_rs::wire::packet::{Segment, TcpFlags, build, parse};
+        use mptcp_rs::wire::tcp_options::{TcpOpt, walk};
+        use mptcp_rs::{
+            ConnectConfig, ConnectionHandle, Endpoint, Instant, SeqNum, SubflowId, crypto,
+        };
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        const PEER_KEY: u64 = 0x1020_3040_5060_7080;
+        let at = |d: Duration| Instant::from_nanos(d.as_nanos() as u64);
+        let opt = |o: MptcpOption| {
+            let mut b = [0; 40];
+            let n = mptcp::encode(&o, &mut b).unwrap();
+            b[..n].to_vec()
+        };
+        let mptcp_opts = |seg: &Segment| -> Vec<MptcpOption> {
+            (walk(seg.options).filter_map(|o| match o {
+                Ok(TcpOpt::Mptcp(b)) => mptcp::parse(b).ok(),
+                _ => None,
+            }))
+            .collect()
+        };
+        let mut pkt = vec![0; 1500];
+        let feed = |ep: &mut Endpoint<ChaCha20Rng>, seg: &Segment, t: Duration| {
+            let mut wire = [0; 1500];
+            let n = build(seg, 0, &mut wire).unwrap();
+            ep.handle_packet(at(t), &wire[..n]);
+        };
+        let (local, remote) = ("10.0.0.1".parse().unwrap(), "10.0.0.2:80".parse().unwrap());
+        let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(11));
+        let cfg = ConnectConfig::default();
+        let mtu = cfg.mtu;
+        let h: ConnectionHandle = ep.connect_mptcp(at(s(0)), local, remote, cfg).unwrap();
+        let mut drv = Driver {
+            script: Script::parse("on down-transient rejoin +500").unwrap(),
+            subs: vec![(SubflowId::INITIAL, local, remote, mtu, false)],
+            down: Vec::new(),
+            log: None,
+            complete: false,
+        };
+        let mut st = State::default();
+        let n = ep.poll_transmit(at(s(0)), &mut pkt).unwrap();
+        let syn = parse(&pkt[..n]).unwrap();
+        let (us, iss) = (syn.src, syn.seq);
+        // The peer's side of the 4-tuple, from sequence number 5001.
+        let peer = |flags, options| Segment {
+            src: remote,
+            dst: us,
+            seq: SeqNum(5001),
+            ack: iss.wrapping_add(1),
+            flags,
+            wnd: 65535,
+            options,
+            payload: &[],
+        };
+        let capable = opt(MptcpOption::Capable(MpCapable {
+            version: 1,
+            flags: CAP_H,
+            sender_key: Some(PEER_KEY),
+            receiver_key: None,
+            data_len: None,
+            checksum: None,
+        }));
+        let synack = Segment {
+            seq: SeqNum(5000),
+            ..peer(TcpFlags::SYN | TcpFlags::ACK, &capable)
+        };
+        feed(&mut ep, &synack, s(1));
+        let n = ep.poll_transmit(at(s(1)), &mut pkt).unwrap();
+        let third = parse(&pkt[..n]).unwrap();
+        let [MptcpOption::Capable(c)] = mptcp_opts(&third)[..] else {
+            panic!("third ACK: {third:?}")
+        };
+        // A DATA_ACK from the peer confirms the connection.
+        let idsn = crypto::key_token_idsn(c.sender_key.unwrap()).1;
+        let dss = opt(MptcpOption::Dss(Dss {
+            data_fin: false,
+            data_ack: Some(DataAck::Ack64(idsn.wrapping_add(1))),
+            mapping: None,
+        }));
+        feed(&mut ep, &peer(TcpFlags::ACK, &dss), s(2));
+        let rst = opt(MptcpOption::TcpRst {
+            transient,
+            reason: 0x00,
+        });
+        let mut joins = Vec::new();
+        let mut now = s(2);
+        while now <= s(10_000) {
+            if now == s(100) {
+                feed(&mut ep, &peer(TcpFlags::RST | TcpFlags::ACK, &rst), now);
+            }
+            if ep.poll_timeout().is_some_and(|d| d <= at(now)) {
+                ep.handle_timeout(at(now));
+            }
+            while let Some((_, ev)) = ep.poll_event() {
+                drv.on_event(&ev, now);
+            }
+            for action in drv.script.due(now) {
+                drv.act(&mut ep, h, at(now), &action, &mut st).unwrap();
+            }
+            while let Some(n) = ep.poll_transmit(at(now), &mut pkt) {
+                let seg = parse(&pkt[..n]).unwrap();
+                let join = mptcp_opts(&seg)
+                    .into_iter()
+                    .any(|o| matches!(o, MptcpOption::Join(_)));
+                // A retransmitted SYN is the same join.
+                let new = !joins.iter().any(|j: &(_, SocketAddr, _)| j.1 == seg.src);
+                if seg.flags == TcpFlags::SYN && join && new {
+                    joins.push((now, seg.src, seg.dst));
+                }
+            }
+            now += s(1);
+        }
+        assert_eq!(drv.down, [SubflowId::INITIAL]);
+        joins
+    }
+
+    #[test]
+    fn driver_transient_rst_rejoins() {
+        let joins = reset_under_driver(true);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        let (t, src, dst) = joins[0];
+        assert_eq!(t, s(600), "D = 500 ms after the reset");
+        let (local, remote): (IpAddr, SocketAddr) =
+            ("10.0.0.1".parse().unwrap(), "10.0.0.2:80".parse().unwrap());
+        assert_eq!(
+            (src.ip(), dst),
+            (local, remote),
+            "the same local and remote"
+        );
+    }
+
+    #[test]
+    fn driver_permanent_rst_no_rejoin() {
+        assert_eq!(reset_under_driver(false), vec![]);
+    }
 }
