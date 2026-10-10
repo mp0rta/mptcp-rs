@@ -94,7 +94,7 @@ impl Connection {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.reset {
+        if self.reset || self.aborting {
             return Err(ReadError::Reset);
         }
         let eof = self.hooks.eof(self.subflows[0].tcb.fin_received());
@@ -132,7 +132,7 @@ impl Connection {
     /// Does nothing once `Closed` was reported, or on a second call.
     pub fn abort(&mut self) {
         self.closed_by_app = true;
-        self.aborting = true;
+        self.aborting |= !crate::endpoint::ended(self);
     }
 
     /// Opportunistic retransmission counters, for test drivers; not a stable API.

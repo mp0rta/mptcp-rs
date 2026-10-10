@@ -2885,3 +2885,172 @@ fn add_addr_v6_on_v4_connection_announced() {
     let jsyn = from(&drain(&mut ep, ms(20)), "fd00:92::2").pop();
     assert_eq!(jsyn.expect("join SYN").dst, remote);
 }
+
+// Final whole-branch review fixes.
+
+/// M3 spec §4.1: the cap counts open or queued subflows. Retired ones in TIME-WAIT (and the
+/// initial subflow kept Closed) take no slot, so make-before-break repeats within 2·MSL.
+#[test]
+fn make_before_break_repeated_within_2msl() {
+    let (mut ep, h, _, mut jsyn) = two_paths(reno, reno);
+    let mut s = SubflowId(1);
+    for k in 0..10 {
+        let now = ms(20 + k);
+        let (id, next) = joined(&mut ep, h, now, JOIN_IP, 1500, 7);
+        retire_to_time_wait(&mut ep, h, &jsyn, s, now);
+        (s, jsyn) = (id, next);
+    }
+    let tw = (ep.conns[&h].subflows.iter()).filter(|sf| sf.tcb.state() == TcpState::TimeWait);
+    assert_eq!(tw.count(), 10);
+    // TIME-WAIT ends silently: entering it reported `SubflowDown`.
+    drive(&mut ep, ms(30), ms(130_000));
+    assert_eq!(events(&mut ep), vec![]);
+    assert_eq!(
+        ep.conns[&h].subflows.len(),
+        2,
+        "the initial and the live one"
+    );
+}
+
+/// The last live subflow ends while a retired one is in TIME-WAIT: the no-subflow wait starts
+/// at once (M3 spec §5.5), not when TIME-WAIT ends.
+#[test]
+fn last_live_subflow_down_with_other_in_time_wait_starts_wait() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    retire_to_time_wait(&mut ep, h, &jsyn, SubflowId(1), ms(20));
+    let t = ms(30);
+    input_at(&mut ep, &rst_on(&syn), t);
+    assert_eq!(events(&mut ep), vec![initial_down(CloseReason::Reset)]);
+    ep.handle_timeout(t);
+    assert_eq!(ep.poll_timeout(), Some(t + Duration::from_secs(60)));
+    drive(&mut ep, t, t + Duration::from_secs(60));
+    let reason = CloseReason::Timeout;
+    assert_eq!(events(&mut ep), vec![Event::Closed { reason }]);
+}
+
+/// `abort` discards unread data at once: `read` fails before the endpoint carries it out. Once
+/// `Closed` was reported `abort` does nothing, so unread data stays readable.
+#[test]
+fn read_after_abort_is_reset() {
+    let (mut ep, h, syn, _) = confirmed();
+    let opts = mapping(1, peer_dsn(), 5);
+    input_at(&mut ep, &peer_data(&syn, 5001, &opts, b"hello"), ms(10));
+    ep.connection(h).unwrap().abort();
+    let mut buf = [0; 16];
+    assert_eq!(
+        ep.connection(h).unwrap().read(&mut buf),
+        Err(crate::ReadError::Reset)
+    );
+
+    // Plain TCP, closed normally (TIME-WAIT) with 4 octets unread.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let cfg = ConnectConfig::default();
+    let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
+    drain(&mut ep, ms(1));
+    ep.connection(h).unwrap().close();
+    drain(&mut ep, ms(1));
+    let fin = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: syn.seq.wrapping_add(2),
+        ..peer_data(&syn, 5001, &[], b"tail")
+    };
+    input_at(&mut ep, &fin, ms(2));
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert_eq!(events(&mut ep).last(), Some(&closed));
+    ep.connection(h).unwrap().abort();
+    assert_eq!(ep.connection(h).unwrap().read(&mut buf), Ok(4));
+}
+
+/// A malformed signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_TCPRST) is ignored like an
+/// unknown one: the segment's DSS still maps its data and confirms the connection.
+#[test]
+fn malformed_signal_option_keeps_dss() {
+    let bad: [&[u8]; 4] = [
+        &[30, 5, 0x30, 2, 10],
+        &[30, 3, 0x40],
+        &[30, 4, 0x50, 0],
+        &[30, 3, 0x80],
+    ];
+    for bad in bad {
+        assert!(mptcp::parse(bad).is_err(), "{bad:?}");
+        let (mut ep, h, syn) = preconfirmed();
+        let dss = encode(&MptcpOption::Dss(mptcp::Dss {
+            data_fin: false,
+            data_ack: Some(mptcp::DataAck::Ack64(una(&ep, h))),
+            mapping: Some(mptcp::Mapping {
+                ssn: 1,
+                dsn: mptcp::Dsn::Dsn64(peer_dsn()),
+                data_len: 5,
+                checksum: None,
+            }),
+        }));
+        let opts = [dss, bad.to_vec()].concat();
+        input_at(&mut ep, &peer_data(&syn, 5001, &opts, b"hello"), ms(2));
+        assert_eq!(state(&ep, h), State::Confirmed, "{bad:?}");
+        let mut buf = [0; 16];
+        assert_eq!(ep.connection(h).unwrap().read(&mut buf), Ok(5), "{bad:?}");
+    }
+}
+
+/// `Connection::abort`: `Closed { Aborted }` is the last event; a queued join is dropped
+/// silently.
+#[test]
+fn abort_with_queued_join_no_event_after_closed() {
+    let (mut ep, h, _) = preconfirmed();
+    queue_join(&mut ep, h, "10.0.0.2:80");
+    ep.connection(h).unwrap().abort();
+    assert!(from(&drain(&mut ep, ms(3)), JOIN_IP).is_empty());
+    ep.handle_timeout(ms(3));
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    assert!(ep.connection(h).is_none());
+}
+
+/// Ruling R20a: a join in SYN-SENT is deleted without a RST (RFC 9293 §3.10.5) when its local
+/// address is withdrawn, its SYN reaches R2, or the peer's MP_FASTCLOSE resets the connection;
+/// the events are unchanged.
+#[test]
+fn syn_sent_join_ends_without_rst() {
+    let no_rst = |out: &[(Instant, Segment)]| {
+        let rsts = out.iter().filter(|(_, g)| g.flags.contains(TcpFlags::RST));
+        assert!(
+            rsts.clone().all(|(_, g)| g.src.ip() != ip(JOIN_IP)),
+            "{out:?}"
+        );
+    };
+    // `remove_address`.
+    let (mut ep, h, _, _) = confirmed();
+    let (id, _) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    ep.remove_address(ms(20), h, ip(JOIN_IP)).unwrap();
+    assert_eq!(events(&mut ep), vec![reset_down(id)]);
+    no_rst(&drive(&mut ep, ms(20), ms(10_000)));
+    ep.handle_timeout(ms(10_000));
+    assert!(ep.conns[&h].subflows.iter().all(|sf| sf.id != id), "freed");
+    // SYN R2.
+    let (mut ep, h, _, _) = confirmed();
+    let (id, _) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    no_rst(&drive(&mut ep, ms(10), ms(300_000)));
+    let down = Event::SubflowDown {
+        subflow: id,
+        reason: CloseReason::Timeout,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    assert!(ep.conns[&h].subflows.iter().all(|sf| sf.id != id), "freed");
+    // The peer's MP_FASTCLOSE.
+    let (mut ep, h, syn, _) = confirmed();
+    join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let fc = encode(&MptcpOption::FastClose {
+        receiver_key: local_key(&ep, h),
+    });
+    input_at(&mut ep, &peer_data(&syn, 5001, &fc, &[]), ms(20));
+    let out = drive(&mut ep, ms(20), ms(10_000));
+    no_rst(&out);
+    assert!(
+        out.iter().any(|(_, g)| g.flags.contains(TcpFlags::RST)),
+        "the initial's RST"
+    );
+}

@@ -54,6 +54,12 @@ impl Subflow {
             && self.mp.keepalive.is_none()
             && self.tcb.state() == crate::tcp::TcpState::Established
     }
+    /// Its TCB is Closed or in TIME-WAIT (entering it reported `SubflowDown`): it no longer
+    /// counts as open, for the subflow cap, the path calls or the no-subflow wait.
+    pub fn ended(&self) -> bool {
+        use crate::tcp::TcpState::{Closed, TimeWait};
+        matches!(self.tcb.state(), Closed | TimeWait)
+    }
 }
 
 /// MPTCP state tied to one subflow's TCP sequence space, options or window scale. The creator

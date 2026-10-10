@@ -118,7 +118,8 @@ pub enum AddSubflowError {
     Closed,
     /// All ephemeral ports from `local` to the remote are in use.
     NoPort,
-    /// The connection has 8 subflows, queued joins included.
+    /// The connection has 8 open subflows (not ended: TIME-WAIT does not count), queued joins
+    /// included.
     TooManySubflows,
     /// The connection has bound 256 local IPs, each to its own address ID, and `local` is
     /// another one.
@@ -340,7 +341,8 @@ impl<R: CryptoRng> Endpoint<R> {
         if mtu < min {
             return Err(E::InvalidMtu);
         }
-        if c.subflows.len() + c.queued_joins.len() >= SUBFLOW_CAP {
+        let open = c.subflows.iter().filter(|sf| !sf.ended()).count();
+        if open + c.queued_joins.len() >= SUBFLOW_CAP {
             return Err(E::TooManySubflows);
         }
         let id = SubflowId(c.next_subflow);
@@ -396,8 +398,7 @@ impl<R: CryptoRng> Endpoint<R> {
     ) -> Result<&mut Connection, SubflowError> {
         use SubflowError as E;
         let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
-        let ended = |sf: &Subflow| matches!(sf.tcb.state(), TcpState::Closed | TcpState::TimeWait);
-        let open = |sf: &Subflow| sf.id == s && !ended(sf);
+        let open = |sf: &Subflow| sf.id == s && !sf.ended();
         if !(c.subflows.iter().any(open) || c.queued_joins.iter().any(|q| q.id == s)) {
             return Err(E::NoSubflow);
         }
@@ -483,12 +484,13 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// Withdraws the local IP `local`, which is no longer valid (its interface is gone; RFC
-    /// 8684 §3.4.2). Every subflow using it is reset with MP_TCPRST 0x00 T=0, and joins queued
-    /// from it are dropped, each with `SubflowDown { Reset }`; with no subflow left the
-    /// no-subflow wait starts. If the peer has learned `local`'s address ID (the initial IP's
-    /// is 0), a REMOVE_ADDR for it goes once on another Active subflow, when one exists. A later
-    /// `add_subflow` from `local` keeps the ID and drops that REMOVE_ADDR if it has not gone
-    /// out yet. To retire a working path, `close_subflow` it first (make-before-break).
+    /// 8684 §3.4.2). Every subflow using it is reset with MP_TCPRST 0x00 T=0 (a join still in
+    /// SYN-SENT is deleted, sending nothing), and joins queued from it are dropped, each with
+    /// `SubflowDown { Reset }`; with no subflow left the no-subflow wait starts. If the peer has
+    /// learned `local`'s address ID (the initial IP's is 0), a REMOVE_ADDR for it goes once on
+    /// another Active subflow, when one exists. A later `add_subflow` from `local` keeps the ID
+    /// and drops that REMOVE_ADDR if it has not gone out yet. To retire a working path,
+    /// `close_subflow` it first (make-before-break).
     pub fn remove_address(
         &mut self,
         now: Instant,
@@ -504,13 +506,18 @@ impl<R: CryptoRng> Endpoint<R> {
         let c = self.conns.get_mut(&h).unwrap();
         for i in 0..c.subflows.len() {
             let sf = &c.subflows[i];
-            let ended = matches!(sf.tcb.state(), TcpState::Closed | TcpState::TimeWait);
-            if sf.local.ip() != local || ended {
+            if sf.local.ip() != local || sf.ended() {
                 continue;
             }
             let last = !others_open(&c.subflows, i);
-            let rst = Some(tcprst(0x00, false));
-            let r = c.subflows[i].tcb.abort_with(CloseReason::Reset, rst, now);
+            let tcb = &mut c.subflows[i].tcb;
+            let r = if tcb.state() == TcpState::SynSent {
+                // RFC 9293 §3.10.5: ABORT in SYN-SENT sends nothing (ruling R20a).
+                tcb.delete(now);
+                Reaction::Closed(CloseReason::Reset)
+            } else {
+                tcb.abort_with(CloseReason::Reset, Some(tcprst(0x00, false)), now)
+            };
             Self::report(&mut self.events, h, c, i, r, last, now);
         }
         for q in std::mem::take(&mut c.queued_joins) {
@@ -895,6 +902,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 continue;
             }
             let key = c.hooks.abort();
+            // Dropped silently: nothing follows `Closed { Aborted }`.
+            c.queued_joins.clear();
             for sf in &mut c.subflows {
                 let state = sf.tcb.state();
                 if state == TcpState::Closed {
@@ -907,7 +916,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 }
                 let (src, dst) = (sf.local, sf.remote);
                 let (ack, flags, option) = (SeqNum(0), TcpFlags::RST, key.map(fastclose));
-                // Not bounded by MAX_PENDING_RST: at most SUBFLOW_CAP, once per connection.
+                // Not bounded by MAX_PENDING_RST: at most one per subflow, once per connection.
                 (self.pending_rst).push_back(PendingRst {
                     src,
                     dst,
@@ -1086,14 +1095,14 @@ impl<R: CryptoRng> Endpoint<R> {
             .values()
             .filter(|c| !c.detached)
             .filter_map(|c| {
+                // A Closed TCB's deadline frees the connection, which waits for TIME-WAIT.
+                let time_wait = (c.subflows.iter()).any(|sf| sf.tcb.state() == TcpState::TimeWait);
+                let free = !(c.hooks.retained() || time_wait);
                 c.subflows
                     .iter()
                     .flat_map(|sf| {
                         let open = sf.tcb.state() != TcpState::Closed;
-                        let tcb = sf
-                            .tcb
-                            .poll_send_at()
-                            .filter(|_| !c.hooks.retained() || open);
+                        let tcb = sf.tcb.poll_send_at().filter(|_| free || open);
                         let join = (sf.mp.join.as_ref().filter(|_| open))
                             .and_then(|j| j.deadline(c.cfg.r2_data));
                         let strand = sf.mp.strand_at.filter(|_| open);
@@ -1127,6 +1136,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     sf: &mut sf.mp,
                 };
                 let mut r = Reaction::None;
+                let syn_sent = sf.tcb.state() == TcpState::SynSent;
                 if hk.sf.strand_at.is_some_and(|t| t <= now) && sf.tcb.state() != TcpState::Closed {
                     // Like a FIN exchange's end, a joined subflow reports `SubflowDown`.
                     r = sf
@@ -1149,11 +1159,13 @@ impl<R: CryptoRng> Endpoint<R> {
                 if r == Reaction::Closed(CloseReason::Timeout) && hk.sf.joining() {
                     hk.sf.join_failed = Some(None);
                 }
-                // Once a join was started, a subflow ended at R2 is reset, so that the peer
-                // frees it too and schedules nothing more on it; before that, the initial
-                // subflow keeps the M0/M1 behaviour.
+                // Once a join was started, a synchronized subflow ended at R2 is reset, so that
+                // the peer frees it too and schedules nothing more on it; one in SYN-SENT sends
+                // nothing (RFC 9293 §3.10.5, ruling R20a); before any join, the initial subflow
+                // keeps the M0/M1 behaviour.
                 if (hk.sf.join.is_some() || hk.conn.joined_ever)
                     && r == Reaction::Closed(CloseReason::Timeout)
+                    && !syn_sent
                     && !sf.tcb.reset_pending()
                 {
                     sf.tcb
@@ -1208,13 +1220,13 @@ fn min_mtu(local: IpAddr, remote: IpAddr) -> Option<u16> {
     }
 }
 
-/// Some subflow other than `subflows[i]` is open.
+/// Some subflow other than `subflows[i]` is open (not `Subflow::ended`).
 fn others_open(subflows: &[Subflow], i: usize) -> bool {
-    (subflows.iter().enumerate()).any(|(j, s)| j != i && s.tcb.state() != TcpState::Closed)
+    (subflows.iter().enumerate()).any(|(j, s)| j != i && !s.ended())
 }
 
 /// `Closed` was reported, or (a `close` in SYN-SENT) is due without further input.
-fn ended(c: &Connection) -> bool {
+pub(crate) fn ended(c: &Connection) -> bool {
     let initial = c.subflows[0].tcb.state();
     c.detached
         || if c.hooks.active() {

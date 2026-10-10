@@ -10,7 +10,7 @@ mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
 pub(crate) use join::Join;
-use opp::Cand;
+pub(crate) use opp::Cand;
 pub use opp::DebugStats;
 pub(crate) use opp::{Episode, Repair};
 use sched::{
@@ -166,12 +166,16 @@ impl ConnectionHooks {
         })
     }
     pub fn recovery_deadline(&self) -> Option<Instant> {
-        self.data.as_ref().and_then(|d| {
-            [d.recovery_at, d.close.at, d.close.no_subflow_at]
-                .into_iter()
-                .flatten()
-                .min()
-        })
+        // None once the data level has closed (a TIME-WAIT subflow may keep the connection).
+        self.data
+            .as_ref()
+            .filter(|d| !d.close.closed)
+            .and_then(|d| {
+                [d.recovery_at, d.close.at, d.close.no_subflow_at]
+                    .into_iter()
+                    .flatten()
+                    .min()
+            })
     }
     pub fn write(&mut self, bytes: &[u8]) -> usize {
         self.data
@@ -349,9 +353,7 @@ impl Connection {
         let Some(d) = &mut self.hooks.data else {
             return;
         };
-        if !(self.subflows.iter())
-            .any(|sf| sf.state != SubflowState::Joining && sf.tcb.state() != TcpState::Closed)
-        {
+        if !(self.subflows.iter()).any(|sf| sf.state != SubflowState::Joining && !sf.ended()) {
             // Nothing could consume an expiry (`poll_timeout` would stay in the past): disarm;
             // the head stays, so it rearms once a subflow is up. The DATA_FIN retry needs
             // nothing: `prepare_send` on `subflows[0]`, never Joining, consumes it.
@@ -523,7 +525,13 @@ impl Connection {
         rst_option: Option<[u8; 4]>,
     ) {
         for (j, sf) in self.subflows.iter_mut().enumerate() {
-            if Some(j) != except && sf.tcb.state() != TcpState::Closed {
+            if Some(j) == except || sf.tcb.state() == TcpState::Closed {
+                continue;
+            }
+            // RFC 9293 §3.10.5: ABORT in SYN-SENT sends nothing (ruling R20a).
+            if sf.tcb.state() == TcpState::SynSent {
+                sf.tcb.delete(now);
+            } else {
                 sf.tcb
                     .abort_with(crate::tcp::CloseReason::Reset, rst_option, now);
             }
@@ -540,11 +548,7 @@ impl Connection {
         for sf in &mut self.subflows {
             if sf.mp.peer_addr_id() == Some(id) {
                 known = true;
-                let open = !matches!(
-                    sf.tcb.state(),
-                    TcpState::Closed | TcpState::SynSent | TcpState::TimeWait
-                );
-                if open {
+                if !sf.ended() && sf.tcb.state() != TcpState::SynSent {
                     let k = subflow::Keepalive {
                         sent: 0,
                         deadline: None,
@@ -637,10 +641,12 @@ impl Connection {
         opp: Option<Cand>,
         buf: usize,
     ) {
-        // Per subflow: the candidate's prefix that its own live mappings leave uncovered.
+        // Per open subflow, in order (at most SUBFLOW_CAP: `add_subflow`): the candidate's
+        // prefix that its own live mappings leave uncovered. Ended ones are never targets.
         let mut opp_lens = [0; SUBFLOW_CAP];
         if let Some(c) = opp {
-            for (k, t) in self.subflows.iter().enumerate().take(SUBFLOW_CAP) {
+            let open = self.subflows.iter().filter(|sf| !sf.ended());
+            for (k, t) in open.enumerate().take(SUBFLOW_CAP) {
                 if self.opp_target(t, c.dsn, c.blocking, !c.repair) {
                     opp_lens[k] = t.mp.tx.uncovered_len(c.dsn, c.len as usize);
                 }
@@ -648,7 +654,10 @@ impl Connection {
         }
         let mut snapshots = std::mem::take(&mut self.hooks.snapshots);
         snapshots.clear();
-        for (k, sf) in self.subflows.iter_mut().enumerate() {
+        let mut k = 0;
+        for sf in self.subflows.iter_mut() {
+            let open_k = (!sf.ended()).then_some(k);
+            k += usize::from(open_k.is_some());
             let hk = SubflowHooks {
                 conn: &mut self.hooks,
                 sf: &mut sf.mp,
@@ -662,7 +671,7 @@ impl Connection {
                     let c = c as usize;
                     reinject_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
                 }
-                let c = opp_lens.get(k).copied().unwrap_or(0);
+                let c = open_k.and_then(|k| opp_lens.get(k)).copied().unwrap_or(0);
                 if c > 0 {
                     opp_budget = sf.tcb.send_budget(now, c, c, true, options, &hk);
                 }
@@ -1177,6 +1186,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                         port,
                         hmac: Some(hmac),
                     }) => added.push((signal::Echo { id, addr, port }, hmac)),
+                    // A malformed signal-only option is ignored, like an unknown one.
+                    Err(_) if mptcp::is_signal(raw) => {}
                     Ok(
                         MptcpOption::Dss(_)
                         | MptcpOption::Capable(_)
@@ -1567,6 +1578,7 @@ impl Negotiation {
                     Err(_) => return,
                     Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
                         Ok(MptcpOption::Dss(_)) if !dss => dss = true,
+                        Err(_) if mptcp::is_signal(raw) => {}
                         Ok(MptcpOption::Dss(_)) | Err(_) => return,
                         _ => {}
                     },

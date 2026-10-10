@@ -227,6 +227,13 @@ fn parse_dss(opt: &[u8]) -> Result<Dss, MptcpError> {
     })
 }
 
+/// `opt` is a signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_TCPRST), well-formed or
+/// not: a malformed one is ignored like an unknown option, so the segment's DSS still counts.
+pub(crate) fn is_signal(opt: &[u8]) -> bool {
+    opt.get(2)
+        .is_some_and(|b| matches!(b >> 4, ST_ADD_ADDR | ST_REMOVE_ADDR | ST_PRIO | ST_TCPRST))
+}
+
 pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
     let (&kind, &len, &b2) = match opt {
         [k, l, b, ..] => (k, l, b),

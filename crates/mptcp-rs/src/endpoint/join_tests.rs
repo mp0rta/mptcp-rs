@@ -2259,7 +2259,9 @@ fn close_two_subflows_fin_fin() {
 /// Both DATA_FINs are DATA_ACKed and both subflows send their FIN. The peer answers subflow
 /// `1 - k` at once (TIME-WAIT); subflow `k`'s FIN goes unanswered through R1 = 3 RTOs
 /// (`SubflowStale`), then the peer's ACK+FIN puts it in TIME-WAIT: `SubflowDown { Normal }`
-/// and no `SubflowRecovered` after it (a subflow whose FIN is ACKed carries no data again).
+/// and no `SubflowRecovered` after it (a subflow whose FIN is ACKed carries no data again). For
+/// the initial subflow (`k` 0) nothing: the other one is in TIME-WAIT, so it is the last open
+/// subflow ending after both DATA_FINs (`Closed` follows its TIME-WAIT).
 fn stale_fin_then_time_wait(k: usize) -> (Endpoint<ChaCha20Rng>, ConnectionHandle, SubflowId) {
     let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
     let (t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
@@ -2311,14 +2313,12 @@ fn stale_fin_then_time_wait(k: usize) -> (Endpoint<ChaCha20Rng>, ConnectionHandl
     answer(&mut ep, k, t);
     drain(&mut ep, t);
     let reason = CloseReason::Normal;
-    assert_eq!(
-        events(&mut ep),
-        vec![Event::SubflowDown {
-            subflow: id,
-            reason,
-            rst: None
-        }]
-    );
+    let down = Event::SubflowDown {
+        subflow: id,
+        reason,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), if k == 0 { vec![] } else { vec![down] });
     (ep, h, id)
 }
 
@@ -4409,6 +4409,126 @@ fn repair_and_episode_probe_share_one_tail_probe() {
     );
     let c = &ep.conns[&h];
     assert!(c.repair.probe.is_none() && c.opp.as_ref().is_none_or(|e| e.probed));
+}
+
+#[test]
+fn lookahead_boundary_skips_data_acked_mappings() {
+    // S (B) at 10 ms like A: by S's silence deadline (t + 20 ms) DATA_ACK has passed run 0
+    // through the episode's copy, while S still holds run 0's mapping (never TCP-ACKed).
+    let k = 8;
+    let (mut ep, h, mut peer, t, head, _) = b_runs(k, 10, Duration::ZERO, true, |_| Vec::new());
+    let at = t + ms_d(20);
+    peer.run(&mut ep, h, t, t + ms_d(19));
+    assert!(una(&ep, h) > head + 2 * SEG as u64, "run 0 DATA_ACKed");
+    let tx = &ep.conns[&h].subflows[0].mp.tx;
+    assert_eq!(
+        tx.ranges().next().map(|r| r.0),
+        Some(head),
+        "S still holds run 0"
+    );
+    let last_end = tx.ranges().map(|(d, n)| d + n).max();
+    peer.run(&mut ep, h, t + ms_d(19), at);
+    assert_eq!(stats(&mut ep, h).lookaheads, 1);
+    // The boundary is the end of S's last mapping, wrap-safe relative to `send.una`: the
+    // lookahead stays active and copies every remaining hole of S at once.
+    let la = ep.conns[&h].repair.lookahead.expect("lookahead active");
+    assert_eq!(Some(la.boundary), last_end);
+    for i in 2..k {
+        let on_a: Vec<_> = (peer.log.iter())
+            .filter(|l| l.1 == 1 && l.2 == run_dsn(head, i))
+            .map(|l| l.0)
+            .collect();
+        assert_eq!(on_a, [at], "run {i} copied once, at the deadline");
+    }
+}
+
+/// M3 spec §2.3: the episode's `end` only advances; an install below it (a lookahead copying
+/// again what is no longer live on A) leaves it, while the install still counts for the
+/// deadline and the tail.
+#[test]
+fn episode_end_never_moves_back() {
+    let cap = 32 * SEG;
+    let (mut ep, h, mut peer, t, head, _) = hol(cc_b, cc_a, cap, cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &pattern(cap));
+    drain(&mut ep, t);
+    let end = head + 2 * SEG as u64;
+    assert_eq!(ep.conns[&h].opp.as_ref().map(|e| e.end), Some(end));
+    let c = ep.conns.get_mut(&h).unwrap();
+    let cand = crate::mptcp::Cand {
+        dsn: head,
+        len: SEG as u32,
+        blocking: Some(SubflowId(0)),
+        repair: false,
+    };
+    c.opp_installed(1, cand, SEG as u32, t + ms_d(5));
+    let e = c.opp.as_ref().unwrap();
+    assert_eq!(e.end, end, "end kept");
+    let rto = c.subflows[1].tcb.base_rto().unwrap();
+    assert_eq!(
+        e.deadline,
+        t + ms_d(5) + rto,
+        "the install moves the deadline"
+    );
+}
+
+/// M3 spec §2.3: the episode deadline is `max(last install, last DATA_ACK advance)` + T's
+/// un-backed-off RTO. A at 600 ms, primed three times so that its RTO is below 2·srtt: the
+/// deadline, not H1's clock (2·srtt after the copy's TCP ACK), decides. S (B) at 2 s.
+#[test]
+fn opp_episode_deadline_from_install_and_data_ack_advance() {
+    PENALIZED.with(|p| p.set([0, 0]));
+    let (cap, rtt_a) = (32 * SEG, 600);
+    let (mut ep, h, syn, _) = confirmed_cc(cc_b);
+    ep.cc = Some(cc_a);
+    let (_, jsyn) = joined(&mut ep, h, ms(10), JOIN_IP, 1500, 7);
+    let (mut t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 2000);
+    for _ in 0..3 {
+        t = prime(&mut ep, h, &jsyn, SubflowId(1), t, rtt_a).0;
+    }
+    events(&mut ep);
+    let head = una(&ep, h);
+    let d = ep.conns.get_mut(&h).unwrap().hooks.data.as_mut().unwrap();
+    d.send = crate::mptcp::data::SendStore::new(head, cap);
+    let mut peer = Peer::new(head, cap, &[(&syn, 2000), (&jsyn, rtt_a)]);
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    // The copy's second segment is TCP-ACKed and dropped by the receiver.
+    let half = head + SEG as u64;
+    peer.lose = vec![(1, half, true)];
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    let rto = |ep: &Endpoint<ChaCha20Rng>| ep.conns[&h].subflows[1].tcb.base_rto().unwrap();
+    let deadline = |ep: &Endpoint<ChaCha20Rng>| ep.conns[&h].opp.as_ref().map(|e| e.deadline);
+    // Installed at t.
+    for s in drain(&mut ep, t) {
+        peer.take(t, leak(s));
+    }
+    assert_eq!(
+        (sent_at_dsn(&peer, 1, head), sent_at_dsn(&peer, 1, half)),
+        (1, 1)
+    );
+    let first = t + rto(&ep);
+    assert_eq!(deadline(&ep), Some(first));
+    // DATA_ACK advances to `half` at t + 600 ms: the deadline moves to then + RTO.
+    let acked = t + ms_d(rtt_a);
+    peer.run(&mut ep, h, t, acked);
+    assert_eq!(una(&ep, h), half);
+    let moved = acked + rto(&ep);
+    assert!(rto(&ep) < 2 * ep.conns[&h].subflows[1].tcb.srtt().unwrap());
+    assert!(moved > first);
+    assert_eq!(deadline(&ep), Some(moved));
+    assert_eq!(
+        ep.poll_timeout(),
+        Some(moved),
+        "the expiry is its own deadline"
+    );
+    // It expires exactly then, and a new episode copies the rest of the run at once.
+    peer.run(&mut ep, h, acked, moved);
+    assert_eq!(copies(&peer, head), [(t, head), (moved, half)]);
+    let s = stats(&mut ep, h);
+    assert_eq!((s.opp_episodes, s.opp_repairs), (2, 0));
+    peer.run(&mut ep, h, moved, moved + Duration::from_secs(3));
+    assert_eq!(peer.received(), data);
 }
 
 // M3 Task 4: path-management API groundwork, reusing the helpers above.

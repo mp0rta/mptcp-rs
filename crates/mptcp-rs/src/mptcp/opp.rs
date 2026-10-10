@@ -301,8 +301,10 @@ impl Connection {
         }
         if let Some((_, s)) = self.silence_deadline().filter(|&(at, _)| now >= at) {
             let sf = self.subflows.iter().find(|sf| sf.id == s).unwrap();
+            // Signed offsets from `send.una`: a mapping a copy got DATA_ACKed ends at or below it.
+            let off = |e: u64| e.wrapping_sub(una) as i64;
             let ends = sf.mp.tx.ranges().map(|(dsn, n)| dsn.wrapping_add(n));
-            let boundary = ends.max_by_key(|e| e.wrapping_sub(una)).unwrap_or(una);
+            let boundary = (ends.filter(|&e| off(e) > 0).max_by_key(|&e| off(e))).unwrap_or(una);
             let started = now;
             self.repair.lookahead = Some(Lookahead {
                 s,
@@ -452,7 +454,9 @@ impl Connection {
             la.cursor = later(Some(la.cursor), end).unwrap();
         }
         if let Some(e) = &mut self.opp {
-            (e.end, e.deadline, e.ssn_end) = (end, deadline, ssn_end);
+            // `end` only advances (§2.3): a lookahead may copy again below it.
+            e.end = later(Some(e.end), end).unwrap();
+            (e.deadline, e.ssn_end) = (deadline, ssn_end);
         } else {
             self.opp = Some(Episode {
                 start: dsn,
