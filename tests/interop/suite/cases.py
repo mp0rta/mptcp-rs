@@ -2,12 +2,13 @@
 
 - name; group: the mptcp_join.sh family it is modelled on (for the coverage note)
 - server: family v4|v6|dual, bidi, abort_after (bytes or None), pm (`ip mptcp` argument strings run
-  in srv at t=0), timed [(barrier, ms, shell command in srv)], optional sysctl ["key=value"] set in
-  srv before the server starts
+  in srv at t=0), timed [(barrier, ms, shell command in srv)], optional sysctl ["key=value"] and
+  setup [shell command] run in srv before the server starts
 - client: script (scenario text for `mptcp-rs-tun --script`, crates/mptcp-rs-tun/src/script.rs),
   send_secs, send_rate (Mbit/s as a string; None: unlimited), optional args (extra mptcp-rs-tun
   flags, e.g. --join)
-- links {i: {"rate", "delay"}} overriding 20mbit/10ms; fail [(link, barrier, ms, secs)]
+- links {i: {"rate", "delay"}} overriding 20mbit/10ms; fail [(link, barrier, ms, secs)]; optional
+  drop_once (an iptables match): a cli FORWARD DROP rule, deleted once it has dropped one packet
 - expect: bytes c2s|s2c|bidi, nstat {counter: int or (op, int)} on the srv delta, pcap [check(r)]
   raising AssertionError, events (ordered prefixes of client `event:` lines; the runner requires
   "Closed Normal" itself when the client closes passively, and stops an active closer in
@@ -307,6 +308,184 @@ def make_before_break():
     return case
 
 
+SIGNALLED = "10.0.2.2"
+REACT = f"on announced join {BACKUP}"
+
+
+def add_addrs(r, point, d, echo):
+    """ADD_ADDR options with E=echo ("0" or "1") at `point` in direction d, with their segments."""
+    return [(g, o) for g, o in mptcp_with(r, point, d, "3") if o.get("tcp.options.mptcp.echo") == echo]
+
+
+def echoed(rid, ip, port=None):
+    """At mtun0: every echo the client sent is ADD_ADDR rid with E=1, no HMAC, and the announced
+    address and port (M3 spec §3.2)."""
+    def check(r):
+        got = {(o.get("tcp.options.mptcp.addrid"), o.get("tcp.options.mptcp.ipv4"), o.get("tcp.options.mptcp.port"),
+                "tcp.options.mptcp.addaddrtrunchmac" in o) for _, o in add_addrs(r, "cli", "c2s", "1")}
+        assert got == {(str(rid), ip, port and str(port), False)}, f"echoes {got}"
+    return check
+
+
+def join_syns(r):
+    """The MP_JOIN SYNs at mtun0 (their retransmissions included)."""
+    return [g for g, _ in mptcp_with(r, "cli", "c2s", "1") if g.flags & 0x12 == 0x02]
+
+
+def joined_only(*dsts):
+    """At mtun0: the MP_JOIN SYNs went from 10.0.92.2 to dsts ("IP:port") and nowhere else."""
+    def check(r):
+        got = {(g.src, f"{g.dst}:{g.dport}") for g in join_syns(r)}
+        assert got == {(BACKUP, d) for d in dsts}, f"join SYNs {got}"
+    return check
+
+
+def signal(name, script=REACT, endpoint=f"{SIGNALLED} dev s2 id 2 signal", announced=f"{SIGNALLED}:5201",
+           direction="s2c", joins=1):
+    """The server announces `endpoint` (ADD_ADDR, as `announced`) once the connection is up; the
+    client echoes it and, by `script`, joins it from 10.0.92.2 on link 2. Linux's first ADD_ADDR
+    may arrive before its first DSS, when the client is not yet Confirmed and ignores it (M3 spec
+    §3.3); Linux repeats it unechoed."""
+    case = scripted(name, "signal", direction, script)
+    case["server"]["pm"] = ["limits set subflows 1 add_addr_accepted 0", f"endpoint add {endpoint}"]
+    ip, _, port = announced.rpartition(":")
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtAddAddrTx=(">=", 1), MPTcpExtEchoAdd=(">=", 1),
+                      MPTcpExtMPJoinSynRx=joins, MPTcpExtMPJoinAckRx=joins)
+    e["pcap"] += [echoed(2, ip, None if " port " not in endpoint else port), joined_only(*[announced] * bool(joins))]
+    e["events"] = ["Connected mptcp=true", f"AddressAnnounced {{ id: 2, addr: {announced} }}"] + ["SubflowUp"] * joins
+    return case
+
+
+def signal_port_join():
+    """A signalled endpoint with its own port: the echo repeats the port and the join goes to it."""
+    case = signal("signal-port-join", endpoint=f"{SIGNALLED} dev s2 id 2 signal port 10100",
+                  announced=f"{SIGNALLED}:10100")
+    case["expect"]["nstat"]["MPTcpExtMPJoinPortSynRx"] = 1
+    return case
+
+
+def signal_unused():
+    """No join reaction: the announcement is echoed and nothing else happens."""
+    return signal("signal-unused", script="", joins=0)
+
+
+def one_attempt(dst):
+    """At mtun0: a single join attempt to dst (SYN retransmissions keep its source port and ISN)
+    before any later ADD_ADDR from the server (a refresh, M3 spec §3.3)."""
+    def check(r):
+        syns = [g for g in join_syns(r) if f"{g.dst}:{g.dport}" == dst]
+        assert syns, f"no join SYN to {dst}"
+        refresh = min([g.t for g, _ in add_addrs(r, "cli", "s2c", "0") if g.t > syns[0].t], default=float("inf"))
+        attempts = {(g.sport, g.seq) for g in syns if g.t < refresh}
+        assert len(attempts) == 1, f"join attempts to {dst} before a refresh: {sorted(attempts)}"
+    return check
+
+
+def signal_unreachable():
+    """The server's own kernel refuses SYNs to the signalled address with a TCP RST, so the join
+    to it fails and the address is marked failed: no new attempt until a refresh."""
+    case = signal("signal-unreachable", joins=0)
+    case["server"]["setup"] = [f"iptables -A INPUT -d {SIGNALLED} -p tcp --syn -j REJECT --reject-with tcp-reset"]
+    e = case["expect"]
+    e["pcap"] = [echoed(2, SIGNALLED), one_attempt(f"{SIGNALLED}:5201")]
+    e["events"] += ["SubflowDown SubflowId(1) Reset rst=none"]
+    return case
+
+
+# The first ADD_ADDR echo after DSS12 (kind 30, subtype 3, E=1; any length) leaving mtun0, read
+# at TCP offset 32 behind the IP header.
+ECHO_AFTER_DSS12 = "-i mtun0 -p tcp -m u32 --u32 0>>22&0x3C@32&0xFF00FF00=0x1E003100"
+
+
+def echo_redone(r):
+    """The first echo left the client (mtun0) but never reached the server; Linux announced again
+    after it, and a later echo reached the server."""
+    sent, got = add_addrs(r, "cli", "c2s", "1"), add_addrs(r, "srv", "c2s", "1")
+    assert len(sent) >= 2, f"{len(sent)} echoes sent"
+    first = sent[0][0]
+    key = lambda g: (g.flow, g.seq, g.ack)
+    assert key(first) not in {key(g) for g, _ in got}, "the first echo reached the server"
+    again = [g for g, _ in add_addrs(r, "srv", "s2c", "0") if g.t > first.t]
+    assert again, "no ADD_ADDR after the dropped echo"
+    assert any(g.t > again[0].t for g, _ in got), "no echo of the repeated ADD_ADDR reached the server"
+
+
+def echo_dropped():
+    """The first echo is dropped between mtun0 and the veth (`drop_once`); with add_addr_timeout=2
+    Linux re-announces (probe `add_addr_retransmit_without_echo`) and a second echo follows. The
+    repeated announcement is a refresh: `AddressAnnounced` again, and the driver does not join a
+    second time to an address it has an open subflow to."""
+    case = signal("echo-dropped")
+    case["server"]["sysctl"] = ["net.mptcp.add_addr_timeout=2"]
+    case["drop_once"] = ECHO_AFTER_DSS12
+    e = case["expect"]
+    e["pcap"] += [echo_redone]
+    e["events"] = ["Connected mptcp=true"] + [f"AddressAnnounced {{ id: 2, addr: {SIGNALLED}:5201 }}"] * 2
+    return case
+
+
+def capable_c1(r):
+    """At mtun0: the MP_CAPABLE SYN/ACK has C=1."""
+    flags = [o.get("tcp.options.mptcp.nomoresubflows.flag") for g, o in mptcp_with(r, "cli", "s2c", "0")
+             if g.flags & 0x12 == 0x12]
+    assert flags == ["1"], f"SYN/ACK C flags {flags}"
+
+
+def c1_alternate_port():
+    """`allow_join_initial_addr_port=0` (C=1, probe `c1_from_sysctl`): the server signals its
+    initial IP with another port; the client joins that and never the initial pair."""
+    case = signal("c1-alternate-port", endpoint="10.0.1.2 dev s1 id 2 signal port 10100", announced="10.0.1.2:10100")
+    case["server"]["sysctl"] = ["net.mptcp.allow_join_initial_addr_port=0"]
+    e = case["expect"]
+    e["nstat"]["MPTcpExtMPJoinPortSynRx"] = 1
+    e["pcap"] += [capable_c1]
+    return case
+
+
+def removed_signal(r):
+    """At mtun0: Linux's REMOVE_ADDR id 2 reached the client, and no join SYN went to the removed
+    address after it."""
+    rms = [g for g, o in mptcp_with(r, "cli", "s2c", "4") if o.get("tcp.options.mptcp.addrid") == "2"]
+    assert rms, "no REMOVE_ADDR id 2 at mtun0"
+    late = [g for g in join_syns(r) if g.dst == SIGNALLED and g.t > rms[0].t]
+    assert not late, f"join SYNs to {SIGNALLED} after REMOVE_ADDR: {[(g.t, g.sport) for g in late]}"
+
+
+def server_remove_signal():
+    """`endpoint delete` of the signalled address 1 s after the join to it is up: observable
+    assertions only (amendment §5.6). REMOVE_ADDR reaches the client, `AddressRemoved` is
+    emitted, the joined subflow ends, the transfer completes on the initial subflow, and no join
+    goes to the removed address afterwards."""
+    case = signal("server-remove-signal")
+    case["server"]["timed"] = [("SubflowUp:1", 1000, "ip mptcp endpoint delete id 2")]
+    e = case["expect"]
+    e["nstat"]["MPTcpExtRmAddrTx"] = (">=", 1)
+    e["pcap"] = [echoed(2, SIGNALLED), joined_only(f"{SIGNALLED}:5201"), removed_signal]
+    e["events"] += ["AddressRemoved { id: 2 }", "SubflowDown SubflowId(1)"]
+    return case
+
+
+def synack_backup(r):
+    """At mtun0: the SYN/ACK of the join to the signalled address carries B=1."""
+    bits = [o.get("tcp.options.mptcp.backup.flag") for g, o in mptcp_with(r, "cli", "s2c", "1")
+            if g.flags & 0x12 == 0x12 and g.src == SIGNALLED]
+    assert bits == ["1"], f"join SYN/ACK B bits {bits}"
+
+
+def signal_backup_failover():
+    """The server signals its address as a backup endpoint; the client joins it on announcement,
+    and Linux's join SYN/ACK asks for backup (B=1, M3 spec §3.3). The client sends no new data on
+    it while the initial path is usable, then carries the transfer on it while link 1 is down."""
+    case = failover("signal-backup-failover", "link_failure", "c2s", REACT, BACKUP,
+                    [no_new_on_backup("c2s", before_window=True), synack_backup, echoed(2, SIGNALLED)])
+    case["server"]["pm"] = ["limits set subflows 1 add_addr_accepted 0", f"endpoint add {SIGNALLED} dev s2 id 2 signal backup"]
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtAddAddrTx=(">=", 1), MPTcpExtEchoAdd=(">=", 1))
+    e["events"] = ["Connected mptcp=true", f"AddressAnnounced {{ id: 2, addr: {SIGNALLED}:5201 }}", "SubflowUp"]
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
@@ -329,4 +508,12 @@ CASES = [
     remove_address("client-remove-joined", BACKUP, PRIMARY, 1),
     remove_address("client-remove-id0", PRIMARY, BACKUP, 0),
     make_before_break(),
+    signal("signal-join"),
+    signal_port_join(),
+    signal_unused(),
+    signal_unreachable(),
+    echo_dropped(),
+    c1_alternate_port(),
+    server_remove_signal(),
+    signal_backup_failover(),
 ]

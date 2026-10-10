@@ -34,8 +34,6 @@ impl LocalAddrs {
 }
 
 /// One entry of the peer address table, keyed by the peer's address id.
-// Built from an authenticated ADD_ADDR (M3 Task 9).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PeerAddr {
     /// Set only from an authenticated ADD_ADDR.
     pub advertised: Option<(IpAddr, u16)>,
@@ -43,11 +41,36 @@ pub(crate) struct PeerAddr {
     pub failed: bool,
 }
 
+/// Entries of the peer address table (M3 spec §3.3).
+const PEER_ADDR_CAP: usize = 8;
+
 /// The peer's announced addresses (soft state, RFC 8684 L1999–2005).
 #[derive(Default)]
 pub(crate) struct PeerAddrs(pub BTreeMap<u8, PeerAddr>);
 
 impl PeerAddrs {
+    /// Binds `id` to `addr`: a new entry, or a refresh that may change the port and clears the
+    /// failed mark. False, changing nothing, when the table is full.
+    pub fn announce(&mut self, id: u8, addr: SocketAddr) -> bool {
+        if !self.0.contains_key(&id) && self.0.len() >= PEER_ADDR_CAP {
+            return false;
+        }
+        let advertised = Some((addr.ip(), addr.port()));
+        let entry = PeerAddr {
+            advertised,
+            failed: false,
+        };
+        self.0.insert(id, entry);
+        true
+    }
+    /// A join to `remote` failed: if announced, no new join goes to it until a refresh (RFC
+    /// 8684 L2036–2039).
+    pub fn fail(&mut self, remote: SocketAddr) {
+        let r = Some((remote.ip(), remote.port()));
+        for a in self.0.values_mut().filter(|a| a.advertised == r) {
+            a.failed = true;
+        }
+    }
     /// `remote` is an announced endpoint marked failed.
     pub fn failed(&self, remote: SocketAddr) -> bool {
         let r = Some((remote.ip(), remote.port()));

@@ -162,6 +162,7 @@ impl SubflowHooks<'_> {
             _ => {
                 self.sf.reset = true;
                 self.sf.reset_option = Some(super::tcprst(0x01, false));
+                self.sf.join_failed = Some(None);
             }
         }
     }

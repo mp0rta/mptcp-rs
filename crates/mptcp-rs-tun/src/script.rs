@@ -5,7 +5,8 @@
 //! - `at <barrier> +<ms> <action>`: `<ms>` after the barrier event first happens. Barriers:
 //!   `Connected`, `SubflowUp:<n>`, `AddressAnnounced:<id>`, `SubflowDown:<n>`.
 //! - `after <label> +<ms> <action>`: `<ms>` after the action labelled `<label>` ran.
-//! - `on announced join <local>`: each announced address is joined from `<local>`.
+//! - `on announced join <local>`: each announced address is joined from `<local>`, unless a
+//!   subflow from `<local>` to it is open (a repeated announcement).
 //! - `on down-transient rejoin +<ms>`: a subflow reset with a transient MP_TCPRST is joined
 //!   again from the same local IP to the same remote, `<ms>` later.
 //!
@@ -32,6 +33,8 @@ pub enum Action {
     Abort,
     /// Join again from subflow `n`'s local IP to its remote.
     Rejoin(usize),
+    /// `on announced join`: join `remote` from `local` unless a subflow between them is open.
+    JoinAnnounced(IpAddr, SocketAddr),
 }
 
 /// What the driver reacts to; subflows by number.
@@ -200,13 +203,8 @@ impl Script {
         match ev {
             Ev::Announced { addr, .. } => {
                 if let Some(local) = self.join_announced {
-                    let join = Action::Join {
-                        local,
-                        remote: addr,
-                        backup: false,
-                        mtu: None,
-                    };
-                    self.reactions.push((now, join));
+                    self.reactions
+                        .push((now, Action::JoinAnnounced(local, addr)));
                 }
             }
             Ev::Down {
@@ -428,12 +426,7 @@ mod tests {
         let mut sc = Script::parse("on announced join 10.0.93.2").unwrap();
         let addr = "10.0.3.2:5201".parse().unwrap();
         sc.on_event(Ev::Announced { id: 3, addr }, s(7));
-        let join = Action::Join {
-            local: "10.0.93.2".parse().unwrap(),
-            remote: addr,
-            backup: false,
-            mtu: None,
-        };
+        let join = Action::JoinAnnounced("10.0.93.2".parse().unwrap(), addr);
         assert_eq!(sc.due(s(7)), vec![join]);
     }
 }

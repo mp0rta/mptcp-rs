@@ -109,8 +109,9 @@ pub(crate) struct SubflowMp {
     pub strand_at: Option<Instant>,
     /// The MP_TCPRST of the acceptable peer RST that ended it (`None`: none, or no RST).
     pub rst: Option<crate::MpTcpRst>,
-    /// A join ended by an acceptable peer RST while SYN-SENT or Joining, with that RST's
-    /// MP_TCPRST (M3 spec §3.3 failed mark).
+    /// A join failed while SYN-SENT or Joining: an acceptable peer RST (with its MP_TCPRST),
+    /// an invalid SYN/ACK or a timeout (`None`), for the failed mark (M3 spec §3.3;
+    /// `Connection::note_join_failure`).
     pub join_failed: Option<Option<crate::MpTcpRst>>,
     /// Our own transmit policy (`Endpoint::set_local_backup`).
     pub local_backup: bool,

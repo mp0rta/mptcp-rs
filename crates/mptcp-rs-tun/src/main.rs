@@ -168,6 +168,7 @@ fn run(a: Args) -> Result<String, String> {
     let mut drv = Driver {
         script: Script::parse(&a.scenario()?)?,
         subs: vec![(SubflowId::INITIAL, a.local, a.remote, mtu, false)],
+        down: Vec::new(),
         log: match &a.event_log {
             Some(path) => Some(EventLog::create(path, start).map_err(io_err("event log"))?),
             None => None,
@@ -516,6 +517,8 @@ impl State {
 struct Driver {
     script: Script,
     subs: Vec<(SubflowId, IpAddr, SocketAddr, u16, bool)>,
+    /// The subflows that ended (`SubflowDown`).
+    down: Vec<SubflowId>,
     log: Option<EventLog>,
     /// `script: complete` was printed.
     complete: bool,
@@ -527,6 +530,9 @@ impl Driver {
     }
 
     fn on_event(&mut self, ev: &Event, now: Duration) {
+        if let Event::SubflowDown { subflow, .. } = ev {
+            self.down.push(*subflow);
+        }
         let n = |id: &SubflowId| self.subs.iter().position(|s| s.0 == *id);
         let ev = match ev {
             Event::Connected { .. } => Some(Ev::Connected),
@@ -567,6 +573,16 @@ impl Driver {
                 mtu.unwrap_or(ConnectConfig::default().mtu),
                 backup,
             ),
+            Action::JoinAnnounced(local, remote) => {
+                let open = |s: &&(SubflowId, IpAddr, SocketAddr, u16, bool)| {
+                    (s.1, s.2) == (local, remote) && !self.down.contains(&s.0)
+                };
+                if let Some(s) = self.subs.iter().find(open) {
+                    eprintln!("join: {remote} from {local} already open as {:?}", s.0);
+                    return Ok(());
+                }
+                (local, remote, ConnectConfig::default().mtu, false)
+            }
             Action::Rejoin(n) => {
                 self.sub(n)?;
                 let (_, local, remote, mtu, backup) = self.subs[n];

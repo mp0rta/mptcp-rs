@@ -69,6 +69,8 @@ pub enum Event {
         subflow: SubflowId,
     },
     /// The peer announced an address (ADD_ADDR) as `id`; `addr` carries the port to join.
+    /// Emitted again when the peer repeats the announcement, which also lifts `AddressFailed`.
+    /// Never for an unspecified, multicast or loopback address.
     AddressAnnounced {
         id: u8,
         addr: SocketAddr,
@@ -660,10 +662,12 @@ impl<R: CryptoRng> Endpoint<R> {
             sf: &mut sf.mp,
         };
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
+        let port = sf.remote.port();
         if let Some(backup) = sf.mp.peer_prio.take() {
             let subflow = sf.id;
             (self.events).push_back((h, Event::PeerPriority { subflow, backup }));
         }
+        c.note_join_failure(i);
         // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
         if c.hooks.fast_closed {
             c.abort_all(now, Some(i), None);
@@ -681,6 +685,14 @@ impl<R: CryptoRng> Endpoint<R> {
         for id in std::mem::take(&mut c.hooks.peer_removed) {
             if c.hooks.active() && c.peer_removed(id) {
                 self.events.push_back((h, Event::AddressRemoved { id }));
+            }
+        }
+        for e in std::mem::take(&mut c.hooks.peer_announced) {
+            if let Some(addr) = (c.hooks.active())
+                .then(|| c.peer_announced(e, port))
+                .flatten()
+            {
+                (self.events).push_back((h, Event::AddressAnnounced { id: e.id, addr }));
             }
         }
         // Events first: a join this segment completed is Active before `update_health`, so a
@@ -757,6 +769,7 @@ impl<R: CryptoRng> Endpoint<R> {
         last: bool,
         now: Instant,
     ) {
+        c.note_join_failure(i);
         if let Some(e) = c.update_health(i) {
             events.push_back((h, e));
         }
@@ -1111,6 +1124,10 @@ impl<R: CryptoRng> Endpoint<R> {
                     if r == Reaction::None && sf.tcb.state() != TcpState::Closed {
                         r = j.on_timeout(&mut sf.tcb, now, c.cfg.r2_data);
                     }
+                }
+                // A join that timed out (SYN R2, third-ACK give-up) failed (M3 spec §3.3).
+                if r == Reaction::Closed(CloseReason::Timeout) && hk.sf.joining() {
+                    hk.sf.join_failed = Some(None);
                 }
                 // Once a join was started, a subflow ended at R2 is reset, so that the peer
                 // frees it too and schedules nothing more on it; before that, the initial

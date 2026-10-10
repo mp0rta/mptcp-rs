@@ -7,7 +7,7 @@ mod opp;
 pub(crate) mod sched;
 pub(crate) mod signal;
 mod subflow;
-use crate::crypto::key_token_idsn;
+use crate::crypto::{add_addr_hmac, key_token_idsn};
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
 pub(crate) use join::Join;
 use opp::Cand;
@@ -34,6 +34,7 @@ use crate::wire::{
     mptcp::{self, CAP_C, CAP_H, MpCapable, MptcpOption},
     tcp_options::{TcpOpt, walk},
 };
+use std::net::SocketAddr;
 use std::time::Duration;
 
 pub(crate) struct ConnectionHooks {
@@ -58,6 +59,12 @@ pub(crate) struct ConnectionHooks {
     /// Peer address ids named by REMOVE_ADDR in the current input
     /// (`Connection::peer_removed`).
     pub peer_removed: Vec<u8>,
+    /// Authenticated ADD_ADDRs in the current input (`Connection::peer_announced`).
+    pub peer_announced: Vec<signal::Echo>,
+    /// ADD_ADDRs whose HMAC did not match (RFC 8684 L2017–2018); debug counter.
+    pub add_addr_bad_hmac: u64,
+    /// ADD_ADDRs naming a known id with another IP (RFC 8684 L2043–2047); debug counter.
+    pub add_addr_conflicts: u64,
     /// Plans rejected by validation (spec §4 rule 1); debug counter.
     pub rejected_plans: u64,
     /// Validated plans `SendStore::assign` refused; stays 0 by construction.
@@ -123,6 +130,9 @@ impl ConnectionHooks {
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             signals: Default::default(),
             peer_removed: Vec::new(),
+            peer_announced: Vec::new(),
+            add_addr_bad_hmac: 0,
+            add_addr_conflicts: 0,
             rejected_plans: 0,
             assign_failures: 0,
             debug: DebugStats::default(),
@@ -541,6 +551,39 @@ impl Connection {
             }
         }
         known
+    }
+
+    /// An authenticated ADD_ADDR (M3 spec §3.3) that arrived on a subflow whose remote port is
+    /// `port`: it is echoed, then binds its id in the peer address table. Returns the endpoint
+    /// to announce, with the option's port or else `port` (RFC 8684 L1977–1981). Nothing when
+    /// the echo queue is full (discarded entirely, so the peer's retransmission tries again,
+    /// RFC 8684 L1999–2001), for a known id with another IP (L2043–2047), for an address
+    /// nobody can join (unspecified, multicast, loopback) or with the table full.
+    pub(crate) fn peer_announced(&mut self, e: signal::Echo, port: u16) -> Option<SocketAddr> {
+        if !self.hooks.signals.echo(e) {
+            return None;
+        }
+        let old = self.peer_addrs.0.get(&e.id).and_then(|a| a.advertised);
+        if old.is_some_and(|(ip, _)| ip != e.addr) {
+            self.hooks.add_addr_conflicts += 1;
+            return None;
+        }
+        let ip = e.addr;
+        let addr = SocketAddr::new(ip, e.port.unwrap_or(port));
+        let usable = !(ip.is_unspecified() || ip.is_multicast() || ip.is_loopback());
+        (usable && self.peer_addrs.announce(e.id, addr)).then_some(addr)
+    }
+
+    /// Subflow `i`'s join failed before it became Active (`SubflowMp::join_failed`): its
+    /// remote, if announced, is marked failed, unless the peer's RST said transient (M3 spec
+    /// §3.3).
+    pub(crate) fn note_join_failure(&mut self, i: usize) {
+        let sf = &mut self.subflows[i];
+        if let Some(rst) = sf.mp.join_failed.take() {
+            if !rst.is_some_and(|r| r.transient) {
+                self.peer_addrs.fail(sf.remote);
+            }
+        }
     }
 
     /// Queues subflow `i`'s un-subflow-ACKed DSN ranges for reinjection, except where a live
@@ -1095,7 +1138,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         }
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
-        let mut removed = Vec::new();
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
         for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
             match opt {
                 Err(_) => return,
@@ -1107,6 +1150,14 @@ impl SegmentHooks for SubflowHooks<'_> {
                     }
                     Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
                     Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
+                    // E=1 echoes our ADD_ADDR, and we send none.
+                    Ok(MptcpOption::AddAddr {
+                        echo: false,
+                        id,
+                        addr,
+                        port,
+                        hmac: Some(hmac),
+                    }) => added.push((signal::Echo { id, addr, port }, hmac)),
                     Ok(
                         MptcpOption::Dss(_)
                         | MptcpOption::Capable(_)
@@ -1198,6 +1249,14 @@ impl SegmentHooks for SubflowHooks<'_> {
         }
         if m.state == State::Confirmed {
             self.conn.peer_removed.extend(removed);
+            // Key-peer ‖ Key-local: the peer sent it (RFC 8684 L1985–2016).
+            for (e, hmac) in added {
+                if hmac == add_addr_hmac(m.peer_key.unwrap(), m.local_key, e.id, e.addr, e.port) {
+                    self.conn.peer_announced.push(e);
+                } else {
+                    self.conn.add_addr_bad_hmac += 1;
+                }
+            }
         }
         if let Some(c) = capable {
             if let Some(len) = c.data_len {

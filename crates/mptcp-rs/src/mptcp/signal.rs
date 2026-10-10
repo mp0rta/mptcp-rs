@@ -11,8 +11,6 @@ use crate::time::Instant;
 use crate::wire::mptcp::{self, MptcpOption, RemoveIds};
 
 /// An ADD_ADDR echo: the announcement's id, address and port, as received.
-// Queued by ADD_ADDR receive (M3 Task 9).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Echo {
     pub id: u8,
@@ -65,7 +63,6 @@ impl Signals {
         }
     }
     /// Queues an echo; false when 8 distinct echoes already wait. A duplicate is not queued twice.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn echo(&mut self, e: Echo) -> bool {
         if !self.echoes.contains(&e) {
             if self.echoes.len() == MAX_ECHOES {

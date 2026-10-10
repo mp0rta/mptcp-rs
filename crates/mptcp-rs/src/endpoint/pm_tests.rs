@@ -2049,3 +2049,502 @@ fn close_subflow_reinjects_on_end() {
     };
     assert_eq!(events(&mut ep), vec![down]);
 }
+
+// M3 Task 9: ADD_ADDR receive, the peer address table and joins to announced endpoints (M3
+// spec §3.2, §3.3).
+
+use crate::crypto::add_addr_hmac;
+
+const ANNOUNCED: &str = "10.0.2.2";
+
+fn encode(o: &MptcpOption) -> Vec<u8> {
+    let mut out = [0; 40];
+    let n = mptcp::encode(o, &mut out).unwrap();
+    out[..n].to_vec()
+}
+/// The peer's ADD_ADDR (E=0) of `id`, `addr` and `port`, with the HMAC keyed peer ‖ local.
+fn add_addr(
+    ep: &Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    id: u8,
+    addr: &str,
+    port: Option<u16>,
+) -> Vec<u8> {
+    let addr = ip(addr);
+    let hmac = Some(add_addr_hmac(PEER_KEY, local_key(ep, h), id, addr, port));
+    encode(&MptcpOption::AddAddr {
+        echo: false,
+        id,
+        addr,
+        port,
+        hmac,
+    })
+}
+/// `add_addr` on an ACK of subflow `s` at `now`.
+fn announce(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    s: &Segment,
+    (id, addr, port): (u8, &str, Option<u16>),
+    now: Instant,
+) {
+    let opt = add_addr(ep, h, id, addr, port);
+    signal_ack(ep, s, s.seq.wrapping_add(1), &opt, now);
+}
+fn echo(id: u8, addr: &str, port: Option<u16>) -> MptcpOption {
+    MptcpOption::AddAddr {
+        echo: true,
+        id,
+        addr: ip(addr),
+        port,
+        hmac: None,
+    }
+}
+/// Every ADD_ADDR we sent among `pkts`, with its subflow's source.
+fn echoes(pkts: &[Vec<u8>]) -> Vec<(SocketAddr, MptcpOption)> {
+    let segs = pkts.iter().map(|p| leak(p.clone()));
+    (segs.flat_map(|s| mptcp_opts(&s).into_iter().map(move |o| (s.src, o))))
+        .filter(|(_, o)| matches!(o, MptcpOption::AddAddr { .. }))
+        .collect()
+}
+fn announced(id: u8, addr: &str) -> Event {
+    Event::AddressAnnounced {
+        id,
+        addr: addr.parse().unwrap(),
+    }
+}
+/// A peer address table entry: id, advertised binding, failed mark.
+type Entry = (u8, Option<(IpAddr, u16)>, bool);
+fn table(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<Entry> {
+    let t = &ep.conns[&h].peer_addrs.0;
+    t.iter()
+        .map(|(&id, a)| (id, a.advertised, a.failed))
+        .collect()
+}
+/// `add_subflow` from `JOIN_IP` to `remote` and the MP_JOIN SYN it sends.
+fn join_to(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    now: Instant,
+    remote: SocketAddr,
+) -> (SubflowId, Segment<'static>) {
+    let id = ep
+        .add_subflow(now, h, ip(JOIN_IP), remote, 1500, false)
+        .unwrap();
+    let syn = from(&drain(ep, now), JOIN_IP).pop().expect("join SYN");
+    assert_eq!(syn.dst, remote);
+    (id, syn)
+}
+fn add_to(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    remote: &str,
+) -> Result<SubflowId, AddSubflowError> {
+    let remote = remote.parse().unwrap();
+    ep.add_subflow(ms(500_000), h, ip(JOIN_IP), remote, 1500, false)
+}
+
+#[test]
+fn add_addr_valid_echoed_and_announced() {
+    let (mut ep, h, syn, _) = confirmed();
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, Some(8080)), ms(10));
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:8080")]);
+    let want = (syn.src, echo(4, ANNOUNCED, Some(8080)));
+    assert_eq!(echoes(&drain(&mut ep, ms(10))), vec![want]);
+    let a = Some((ip(ANNOUNCED), 8080));
+    assert_eq!(table(&ep, h), vec![(4, a, false)]);
+    // IPv6, without a port: echoed without one.
+    announce(&mut ep, h, &syn, (5, "dead:beef:2::2", None), ms(20));
+    assert_eq!(events(&mut ep), vec![announced(5, "[dead:beef:2::2]:80")]);
+    let want = (syn.src, echo(5, "dead:beef:2::2", None));
+    assert_eq!(echoes(&drain(&mut ep, ms(20))), vec![want]);
+}
+
+#[test]
+fn add_addr_bad_hmac_ignored() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (local, a) = (local_key(&ep, h), ip(ANNOUNCED));
+    // Keyed local ‖ peer (our own ADD_ADDR's key), and one bit off.
+    let reversed = add_addr_hmac(local, PEER_KEY, 4, a, None);
+    let flipped = add_addr_hmac(PEER_KEY, local, 4, a, None) ^ 1;
+    for hmac in [reversed, flipped] {
+        let opt = encode(&MptcpOption::AddAddr {
+            echo: false,
+            id: 4,
+            addr: a,
+            port: None,
+            hmac: Some(hmac),
+        });
+        signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &opt, ms(10));
+    }
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(echoes(&drain_until(&mut ep, ms(10), ms(5000))).is_empty());
+    assert!(table(&ep, h).is_empty());
+    assert_eq!(ep.conns[&h].hooks.add_addr_bad_hmac, 2);
+}
+
+#[test]
+fn add_addr_port_absent_uses_carrying_subflow_port() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (id, jsyn) = join_to(&mut ep, h, ms(10), "10.0.0.2:8443".parse().unwrap());
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(10));
+    drain(&mut ep, ms(10));
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, ms(10), jsyn.seq.wrapping_add(1), head, 1000);
+    assert_eq!(events(&mut ep), vec![Event::SubflowUp { subflow: id }]);
+    announce(&mut ep, h, &jsyn, (4, ANNOUNCED, None), ms(20));
+    announce(&mut ep, h, &syn, (6, "10.0.3.2", None), ms(20));
+    assert_eq!(
+        events(&mut ep),
+        vec![announced(4, "10.0.2.2:8443"), announced(6, "10.0.3.2:80")]
+    );
+    // The echoes repeat the option as received: no port.
+    let sent: Vec<_> = (echoes(&drain_until(&mut ep, ms(20), ms(5000))).into_iter())
+        .map(|e| e.1)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![echo(4, ANNOUNCED, None), echo(6, "10.0.3.2", None)]
+    );
+}
+
+#[test]
+fn add_addr_refresh_clears_failed_and_reannounces() {
+    let (mut ep, h, syn, _) = confirmed();
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(10));
+    drain(&mut ep, ms(10));
+    let (id, jsyn) = join_to(&mut ep, h, ms(20), "10.0.2.2:80".parse().unwrap());
+    input_at(&mut ep, &rst_on(&jsyn), ms(30));
+    let down = Event::SubflowDown {
+        subflow: id,
+        reason: CloseReason::Reset,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:80"), down]);
+    assert_eq!(
+        add_to(&mut ep, h, "10.0.2.2:80"),
+        Err(AddSubflowError::AddressFailed)
+    );
+    // The same address again: the mark is cleared and the policy hears of it again.
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(40));
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:80")]);
+    assert_eq!(table(&ep, h), vec![(4, Some((ip(ANNOUNCED), 80)), false)]);
+    assert!(add_to(&mut ep, h, "10.0.2.2:80").is_ok());
+    // The same IP with another port: a refresh too.
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, Some(81)), ms(50));
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:81")]);
+    assert_eq!(table(&ep, h), vec![(4, Some((ip(ANNOUNCED), 81)), false)]);
+}
+
+#[test]
+fn add_addr_same_id_new_ip_ignored() {
+    let (mut ep, h, syn, _) = confirmed();
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(10));
+    announce(&mut ep, h, &syn, (4, "10.0.3.2", None), ms(10));
+    // Both are authenticated, so both are echoed; the second changes nothing.
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:80")]);
+    let sent: Vec<_> = (echoes(&drain_until(&mut ep, ms(10), ms(5000))).into_iter())
+        .map(|e| e.1)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![echo(4, ANNOUNCED, None), echo(4, "10.0.3.2", None)]
+    );
+    assert_eq!(table(&ep, h), vec![(4, Some((ip(ANNOUNCED), 80)), false)]);
+    assert_eq!(ep.conns[&h].hooks.add_addr_conflicts, 1);
+}
+
+#[test]
+fn add_addr_nat_observed_differs_from_advertised_ok() {
+    // Subflow 1's SYN/ACK named peer address id 5 on 10.0.0.2 (behind a NAT, say); the peer
+    // advertises id 5 as 10.0.5.2.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    assert_eq!(ep.conns[&h].subflows[1].mp.peer_addr_id(), Some(5));
+    announce(&mut ep, h, &jsyn, (5, "10.0.5.2", None), ms(20));
+    assert_eq!(events(&mut ep), vec![announced(5, "10.0.5.2:80")]);
+    assert_eq!(table(&ep, h), vec![(5, Some((ip("10.0.5.2"), 80)), false)]);
+}
+
+#[test]
+fn add_addr_table_cap_8_echo_only() {
+    let (mut ep, h, syn, _) = confirmed();
+    for id in 1..=9u8 {
+        let t = ms(1000 * u64::from(id));
+        let addr = format!("10.0.{id}.2");
+        announce(&mut ep, h, &syn, (id, &addr, None), t);
+        let want = vec![(syn.src, echo(id, &addr, None))];
+        assert_eq!(echoes(&drain(&mut ep, t)), want, "{id} echoed");
+    }
+    let want: Vec<_> = (1..=8)
+        .map(|id| announced(id, &format!("10.0.{id}.2:80")))
+        .collect();
+    assert_eq!(events(&mut ep), want, "nothing for the ninth");
+    let ids: Vec<_> = table(&ep, h).into_iter().map(|e| e.0).collect();
+    assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+}
+
+#[test]
+fn echo_queue_dedup_and_overflow_discards() {
+    let (mut ep, h, syn, _) = confirmed();
+    // Eight distinct echoes wait (nothing is sent in between) ...
+    for id in 1..=8u8 {
+        announce(
+            &mut ep,
+            h,
+            &syn,
+            (id, &format!("10.0.{id}.2"), None),
+            ms(10),
+        );
+    }
+    // ... a repeat of the first coalesces with its pending echo (a refresh) ...
+    announce(&mut ep, h, &syn, (1, "10.0.1.2", None), ms(10));
+    // ... and a ninth distinct one (a new port for id 1) is discarded entirely.
+    announce(&mut ep, h, &syn, (1, "10.0.1.2", Some(81)), ms(10));
+    let mut want: Vec<_> = (1..=8)
+        .map(|id| announced(id, &format!("10.0.{id}.2:80")))
+        .collect();
+    want.push(announced(1, "10.0.1.2:80"));
+    assert_eq!(events(&mut ep), want);
+    assert_eq!(table(&ep, h)[0], (1, Some((ip("10.0.1.2"), 80)), false));
+    let sent: Vec<_> = (echoes(&drain_until(&mut ep, ms(10), ms(20_000))).into_iter())
+        .map(|e| e.1)
+        .collect();
+    let want: Vec<_> = (1..=8)
+        .map(|id| echo(id, &format!("10.0.{id}.2"), None))
+        .collect();
+    assert_eq!(sent, want, "each once, in arrival order");
+    // The peer's retransmission of the discarded one is taken.
+    let t = ms(20_000);
+    announce(&mut ep, h, &syn, (1, "10.0.1.2", Some(81)), t);
+    assert_eq!(events(&mut ep), vec![announced(1, "10.0.1.2:81")]);
+    let want = vec![(syn.src, echo(1, "10.0.1.2", Some(81)))];
+    assert_eq!(echoes(&drain(&mut ep, t)), want);
+}
+
+#[test]
+fn echo_repeated_on_readvertise() {
+    let (mut ep, h, syn, _) = confirmed();
+    for t in [ms(10), ms(2000)] {
+        announce(&mut ep, h, &syn, (4, ANNOUNCED, None), t);
+        let want = vec![(syn.src, echo(4, ANNOUNCED, None))];
+        assert_eq!(echoes(&drain(&mut ep, t)), want);
+        assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:80")]);
+    }
+}
+
+#[test]
+fn one_add_addr_per_segment() {
+    let (mut ep, h, syn, _) = confirmed();
+    // Two ADD_ADDRs in one segment; each is echoed on an ACK of its own.
+    let mut opts = add_addr(&ep, h, 4, ANNOUNCED, None);
+    opts.extend(add_addr(&ep, h, 6, "10.0.3.2", None));
+    signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &opts, ms(10));
+    assert_eq!(
+        events(&mut ep),
+        vec![announced(4, "10.0.2.2:80"), announced(6, "10.0.3.2:80")]
+    );
+    let out = drain_until(&mut ep, ms(10), ms(5000));
+    let per: Vec<_> = (out.iter())
+        .map(|p| echoes(std::slice::from_ref(p)).len())
+        .collect();
+    assert_eq!(per, vec![1, 1], "{per:?}");
+}
+
+/// A Confirmed connection whose peer announced id 4 as 10.0.2.2 (port 80, from the initial
+/// subflow), with `r2_data` 5 s, and a join to it in SYN-SENT.
+fn announced_join() -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    SubflowId,
+    Segment<'static>,
+) {
+    let (mut ep, h, syn, _) = confirmed();
+    ep.conns.get_mut(&h).unwrap().cfg.r2_data = Duration::from_secs(5);
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(10));
+    assert_eq!(events(&mut ep), vec![announced(4, "10.0.2.2:80")]);
+    drain(&mut ep, ms(10));
+    let (id, jsyn) = join_to(&mut ep, h, ms(20), "10.0.2.2:80".parse().unwrap());
+    (ep, h, syn, id, jsyn)
+}
+/// The join's SYN/ACK and our third ACK: the join is Joining.
+fn to_joining(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle, jsyn: &Segment) {
+    let opts = synack_opts(ep, h, jsyn, 7, None);
+    synack(ep, jsyn, &opts, ms(30));
+    assert_eq!(from(&drain(ep, ms(30)), JOIN_IP).len(), 1, "third ACK");
+}
+/// A RST from the peer on the join, with MP_TCPRST `opt`: SYN-SENT needs RST+ACK, a
+/// synchronized subflow takes it at RCV.NXT.
+fn join_rst(jsyn: &Segment, opt: Option<MpTcpRst>, synced: bool) -> Segment<'static> {
+    let opts = opt.map_or(vec![], |r| tcprst(r.reason, r.transient).to_vec());
+    let flags = if synced {
+        TcpFlags::RST
+    } else {
+        TcpFlags::RST | TcpFlags::ACK
+    };
+    Segment {
+        flags,
+        ..peer_data(jsyn, 5001, opts.leak(), &[])
+    }
+}
+fn down_of(ev: &[Event], id: SubflowId) -> bool {
+    ev.iter()
+        .any(|e| matches!(e, Event::SubflowDown { subflow, .. } if *subflow == id))
+}
+
+#[test]
+fn failed_mark_on_syn_r2_bad_synack_thirdack_giveup_nontransient_rst() {
+    type Fail = fn(&mut Endpoint<ChaCha20Rng>, ConnectionHandle, &Segment);
+    let causes: [(&str, Fail); 5] = [
+        ("SYN R2", |ep, _, _| {
+            drive(ep, ms(20), ms(300_000));
+        }),
+        ("bad SYN/ACK", |ep, h, jsyn| {
+            let opts = synack_opts(ep, h, jsyn, 7, Some(1));
+            synack(ep, jsyn, &opts, ms(30));
+            drain(ep, ms(30));
+        }),
+        ("third-ACK give-up", |ep, h, jsyn| {
+            to_joining(ep, h, jsyn);
+            drive(ep, ms(30), ms(60_000));
+        }),
+        ("RST T=0 in SYN-SENT", |ep, _, jsyn| {
+            let t0 = MpTcpRst {
+                reason: 0x03,
+                transient: false,
+            };
+            input_at(ep, &join_rst(jsyn, Some(t0), false), ms(30));
+        }),
+        ("bare RST while Joining", |ep, h, jsyn| {
+            to_joining(ep, h, jsyn);
+            input_at(ep, &join_rst(jsyn, None, true), ms(40));
+        }),
+    ];
+    for (name, fail) in causes {
+        let (mut ep, h, _, id, jsyn) = announced_join();
+        fail(&mut ep, h, &jsyn);
+        assert!(down_of(&events(&mut ep), id), "{name}: SubflowDown");
+        assert_eq!(
+            add_to(&mut ep, h, "10.0.2.2:80"),
+            Err(AddSubflowError::AddressFailed),
+            "{name}"
+        );
+        // Only that endpoint: another port on the same IP is not announced, so not failed.
+        assert!(add_to(&mut ep, h, "10.0.2.2:81").is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn failed_mark_not_on_local_cancel() {
+    type Cancel = fn(&mut Endpoint<ChaCha20Rng>, ConnectionHandle, &Segment, &Segment, SubflowId);
+    let cancels: [(&str, Cancel); 7] = [
+        ("remove_address in SYN-SENT", |ep, h, _, _, _| {
+            ep.remove_address(ms(30), h, ip(JOIN_IP)).unwrap();
+        }),
+        ("remove_address while Joining", |ep, h, _, jsyn, _| {
+            to_joining(ep, h, jsyn);
+            ep.remove_address(ms(30), h, ip(JOIN_IP)).unwrap();
+        }),
+        ("close_subflow in SYN-SENT", |ep, h, _, _, id| {
+            ep.close_subflow(ms(30), h, id).unwrap();
+        }),
+        ("close_subflow while Joining", |ep, h, _, jsyn, id| {
+            to_joining(ep, h, jsyn);
+            ep.close_subflow(ms(30), h, id).unwrap();
+        }),
+        ("abort", |ep, h, _, jsyn, _| {
+            to_joining(ep, h, jsyn);
+            ep.connection(h).unwrap().abort();
+        }),
+        ("fallback", |ep, _, syn, _, _| {
+            peer_infinite_mapping(ep, syn, ms(30));
+        }),
+        ("close", |ep, h, _, jsyn, _| {
+            to_joining(ep, h, jsyn);
+            ep.connection(h).unwrap().close();
+        }),
+    ];
+    for (name, cancel) in cancels {
+        let (mut ep, h, syn, id, jsyn) = announced_join();
+        cancel(&mut ep, h, &syn, &jsyn, id);
+        drain(&mut ep, ms(30));
+        assert!(!ep.conns[&h].peer_addrs.0[&4].failed, "{name}");
+        // An aborted connection is freed here; the others go on.
+        drive(&mut ep, ms(40), ms(1000));
+        events(&mut ep);
+        let Some(c) = ep.conns.get(&h) else {
+            assert_eq!(name, "abort");
+            continue;
+        };
+        assert!(!c.peer_addrs.0[&4].failed, "{name}");
+        if c.hooks.active() && !c.closed_by_app {
+            assert!(add_to(&mut ep, h, "10.0.2.2:80").is_ok(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn transient_rst_does_not_mark_failed() {
+    let t1 = Some(MpTcpRst {
+        reason: 0x02,
+        transient: true,
+    });
+    for synced in [false, true] {
+        let (mut ep, h, _, id, jsyn) = announced_join();
+        if synced {
+            to_joining(&mut ep, h, &jsyn);
+        }
+        input_at(&mut ep, &join_rst(&jsyn, t1, synced), ms(40));
+        assert!(down_of(&events(&mut ep), id), "synced {synced}");
+        assert!(add_to(&mut ep, h, "10.0.2.2:80").is_ok(), "synced {synced}");
+    }
+}
+
+#[test]
+fn add_addr_ignored_before_confirmed_and_after_fallback() {
+    // PreConfirmed: the keys are known, but the peer has sent no DSS yet.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(40));
+    let h = open(&mut ep);
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    drain(&mut ep, ms(1));
+    events(&mut ep);
+    assert_eq!(state(&ep, h), State::PreConfirmed);
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(2));
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(echoes(&drain(&mut ep, ms(2))).is_empty());
+    // Not kept for later either.
+    let dss = data_ack(una(&ep, h));
+    input_at(&mut ep, &peer_data(&syn, 5001, &dss, &[]), ms(3));
+    assert_eq!(state(&ep, h), State::Confirmed);
+    assert!(echoes(&drain_until(&mut ep, ms(3), ms(5000))).is_empty());
+    assert!(table(&ep, h).is_empty());
+    assert_eq!(events(&mut ep), vec![]);
+
+    // After fallback.
+    let (mut ep, h, syn, _) = confirmed();
+    peer_infinite_mapping(&mut ep, &syn, ms(10));
+    assert!(!ep.conns[&h].hooks.active());
+    drain(&mut ep, ms(10));
+    events(&mut ep);
+    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(20));
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(echoes(&drain_until(&mut ep, ms(20), ms(5000))).is_empty());
+    assert!(table(&ep, h).is_empty());
+}
+
+/// Review Focus 1: an authenticated ADD_ADDR naming an address nobody can join.
+#[test]
+fn add_addr_unusable_address_echoed_not_announced() {
+    let (mut ep, h, syn, _) = confirmed();
+    let unusable = ["0.0.0.0", "224.0.0.1", "127.0.0.1", "::", "ff02::1", "::1"];
+    for (id, addr) in (1u8..).zip(unusable) {
+        let t = ms(1000 * u64::from(id));
+        announce(&mut ep, h, &syn, (id, addr, None), t);
+        let want = vec![(syn.src, echo(id, addr, None))];
+        assert_eq!(echoes(&drain(&mut ep, t)), want, "{addr} echoed");
+    }
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(table(&ep, h).is_empty());
+}

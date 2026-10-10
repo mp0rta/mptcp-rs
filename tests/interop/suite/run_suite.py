@@ -79,6 +79,19 @@ def drop(i, op):
         ns("cli", ipt, op, "FORWARD", "-i", f"c{i}", "-j", "DROP")
 
 
+def drop_once(rule, r, alive):
+    """Deletes the case's cli FORWARD rule `drop_once` once it has dropped a packet (polled every
+    10 ms while alive())."""
+    while alive():
+        hit = [ln for ln in ns("cli", "iptables", "-nvxL", "FORWARD").splitlines() if "drop-once" in ln]
+        if hit and int(hit[0].split()[0]) >= 1:
+            ns("cli", "iptables", "-D", "FORWARD", *rule.split(), "-m", "comment", "--comment", "drop-once", "-j", "DROP")
+            r.marks.append(("drop-once hit", time.time()))
+            return
+        time.sleep(0.01)
+    r.errors.append(f"drop-once never hit: {rule}")
+
+
 def lost(log):
     """Packets tcpdump dropped, or received but never wrote (still queued when it stopped)."""
     n = lambda what: sum(map(int, re.findall(rf"(\d+) packets? {what}", log)))
@@ -107,6 +120,10 @@ def run_case(case, out):
         ns("srv", "sysctl", "-qw", kv)
     for pm in case["server"]["pm"]:
         sh("ip", "-n", "srv", "mptcp", *pm.split())
+    for cmd in case["server"].get("setup", []):
+        ns("srv", "sh", "-c", cmd)
+    if case.get("drop_once"):
+        ns("cli", "iptables", "-I", "FORWARD", *case["drop_once"].split(), "-m", "comment", "--comment", "drop-once", "-j", "DROP")
     caps = {"tun": ("cli", "mtun0")} | {f"srv-s{i}": ("srv", f"s{i}") for i in LINKS}
     procs = {}
     for name, (n, dev) in caps.items():
@@ -168,6 +185,8 @@ def run_case(case, out):
             for b, ms, cmd in s["timed"]]
     acts += [threading.Thread(target=at, args=(b, ms, f"link {i} down", lambda i=i, t=t: window(i, t)))
              for i, b, ms, t in case["fail"]]
+    if case.get("drop_once"):
+        acts.append(threading.Thread(target=drop_once, args=(case["drop_once"], r, lambda: cli.poll() is None)))
     for t in acts:
         t.start()
     r.watchdog = r.time_wait = False
