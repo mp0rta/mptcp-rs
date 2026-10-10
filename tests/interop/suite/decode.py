@@ -5,6 +5,7 @@ before point (client to server: "cli" = mtun0; server to client: "srv" = a srv v
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import subprocess
 
 SYN, ACK = 0x02, 0x10
@@ -47,13 +48,15 @@ def _flat(obj):
 
 
 def _segs(pcap, point):
-    p = subprocess.run(["tshark", "-r", str(pcap), "-Y", "tcp && !icmp && !icmpv6", "-T", "json", "-J", "frame ip ipv6 tcp",
+    # The capture goes in on stdin: on the CI host (Ubuntu 26.04) tshark may not open files under
+    # the checkout itself ("You don't have permission"), although it runs as root.
+    data = Path(pcap).read_bytes()
+    p = subprocess.run(["tshark", "-r", "-", "-Y", "tcp && !icmp && !icmpv6", "-T", "json", "-J", "frame ip ipv6 tcp",
                         "--disable-protocol", "iperf3", "-o", "tcp.analyze_sequence_numbers:FALSE",
-                        "-o", "mptcp.analyze_mptcp:FALSE"], capture_output=True, text=True)
+                        "-o", "mptcp.analyze_mptcp:FALSE"], input=data, capture_output=True)
     if p.returncode:
-        size = pcap.stat().st_size if pcap.exists() else None
-        raise RuntimeError(f"tshark -r {pcap} ({size} bytes): exit {p.returncode}: {p.stderr.strip()}")
-    out = p.stdout
+        raise RuntimeError(f"tshark < {pcap} ({len(data)} bytes): exit {p.returncode}: {p.stderr.decode(errors='replace').strip()}")
+    out = p.stdout.decode()
     # Objects become tuples of pairs: tshark repeats a key once per option instance.
     for p in json.loads(out, object_pairs_hook=tuple):
         layers = _get(_get(p, "_source"), "layers")
