@@ -1975,8 +1975,12 @@ fn fastclose_valid_key_closes_once_on_ack_or_rst_after_tcp_validation() {
                         }
                     ))
                 );
-                let bytes = transmit(&mut ep, Instant::from_nanos(3));
-                assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+                // A RST is never answered (RFC 9293 §3.10.7); an ACK carrying it is.
+                let mut buf = [0; 1500];
+                let out = ep.poll_transmit(Instant::from_nanos(3), &mut buf);
+                let rst = out.map(|n| packet::parse(&buf[..n]).unwrap().flags);
+                let want = (flags == TcpFlags::ACK).then_some(TcpFlags::RST);
+                assert_eq!(rst, want, "{flags:?}");
                 input(&mut ep, &seg);
                 assert_eq!(ep.poll_event(), None);
             } else {
@@ -2415,6 +2419,14 @@ fn fastclose_reset_survives_timeout_drive() {
             ))
         );
         let now = Instant::from_nanos(3);
+        if flags == TcpFlags::RST {
+            // A RST is never answered (RFC 9293 §3.10.7): nothing is due, the TCB is freed.
+            assert!(ep.poll_transmit(now, &mut [0; 1500]).is_none());
+            ep.handle_timeout(now);
+            assert!(ep.connection(h).is_none());
+            assert_eq!((ep.poll_timeout(), ep.poll_event()), (None, None));
+            continue;
+        }
         ep.handle_timeout(now);
         assert!(ep.poll_transmit(now, &mut [0; 20]).is_none());
         ep.handle_timeout(now);

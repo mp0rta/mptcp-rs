@@ -1158,11 +1158,10 @@ impl Tcb {
         if seg.flags.contains(TcpFlags::RST) {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
+                // Even when the hooks ask for a reset (MP_FASTCLOSE on it): a RST is never
+                // answered (RFC 9293 §3.10.7).
                 h.on_valid_segment(seg);
                 h.on_reset(seg);
-                if h.reset_requested() {
-                    return self.abort_with(CloseReason::Reset, h.reset_option(), now);
-                }
                 return self.on_reset(now);
             }
             self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();

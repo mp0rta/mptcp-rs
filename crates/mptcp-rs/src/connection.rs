@@ -120,7 +120,7 @@ impl Connection {
     }
 
     /// Tears the connection down at once (RFC 8684 §3.5, without waiting for the peer). Each
-    /// subflow past its SYN/ACK, except one in TIME-WAIT, gets a RST at SND.MAX carrying
+    /// subflow past its SYN/ACK, TIME-WAIT included, gets a RST at SND.MAX carrying
     /// MP_FASTCLOSE with the peer's key, or a plain RST for plain TCP and after a fallback; a
     /// subflow in SYN-SENT gets nothing. The connection ends with `Closed { Aborted }`, without
     /// `SubflowDown`; queued and unread data are discarded. The endpoint does this at its next

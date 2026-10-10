@@ -736,8 +736,8 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// Carries out `Connection::abort` (M3 spec §3.5) where it was called: every TCB is
-    /// deleted, each synchronized one but TIME-WAIT with a RST at SND.MAX, with MP_FASTCLOSE
-    /// and a retained 4-tuple when MPTCP is in use.
+    /// deleted, each synchronized one (TIME-WAIT included) with a RST at SND.MAX, with
+    /// MP_FASTCLOSE and a retained 4-tuple when MPTCP is in use.
     fn apply_aborts(&mut self, now: Instant) {
         for (&h, c) in &mut self.conns {
             if !std::mem::take(&mut c.aborting) || ended(c) {
@@ -751,7 +751,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 }
                 let rto = sf.tcb.retransmission_timeout();
                 let seq = sf.tcb.delete(now);
-                if matches!(state, TcpState::SynSent | TcpState::TimeWait) {
+                if state == TcpState::SynSent {
                     continue;
                 }
                 let (src, dst) = (sf.local, sf.remote);

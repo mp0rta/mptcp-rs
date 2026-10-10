@@ -842,3 +842,71 @@ fn abort_is_idempotent_in_every_state() {
     assert!(ep.connection(h).is_none());
     assert_eq!(ep.poll_timeout(), None);
 }
+
+/// RFC 9293 §3.10.7: a valid peer RST at RCV.NXT is never answered, with or without
+/// MP_FASTCLOSE; MP_FASTCLOSE still resets the connection's other subflows.
+#[test]
+fn valid_peer_rst_never_answered() {
+    for with_fastclose in [false, true] {
+        let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+        let fc = fastclose(local_key(&ep, h));
+        let opts = if with_fastclose { &fc[..] } else { &[] };
+        let rst = Segment {
+            options: opts,
+            ..rst_on(&syn)
+        };
+        input_at(&mut ep, &rst, ms(20));
+        let out: Vec<_> = drain(&mut ep, ms(20)).into_iter().map(leak).collect();
+        assert!(
+            out.iter().all(|g| g.src != syn.src),
+            "{with_fastclose}: {out:?}"
+        );
+        let others = out
+            .iter()
+            .filter(|g| g.src == jsyn.src && g.flags.contains(TcpFlags::RST));
+        assert_eq!(others.count(), usize::from(with_fastclose));
+    }
+}
+
+/// Ruling R15: TIME-WAIT subflows are synchronized too, so `abort` resets them with
+/// MP_FASTCLOSE at SND.MAX and retains their 4-tuples.
+#[test]
+fn abort_resets_time_wait_subflows() {
+    let (mut ep, h, _) = stale_fin_then_time_wait(1);
+    let now = ms(10_000);
+    let tuples: Vec<_> = (ep.conns[&h].subflows.iter())
+        .map(|sf| (sf.local, sf.remote))
+        .collect();
+    assert!((ep.conns[&h].subflows.iter()).all(|sf| sf.tcb.state() == TcpState::TimeWait));
+    // The peer's FIN again, without ACK: TIME-WAIT ACKs it at SND.NXT, which is SND.MAX.
+    let fin = |(local, remote): (SocketAddr, SocketAddr)| Segment {
+        src: remote,
+        dst: local,
+        seq: SeqNum(5001),
+        ack: SeqNum(0),
+        flags: TcpFlags::FIN,
+        wnd: 65535,
+        options: &[],
+        payload: &[],
+    };
+    let max: Vec<_> = (tuples.iter())
+        .map(|&t| answer(&mut ep, &fin(t), now).expect("TIME-WAIT ACK").seq)
+        .collect();
+    ep.connection(h).unwrap().abort();
+    ep.handle_timeout(now);
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    let out: Vec<_> = drain(&mut ep, now).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 2);
+    let fc = fastclose(PEER_KEY);
+    for (&(local, _), max) in tuples.iter().zip(max) {
+        let rst = out.iter().find(|g| g.src == local).expect("RST");
+        assert_eq!(
+            (rst.seq, rst.flags, rst.options),
+            (max, TcpFlags::RST, &fc[..])
+        );
+    }
+    for &t in &tuples {
+        let rst = answer(&mut ep, &fin(t), now).expect("retained answer");
+        assert_eq!((rst.ack, rst.options), (SeqNum(5002), &fc[..]));
+    }
+}
