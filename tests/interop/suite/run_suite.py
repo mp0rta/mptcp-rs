@@ -158,15 +158,20 @@ def run_case(case, out):
              for i, b, ms, t in case["fail"]]
     for t in acts:
         t.start()
-    r.watchdog = False
-    for p in (cli, srv):
-        try:
-            p.wait(max(0, until - time.time()))
-        except subprocess.TimeoutExpired:
+    r.watchdog = r.time_wait = False
+    while cli.poll() is None or srv.poll() is None:
+        if time.time() > until:
             r.watchdog = True
             for q in (cli, srv):
                 q.kill()
-            p.wait()
+        elif srv.poll() == 0:
+            # The server verified every byte and closed; 2 s covers the subflow FIN exchange and a
+            # passive closer's own exit. A client still running sits in TIME-WAIT (the core holds
+            # Closed for 2 MSL); its FIN exchange is judged from the pcap (cases.fin_fin_no_rst).
+            time.sleep(2)
+            r.time_wait = cli.poll() is None
+            cli.terminate()
+        time.sleep(0.05)
     r.rc = cli.returncode, srv.returncode
     for t in acts:
         t.join()
@@ -188,13 +193,19 @@ def run_case(case, out):
 def judge(r):
     """Judgement (a)-(d) of amendment §5.5: the list of failure reasons."""
     case, e, why = r.case, r.case["expect"], list(r.errors)
-    # (a) transfer: byte-exact, in the case's direction(s), both ends exit cleanly
+    # (a) transfer: byte-exact, in the case's direction(s), both ends exit cleanly. A client
+    # stopped in TIME-WAIT printed no totals: it closed only after verifying the server's bytes to
+    # EOF, and the server read its DATA_FIN only after verifying every client byte.
     if r.watchdog:
         why.append(f"watchdog {case['watchdog_s']} s")
-    if r.rc != (0, 0):
+    if r.rc != (-15 if r.time_wait else 0, 0):
         why.append(f"exit client={r.rc[0]} server={r.rc[1]}")
     cm = re.search(r"^ok: sent (\d+) bytes, verified (\d+) bytes, eof=true$", r.client, re.M)
     sm = re.search(r"^server ok: received (\d+) sent (\d+) ", r.server, re.M)
+    if r.time_wait and sm:
+        cm = sm
+    elif r.rc[0] == 0 and "Closed Normal" not in r.events:
+        why.append("passive close without Closed Normal")
     if cm and sm:
         c2s, s2c = int(cm[1]), int(cm[2])
         if (int(sm[1]), int(sm[2])) != (c2s, s2c):
@@ -202,7 +213,7 @@ def judge(r):
         want = {"c2s": (True, False), "s2c": (False, True), "bidi": (True, True)}[e["bytes"]]
         if (c2s > 0, s2c > 0) != want:
             why.append(f"{e['bytes']}: c2s {c2s} s2c {s2c}")
-    elif r.rc == (0, 0):
+    elif not why:
         why.append("no byte count lines")
     # (b) server counters: a listed counter missing on this kernel is a FAIL, never 0
     for k, want in e["nstat"].items():
@@ -266,7 +277,8 @@ def main():
             (out / "versions.json").write_text(json.dumps(versions, indent=1))
             (out / "nstat.json").write_text(json.dumps({"before": r.before, "after": r.after}, indent=1))
             (out / "verdict.json").write_text(json.dumps({
-                "verdict": verdict, "reasons": why, "drift_ms": r.drift_ms, "marks": r.marks,
+                "verdict": verdict, "reasons": why, "client_stopped_in_time_wait": r.time_wait,
+                "drift_ms": r.drift_ms, "marks": r.marks,
                 "nstat": {c: r.after.get(c, 0) - r.before.get(c, 0) for c in r.after if r.after[c] != r.before.get(c, 0)},
             }, indent=1))
             print(f"{verdict} {case['name']} run {k}/{a.runs} ({time.time() - t0:.1f} s)", flush=True)

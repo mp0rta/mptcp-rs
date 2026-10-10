@@ -8,12 +8,23 @@
   (extra mptcp-rs-tun flags, e.g. --join)
 - links {i: {"rate", "delay"}} overriding 20mbit/10ms; fail [(link, barrier, ms, secs)]
 - expect: bytes c2s|s2c|bidi, nstat {counter: int or (op, int)} on the srv delta, pcap [check(r)]
-  raising AssertionError, events (ordered prefixes of client `event:` lines), kernel ("X.Y"
-  minimum, else SKIP)
+  raising AssertionError, events (ordered prefixes of client `event:` lines; the runner requires
+  "Closed Normal" itself when the client closes passively, and stops an active closer in
+  TIME-WAIT), kernel ("X.Y" minimum, else SKIP)
 - watchdog_s; ci (part of the CI subset)
 
 A barrier is a client event name with an optional subflow number: "Connected", "SubflowUp:1".
 """
+
+
+def fin_fin_no_rst(r):
+    """At mtun0: no RST, and every subflow carried a FIN from each end. Every case whose client
+    may be stopped in TIME-WAIT needs this check: it is the proof of the FIN exchange."""
+    tun = [g for g in r.segs if g.point == "cli"]
+    assert not any(g.flags & 0x04 for g in tun), "RST present"
+    for f in {g.flow for g in tun}:
+        fins = {g.direction for g in tun if g.flow == f and g.flags & 0x01}
+        assert fins == {"c2s", "s2c"}, f"{f}: FIN only {sorted(fins)}"
 
 
 def subflows(*cips):
@@ -43,17 +54,15 @@ def joins(name, n, direction):
         "expect": {"bytes": direction,
                    "nstat": {"MPTcpExtMPCapableSYNRX": 1, "MPTcpExtMPCapableFallbackACK": 0,
                              "MPTcpExtMPJoinSynRx": n, "MPTcpExtMPJoinAckRx": n},
-                   "pcap": [subflows(*cips)],
-                   "events": ["Connected mptcp=true"] + ["SubflowUp"] * n + ["Closed Normal"],
+                   "pcap": [subflows(*cips), fin_fin_no_rst],
+                   "events": ["Connected mptcp=true"] + ["SubflowUp"] * n,
                    "kernel": None},
-        "watchdog_s": 150, "ci": True,
+        "watchdog_s": 40, "ci": True,
     }
 
 
-# No c2s-only case: the client would close first and its Closed event waits out TIME-WAIT
-# (2 MSL = 120 s), so with bidi or s2c the server closes first.
 CASES = [
-    joins("no-join", 0, "s2c"),
-    joins("one-join", 1, "bidi"),
+    joins("no-join", 0, "c2s"),
+    joins("one-join", 1, "s2c"),
     joins("two-joins", 2, "bidi"),
 ]
