@@ -72,6 +72,9 @@ impl Signals {
         }
         true
     }
+    pub fn clear_echoes(&mut self) {
+        self.echoes.clear();
+    }
     pub fn remove(&mut self, id: u8) {
         self.removes.insert(id);
     }

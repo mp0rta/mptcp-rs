@@ -491,6 +491,9 @@ impl Connection {
             .any(|end| end.wrapping_sub(una) as i64 > 0);
         d.reinject.clear();
         d.settling = false;
+        // Signals end with MPTCP (M3 spec §3.3 rev3 S4); published events stand.
+        self.peer_addrs.0.clear();
+        self.hooks.signals.clear_echoes();
         self.opp = None;
         self.repair = Repair::default();
         d.release(self.subflows[i].mp.tcp_acked_dsn);
@@ -574,13 +577,29 @@ impl Connection {
         (usable && self.peer_addrs.announce(e.id, addr)).then_some(addr)
     }
 
+    /// REMOVE_ADDR of `id` while PreConfirmed (M3 spec §3.3 rev3 S2): its staged binding is
+    /// dropped, and the queued joins to that endpoint are cancelled; returns them. An id without
+    /// a staged binding, id 0 included, is ignored.
+    pub(crate) fn staged_removed(&mut self, id: u8) -> Vec<SubflowId> {
+        let Some((ip, port)) = self.peer_addrs.0.remove(&id).and_then(|a| a.advertised) else {
+            return Vec::new();
+        };
+        let gone = SocketAddr::new(ip, port);
+        let (cancelled, kept) = (std::mem::take(&mut self.queued_joins).into_iter())
+            .partition::<Vec<_>, _>(|q| q.remote == gone);
+        self.queued_joins = kept;
+        cancelled.into_iter().map(|q| q.id).collect()
+    }
+
     /// Subflow `i`'s join failed before it became Active (`SubflowMp::join_failed`): its
-    /// remote, if announced, is marked failed, unless the peer's RST said transient (M3 spec
-    /// §3.3).
+    /// remote, if announced, is marked failed, unless the peer's RST said transient or the join
+    /// was already cancelled locally: `close_subflow` (ruling R24) or `close` (M3 spec §3.3).
     pub(crate) fn note_join_failure(&mut self, i: usize) {
+        let cancelled = self.closed_by_app;
         let sf = &mut self.subflows[i];
         if let Some(rst) = sf.mp.join_failed.take() {
-            if !rst.is_some_and(|r| r.transient) {
+            let cancelled = cancelled || sf.state == SubflowState::Closing;
+            if !rst.is_some_and(|r| r.transient) && !cancelled {
                 self.peer_addrs.fail(sf.remote);
             }
         }
@@ -1247,7 +1266,8 @@ impl SegmentHooks for SubflowHooks<'_> {
             self.sf.peer_backup = backup;
             self.sf.peer_prio = Some(backup);
         }
-        if m.state == State::Confirmed {
+        // ADD_ADDR and REMOVE_ADDR are staged while PreConfirmed (M3 spec §3.3 rev3).
+        if matches!(m.state, State::PreConfirmed | State::Confirmed) {
             self.conn.peer_removed.extend(removed);
             // Key-peer ‖ Key-local: the peer sent it (RFC 8684 L1985–2016).
             for (e, hmac) in added {

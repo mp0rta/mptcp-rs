@@ -70,6 +70,7 @@ pub enum Event {
     },
     /// The peer announced an address (ADD_ADDR) as `id`; `addr` carries the port to join.
     /// Emitted again when the peer repeats the announcement, which also lifts `AddressFailed`.
+    /// An announcement that arrives before the connection is confirmed is reported once it is.
     /// Never for an unspecified, multicast or loopback address.
     AddressAnnounced {
         id: u8,
@@ -661,6 +662,10 @@ impl<R: CryptoRng> Endpoint<R> {
             conn: &mut c.hooks,
             sf: &mut sf.mp,
         };
+        let m = |c: &ConnectionHooks| c.negotiation.as_ref().map(|m| m.state);
+        // An input that begins PreConfirmed stages ADD_ADDR and REMOVE_ADDR for its whole
+        // length (M3 spec §3.3 rev3 S2a).
+        let staged = m(hk.conn) == Some(State::PreConfirmed);
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
         let port = sf.remote.port();
         if let Some(backup) = sf.mp.peer_prio.take() {
@@ -683,16 +688,31 @@ impl<R: CryptoRng> Endpoint<R> {
             i = 0;
         }
         for id in std::mem::take(&mut c.hooks.peer_removed) {
-            if c.hooks.active() && c.peer_removed(id) {
+            if !c.hooks.active() {
+                continue;
+            }
+            if staged {
+                for q in c.staged_removed(id) {
+                    (self.events).push_back((h, down(q, CloseReason::Reset, None)));
+                }
+            } else if c.peer_removed(id) {
                 self.events.push_back((h, Event::AddressRemoved { id }));
             }
         }
         for e in std::mem::take(&mut c.hooks.peer_announced) {
-            if let Some(addr) = (c.hooks.active())
-                .then(|| c.peer_announced(e, port))
-                .flatten()
-            {
+            let addr = (c.hooks.active()).then(|| c.peer_announced(e, port));
+            if let Some(addr) = addr.flatten().filter(|_| !staged) {
                 (self.events).push_back((h, Event::AddressAnnounced { id: e.id, addr }));
+            }
+        }
+        // The input that confirms publishes the staged table, after its own signals and
+        // fallback detection, before any queued join starts (S3).
+        if staged && c.hooks.active() && m(&c.hooks) == Some(State::Confirmed) {
+            for (&id, a) in &c.peer_addrs.0 {
+                if let Some((ip, port)) = a.advertised {
+                    let addr = SocketAddr::new(ip, port);
+                    (self.events).push_back((h, Event::AddressAnnounced { id, addr }));
+                }
             }
         }
         // Events first: a join this segment completed is Active before `update_health`, so a

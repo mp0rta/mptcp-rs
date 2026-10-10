@@ -344,8 +344,8 @@ def signal(name, script=REACT, endpoint=f"{SIGNALLED} dev s2 id 2 signal", annou
            direction="s2c", joins=1):
     """The server announces `endpoint` (ADD_ADDR, as `announced`) once the connection is up; the
     client echoes it and, by `script`, joins it from 10.0.92.2 on link 2. Linux's first ADD_ADDR
-    may arrive before its first DSS, when the client is not yet Confirmed and ignores it (M3 spec
-    §3.3); Linux repeats it unechoed."""
+    may arrive before its first DSS: the client stages it and echoes it once Confirmed (M3 spec
+    §3.3 rev3)."""
     case = scripted(name, "signal", direction, script)
     case["server"]["pm"] = ["limits set subflows 1 add_addr_accepted 0", f"endpoint add {endpoint}"]
     ip, _, port = announced.rpartition(":")
@@ -354,6 +354,23 @@ def signal(name, script=REACT, endpoint=f"{SIGNALLED} dev s2 id 2 signal", annou
                       MPTcpExtMPJoinSynRx=joins, MPTcpExtMPJoinAckRx=joins)
     e["pcap"] += [echoed(2, ip, None if " port " not in endpoint else port), joined_only(*[announced] * bool(joins))]
     e["events"] = ["Connected mptcp=true", f"AddressAnnounced {{ id: 2, addr: {announced} }}"] + ["SubflowUp"] * joins
+    return case
+
+
+def echo_before_repeat(r):
+    """At mtun0: the client's echo left before any second ADD_ADDR arrived, so the first ADD_ADDR,
+    sent before Linux's first DSS, was the one echoed (M3 spec §3.3 rev3)."""
+    adds, echoes = add_addrs(r, "cli", "s2c", "0"), add_addrs(r, "cli", "c2s", "1")
+    assert echoes, "no echo"
+    assert len(adds) < 2 or echoes[0][0].t < adds[1][0].t, \
+        f"echo at {echoes[0][0].t:.3f}, ADD_ADDRs at {[round(g.t, 3) for g, _ in adds]}"
+
+
+def signal_join():
+    """The first ADD_ADDR is used: one ADD_ADDR on the wire, echoed before Linux could repeat it."""
+    case = signal("signal-join")
+    case["expect"]["nstat"]["MPTcpExtAddAddrTx"] = 1
+    case["expect"]["pcap"] += [echo_before_repeat]
     return case
 
 
@@ -508,7 +525,7 @@ CASES = [
     remove_address("client-remove-joined", BACKUP, PRIMARY, 1),
     remove_address("client-remove-id0", PRIMARY, BACKUP, 0),
     make_before_break(),
-    signal("signal-join"),
+    signal_join(),
     signal_port_join(),
     signal_unused(),
     signal_unreachable(),

@@ -2469,15 +2469,18 @@ fn failed_mark_not_on_local_cancel() {
         let (mut ep, h, syn, id, jsyn) = announced_join();
         cancel(&mut ep, h, &syn, &jsyn, id);
         drain(&mut ep, ms(30));
-        assert!(!ep.conns[&h].peer_addrs.0[&4].failed, "{name}");
-        // An aborted connection is freed here; the others go on.
-        drive(&mut ep, ms(40), ms(1000));
+        // Fallback clears the table (M3 spec §3.3 rev3 S4): no entry is no mark either.
+        let failed = |c: &Connection| c.peer_addrs.0.get(&4).is_some_and(|a| a.failed);
+        assert!(!failed(&ep.conns[&h]), "{name}");
+        // An aborted connection is freed here; the others go on, past R2 (5 s): a cancelled
+        // join's third-ACK item giving up later is no failure (ruling R24).
+        drive(&mut ep, ms(40), ms(30_000));
         events(&mut ep);
         let Some(c) = ep.conns.get(&h) else {
             assert_eq!(name, "abort");
             continue;
         };
-        assert!(!c.peer_addrs.0[&4].failed, "{name}");
+        assert!(!failed(c), "{name}");
         if c.hooks.active() && !c.closed_by_app {
             assert!(add_to(&mut ep, h, "10.0.2.2:80").is_ok(), "{name}");
         }
@@ -2502,27 +2505,7 @@ fn transient_rst_does_not_mark_failed() {
 }
 
 #[test]
-fn add_addr_ignored_before_confirmed_and_after_fallback() {
-    // PreConfirmed: the keys are known, but the peer has sent no DSS yet.
-    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(40));
-    let h = open(&mut ep);
-    let syn = leak(transmit(&mut ep, ms(0)));
-    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
-    drain(&mut ep, ms(1));
-    events(&mut ep);
-    assert_eq!(state(&ep, h), State::PreConfirmed);
-    announce(&mut ep, h, &syn, (4, ANNOUNCED, None), ms(2));
-    assert_eq!(events(&mut ep), vec![]);
-    assert!(echoes(&drain(&mut ep, ms(2))).is_empty());
-    // Not kept for later either.
-    let dss = data_ack(una(&ep, h));
-    input_at(&mut ep, &peer_data(&syn, 5001, &dss, &[]), ms(3));
-    assert_eq!(state(&ep, h), State::Confirmed);
-    assert!(echoes(&drain_until(&mut ep, ms(3), ms(5000))).is_empty());
-    assert!(table(&ep, h).is_empty());
-    assert_eq!(events(&mut ep), vec![]);
-
-    // After fallback.
+fn add_addr_ignored_after_fallback() {
     let (mut ep, h, syn, _) = confirmed();
     peer_infinite_mapping(&mut ep, &syn, ms(10));
     assert!(!ep.conns[&h].hooks.active());
@@ -2547,4 +2530,223 @@ fn add_addr_unusable_address_echoed_not_announced() {
     }
     assert_eq!(events(&mut ep), vec![]);
     assert!(table(&ep, h).is_empty());
+}
+
+// M3 Task 9 fix round 1: ADD_ADDR before confirmation (M3 spec §3.3 rev3, S1–S5).
+
+/// A PreConfirmed connection: our third ACK went out, the peer has sent no DSS yet.
+fn preconfirmed() -> (Endpoint<ChaCha20Rng>, ConnectionHandle, Segment<'static>) {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(40));
+    let h = open(&mut ep);
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    drain(&mut ep, ms(1));
+    events(&mut ep);
+    assert_eq!(state(&ep, h), State::PreConfirmed);
+    (ep, h, syn)
+}
+/// The peer's first DSS (a DATA_ACK), with `extra` options on the same segment.
+fn confirm(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    syn: &Segment,
+    extra: &[u8],
+    now: Instant,
+) {
+    let mut opts = data_ack(una(ep, h));
+    opts.extend(extra);
+    input_at(ep, &peer_data(syn, 5001, &opts, &[]), now);
+}
+fn remove_opt(id: u8) -> [u8; 4] {
+    [30, 4, 0x40, id]
+}
+/// `add_subflow` from `JOIN_IP` to `remote` while PreConfirmed: queued, nothing sent.
+fn queue_join(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle, remote: &str) -> SubflowId {
+    let id = ep
+        .add_subflow(ms(2), h, ip(JOIN_IP), remote.parse().unwrap(), 1500, false)
+        .unwrap();
+    assert!(from(&drain(ep, ms(2)), JOIN_IP).is_empty(), "queued");
+    id
+}
+fn reset_down(subflow: SubflowId) -> Event {
+    Event::SubflowDown {
+        subflow,
+        reason: CloseReason::Reset,
+        rst: None,
+    }
+}
+fn is_announced(e: &Event) -> bool {
+    matches!(e, Event::AddressAnnounced { .. })
+}
+
+#[test]
+fn add_addr_preconfirmed_published_at_confirm() {
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(echoes(&drain(&mut ep, ms(2))).is_empty(), "the echo waits");
+    assert_eq!(
+        state(&ep, h),
+        State::PreConfirmed,
+        "an HMAC confirms nothing"
+    );
+    assert_eq!(table(&ep, h), vec![(2, Some((ip(ANNOUNCED), 80)), false)]);
+    // A DSS-only ACK confirms: one event, then the echo on our next ACK.
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    assert_eq!(state(&ep, h), State::Confirmed);
+    assert_eq!(events(&mut ep), vec![announced(2, "10.0.2.2:80")]);
+    let want = vec![(syn.src, echo(2, ANNOUNCED, None))];
+    assert_eq!(echoes(&drain(&mut ep, ms(3))), want);
+}
+
+#[test]
+fn add_addr_preconfirmed_repeats_coalesce() {
+    let (mut ep, h, syn) = preconfirmed();
+    for t in [2, 3, 4] {
+        announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(t));
+    }
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(drain(&mut ep, ms(4)).is_empty(), "no echo, no MP_JOIN");
+    confirm(&mut ep, h, &syn, &[], ms(5));
+    assert_eq!(events(&mut ep), vec![announced(2, "10.0.2.2:80")]);
+    let out = drain_until(&mut ep, ms(5), ms(10_000));
+    assert_eq!(echoes(&out), vec![(syn.src, echo(2, ANNOUNCED, None))]);
+    assert!(from(&out, JOIN_IP).is_empty());
+}
+
+#[test]
+fn add_addr_preconfirmed_removed_then_rebound() {
+    let (mut ep, h, syn) = preconfirmed();
+    let ack = syn.seq.wrapping_add(1);
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    signal_ack(&mut ep, &syn, ack, &remove_opt(2), ms(2));
+    announce(&mut ep, h, &syn, (2, "10.0.3.2", None), ms(2));
+    assert_eq!(
+        events(&mut ep),
+        vec![],
+        "no AddressRemoved for an unpublished binding"
+    );
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    assert_eq!(events(&mut ep), vec![announced(2, "10.0.3.2:80")]);
+    // Withdrawal only: nothing to publish.
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    signal_ack(&mut ep, &syn, ack, &remove_opt(2), ms(2));
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(table(&ep, h).is_empty());
+}
+
+#[test]
+fn add_addr_preconfirmed_withdrawal_cancels_queued_join() {
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    let id = queue_join(&mut ep, h, "10.0.2.2:80");
+    // Another queued join, to an endpoint not withdrawn, survives.
+    let other = queue_join(&mut ep, h, "10.0.0.2:81");
+    signal_ack(
+        &mut ep,
+        &syn,
+        syn.seq.wrapping_add(1),
+        &remove_opt(2),
+        ms(2),
+    );
+    assert_eq!(events(&mut ep), vec![reset_down(id)]);
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    let out = from(&drain(&mut ep, ms(3)), JOIN_IP);
+    let dsts: Vec<_> = out.iter().map(|s| s.dst).collect();
+    assert_eq!(dsts, vec!["10.0.0.2:81".parse().unwrap()], "{other:?} only");
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+#[test]
+fn add_addr_preconfirmed_confirming_segment_combos() {
+    // (a) The confirming DSS withdraws a staged binding a join is queued to.
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    let id = queue_join(&mut ep, h, "10.0.2.2:80");
+    confirm(&mut ep, h, &syn, &remove_opt(2), ms(3));
+    assert_eq!(state(&ep, h), State::Confirmed);
+    assert_eq!(events(&mut ep), vec![reset_down(id)]);
+    assert!(from(&drain(&mut ep, ms(3)), JOIN_IP).is_empty(), "no SYN");
+    // (b) It refreshes a staged binding with another port: one event, the new port.
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    let refresh = add_addr(&ep, h, 2, ANNOUNCED, Some(81));
+    confirm(&mut ep, h, &syn, &refresh, ms(3));
+    assert_eq!(events(&mut ep), vec![announced(2, "10.0.2.2:81")]);
+    // (c) It carries an infinite mapping: fallback, nothing published, the table cleared.
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    peer_infinite_mapping(&mut ep, &syn, ms(3));
+    assert!(!ep.conns[&h].hooks.active());
+    assert!(!events(&mut ep).iter().any(is_announced));
+    assert!(table(&ep, h).is_empty());
+    assert!(echoes(&drain_until(&mut ep, ms(3), ms(5000))).is_empty());
+}
+
+#[test]
+fn remove_addr_id0_preconfirmed_ignored() {
+    let (mut ep, h, syn) = preconfirmed();
+    let id = queue_join(&mut ep, h, "10.0.0.2:81");
+    signal_ack(
+        &mut ep,
+        &syn,
+        syn.seq.wrapping_add(1),
+        &remove_opt(0),
+        ms(2),
+    );
+    assert_eq!(events(&mut ep), vec![]);
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    assert_eq!(events(&mut ep), vec![]);
+    assert_eq!(
+        from(&drain(&mut ep, ms(3)), JOIN_IP).len(),
+        1,
+        "{id:?} starts"
+    );
+    assert!(ep.conns[&h].subflows[0].mp.keepalive.is_none());
+}
+
+#[test]
+fn add_addr_preconfirmed_bad_hmac_ignored() {
+    let (mut ep, h, syn) = preconfirmed();
+    let a = ip(ANNOUNCED);
+    let hmac = add_addr_hmac(PEER_KEY, local_key(&ep, h), 2, a, None) ^ 1;
+    let opt = encode(&MptcpOption::AddAddr {
+        echo: false,
+        id: 2,
+        addr: a,
+        port: None,
+        hmac: Some(hmac),
+    });
+    signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &opt, ms(2));
+    assert_eq!(ep.conns[&h].hooks.add_addr_bad_hmac, 1);
+    confirm(&mut ep, h, &syn, &[], ms(3));
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(echoes(&drain_until(&mut ep, ms(3), ms(5000))).is_empty());
+    assert!(table(&ep, h).is_empty());
+}
+
+#[test]
+fn add_addr_preconfirmed_then_fallback_discards() {
+    let (mut ep, h, syn) = preconfirmed();
+    announce(&mut ep, h, &syn, (2, ANNOUNCED, None), ms(2));
+    // Our data, then the peer's TCP ACK of it without a DATA_ACK: fallback while PreConfirmed.
+    ep.connection(h).unwrap().write(&[5; 100]).unwrap();
+    let sent = on(&drain(&mut ep, ms(3)), &syn);
+    let data = sent.iter().find(|s| !s.payload.is_empty()).expect("data");
+    let ack = Segment {
+        ack: end(data),
+        ..peer_data(&syn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &ack, ms(4));
+    assert_eq!(state(&ep, h), State::FellBack);
+    assert!(!events(&mut ep).iter().any(is_announced));
+    assert!(table(&ep, h).is_empty());
+    assert!(echoes(&drain_until(&mut ep, ms(4), ms(5000))).is_empty());
+    let remote = "10.0.2.2:80".parse().unwrap();
+    assert_eq!(
+        ep.add_subflow(ms(5000), h, ip(JOIN_IP), remote, 1500, false),
+        Err(AddSubflowError::NotMptcp)
+    );
 }
