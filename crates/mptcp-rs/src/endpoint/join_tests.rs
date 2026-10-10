@@ -713,7 +713,10 @@ fn signals_ignored(
         signal_ack(ep, syn, seq, opt, now);
         assert!(drain(ep, now).is_empty(), "no retransmission, no RST");
     }
-    assert_eq!(events(ep), vec![]);
+    // MP_PRIO only reports the peer's preference (M3 Task 7).
+    let ev = events(ep);
+    assert_eq!(ev.len(), 2);
+    assert!((ev.iter()).all(|e| matches!(e, Event::PeerPriority { backup: false, .. })));
     assert_eq!(state(ep, h), State::Confirmed);
     let dss = data_ack(una(ep, h));
     for _ in 0..2 {

@@ -104,6 +104,17 @@ pub(crate) struct SubflowMp {
     /// A join ended by an acceptable peer RST while SYN-SENT or Joining, with that RST's
     /// MP_TCPRST (M3 spec §3.3 failed mark).
     pub join_failed: Option<Option<crate::MpTcpRst>>,
+    /// Our own transmit policy (`Endpoint::set_local_backup`).
+    pub local_backup: bool,
+    /// The peer's MP_JOIN SYN/ACK B bit, then its latest MP_PRIO (RFC 8684 L1849–1852).
+    pub peer_backup: bool,
+    /// An MP_PRIO arrived with this B bit: `Event::PeerPriority` is due.
+    pub peer_prio: Option<bool>,
+    /// This subflow's id, the time and its srtt at the latest `prepare_send`: the signal
+    /// clock of its ACKs.
+    pub signal_clock: Option<(super::SubflowId, Instant, std::time::Duration)>,
+    /// The signals the ACK being built carries, until it goes out.
+    pub signal_take: Option<super::signal::Take>,
 }
 
 impl SubflowMp {
@@ -137,7 +148,16 @@ impl SubflowMp {
             strand_at: None,
             rst: None,
             join_failed: None,
+            local_backup: false,
+            peer_backup: false,
+            peer_prio: None,
+            signal_clock: None,
+            signal_take: None,
         }
+    }
+    /// The effective transmit-backup: local or peer-requested (M3 spec §4.2).
+    pub fn backup(&self) -> bool {
+        self.local_backup || self.peer_backup
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.
     pub fn joining(&self) -> bool {

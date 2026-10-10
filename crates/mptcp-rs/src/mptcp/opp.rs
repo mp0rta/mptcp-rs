@@ -366,9 +366,10 @@ impl Connection {
         }
     }
 
-    /// `t` is an eligible target for a copy starting at `start` (§2.2): usable, not the
-    /// blocking subflow, no live mapping of its own covers `start`, it may take a mapping, and,
-    /// for an `episode` copy, it is the current episode's target if there is one.
+    /// `t` is an eligible target for a copy starting at `start` (§2.2): usable, a backup only
+    /// while no non-backup subflow is usable (§4.5), not the blocking subflow, no live mapping
+    /// of its own covers `start`, it may take a mapping, and, for an `episode` copy, it is the
+    /// current episode's target if there is one.
     pub(crate) fn opp_target(
         &self,
         t: &Subflow,
@@ -378,6 +379,7 @@ impl Connection {
     ) -> bool {
         blocking != Some(t.id)
             && usable(t)
+            && !(t.mp.backup() && (self.subflows.iter()).any(|sf| usable(sf) && !sf.mp.backup()))
             && t.mp.tx.covering_end(start).is_none()
             && may_assign(&self.hooks, &t.mp, &t.tcb)
             && (!episode || self.opp.as_ref().is_none_or(|e| e.target == t.id))

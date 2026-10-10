@@ -304,7 +304,9 @@ impl<R: CryptoRng> Endpoint<R> {
     /// Opens an MP_JOIN subflow from `local`, whose path MTU is `mtu`, to `remote`: the
     /// connection's remote address, or another endpoint of the peer such as one it announced
     /// (`Event::AddressAnnounced`). Its `Tcb` uses the connection's `ConnectConfig` with this
-    /// MTU. `backup` is the preference the join advertises (the MP_JOIN B bit; not sent yet).
+    /// MTU. `backup` is the preference the join advertises, the MP_JOIN SYN's B bit: whether
+    /// the peer should send on it only as a backup (`set_backup` changes it later; our own use
+    /// of the subflow is `set_local_backup`).
     /// Before the connection is Confirmed (the peer's first DSS) the join is queued and starts
     /// at the first `poll_transmit` after that (RFC 8684 L884–887); a queued join that can no
     /// longer start (fallback, C=1) ends with `SubflowDown { Reset }`. `SubflowUp` follows the
@@ -319,7 +321,6 @@ impl<R: CryptoRng> Endpoint<R> {
         backup: bool,
     ) -> Result<SubflowId, AddSubflowError> {
         use AddSubflowError as E;
-        let _ = backup; // the join SYN B bit (M3 Task 7)
         // Only IP and port reach the wire (`connect`).
         let remote = SocketAddr::new(remote.ip(), remote.port());
         let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
@@ -349,6 +350,8 @@ impl<R: CryptoRng> Endpoint<R> {
             remote,
             mtu,
             addr_id,
+            backup,
+            local_backup: false,
         };
         if m.state == State::Confirmed {
             self.start_join(now, h, join)?;
@@ -394,29 +397,43 @@ impl<R: CryptoRng> Endpoint<R> {
         Ok(c)
     }
 
-    /// Advertises whether the peer should treat subflow `s` as backup (MP_PRIO). Not
-    /// implemented yet: checks its arguments only.
-    #[doc(hidden)]
+    /// Advertises whether the peer should send on subflow `s` only as a backup: an MP_PRIO on
+    /// `s` (RFC 8684 §3.3.8), sent once on an ACK when `s` is up and the connection Confirmed.
+    /// MP_PRIO is not acknowledged, so it may be lost; call again to repeat it. Each call
+    /// leaves one MP_PRIO due with the latest value. Our own use of `s` is unchanged
+    /// (`set_local_backup`); the peer's requests arrive as `Event::PeerPriority`.
     pub fn set_backup(
         &mut self,
         _now: Instant,
         h: ConnectionHandle,
         s: SubflowId,
-        _backup: bool,
+        backup: bool,
     ) -> Result<(), SubflowError> {
-        self.subflow_conn(h, s).map(drop)
+        let c = self.subflow_conn(h, s)?;
+        c.hooks.signals.prio(s, backup);
+        Ok(())
     }
 
-    /// Sends on subflow `s` only as a backup, or not; no wire effect. Not implemented yet:
-    /// checks its arguments only.
-    #[doc(hidden)]
+    /// Sends on subflow `s` only as a backup, or not; no wire effect. A subflow is a backup if
+    /// this says so or the peer asked for it (MP_JOIN B bit, MP_PRIO): new data, reinjections
+    /// and copies go to a backup subflow only while no other subflow is usable, Active with a
+    /// nonzero peer window. A busy (cwnd- or pacing-limited) subflow is still usable. May be
+    /// called as soon as `add_subflow` returns.
     pub fn set_local_backup(
         &mut self,
         h: ConnectionHandle,
         s: SubflowId,
-        _backup: bool,
+        backup: bool,
     ) -> Result<(), SubflowError> {
-        self.subflow_conn(h, s).map(drop)
+        let c = self.subflow_conn(h, s)?;
+        match c.subflows.iter_mut().find(|sf| sf.id == s) {
+            Some(sf) => sf.mp.local_backup = backup,
+            None => {
+                let q = c.queued_joins.iter_mut().find(|q| q.id == s).unwrap();
+                q.local_backup = backup;
+            }
+        }
+        Ok(())
     }
 
     /// Retires subflow `s` by FIN exchange. Not implemented yet: checks its arguments only.
@@ -469,7 +486,8 @@ impl<R: CryptoRng> Endpoint<R> {
         let mut mp = SubflowMp::new();
         mp.local_isn = isn;
         mp.tcp_acked_dsn = c.hooks.data.as_ref().map_or(0, |d| d.send.una);
-        mp.join = Some(Join::new(nonce, q.addr_id));
+        mp.join = Some(Join::new(nonce, q.addr_id, q.backup));
+        mp.local_backup = q.local_backup;
         c.hooks.cancel_no_subflow_wait();
         self.demux.insert((local, remote), (h, q.id));
         c.subflows.push(Subflow {
@@ -583,6 +601,10 @@ impl<R: CryptoRng> Endpoint<R> {
             sf: &mut sf.mp,
         };
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
+        if let Some(backup) = sf.mp.peer_prio.take() {
+            let subflow = sf.id;
+            (self.events).push_back((h, Event::PeerPriority { subflow, backup }));
+        }
         // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
         if c.hooks.fast_closed {
             c.abort_all(now, Some(i), None);
@@ -642,11 +664,13 @@ impl<R: CryptoRng> Endpoint<R> {
     ) {
         let mut first = true;
         let freed = &mut c.hooks.freed_dsn_end;
+        let signals = &mut c.hooks.signals;
         c.subflows.retain(|sf| {
             let keep = std::mem::take(&mut first)
                 || sf.tcb.state() != TcpState::Closed
                 || sf.tcb.reset_pending();
             if !keep {
+                signals.forget(sf.id);
                 if let Some(end) = sf.mp.dsn_end {
                     *freed = crate::mptcp::later(*freed, end);
                 }
@@ -850,7 +874,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     if buf.len() < sf.tcb.mtu() {
                         continue;
                     }
-                    hk.prepare_send(&mut sf.tcb, now);
+                    hk.prepare_send(&mut sf.tcb, now, sf.id);
                     if c.closed_by_app && !hk.conn.close() {
                         sf.tcb.close();
                     }
@@ -940,6 +964,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     })
                     .chain(c.hooks.recovery_deadline())
                     .chain(c.opp_deadline())
+                    .chain(c.hooks.signals.next_wake())
                     .chain(c.aborting.then_some(Instant::from_nanos(0)))
                     .min()
             })

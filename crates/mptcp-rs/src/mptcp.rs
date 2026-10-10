@@ -5,6 +5,7 @@ pub(crate) mod data;
 mod join;
 mod opp;
 pub(crate) mod sched;
+pub(crate) mod signal;
 mod subflow;
 use crate::crypto::key_token_idsn;
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
@@ -24,7 +25,8 @@ use crate::connection::Connection;
 use crate::tcp::rtt::INITIAL_RTO;
 
 use crate::tcp::{
-    AppLimited, ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb, TcpState,
+    AckPurpose, AppLimited, ConnectConfig, PlainHooks, SegmentHooks, SendBudget, SendBuf, Tcb,
+    TcpState,
 };
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
@@ -51,6 +53,8 @@ pub(crate) struct ConnectionHooks {
     pub scheduler: Box<dyn Scheduler>,
     /// Refilled every scheduling step; capacity = subflow cap, so steps never allocate.
     snapshots: Vec<SubflowSnapshot>,
+    /// Signals waiting for an ACK-only segment (M3 spec §3.2).
+    pub signals: signal::Signals,
     /// Plans rejected by validation (spec §4 rule 1); debug counter.
     pub rejected_plans: u64,
     /// Validated plans `SendStore::assign` refused; stays 0 by construction.
@@ -114,6 +118,7 @@ impl ConnectionHooks {
             freed_dsn_end: None,
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
+            signals: Default::default(),
             rejected_plans: 0,
             assign_failures: 0,
             debug: DebugStats::default(),
@@ -289,6 +294,14 @@ impl Connection {
                     .or_else(|| lowest_rtt(sfs, active))
             })
             .flatten();
+        // Connection-scoped signals (M3 spec §3.2): echoes on the lowest-RTT usable subflow,
+        // REMOVE_ADDR on the lowest-RTT Active one not using a removed address.
+        let signals = &self.hooks.signals;
+        let echo = lowest_rtt(sfs, opp::usable).map(|i| sfs[i].id);
+        let removed = |sf: &Subflow| {
+            (self.local_addrs.id(sf.local.ip())).is_some_and(|id| signals.removing(id))
+        };
+        let remove = lowest_rtt(sfs, |sf| active(sf) && !removed(sf)).map(|i| sfs[i].id);
         let mut mss = 0;
         for (i, sf) in self.subflows.iter_mut().enumerate() {
             let active = sf.is(SubflowState::Active);
@@ -300,6 +313,10 @@ impl Connection {
             }
         }
         self.hooks.sws_mss = mss;
+        (
+            self.hooks.signals.echo_carrier,
+            self.hooks.signals.remove_carrier,
+        ) = (echo, remove);
     }
 
     /// Connection-level timers, evaluated once per input and per `poll_transmit` over all
@@ -572,6 +589,8 @@ impl Connection {
                 opp_budget,
                 srtt: sf.tcb.srtt().unwrap_or(INITIAL_RTO),
                 app_limited: sf.tcb.app_limited(),
+                backup: sf.mp.backup(),
+                usable: opp::usable(sf),
             });
         }
         self.hooks.snapshots = snapshots;
@@ -708,7 +727,14 @@ impl Connection {
 }
 
 impl SubflowHooks<'_> {
-    pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant) {
+    pub fn prepare_send(&mut self, tcb: &mut Tcb, now: Instant, id: SubflowId) {
+        let srtt = tcb.srtt().unwrap_or(INITIAL_RTO);
+        self.sf.signal_clock = Some((id, now, srtt));
+        // A signal-only ACK, once synchronized and Confirmed (M3 spec §3.2).
+        let open = matches!(tcb.state(), TcpState::Established | TcpState::CloseWait);
+        if (self.conn.signals).wants(id, now, srtt, open && self.signals_allowed()) {
+            tcb.request_signal_ack();
+        }
         if self.sf.joining() {
             // No data, probes or DATA_FIN while joining; it still closes with the rest.
             if self.conn.data.as_ref().is_some_and(|d| d.close.acked) {
@@ -804,6 +830,17 @@ impl SubflowHooks<'_> {
     }
     fn candidate_len(&self) -> usize {
         self.conn.candidate_len()
+    }
+    /// Signals may ride this subflow's ACKs: joined, and the connection Confirmed and not
+    /// fallen back (M3 spec §3.2).
+    fn signals_allowed(&self) -> bool {
+        !self.sf.joining()
+            && self
+                .conn
+                .negotiation
+                .as_ref()
+                .is_some_and(|m| m.state == State::Confirmed)
+            && self.conn.data.as_ref().is_some_and(|d| !d.fallback)
     }
 }
 impl SendBuf for SubflowHooks<'_> {
@@ -1001,10 +1038,26 @@ impl SegmentHooks for SubflowHooks<'_> {
             .as_mut()
             .map_or(0, |m| m.options_for(flags, out))
     }
+    fn ack_signals(&mut self, purpose: AckPurpose, room: usize, out: &mut [u8]) -> usize {
+        self.sf.signal_take = None;
+        let Some((id, now, srtt)) = self.sf.signal_clock.filter(|_| self.signals_allowed()) else {
+            return 0;
+        };
+        let signals = &self.conn.signals;
+        let (n, take) = signals.peek_ack_options(id, purpose, now, srtt, room, out);
+        self.sf.signal_take = Some(take);
+        n
+    }
+    fn ack_emitted(&mut self) {
+        if let (Some(take), Some((_, now, _))) = (self.sf.signal_take.take(), self.sf.signal_clock)
+        {
+            self.conn.signals.commit(take, now);
+        }
+    }
     fn on_valid_segment(&mut self, seg: &Segment<'_>) {
         self.sf.valid_data_ack = None;
         // Validate the whole option list before mutating mapping or DATA_ACK state.
-        let (mut dss, mut capable, mut fastclose) = (None, None, None);
+        let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
         for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
             match opt {
                 Err(_) => return,
@@ -1014,6 +1067,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                     Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
                         fastclose = Some(receiver_key)
                     }
+                    Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
                     Ok(
                         MptcpOption::Dss(_)
                         | MptcpOption::Capable(_)
@@ -1097,6 +1151,11 @@ impl SegmentHooks for SubflowHooks<'_> {
         };
         if d.fallback {
             return;
+        }
+        // MP_PRIO: the peer's preference for the subflow it arrived on (M3 spec §3.3).
+        if let Some(backup) = prio.filter(|_| m.state == State::Confirmed) {
+            self.sf.peer_backup = backup;
+            self.sf.peer_prio = Some(backup);
         }
         if let Some(c) = capable {
             if let Some(len) = c.data_len {

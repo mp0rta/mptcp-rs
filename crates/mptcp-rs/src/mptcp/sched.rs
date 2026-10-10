@@ -26,6 +26,10 @@ pub(crate) struct SubflowSnapshot {
     /// Why the subflow is in an app-limited interval, if it is: its ACK samples then say
     /// nothing about path capacity.
     pub app_limited: Option<AppLimited>,
+    /// The effective transmit-backup: local or peer-requested (M3 §4.2).
+    pub backup: bool,
+    /// Active, and the peer is not advertising a zero subflow window (M3 §4.5).
+    pub usable: bool,
 }
 
 pub(crate) struct Pending<'a> {
@@ -98,16 +102,20 @@ pub(crate) trait Scheduler: Send {
     fn on_assigned(&mut self, _subflow: SubflowId, _bytes: u32, _reinject: bool) {}
 }
 
-/// Lowest `srtt` among Active subflows with budget; queued reinjection first, then New, then
-/// the opportunistic candidate.
+/// Lowest `srtt` among usable subflows with budget, backup subflows only while no non-backup
+/// subflow is usable (M3 §4.5); queued reinjection first, then New, then the opportunistic
+/// candidate.
 pub(crate) struct MinRtt;
 
 impl Scheduler for MinRtt {
     fn plan(&mut self, _now: Instant, pending: &Pending<'_>, subflows: &[SubflowSnapshot]) -> Plan {
+        let usable = |s: &&SubflowSnapshot| s.state == SubflowState::Active && s.usable;
+        let primary = subflows.iter().filter(usable).any(|s| !s.backup);
         let best = |budget: fn(&SubflowSnapshot) -> SendBudget| {
             subflows
                 .iter()
-                .filter(|s| s.state == SubflowState::Active && budget(s).bytes() > 0)
+                .filter(usable)
+                .filter(|s| !(s.backup && primary) && budget(s).bytes() > 0)
                 .min_by_key(|s| s.srtt)
                 .map(|s| (s.id, budget(s).bytes() as u32))
         };
@@ -289,6 +297,8 @@ mod tests {
             opp_budget: NONE,
             srtt: Duration::from_millis(srtt_ms),
             app_limited: None,
+            backup: false,
+            usable: state == SubflowState::Active,
         }
     }
     fn plan(q: &ReinjectQueue, new_bytes: u64, subflows: &[SubflowSnapshot]) -> Plan {
@@ -653,6 +663,71 @@ mod tests {
             )
         );
         assert_eq!(plan_opp(&q, 0, None, &subflows), Plan::Idle);
+    }
+
+    #[test]
+    fn minrtt_backup_only_when_no_usable_primary() {
+        let b = budget(1000, 2, 0);
+        let mut q = ReinjectQueue::new(0);
+        let backup = SubflowSnapshot {
+            backup: true,
+            opp_budget: b,
+            ..snap(1, Active, 5, b, b)
+        };
+        // The primary is usable but has no budget (cwnd, pacing): nothing spills onto the
+        // faster backup, for any payload.
+        let mut subflows = [
+            SubflowSnapshot {
+                opp_budget: NONE,
+                ..snap(0, Active, 30, NONE, NONE)
+            },
+            backup,
+        ];
+        let opp = Some((0, 3000));
+        assert_eq!(plan(&q, 5000, &subflows), Plan::Idle);
+        assert_eq!(plan_opp(&q, 0, opp, &subflows), Plan::Idle);
+        q.insert(0, 100);
+        assert_eq!(plan(&q, 0, &subflows), Plan::Idle);
+        // With budget, the primary is taken although the backup's srtt is lower.
+        subflows[0] = snap(0, Active, 30, b, b);
+        assert_eq!(
+            plan(&q, 0, &subflows),
+            send(0, Payload::Reinject { dsn: 0, len: 100 })
+        );
+        // Unusable primaries (zero window, or not Active) hand every payload to the backup.
+        for primary in [
+            SubflowSnapshot {
+                usable: false,
+                ..snap(0, Active, 30, NONE, NONE)
+            },
+            snap(0, Stale, 30, NONE, NONE),
+        ] {
+            subflows[0] = primary;
+            assert_eq!(
+                plan(&q, 0, &subflows),
+                send(1, Payload::Reinject { dsn: 0, len: 100 })
+            );
+            let q = ReinjectQueue::new(0);
+            assert_eq!(
+                plan(&q, 5000, &subflows),
+                send(1, Payload::New { bytes: 2000 })
+            );
+            assert_eq!(
+                plan_opp(&q, 0, opp, &subflows),
+                send(1, Payload::Opportunistic { dsn: 0, len: 2000 })
+            );
+        }
+        // Among backups, the lowest srtt.
+        let slow = SubflowSnapshot {
+            id: SubflowId(2),
+            srtt: Duration::from_millis(50),
+            ..backup
+        };
+        let q = ReinjectQueue::new(0);
+        assert_eq!(
+            plan(&q, 5000, &[slow, subflows[0], backup]),
+            send(1, Payload::New { bytes: 2000 })
+        );
     }
 
     #[test]

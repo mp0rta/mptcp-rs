@@ -9,7 +9,7 @@ use rangemap::RangeSet;
 
 use super::cc::{AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck};
 use super::cubic::Cubic;
-use super::hooks::Hooks;
+use super::hooks::{AckPurpose, Hooks};
 use super::recovery::{DupAck, NewAck, NewReno};
 use super::rtt::{INITIAL_RTO, RttEstimator};
 use super::sack::{DupAck as SackDupAck, Sack};
@@ -323,6 +323,8 @@ pub struct Tcb {
     // Segments due at the next `poll_send`.
     syn_due: bool,
     ack_due: bool,
+    /// An ACK only to carry a protocol signal (`request_signal_ack`).
+    signal_ack_due: bool,
     /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`, or ending this TCB, with
     /// the protocol option it carries.
     rst_due: Option<(SeqNum, Option<[u8; 4]>)>,
@@ -412,6 +414,7 @@ impl Tcb {
             closed_at: None,
             syn_due: true,
             ack_due: false,
+            signal_ack_due: false,
             rst_due: None,
             retransmit_due: false,
             probe_due: false,
@@ -777,6 +780,11 @@ impl Tcb {
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }
+    /// An ACK-only segment is due only to carry a protocol signal (`AckPurpose::SignalOnly`
+    /// unless an ACK is due anyway). It goes out only if the hooks add a signal to it.
+    pub(crate) fn request_signal_ack(&mut self) {
+        self.signal_ack_due = true;
+    }
     pub(crate) fn retransmission_timeout(&self) -> Duration {
         self.rtt.rto()
     }
@@ -1018,14 +1026,28 @@ impl Tcb {
                 self.ack_due = true;
             }
         }
-        if self.ack_due {
+        if self.ack_due || self.signal_ack_due {
+            let purpose = if self.ack_due {
+                AckPurpose::Ordinary
+            } else {
+                AckPurpose::SignalOnly
+            };
+            self.signal_ack_due = false;
+            // Protocol options, then signals, then SACK blocks in what is left (M3 spec §3.2).
+            let limit = usize::from(self.mss_option()).min(out.options.len());
+            let n = h.options_for(TcpFlags::ACK, &mut out.options);
+            let room = limit.saturating_sub(n);
+            let k = h.ack_signals(purpose, room, &mut out.options[n..limit.max(n)]);
+            if purpose == AckPurpose::SignalOnly && k == 0 {
+                return None;
+            }
+            let n = n + k;
             let wnd = self.wnd_field(h);
             // SND.MAX, not a pulled-back SND.NXT: a SEQ below the peer's RCV.NXT would make
             // the ACK unacceptable to it (RFC 9293 Table 6).
             let meta = out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd);
-            let limit = usize::from(self.mss_option()).min(out.options.len());
-            let n = h.options_for(TcpFlags::ACK, &mut out.options);
             out.options_len = n + self.write_sacks(&mut out.options[n..limit.max(n)]);
+            h.ack_emitted();
             self.ack_sent();
             return Some(meta);
         }

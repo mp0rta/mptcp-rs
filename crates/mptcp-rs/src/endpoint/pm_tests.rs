@@ -910,3 +910,593 @@ fn abort_resets_time_wait_subflows() {
         assert_eq!((rst.ack, rst.options), (SeqNum(5002), &fc[..]));
     }
 }
+
+// M3 Task 7: MP_PRIO, backup scheduling and the signal queue (M3 spec §3.2, §3.3, §4.5).
+
+use crate::mptcp::signal::Echo;
+use crate::tcp::{AckPurpose, SegmentHooks};
+
+fn mptcp_opts(seg: &Segment) -> Vec<MptcpOption> {
+    (mpc(seg.options).iter())
+        .map(|o| mptcp::parse(o).unwrap())
+        .collect()
+}
+fn prios(seg: &Segment) -> Vec<bool> {
+    (mptcp_opts(seg).into_iter())
+        .filter_map(|o| match o {
+            MptcpOption::Prio { backup } => Some(backup),
+            _ => None,
+        })
+        .collect()
+}
+/// The MP_PRIO values sent on `syn`'s subflow among `pkts`, and that none went elsewhere.
+fn prios_on(pkts: &[Vec<u8>], syn: &Segment) -> Vec<bool> {
+    let all: Vec<_> = pkts.iter().map(|p| leak(p.clone())).collect();
+    assert!(
+        (all.iter()).all(|s| s.src == syn.src || prios(s).is_empty()),
+        "MP_PRIO on another subflow"
+    );
+    all.iter()
+        .filter(|s| s.src == syn.src)
+        .flat_map(prios)
+        .collect()
+}
+/// The peer's DSS DATA_ACK plus MP_PRIO (Linux's form, M3 notes: `endpoint change … backup`).
+fn peer_prio(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle, backup: bool) -> Vec<u8> {
+    let mut opts = data_ack(una(ep, h));
+    opts.extend([30, 3, 0x50 | u8::from(backup)]);
+    opts
+}
+fn snapshot_backup(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<bool> {
+    ep.conns[&h].snapshots().iter().map(|s| s.backup).collect()
+}
+fn signals(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+) -> &mut crate::mptcp::signal::Signals {
+    &mut ep.conns.get_mut(&h).unwrap().hooks.signals
+}
+fn v6_echo() -> Echo {
+    Echo {
+        id: 3,
+        addr: "dead:beef::2".parse().unwrap(),
+        port: Some(5201),
+    }
+}
+type Idle = (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    u64,
+    Instant,
+    SeqNum,
+);
+/// A single-path Confirmed connection (Reno) with an RTT sample of 100 ms: also the peer's
+/// first DSN, the time after the sample and SND.UNA.
+fn idle_100ms() -> Idle {
+    let (mut ep, h, syn, dsn) = confirmed_cc(reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId::INITIAL, ms(20), 100);
+    (ep, h, syn, dsn, t, una0)
+}
+fn srtt0(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Duration {
+    let srtt = ep.conns[&h].subflows[0].tcb.srtt().unwrap();
+    assert!(srtt >= Duration::from_millis(10), "{srtt:?}");
+    srtt
+}
+
+#[test]
+fn mp_prio_sent_on_its_subflow_once() {
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    let now = ms(20);
+    assert_eq!(ep.set_backup(now, h, SubflowId(1), true), Ok(()));
+    let out = drain(&mut ep, now);
+    assert_eq!(prios_on(&out, &jsyn), vec![true]);
+    let seg = on(&out, &jsyn).into_iter().find(|s| !prios(s).is_empty());
+    let seg = seg.unwrap();
+    assert_eq!((seg.flags, seg.payload.len()), (TcpFlags::ACK, 0));
+    assert_eq!(seg.seq, jsyn.seq.wrapping_add(1), "at SND.MAX: acceptable");
+    // A signal-only ACK: the DSS DATA_ACK first, then MP_PRIO B=1.
+    let opts = mptcp_opts(&seg);
+    assert!(
+        matches!(opts[..], [MptcpOption::Dss(d), MptcpOption::Prio { backup: true }]
+            if d.data_ack.is_some() && d.mapping.is_none()),
+        "{opts:?}"
+    );
+    // Sent once: no repeat on later polls and timers.
+    let later = drain_until(&mut ep, now, now + Duration::from_secs(10));
+    assert!(prios_on(&later, &jsyn).is_empty());
+}
+
+#[test]
+fn mp_prio_repeat_and_coalesce() {
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    let s = SubflowId(1);
+    // Sent, lost, then repeated with the same value: sent again.
+    let t = ms(20);
+    ep.set_backup(t, h, s, true).unwrap();
+    assert_eq!(prios_on(&drain(&mut ep, t), &jsyn), vec![true]);
+    ep.set_backup(t, h, s, true).unwrap();
+    assert_eq!(prios_on(&drain(&mut ep, t), &jsyn), vec![true]);
+    // Two identical calls before a poll: one option.
+    let t = ms(3000);
+    ep.set_backup(t, h, s, false).unwrap();
+    ep.set_backup(t, h, s, false).unwrap();
+    assert_eq!(prios_on(&drain(&mut ep, t), &jsyn), vec![false]);
+    // A change reverted before transmission: the latest value, once.
+    let t = ms(6000);
+    ep.set_backup(t, h, s, true).unwrap();
+    ep.set_backup(t, h, s, false).unwrap();
+    assert_eq!(prios_on(&drain(&mut ep, t), &jsyn), vec![false]);
+    assert!(prios_on(&drain_until(&mut ep, t, ms(20_000)), &jsyn).is_empty());
+}
+
+#[test]
+fn join_syn_b_bit_advertises_backup() {
+    let (mut ep, h, _, _) = confirmed();
+    let ip: IpAddr = JOIN_IP.parse().unwrap();
+    for backup in [true, false] {
+        ep.add_subflow(ms(10), h, ip, remote(), 1500, backup)
+            .unwrap();
+        let jsyn = from(&drain(&mut ep, ms(10)), JOIN_IP).pop().unwrap();
+        assert!(matches!(mp_join(&jsyn).0, MpJoin::Syn { backup: b, .. } if b == backup));
+    }
+    // Advertised only: our own transmit policy is unchanged.
+    let c = &ep.conns[&h];
+    assert!(c.subflows.iter().all(|sf| !sf.mp.backup()));
+}
+
+#[test]
+fn peer_mp_prio_and_synack_b_bit_set_peer_requested() {
+    let (mut ep, h, syn, _) = confirmed();
+    let now = ms(10);
+    let (id, jsyn) = join_syn(&mut ep, h, now, JOIN_IP, 1500);
+    let mut opts = synack_opts(&ep, h, &jsyn, 7, None);
+    assert_eq!(opts[..3], [30, 16, 0x10]);
+    opts[2] |= 1; // the SYN/ACK's B bit
+    synack(&mut ep, &jsyn, &opts, now);
+    let ack = from(&drain(&mut ep, now), JOIN_IP)
+        .pop()
+        .expect("third ACK");
+    assert_third_ack(&ep, h, &jsyn, &ack);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, now, jsyn.seq.wrapping_add(1), head, 1000);
+    // The B bit is the initial value: no event.
+    assert_eq!(events(&mut ep), vec![Event::SubflowUp { subflow: id }]);
+    drain(&mut ep, now);
+    assert_eq!(snapshot_backup(&ep, h), [false, true]);
+    // MP_PRIO on the subflow it arrived on, each time.
+    let prio = peer_prio(&ep, h, false);
+    signal_ack(&mut ep, &jsyn, jsyn.seq.wrapping_add(1), &prio, now);
+    let prio = peer_prio(&ep, h, true);
+    signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &prio, now);
+    signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &prio, now);
+    let peer = |subflow, backup| Event::PeerPriority { subflow, backup };
+    let s0 = SubflowId::INITIAL;
+    assert_eq!(
+        events(&mut ep),
+        vec![peer(id, false), peer(s0, true), peer(s0, true)]
+    );
+    drain(&mut ep, now);
+    assert_eq!(snapshot_backup(&ep, h), [true, false]);
+    // A TCP-unacceptable segment carries no signal.
+    let late = Segment {
+        seq: SeqNum(4000),
+        ..peer_data(&jsyn, 5001, &prio, &[])
+    };
+    input_at(&mut ep, &late, now);
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+#[test]
+fn effective_backup_is_local_or_peer() {
+    for (local, peer) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+        let now = ms(20);
+        ep.set_local_backup(h, SubflowId(1), local).unwrap();
+        let prio = peer_prio(&ep, h, peer);
+        signal_ack(&mut ep, &jsyn, jsyn.seq.wrapping_add(1), &prio, now);
+        drain(&mut ep, now);
+        assert_eq!(
+            snapshot_backup(&ep, h),
+            [false, local || peer],
+            "{local} {peer}"
+        );
+        // Our advertised preference (MP_PRIO we send) is a third, independent notion.
+        ep.set_backup(now, h, SubflowId(1), !(local || peer))
+            .unwrap();
+        drain(&mut ep, now);
+        assert_eq!(snapshot_backup(&ep, h), [false, local || peer]);
+    }
+    // `set_local_backup` right after `add_subflow`, while the join is queued.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(40));
+    let h = open(&mut ep);
+    let ip: IpAddr = JOIN_IP.parse().unwrap();
+    let id = ep.add_subflow(ms(0), h, ip, remote(), 1500, false).unwrap();
+    assert_eq!(ep.set_local_backup(h, id, true), Ok(()));
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    drain(&mut ep, ms(1));
+    let dss = data_ack(una(&ep, h));
+    input_at(&mut ep, &peer_data(&syn, 5001, &dss, &[]), ms(2));
+    let jsyn = from(&drain(&mut ep, ms(2)), JOIN_IP)
+        .pop()
+        .expect("join SYN");
+    assert!(matches!(
+        mp_join(&jsyn).0,
+        MpJoin::Syn { backup: false, .. }
+    ));
+    assert!(ep.conns[&h].subflows[1].mp.backup(), "local backup kept");
+}
+
+/// Two Reno paths, subflow 1 (10 ms) faster than subflow 0 (30 ms) and locally backup.
+fn primary_and_backup() -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    Segment<'static>,
+    Instant,
+    SeqNum,
+) {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    ep.set_local_backup(h, SubflowId(1), true).unwrap();
+    (ep, h, syn, jsyn, t, una0)
+}
+
+#[test]
+fn zero_window_primary_activates_backup_and_back() {
+    let (mut ep, h, syn, jsyn, t, una0) = primary_and_backup();
+    // The primary's own window closes while data waits.
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &syn, t, una0, head, 0);
+    ep.connection(h).unwrap().write(&[1; 200_000]).unwrap();
+    // Drives `ep` for `secs` with data always waiting, answering the primary's probes with
+    // window `wnd0` and ACKing the backup's data at once; returns (probes on 0, data octets on
+    // 0, data octets on 1, the time reached).
+    let run = |ep: &mut Endpoint<ChaCha20Rng>, mut now: Instant, secs: u64, wnd0: u16| {
+        let (mut probes, mut on0, mut on1) = (0, 0, 0);
+        let until = now + Duration::from_secs(secs);
+        while now < until {
+            if ep.poll_timeout().is_some_and(|d| d <= now) {
+                ep.handle_timeout(now);
+            }
+            // The application always has more: data waits throughout.
+            ep.connection(h).unwrap().write(&[1; 65536]).unwrap();
+            for s in drain(ep, now).into_iter().map(leak) {
+                let len = s.payload.len();
+                if s.src == syn.src {
+                    if len == 0 && s.seq == una0.wrapping_add(u32::MAX) {
+                        probes += 1;
+                        let head = una(ep, h);
+                        peer_ack(ep, &syn, now, una0, head, wnd0);
+                    }
+                    on0 += len;
+                } else if len > 0 {
+                    on1 += len;
+                    let (dsn, _) = dsn_of(&s, jsyn.seq).unwrap();
+                    peer_ack(ep, &jsyn, now, end(&s), dsn + len as u64, 65535);
+                }
+            }
+            now = now + ms_d(10);
+        }
+        (probes, on0, on1, now)
+    };
+    let (probes, on0, on1, now) = run(&mut ep, t, 5, 0);
+    assert!(probes >= 2, "the primary is probed: {probes}");
+    assert_eq!(on0, 0, "no data on the zero-window primary");
+    assert!(on1 > 0, "the backup carries the data");
+    // The window reopens: new data returns to the primary, none goes to the backup.
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &syn, now, una0, head, 1000);
+    let (_, on0, on1, _) = run(&mut ep, now, 2, 1000);
+    assert!(on0 > 0);
+    assert_eq!(on1, 0);
+}
+
+#[test]
+fn cwnd_exhausted_primary_never_spills_to_backup() {
+    let (mut ep, h, syn, jsyn, t, _) = primary_and_backup();
+    ep.connection(h).unwrap().write(&[1; 200_000]).unwrap();
+    // No ACKs: the primary's cwnd fills and its RTO fires (not yet Stale).
+    let out = drain_until(&mut ep, t, t + Duration::from_secs(3));
+    assert!(!data_on(&out, &syn).is_empty());
+    assert!(
+        data_on(&out, &jsyn).is_empty(),
+        "nothing spills onto the backup"
+    );
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert_ne!(d.send.next, d.send.end, "data still waits");
+}
+
+#[test]
+fn all_backup_still_sends() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, una1) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    // One subflow backup locally, the other by the peer's request.
+    ep.set_local_backup(h, SubflowId::INITIAL, true).unwrap();
+    let prio = peer_prio(&ep, h, true);
+    signal_ack(&mut ep, &jsyn, una1, &prio, t);
+    let n = 300_000;
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(peer.received(), data);
+    assert_eq!(snapshot_backup(&ep, h), [true, true]);
+    assert!(peer.log.iter().any(|l| l.1 == 0) && peer.log.iter().any(|l| l.1 == 1));
+}
+
+#[test]
+fn signal_rate_limit_three_on_idle() {
+    let (mut ep, h, syn, _, t, _) = idle_100ms();
+    let srtt = srtt0(&ep, h);
+    let s = SubflowId::INITIAL;
+    for backup in [true, false] {
+        ep.set_backup(t, h, s, backup).unwrap();
+        assert_eq!(prios_on(&drain(&mut ep, t), &syn), vec![backup]);
+    }
+    ep.set_backup(t, h, s, true).unwrap();
+    assert!(
+        prios_on(&drain(&mut ep, t), &syn).is_empty(),
+        "the third waits"
+    );
+    assert_eq!(ep.poll_timeout(), Some(t + srtt));
+    let early = t + (srtt - Duration::from_nanos(1));
+    ep.handle_timeout(early);
+    assert!(drain(&mut ep, early).is_empty());
+    ep.handle_timeout(t + srtt);
+    assert_eq!(prios_on(&drain(&mut ep, t + srtt), &syn), vec![true]);
+    assert_eq!(ep.poll_timeout(), None);
+}
+
+#[test]
+fn signal_never_displaces_join_or_capable_or_datafin() {
+    // PreConfirmed: every ACK carries the MP_CAPABLE keys; MP_PRIO waits for Confirmed.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(41));
+    let h = open(&mut ep);
+    let syn = leak(transmit(&mut ep, ms(0)));
+    ep.set_backup(ms(0), h, SubflowId::INITIAL, true).unwrap();
+    reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+    let out: Vec<_> = drain(&mut ep, ms(1)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1, "the third ACK");
+    assert!(
+        matches!(mptcp_opts(&out[0])[..], [MptcpOption::Capable(c)] if c.receiver_key.is_some())
+    );
+    let dss = data_ack(una(&ep, h));
+    input_at(&mut ep, &peer_data(&syn, 5001, &dss, &[]), ms(2));
+    assert_eq!(prios_on(&drain(&mut ep, ms(2)), &syn), vec![true]);
+
+    // Joining: every ACK carries only the MP_JOIN third-ACK form; MP_PRIO follows the join.
+    let (mut ep, h, _, _) = confirmed();
+    let (id, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    ep.set_backup(ms(10), h, id, true).unwrap();
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    let acks = from(&drain(&mut ep, ms(20)), JOIN_IP);
+    assert_eq!(acks.len(), 1);
+    assert_third_ack(&ep, h, &jsyn, &acks[0]);
+    let at = ep.poll_timeout().unwrap();
+    ep.handle_timeout(at);
+    let again = from(&drain(&mut ep, at), JOIN_IP);
+    assert_eq!(again.len(), 1);
+    assert_third_ack(&ep, h, &jsyn, &again[0]);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, at, jsyn.seq.wrapping_add(1), head, 1000);
+    assert_eq!(prios_on(&drain(&mut ep, at), &jsyn), vec![true]);
+
+    // A standalone DATA_FIN (DSS 28) stays first and intact; signals take what is left.
+    let (mut ep, h, syn, _) = confirmed();
+    ep.set_backup(ms(10), h, SubflowId::INITIAL, true).unwrap();
+    for id in 10..35 {
+        signals(&mut ep, h).remove(id);
+    }
+    ep.connection(h).unwrap().close();
+    let out = on(&drain(&mut ep, ms(10)), &syn);
+    let fin = (out.iter()).find(|s| data_fin(s)).expect("DATA_FIN");
+    let opts = mptcp_opts(fin);
+    let [
+        MptcpOption::Dss(d),
+        MptcpOption::Prio { backup: true },
+        MptcpOption::RemoveAddr { ids },
+    ] = opts[..]
+    else {
+        panic!("{opts:?}")
+    };
+    assert!(d.data_fin && d.data_ack.is_some());
+    assert_eq!(d.mapping.map(|m| m.data_len), Some(1));
+    assert_eq!(ids.iter().collect::<Vec<_>>(), (10..16).collect::<Vec<_>>());
+    assert!(fin.options.len() <= 40);
+}
+
+#[test]
+fn signals_combine_after_dss() {
+    let (mut ep, h, syn, dsn) = connected_with(1 << 20, Some(reno), true);
+    open_window(&mut ep, &syn, h);
+    // Three holes' worth of out-of-order data: three SACK blocks are pending.
+    let data = |ep: &mut Endpoint<ChaCha20Rng>, off: u32| {
+        let opts = mapping(1 + off, dsn + u64::from(off), 50);
+        input_at(ep, &peer_data(&syn, 5001 + off, &opts, &[9; 50]), ms(10));
+    };
+    data(&mut ep, 100);
+    data(&mut ep, 300);
+    drain(&mut ep, ms(10));
+    ep.set_backup(ms(10), h, SubflowId::INITIAL, true).unwrap();
+    signals(&mut ep, h).remove(7);
+    data(&mut ep, 500);
+    let out = on(&drain(&mut ep, ms(10)), &syn);
+    assert_eq!(out.len(), 1, "one ACK carries both signals");
+    let opts: Vec<_> = walk(out[0].options).map(Result::unwrap).collect();
+    // DSS12, MP_PRIO 3, REMOVE_ADDR 4, one NOP: 20 octets; two SACK blocks in the 20 left.
+    let parsed = mptcp_opts(&out[0]);
+    let [
+        MptcpOption::Dss(d),
+        MptcpOption::Prio { backup: true },
+        MptcpOption::RemoveAddr { ids },
+    ] = parsed[..]
+    else {
+        panic!("{parsed:?}")
+    };
+    assert!(d.data_ack.is_some() && ids.iter().eq([7]));
+    let sack: Vec<_> = (opts.iter())
+        .filter_map(|o| match o {
+            TcpOpt::Sack(b) => Some(b.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sack, vec![16], "two blocks fit");
+    assert!(matches!(opts.last(), Some(TcpOpt::Sack(_))), "SACK last");
+    // Without signals the next ACK carries three.
+    data(&mut ep, 700);
+    let out = on(&drain(&mut ep, ms(10)), &syn);
+    let sack = walk(out[0].options).find_map(|o| match o {
+        Ok(TcpOpt::Sack(b)) => Some(b.len()),
+        _ => None,
+    });
+    assert_eq!(sack, Some(24));
+}
+
+#[test]
+fn signal_not_fitting_is_deferred() {
+    let (mut ep, h, syn, _) = confirmed();
+    assert!(signals(&mut ep, h).echo(v6_echo()));
+    ep.connection(h).unwrap().close();
+    let out = on(&drain(&mut ep, ms(10)), &syn);
+    assert_eq!(out.len(), 2, "{out:?}");
+    // The DATA_FIN ACK (DSS 28) has no room for the 22-octet echo, which waits ...
+    assert!(data_fin(&out[0]));
+    assert_eq!(mptcp_opts(&out[0]).len(), 1);
+    // ... and leaves intact, next to DSS12, on the next ACK.
+    let e = v6_echo();
+    let want = MptcpOption::AddAddr {
+        echo: true,
+        id: e.id,
+        addr: e.addr,
+        port: e.port,
+        hmac: None,
+    };
+    let opts = mptcp_opts(&out[1]);
+    assert!(
+        matches!(opts[..], [MptcpOption::Dss(d), o] if !d.data_fin && o == want),
+        "{opts:?}"
+    );
+    assert_eq!(out[1].options.len(), 36);
+}
+
+#[test]
+fn signal_survives_unsent_option_build() {
+    let (mut ep, h, syn, _, t, _) = idle_100ms();
+    let s = SubflowId::INITIAL;
+    ep.set_backup(t, h, s, true).unwrap();
+    // Option builds whose segment never goes out: signal peeks of both purposes and the
+    // speculative sizing call.
+    {
+        let c = ep.conns.get_mut(&h).unwrap();
+        let sf = &mut c.subflows[0];
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
+        hk.prepare_send(&mut sf.tcb, t, s);
+        let mut o = [0; 40];
+        for purpose in [
+            AckPurpose::Ordinary,
+            AckPurpose::SignalOnly,
+            AckPurpose::SignalOnly,
+        ] {
+            assert_eq!(hk.ack_signals(purpose, 28, &mut o), 4);
+        }
+        assert_eq!(hk.options_for(TcpFlags::ACK, &mut o), 12);
+    }
+    // The first emitted ACK carries it, once; nothing was charged, so a second signal-only ACK
+    // still goes out at once.
+    assert_eq!(prios_on(&drain(&mut ep, t), &syn), vec![true]);
+    ep.set_backup(t, h, s, false).unwrap();
+    assert_eq!(prios_on(&drain(&mut ep, t), &syn), vec![false]);
+}
+
+#[test]
+fn signal_not_on_persist_probe() {
+    let (mut ep, h, syn, _, t, una0) = idle_100ms();
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &syn, t, una0, head, 0);
+    ep.connection(h).unwrap().write(&[1; 5000]).unwrap();
+    assert!(drain(&mut ep, t).is_empty());
+    let p = ep.poll_timeout().expect("persist timer");
+    ep.set_backup(p, h, SubflowId::INITIAL, true).unwrap();
+    ep.handle_timeout(p);
+    let out = on(&drain(&mut ep, p), &syn);
+    assert_eq!(out.len(), 2, "{out:?}");
+    // The probe, at SND.UNA − 1, carries no signal; the next ACK, at SND.MAX, carries it once.
+    assert_eq!(
+        (out[0].seq, out[0].payload.len()),
+        (una0.wrapping_add(u32::MAX), 0)
+    );
+    assert!(prios(&out[0]).is_empty());
+    assert_eq!((out[1].seq, prios(&out[1])), (una0, vec![true]));
+    assert!(prios_on(&drain_until(&mut ep, p, p + Duration::from_secs(5)), &syn).is_empty());
+}
+
+#[test]
+fn ordinary_ack_bypasses_signal_limit() {
+    let (mut ep, h, syn, dsn, t, _) = idle_100ms();
+    let s = SubflowId::INITIAL;
+    for backup in [true, false] {
+        ep.set_backup(t, h, s, backup).unwrap();
+        assert_eq!(prios_on(&drain(&mut ep, t), &syn), vec![backup]);
+    }
+    ep.set_backup(t, h, s, true).unwrap();
+    assert!(drain(&mut ep, t).is_empty(), "both signal-only slots used");
+    // Two data segments before the srtt window ends: TCP ACKs them at once.
+    let now = t + ms_d(10);
+    for off in [0u32, 100] {
+        let opts = mapping(1 + off, dsn + u64::from(off), 100);
+        input_at(&mut ep, &peer_data(&syn, 5001 + off, &opts, &[9; 100]), now);
+    }
+    let out = on(&drain(&mut ep, now), &syn);
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].ack, prios(&out[0])), (SeqNum(5201), vec![true]));
+    // Uncharged: no wake for a signal, nothing more to send.
+    assert!(
+        prios_on(
+            &drain_until(&mut ep, now, now + Duration::from_secs(1)),
+            &syn
+        )
+        .is_empty()
+    );
+}
+
+/// B with room for the whole 32-segment store.
+fn cc_b_wide() -> Box<dyn CongestionControl> {
+    Box::new(Counting {
+        path: 0,
+        cwnd: 64 << 10,
+        rate: None,
+    })
+}
+
+#[test]
+fn opp_and_repair_skip_backup_while_primary_usable() {
+    let cap = 32 * SEG;
+    // B takes the whole store, so the connection is blocked with nothing left to assign.
+    let (mut ep, h, mut peer, t, head, una_b) = hol(cc_b_wide, cc_a, cap, cap);
+    ep.set_local_backup(h, SubflowId(1), true).unwrap();
+    let data = pattern(cap);
+    peer.drop[0] = true;
+    b_holds_head(&mut ep, h, &mut peer, t, &data);
+    // B is blackholed but Active with an open window: usable, so the backup A is no eligible
+    // target. No candidate exists (no trigger), and A gets no copy and no head repair.
+    let t2 = peer.run(&mut ep, h, t, t + Duration::from_millis(500));
+    assert!(peer.log.iter().all(|l| l.1 == 0), "nothing on the backup");
+    let s = stats(&mut ep, h);
+    let s = (s.opp_triggers, s.opp_episodes, s.opp_repairs, s.opp_bytes);
+    assert_eq!(s, (0, 0, 0, 0));
+    // B's window closes: B is unusable and the backup is eligible.
+    let syn = peer.syns[0].clone();
+    peer_ack(&mut ep, &syn, t2, una_b, head, 0);
+    peer.run(&mut ep, h, t2, t2 + Duration::from_secs(2));
+    assert_eq!(peer.received(), data);
+    assert!(moved_at(&peer, 0, 1).is_some(), "copied on the backup");
+}

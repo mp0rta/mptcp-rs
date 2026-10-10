@@ -99,6 +99,8 @@ def barrier_time(log, barrier, until):
 def run_case(case, out):
     """Run one case into out/; return what judgement needs."""
     out.mkdir(parents=True)
+    # iptables accepts any interface name, so a window on a missing link would drop nothing.
+    assert all(f[0] in LINKS for f in case["fail"]), f"fail links {case['fail']} outside {LINKS}"
     r = SimpleNamespace(case=case, out=out, errors=[], marks=[])
     topology(case)
     for kv in case["server"].get("sysctl", []):
@@ -130,6 +132,7 @@ def run_case(case, out):
         (out / "script.txt").write_text(c["script"])
         cargs += ["--script", out / "script.txt"]
     cargs += ["--send-rate", c["send_rate"]] if c["send_rate"] else []
+    cargs += ["--event-log", out / "events.jsonl"]
     until = time.time() + case["watchdog_s"]
     srv = subprocess.Popen(["ip", "netns", "exec", "srv", "python3", "tests/interop/server.py", "--mode", "mptcp",
                             "--port", "5201", *sargs], stdout=open(out / "server.log", "w"), stderr=subprocess.STDOUT)
@@ -140,13 +143,13 @@ def run_case(case, out):
                            stdout=open(out / "client.log", "w"), stderr=subprocess.STDOUT)
 
     def at(barrier, ms, label, act):
-        t = barrier_time(out / "client.log", barrier, until)
-        if t is None:
-            r.errors.append(f"barrier {barrier} never reached for {label}")
-            return
-        time.sleep(max(0, t + ms / 1000 - time.time()))
-        t = time.time()
         try:
+            t = barrier_time(out / "client.log", barrier, until)
+            if t is None:
+                r.errors.append(f"barrier {barrier} never reached for {label}")
+                return
+            time.sleep(max(0, t + ms / 1000 - time.time()))
+            t = time.time()
             act()
         except Exception as err:  # a stimulus that did not happen fails the case
             r.errors.append(f"{label} failed: {err}")
@@ -155,9 +158,11 @@ def run_case(case, out):
 
     def window(i, secs):
         drop(i, "-I")
-        time.sleep(secs)
-        r.marks.append((f"link {i} up", time.time()))
-        drop(i, "-D")
+        try:
+            time.sleep(secs)
+        finally:
+            r.marks.append((f"link {i} up", time.time()))
+            drop(i, "-D")
 
     acts = [threading.Thread(target=at, args=(b, ms, f"srv: {cmd}", lambda cmd=cmd: ns("srv", "sh", "-c", cmd)))
             for b, ms, cmd in s["timed"]]

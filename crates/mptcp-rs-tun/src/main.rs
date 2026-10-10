@@ -6,18 +6,23 @@ mod tun;
 
 #[cfg(test)]
 mod ack_tests;
+mod script;
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use mptcp_rs::{CloseReason, ConnectConfig, DebugStats, Endpoint, Event, Instant, ReadError};
+use mptcp_rs::{
+    CloseReason, ConnectConfig, ConnectionHandle, DebugStats, Endpoint, Event, Instant, ReadError,
+    SubflowId,
+};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use script::{Action, Ev, Script};
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--join IP [--join-mtu N]]... [--abort-after-ms MS]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -46,6 +51,29 @@ struct Args {
     joins: Vec<(IpAddr, u16)>,
     /// `--abort-after-ms`: `Connection::abort` this long after `Connected`, instead of a close.
     abort_after: Option<Duration>,
+    /// `--script`: the scenario file (`script.rs`); `--join` and `--abort-after-ms` add to it.
+    script: Option<String>,
+    /// `--send-rate`: the writer's rate in Mbit/s from `Connected`; unlimited without it.
+    send_rate: Option<f64>,
+    /// `--event-log`: a JSON line per event and action, with a clock pair at start and end.
+    event_log: Option<String>,
+}
+
+impl Args {
+    /// The scenario: the script file, then the `--join` and `--abort-after-ms` shorthands.
+    fn scenario(&self) -> Result<String, String> {
+        let mut text = match &self.script {
+            Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+            None => String::new(),
+        };
+        for (ip, mtu) in &self.joins {
+            text += &format!("\nat Connected +0 join {ip} {} mtu {mtu}", self.remote);
+        }
+        if let Some(d) = self.abort_after {
+            text += &format!("\nat Connected +{} abort", d.as_millis());
+        }
+        Ok(text)
+    }
 }
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
@@ -55,6 +83,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let mut pause_read = Duration::ZERO;
     let mut joins = Vec::new();
     let mut abort_after = None;
+    let (mut script, mut send_rate, mut event_log) = (None, None, None);
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -74,6 +103,9 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             "--join" => joins.push((v.parse().ok()?, ConnectConfig::default().mtu)),
             "--join-mtu" => joins.last_mut()?.1 = v.parse().ok()?,
             "--abort-after-ms" => abort_after = Some(Duration::from_millis(v.parse().ok()?)),
+            "--script" => script = Some(v),
+            "--send-rate" => send_rate = Some(v.parse().ok().filter(|r: &f64| *r > 0.0)?),
+            "--event-log" => event_log = Some(v),
             "--send-secs" => {
                 send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
             }
@@ -102,6 +134,9 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         expect: expect?,
         joins,
         abort_after,
+        script,
+        send_rate,
+        event_log,
     })
 }
 
@@ -127,14 +162,18 @@ fn run(a: Args) -> Result<String, String> {
     if !a.pause_read.is_zero() {
         cfg.recv_buffer = 16384;
     }
+    let mtu = cfg.mtu;
     let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
         .map_err(|e| format!("connect: {e:?}"))?;
-    // Queued until the connection is Confirmed, then started at the next poll.
-    for &(ip, mtu) in &a.joins {
-        let id = (ep.add_subflow(now(start), h, ip, a.remote, mtu, false))
-            .map_err(|e| format!("add_subflow {ip}: {e:?}"))?;
-        eprintln!("join: {id:?} local {ip} mtu {mtu}");
-    }
+    let mut drv = Driver {
+        script: Script::parse(&a.scenario()?)?,
+        subs: vec![(SubflowId::INITIAL, a.local, a.remote, mtu, false)],
+        log: match &a.event_log {
+            Some(path) => Some(EventLog::create(path, start).map_err(io_err("event log"))?),
+            None => None,
+        },
+    };
+    drv.clock("start");
 
     let mut pkt = vec![0u8; 65535];
     let mut rbuf = vec![0u8; 65536];
@@ -150,6 +189,9 @@ fn run(a: Args) -> Result<String, String> {
         let wait = ep.poll_timeout().map_or(CAP, |d| {
             Duration::from_nanos(d.as_nanos().saturating_sub(t.as_nanos())).min(CAP)
         });
+        // Scenario deadlines wake the loop too.
+        let wait = (drv.script.next_deadline())
+            .map_or(wait, |d| wait.min(d.saturating_sub(start.elapsed())));
         tun.wait_readable(Some(wait)).map_err(io_err("poll"))?;
         loop {
             match tun.read(&mut pkt) {
@@ -171,14 +213,11 @@ fn run(a: Args) -> Result<String, String> {
             ep.handle_timeout(t);
         }
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
-        st.events(&mut ep, &a, start.elapsed())?;
-
-        // An abort replaces the close; a close already begun wins.
+        st.events(&mut ep, &a, start.elapsed(), &mut drv)?;
+        // Then the scenario's due actions.
         let elapsed = start.elapsed();
-        let due = (a.abort_after.zip(st.connected_at)).is_some_and(|(d, c)| elapsed >= c + d);
-        if due && !st.aborted && !st.closing {
-            ep.connection(h).ok_or("connection gone")?.abort();
-            st.aborted = true;
+        for action in drv.script.due(elapsed) {
+            drv.act(&mut ep, h, now(start), &action, &mut st)?;
         }
         // After a normal close the connection is gone unless data is still unread.
         if st.drives(ep.connection(h).is_some()) {
@@ -190,6 +229,24 @@ fn run(a: Args) -> Result<String, String> {
                 } else {
                     (a.send - st.sent).min(65536) as usize
                 };
+                // `--send-rate`: what the rate allows since `Connected`, in pieces of 16 KiB or
+                // more (or the rest): writing every octet as it accrues would keep this loop
+                // spinning, with nothing sent or received, until the store is full.
+                let n = match (a.send_rate, st.connected_at) {
+                    (Some(r), Some(c)) => {
+                        let due = (start.elapsed() - c).as_secs_f64() * r * 1e6 / 8.0;
+                        let allowed = (due as u64).saturating_sub(st.sent) as usize;
+                        if allowed < n.min(16384) {
+                            0
+                        } else {
+                            n.min(allowed)
+                        }
+                    }
+                    _ => n,
+                };
+                if n == 0 {
+                    break;
+                }
                 match conn.write(&pat[(st.sent % 251) as usize..][..n]) {
                     Ok(0) => {
                         st.blocked_since.get_or_insert(start.elapsed());
@@ -242,13 +299,20 @@ fn run(a: Args) -> Result<String, String> {
                 );
                 conn.close();
                 st.closing = true;
+                drv.script.on_event(Ev::Stop, start.elapsed());
             }
         }
-        st.events(&mut ep, &a, start.elapsed())?;
+        st.events(&mut ep, &a, start.elapsed(), &mut drv)?;
 
         // Drain before returning: the final ACK of the active close must go out.
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
             write_packet(&tun, &pkt[..n])?;
+        }
+        if st.done {
+            drv.clock("end");
+            if let Some(d) = drv.script.unmet() {
+                return Err(format!("script: unmet {d}"));
+            }
         }
         if st.done && st.aborted {
             return Ok(format!(
@@ -370,14 +434,15 @@ impl State {
         ep: &mut Endpoint<ChaCha20Rng>,
         a: &Args,
         now: Duration,
+        drv: &mut Driver,
     ) -> Result<(), String> {
         // Subflow events carry the time since `Connected` (the harness's blackhole clock).
         let at = |c: Option<Duration>| c.map_or(0.0, |c| (now - c).as_secs_f64());
         while let Some((_, ev)) = ep.poll_event() {
             let t = at(self.connected_at);
-            match ev {
-                Event::FellBack => eprintln!("event: FellBack"),
-                Event::SubflowUp { subflow } => eprintln!("event: SubflowUp {subflow:?} +{t:.3}s"),
+            let text = match ev {
+                Event::FellBack => "FellBack".into(),
+                Event::SubflowUp { subflow } => format!("SubflowUp {subflow:?} +{t:.3}s"),
                 Event::SubflowDown {
                     subflow,
                     reason,
@@ -387,45 +452,173 @@ impl State {
                     let rst = rst.map_or("none".into(), |r| {
                         format!("0x{:02x}/T{}", r.reason, u8::from(r.transient))
                     });
-                    eprintln!("event: SubflowDown {subflow:?} {reason:?} rst={rst} +{t:.3}s")
+                    format!("SubflowDown {subflow:?} {reason:?} rst={rst} +{t:.3}s")
                 }
-                Event::SubflowStale { subflow } => {
-                    eprintln!("event: SubflowStale {subflow:?} +{t:.3}s")
-                }
+                Event::SubflowStale { subflow } => format!("SubflowStale {subflow:?} +{t:.3}s"),
                 Event::SubflowRecovered { subflow } => {
-                    eprintln!("event: SubflowRecovered {subflow:?} +{t:.3}s")
+                    format!("SubflowRecovered {subflow:?} +{t:.3}s")
                 }
                 Event::Connected { mptcp } => {
-                    eprintln!("event: Connected mptcp={mptcp}");
                     self.connected = true;
                     self.connected_at = Some(now);
+                    format!("Connected mptcp={mptcp}")
                 }
+                Event::Closed { reason } => format!("Closed {reason:?}"),
+                other => format!("{other:?}"),
+            };
+            eprintln!("event: {text}");
+            drv.log("event", &text);
+            drv.on_event(&ev, now);
+            match ev {
                 Event::Closed {
                     reason: CloseReason::Normal,
                 } if self.closing
                     && self.recv_done(a)
                     && (a.send_secs.is_some() || self.sent == a.send) =>
                 {
-                    eprintln!("event: Closed Normal");
-                    self.done = true;
+                    self.done = true
                 }
                 Event::Closed {
                     reason: CloseReason::Aborted,
-                } if self.aborted => {
-                    eprintln!("event: Closed Aborted");
-                    self.done = true;
-                }
+                } if self.aborted => self.done = true,
                 Event::Closed { reason } => {
-                    eprintln!("event: Closed {reason:?}");
                     return Err(format!(
                         "connection closed: {reason:?} (sent {}, verified {})",
                         self.sent, self.verified
                     ));
                 }
-                other => eprintln!("event: {other:?}"),
+                _ => {}
             }
         }
         Ok(())
+    }
+}
+
+/// The scenario driver's side effects: the subflows it knows by number (`SubflowId(n)`: the
+/// initial one, then each join in order), with how each was opened (local IP, remote, MTU,
+/// B bit), and the event log.
+struct Driver {
+    script: Script,
+    subs: Vec<(SubflowId, IpAddr, SocketAddr, u16, bool)>,
+    log: Option<EventLog>,
+}
+
+impl Driver {
+    fn sub(&self, n: usize) -> Result<SubflowId, String> {
+        Ok(self.subs.get(n).ok_or(format!("script: no subflow {n}"))?.0)
+    }
+
+    fn on_event(&mut self, ev: &Event, now: Duration) {
+        let n = |id: &SubflowId| self.subs.iter().position(|s| s.0 == *id);
+        let ev = match ev {
+            Event::Connected { .. } => Some(Ev::Connected),
+            Event::SubflowUp { subflow } => n(subflow).map(Ev::Up),
+            Event::SubflowDown { subflow, rst, .. } => n(subflow).map(|sub| Ev::Down {
+                sub,
+                transient: rst.is_some_and(|r| r.transient),
+            }),
+            &Event::AddressAnnounced { id, addr } => Some(Ev::Announced { id, addr }),
+            Event::FellBack | Event::Closed { .. } => Some(Ev::Stop),
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            self.script.on_event(ev, now);
+        }
+    }
+
+    /// Runs one scenario action; a failed call fails the run.
+    fn act(
+        &mut self,
+        ep: &mut Endpoint<ChaCha20Rng>,
+        h: ConnectionHandle,
+        now: Instant,
+        action: &Action,
+        st: &mut State,
+    ) -> Result<(), String> {
+        self.log("action", &format!("{action:?}"));
+        let fail = |e: &dyn std::fmt::Debug| format!("script: {action:?}: {e:?}");
+        let (local, remote, mtu, backup) = match *action {
+            Action::Join {
+                local,
+                remote,
+                backup,
+                mtu,
+            } => (
+                local,
+                remote,
+                mtu.unwrap_or(ConnectConfig::default().mtu),
+                backup,
+            ),
+            Action::Rejoin(n) => {
+                self.sub(n)?;
+                let (_, local, remote, mtu, backup) = self.subs[n];
+                (local, remote, mtu, backup)
+            }
+            Action::SetBackup(n, on) => {
+                return (ep.set_backup(now, h, self.sub(n)?, on)).map_err(|e| fail(&e));
+            }
+            Action::SetLocalBackup(n, on) => {
+                return (ep.set_local_backup(h, self.sub(n)?, on)).map_err(|e| fail(&e));
+            }
+            Action::CloseSubflow(n) => {
+                return (ep.close_subflow(now, h, self.sub(n)?)).map_err(|e| fail(&e));
+            }
+            Action::RemoveAddress(ip) => {
+                return (ep.remove_address(now, h, ip)).map_err(|e| fail(&e));
+            }
+            Action::Abort => {
+                // A close already begun wins.
+                if !st.aborted && !st.closing {
+                    ep.connection(h).ok_or("connection gone")?.abort();
+                    st.aborted = true;
+                    self.script.on_event(Ev::Stop, Duration::ZERO);
+                }
+                return Ok(());
+            }
+        };
+        let id = (ep.add_subflow(now, h, local, remote, mtu, backup))
+            .map_err(|e| format!("add_subflow {local}: {e:?}"))?;
+        eprintln!("join: {id:?} local {local} mtu {mtu}");
+        self.subs.push((id, local, remote, mtu, backup));
+        Ok(())
+    }
+
+    fn log(&mut self, kind: &str, text: &str) {
+        if let Some(l) = &mut self.log {
+            l.line(&format!("\"{kind}\": {text:?}"));
+        }
+    }
+
+    fn clock(&mut self, which: &str) {
+        if let Some(l) = &mut self.log {
+            l.line(&format!("\"clock\": {which:?}"));
+        }
+    }
+}
+
+/// `--event-log`: JSON lines, each with CLOCK_REALTIME epoch time (`realtime`) and the
+/// monotonic time since the client started (`rel`); the start and end lines pair the two
+/// clocks, so a drift between them shows (M3 spec §5.3).
+struct EventLog {
+    file: std::fs::File,
+    start: std::time::Instant,
+}
+
+impl EventLog {
+    fn create(path: &str, start: std::time::Instant) -> io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        Ok(Self { file, start })
+    }
+
+    fn line(&mut self, fields: &str) {
+        let realtime = (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH))
+            .map_or(0.0, |d| d.as_secs_f64());
+        let rel = self.start.elapsed().as_secs_f64();
+        // A full disk only loses log lines; the run goes on.
+        let _ = writeln!(
+            self.file,
+            "{{\"realtime\": {realtime:.6}, \"rel\": {rel:.6}, {fields}}}"
+        );
     }
 }
 
@@ -496,6 +689,29 @@ mod tests {
         assert!(parse_args(v(&format!("{timed} --send 5 --join x"))).is_none());
         let a = parse_args(v(&format!("{timed} --send 5 --abort-after-ms 2000"))).unwrap();
         assert_eq!(a.abort_after, Some(Duration::from_millis(2000)));
+        // The shorthands become scenario directives.
+        let a = parse_args(v(&format!(
+            "{timed} --send 5 --join 10.0.8.2 --join-mtu 1280 --abort-after-ms 2000 --send-rate 8.5 --event-log e.jsonl"
+        )))
+        .unwrap();
+        assert_eq!(
+            (a.send_rate, a.event_log.as_deref()),
+            (Some(8.5), Some("e.jsonl"))
+        );
+        let text = a.scenario().unwrap();
+        assert_eq!(
+            text,
+            "\nat Connected +0 join 10.0.8.2 10.0.1.1:80 mtu 1280\nat Connected +2000 abort"
+        );
+        assert!(Script::parse(&text).is_ok());
+        for bad in ["--send-rate 0", "--send-rate x", "--script"] {
+            assert!(
+                parse_args(v(&format!("{timed} --send 5 {bad}"))).is_none(),
+                "{bad}"
+            );
+        }
+        let a = parse_args(v(&format!("{timed} --send 5 --script /nonexistent"))).unwrap();
+        assert!(a.scenario().is_err());
         assert!(parse_args(v(&format!("{timed} --send 5 --abort-after-ms x"))).is_none());
         assert!(
             parse_args(v(

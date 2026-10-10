@@ -62,6 +62,10 @@ pub(crate) struct QueuedJoin {
     pub mtu: u16,
     /// `local`'s address ID, bound by `add_subflow`.
     pub addr_id: u8,
+    /// The join SYN's B bit (`add_subflow`).
+    pub backup: bool,
+    /// `set_local_backup` before the join started.
+    pub local_backup: bool,
 }
 
 impl Connection {
