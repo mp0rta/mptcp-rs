@@ -38,13 +38,12 @@ targets for 10 minutes:
   client-to-server (gate 338.5) and 350.4 server-to-client (gate 340.1); all four
   1 GiB blackhole cases, with the failed subflow reported stale client-to-server.
 
-- M3, tree `m3` + the 0.1.0 version bump: 574 tests; the Interop Suite (33 cases
-  against Linux kernel MPTCP 7.0) passed 98 of 99 runs, with one failure in the
-  required 3-run set (see the verification note); the head-of-line gap in
-  `m2-blackhole-b` client-to-server is 0.415 s (gate 1.0 s) with the witness; all
-  four 1 GiB blackhole cases pass; M0/M1 scenarios and `m2-mtu` pass; two-path goodput
-  medians 355.3 Mbit/s client-to-server and 350.4 Mbit/s server-to-client; both fuzz
-  targets ran 10 minutes without a crash.
+- M3, final revision 05f11a4 (0.1.0): 576 tests; the Interop Suite (33 cases
+  against Linux kernel MPTCP 7.0) passed 99 of 99 runs (3 of 3 per case, 0 SKIP);
+  the head-of-line gap in `m2-blackhole-b` client-to-server is 0.423 s (gate 1.0 s)
+  with the witness; all four 1 GiB blackhole cases pass; M0/M1 scenarios and
+  `m2-mtu` pass; two-path goodput medians 354.7 Mbit/s client-to-server and
+  350.3 Mbit/s server-to-client; both fuzz targets ran 10 minutes without a crash.
 
 Known limitations (M3):
 
