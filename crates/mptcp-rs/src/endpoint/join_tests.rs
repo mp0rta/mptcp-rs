@@ -2256,6 +2256,69 @@ fn close_two_subflows_fin_fin() {
     assert!(ep.conns.is_empty(), "token released");
 }
 
+/// The interop flake (2026-10-10): the peer's FIN on subflow 0 DATA_ACKs our DATA_FIN, so both
+/// subflows send their FIN before the peer's FIN on subflow 1 is read. Subflow 0 ends from
+/// LAST-ACK while subflow 1 is CLOSING (a simultaneous close), then subflow 1 enters TIME-WAIT
+/// as the last open subflow: `Closed` follows that TIME-WAIT, with `poll_timeout` its deadline.
+#[test]
+fn simultaneous_close_on_last_subflow_closes_after_its_time_wait() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, una1) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    events(&mut ep);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().close();
+    drain(&mut ep, t);
+    let t = t + ms_d(10);
+    let fin_seg = |s: &Segment<'static>, opts: &'static [u8], ack| Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack,
+        wnd: 65535,
+        ..peer_data(s, 5001, opts, &[])
+    };
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1)).leak();
+    input_at(&mut ep, &fin_seg(&syn, opts, una0), t);
+    let out = drain(&mut ep, t);
+    let fin = |s: &Segment| s.flags.contains(TcpFlags::FIN);
+    let fin0 = (on(&out, &syn).into_iter()).find(fin).expect("FIN 0");
+    let fin1 = (on(&out, &jsyn).into_iter()).find(fin).expect("FIN 1");
+    let dack = data_ack(head + 1).leak();
+    input_at(&mut ep, &fin_seg(&jsyn, dack, una1), t);
+    drain(&mut ep, t);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::Closing);
+    for (s, f) in [(&syn, &fin0), (&jsyn, &fin1)] {
+        let seg = Segment {
+            ack: f.seq.wrapping_add(1),
+            wnd: 65535,
+            ..peer_data(s, 5002, dack, &[])
+        };
+        input_at(&mut ep, &seg, t);
+    }
+    drain(&mut ep, t);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+    let down = |i| Event::SubflowDown {
+        subflow: SubflowId(i),
+        reason: CloseReason::Normal,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), [down(0), down(1)]);
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    let (mut ev, mut at) = (Vec::new(), t);
+    for _ in 0..10 {
+        at = ep.poll_timeout().expect("a deadline until Closed");
+        ep.handle_timeout(at);
+        drain(&mut ep, at);
+        ev.extend(events(&mut ep));
+        if ev.contains(&closed) {
+            break;
+        }
+    }
+    assert_eq!(count(&ev, closed), 1, "{ev:?}");
+    assert_eq!(at, t + Duration::from_secs(120), "2·MSL");
+}
+
 /// Both DATA_FINs are DATA_ACKed and both subflows send their FIN. The peer answers subflow
 /// `1 - k` at once (TIME-WAIT); subflow `k`'s FIN goes unanswered through R1 = 3 RTOs
 /// (`SubflowStale`), then the peer's ACK+FIN puts it in TIME-WAIT: `SubflowDown { Normal }`

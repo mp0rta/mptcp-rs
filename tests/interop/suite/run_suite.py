@@ -106,12 +106,19 @@ def lost(log):
 
 
 def active_closer(segs):
-    """At mtun0, the client sent the first FIN of the subflow whose close began last: it is the
-    active closer there, so it holds TIME-WAIT (2 MSL) before reporting `Closed`."""
-    first = {}
+    """At mtun0, on the subflow whose close began last, the client sent its FIN before it had the
+    server's: its first FIN does not ACK the server's, also when that one reached mtun0 first (a
+    simultaneous close). The client ends that subflow in TIME-WAIT, so it holds 2 MSL before
+    reporting `Closed`."""
+    began, first = {}, {}
     for g in sorted((g for g in segs if g.point == "cli" and g.flags & 0x01), key=lambda g: g.t):
-        first.setdefault(g.flow, g)
-    return bool(first) and max(first.values(), key=lambda g: g.t).direction == "c2s"
+        began.setdefault(g.flow, g.t)
+        first.setdefault((g.flow, g.direction), g)
+    if not began:
+        return False
+    flow = max(began, key=began.get)
+    c, s = first.get((flow, "c2s")), first.get((flow, "s2c"))
+    return c is not None and (s is None or c.ack != (s.seq + s.len + 1) % (1 << 32))
 
 
 def barrier_time(log, barrier, until):

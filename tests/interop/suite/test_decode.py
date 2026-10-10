@@ -114,14 +114,18 @@ class Judge(unittest.TestCase):
         import run_suite
         FIN = 0x01
 
-        def seg(t, sport, direction, flags=FIN | ACK):
-            g = decode.Seg(t, "cli", "a", "b", sport, 5201, flags, 0, 0, 0, 0, [], [])
+        # Server FINs at seq 7; a client FIN with ack 8 ACKs it.
+        def seg(t, sport, direction, flags=FIN | ACK, ack=0):
+            seq = 7 if direction == "s2c" else 0
+            g = decode.Seg(t, "cli", "a", "b", sport, 5201, flags, seq, ack, 0, 0, [], [])
             g.direction = direction
             return g
         # A retired subflow closed by the client, then the server closes the last one first.
-        segs = [seg(1, 1, "c2s"), seg(1.1, 1, "s2c"), seg(5, 2, "s2c"), seg(5.1, 2, "c2s")]
+        segs = [seg(1, 1, "c2s"), seg(1.1, 1, "s2c"), seg(5, 2, "s2c"), seg(5.1, 2, "c2s", ack=8)]
         self.assertFalse(run_suite.active_closer(segs))
         self.assertTrue(run_suite.active_closer(segs[:2] + [seg(5, 2, "c2s"), seg(5.1, 2, "s2c")]))
+        # Simultaneous close: the server's FIN reached mtun0 first, the client's does not ACK it.
+        self.assertTrue(run_suite.active_closer(segs[:3] + [seg(5.1, 2, "c2s")]))
         self.assertFalse(run_suite.active_closer([seg(1, 1, "c2s", ACK)]))
         self.assertFalse(run_suite.active_closer([]))
 
