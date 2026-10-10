@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interop Suite host entry (amendment §5.1): build the image, run the suite (or, with --probe, the
 # Linux behaviour probe) inside it. Build the release client first.
-# Usage: run.sh [--case NAME]... [--runs N] [--ci] | run.sh --probe
+# Usage: run.sh [--case NAME]... [--runs N] [--ci] [--shard K/N] | run.sh --probe
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 script=run_suite.py

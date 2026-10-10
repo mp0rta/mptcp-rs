@@ -2,7 +2,7 @@
 """Interop Suite runner (amendment §5), inside the privileged interop image with --network none.
 Each case: fresh cli/srv namespaces, netem per link, capture readiness, nstat snapshot, server and
 client, barrier-timed fail windows and server actions, watchdog, nstat snapshot, judgement (a)-(d).
-Usage: run_suite.py [--case NAME]... [--runs N] [--ci]. Build the release client first."""
+Usage: run_suite.py [--case NAME]... [--runs N] [--ci] [--shard K/N]. Build the release client first."""
 import argparse
 import json
 import operator
@@ -306,6 +306,17 @@ def judge(r):
     return why
 
 
+def shard(selected, k, n):
+    """Shard k of n (1-based), in catalog order: longest first onto the lightest shard, with
+    watchdog_s standing in for duration."""
+    load, part = [0] * n, {}
+    for c in sorted(selected, key=lambda c: -c["watchdog_s"]):
+        i = load.index(min(load))
+        load[i] += c["watchdog_s"]
+        part[c["name"]] = i
+    return [c for c in selected if part[c["name"]] == k - 1]
+
+
 def kernel_ok(req):
     have = tuple(map(int, re.findall(r"\d+", platform.release())[:2]))
     return req is None or have >= tuple(map(int, req.split(".")))
@@ -316,8 +327,14 @@ def main():
     ap.add_argument("--case", action="append", choices=[c["name"] for c in cases.CASES])
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--ci", action="store_true", help="only the cases marked ci")
+    ap.add_argument("--shard", metavar="K/N", help="only shard K of N, balanced by watchdog_s (CI matrix)")
     a = ap.parse_args()
     selected = [c for c in cases.CASES if (not a.case or c["name"] in a.case) and (not a.ci or c["ci"])]
+    if a.shard is not None:
+        m = re.fullmatch(r"(\d+)/(\d+)", a.shard)
+        if not m or not 1 <= int(m[1]) <= int(m[2]):
+            ap.error(f"--shard {a.shard!r}: want K/N with 1 <= K <= N")
+        selected = shard(selected, int(m[1]), int(m[2]))
     root = Path("artifacts/interop/suite") / time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     root.mkdir(parents=True)
     versions = {"kernel": platform.release(), "iproute2": sh("ip", "-V").strip(),

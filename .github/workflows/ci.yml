@@ -45,10 +45,16 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
   # M3 Interop Suite against the runner's kernel MPTCP (amendment §5.7). Docker does not pin the
-  # kernel, so the probe step fails loudly when a feature the suite uses is missing.
+  # kernel, so the probe step fails loudly when a feature the suite uses is missing. The whole
+  # catalog runs, split over one runner per shard: cases share namespace names and are
+  # timing-sensitive, so they never run side by side on one machine.
   interop-suite:
     runs-on: ubuntu-26.04  # kernel 7.0, the suite's reference series
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - name: probe kernel MPTCP, TUN, netns, netem, ip(6)tables and nstat counters
@@ -72,9 +78,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p mptcp-rs-tun
-      - run: bash tests/interop/suite/run.sh --runs 1 --ci
+      - run: bash tests/interop/suite/run.sh --runs 1 --shard ${{ matrix.shard }}/4
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: interop-suite
+          name: interop-suite-${{ matrix.shard }}
           path: artifacts/interop/suite

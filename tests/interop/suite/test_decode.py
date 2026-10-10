@@ -136,6 +136,20 @@ class Judge(unittest.TestCase):
         self.assertFalse(run_suite.active_closer([seg(1, 1, "c2s", ACK)]))
         self.assertFalse(run_suite.active_closer([]))
 
+    def test_shards_partition_the_catalog(self):
+        import cases
+        import run_suite
+        for n in (1, 3, 4):
+            parts = [run_suite.shard(cases.CASES, k, n) for k in range(1, n + 1)]
+            names = [c["name"] for p in parts for c in p]
+            self.assertEqual(sorted(names), sorted(c["name"] for c in cases.CASES))
+            self.assertTrue(all(parts))
+        # Longest first onto the lightest shard, ties to the lower shard, catalog order kept
+        # (round-robin would give a, c, e / b, d, f).
+        fx = [{"name": x, "watchdog_s": w} for x, w in zip("abcdef", (260, 130, 130, 40, 40, 40))]
+        self.assertEqual([[c["name"] for c in run_suite.shard(fx, k, 2)] for k in (1, 2)],
+                         [["a", "d", "f"], ["b", "c", "e"]])
+
 
 if __name__ == "__main__":
     unittest.main()
