@@ -130,6 +130,9 @@ def server_abort():
     case["server"]["abort_after"] = 1000000
     case["expect"].update(aborted="server", pcap=[linux_fastclose],
                           events=["Connected mptcp=true", "Closed Reset"])
+    # MP_FASTCLOSE on SO_LINGER 0 is the reference kernel's (7.0) behaviour; the CI runner's kernel
+    # closes with DATA_FIN and an MP_TCPRST instead (client `Closed Normal`, correctly).
+    case["ci"] = False
     return case
 
 
