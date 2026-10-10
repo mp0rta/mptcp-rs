@@ -43,6 +43,29 @@ pub fn join_hmac(key_self: u64, key_peer: u64, nonce_self: u32, nonce_peer: u32)
     mac.finalize().into_bytes().into()
 }
 
+/// RFC 8684 §3.4.1 ADD_ADDR truncated HMAC: the rightmost 64 bits of HMAC-SHA256 with
+/// key = `key_sender || key_receiver` and message = `id || addr || port` (`0000` if absent).
+pub fn add_addr_hmac(
+    key_sender: u64,
+    key_receiver: u64,
+    id: u8,
+    addr: IpAddr,
+    port: Option<u16>,
+) -> u64 {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&key_sender.to_be_bytes());
+    key[8..].copy_from_slice(&key_receiver.to_be_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts any key length");
+    mac.update(&[id]);
+    match addr {
+        IpAddr::V4(ip) => mac.update(&ip.octets()),
+        IpAddr::V6(ip) => mac.update(&ip.octets()),
+    }
+    mac.update(&port.unwrap_or(0).to_be_bytes());
+    let d = mac.finalize().into_bytes();
+    u64::from_be_bytes(d[24..].try_into().unwrap())
+}
+
 /// RFC 6528 ISN generator: `ISN = M + F(local, remote, secret)`.
 /// No `Debug` impl: the secret must never be logged.
 pub struct IsnGenerator {
@@ -109,6 +132,22 @@ mod tests {
             hex(&join_hmac(kb, ka, rb, ra)),
             "864b40428762fd06fa24bb3c5ea12c1bbf6546e7aace88911139aa8f77f90286"
         );
+    }
+
+    #[test]
+    fn add_addr_hmac_port_zero_bytes() {
+        // Independent check: python3 hmac over bytes 07 c0000201 0000, key KA||KB, last 8 bytes.
+        let (ka, kb) = (0x0102030405060708u64, 0x1112131415161718u64);
+        let ip = IpAddr::V4([192, 0, 2, 1].into());
+        let mut key = ka.to_be_bytes().to_vec();
+        key.extend_from_slice(&kb.to_be_bytes());
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(&[7, 192, 0, 2, 1, 0, 0]);
+        let want = u64::from_be_bytes(mac.finalize().into_bytes()[24..].try_into().unwrap());
+        assert_eq!(add_addr_hmac(ka, kb, 7, ip, None), want);
+        assert_eq!(add_addr_hmac(ka, kb, 7, ip, Some(0)), want);
+        assert_ne!(add_addr_hmac(ka, kb, 7, ip, Some(80)), want);
+        assert_ne!(add_addr_hmac(kb, ka, 7, ip, None), want);
     }
 
     #[test]
