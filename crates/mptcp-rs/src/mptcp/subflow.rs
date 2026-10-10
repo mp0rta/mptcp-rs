@@ -27,7 +27,7 @@ pub(crate) enum SubflowState {
     /// `on_health` judged it Stale: no new data or reinjections, its own TCP retransmissions
     /// go on; Active again on a `Progress` judged Keep.
     Stale,
-    /// The peer retired it with a bare FIN: no new data or reinjections.
+    /// Retiring, by the peer's bare FIN or `close_subflow`: no new data or reinjections.
     Closing,
 }
 
@@ -45,6 +45,14 @@ impl Subflow {
     /// is freed).
     pub fn is(&self, state: SubflowState) -> bool {
         self.state == state && self.tcb.state() != crate::tcp::TcpState::Closed
+    }
+    /// It may take over the data of a subflow `close_subflow` retires (M3 spec §4.2): Active
+    /// (not Joining, Stale or retiring), not under the peer's REMOVE_ADDR keepalive, with an
+    /// established TCB. A full window, cwnd, pacing or mapping slots do not matter.
+    pub fn can_replace(&self) -> bool {
+        self.is(SubflowState::Active)
+            && self.mp.keepalive.is_none()
+            && self.tcb.state() == crate::tcp::TcpState::Established
     }
 }
 
@@ -115,6 +123,19 @@ pub(crate) struct SubflowMp {
     pub signal_clock: Option<(super::SubflowId, Instant, std::time::Duration)>,
     /// The signals the ACK being built carries, until it goes out.
     pub signal_take: Option<super::signal::Take>,
+    /// The peer's REMOVE_ADDR named this subflow's peer address: the keepalive procedure runs.
+    pub keepalive: Option<Keepalive>,
+}
+
+/// Keepalive probes before a REMOVE_ADDR'd subflow is reset (M3 spec §3.3).
+const KEEPALIVE_PROBES: u8 = 3;
+
+/// The REMOVE_ADDR keepalive procedure (M3 spec §3.3): probes sent so far, and the last one's
+/// deadline, its transmission time plus the RTO then (`None`: the next probe is due).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Keepalive {
+    pub sent: u8,
+    pub deadline: Option<Instant>,
 }
 
 impl SubflowMp {
@@ -153,11 +174,39 @@ impl SubflowMp {
             peer_prio: None,
             signal_clock: None,
             signal_take: None,
+            keepalive: None,
         }
     }
     /// The effective transmit-backup: local or peer-requested (M3 spec §4.2).
     pub fn backup(&self) -> bool {
         self.local_backup || self.peer_backup
+    }
+    /// The keepalive procedure at `now`: true once the last probe's deadline has passed
+    /// unanswered; an earlier passed deadline makes the next probe due.
+    pub fn keepalive_failed(&mut self, now: Instant) -> bool {
+        let Some(k) = self.keepalive.as_mut() else {
+            return false;
+        };
+        if !k.deadline.is_some_and(|t| t <= now) {
+            return false;
+        }
+        k.deadline = None;
+        k.sent >= KEEPALIVE_PROBES
+    }
+    /// The keepalive probe requested at the last `prepare_send` went out at `now` (the `Tcb`
+    /// no longer has it `pending`): its deadline is one `rto` later.
+    pub fn keepalive_sent(&mut self, pending: bool, now: Instant, rto: std::time::Duration) {
+        if let Some(k) = self.keepalive.as_mut().filter(|k| k.deadline.is_none()) {
+            if !pending {
+                k.sent += 1;
+                k.deadline = Some(now + rto);
+            }
+        }
+    }
+    /// The peer address id this subflow's handshake carried: 0 for the initial subflow, the
+    /// MP_JOIN SYN/ACK's for a joined one.
+    pub fn peer_addr_id(&self) -> Option<u8> {
+        self.join.as_ref().map_or(Some(0), |j| j.peer_addr_id)
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.
     pub fn joining(&self) -> bool {

@@ -55,6 +55,9 @@ pub(crate) struct ConnectionHooks {
     snapshots: Vec<SubflowSnapshot>,
     /// Signals waiting for an ACK-only segment (M3 spec §3.2).
     pub signals: signal::Signals,
+    /// Peer address ids named by REMOVE_ADDR in the current input
+    /// (`Connection::peer_removed`).
+    pub peer_removed: Vec<u8>,
     /// Plans rejected by validation (spec §4 rule 1); debug counter.
     pub rejected_plans: u64,
     /// Validated plans `SendStore::assign` refused; stays 0 by construction.
@@ -119,6 +122,7 @@ impl ConnectionHooks {
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
             signals: Default::default(),
+            peer_removed: Vec::new(),
             rejected_plans: 0,
             assign_failures: 0,
             debug: DebugStats::default(),
@@ -513,6 +517,32 @@ impl Connection {
         }
     }
 
+    /// REMOVE_ADDR for peer address `id` (M3 spec §3.3). An unknown id is ignored (RFC 8684
+    /// L2108–2110). A known one, in the peer address table or recorded by a subflow's
+    /// handshake, loses its advertised binding, and every subflow to it that can send runs the
+    /// keepalive procedure; a path that answers is kept (RFC 8684 L2089–2096). Returns whether
+    /// `id` was known.
+    pub(crate) fn peer_removed(&mut self, id: u8) -> bool {
+        let mut known = self.peer_addrs.0.remove(&id).is_some();
+        for sf in &mut self.subflows {
+            if sf.mp.peer_addr_id() == Some(id) {
+                known = true;
+                let open = !matches!(
+                    sf.tcb.state(),
+                    TcpState::Closed | TcpState::SynSent | TcpState::TimeWait
+                );
+                if open {
+                    let k = subflow::Keepalive {
+                        sent: 0,
+                        deadline: None,
+                    };
+                    sf.mp.keepalive.get_or_insert(k);
+                }
+            }
+        }
+        known
+    }
+
     /// Queues subflow `i`'s un-subflow-ACKed DSN ranges for reinjection, except where a live
     /// copy on an Active subflow covers them (dedup at insertion; `i` itself is not Active).
     fn reinject_ranges(&mut self, i: usize) {
@@ -734,6 +764,9 @@ impl SubflowHooks<'_> {
         let open = matches!(tcb.state(), TcpState::Established | TcpState::CloseWait);
         if (self.conn.signals).wants(id, now, srtt, open && self.signals_allowed()) {
             tcb.request_signal_ack();
+        }
+        if self.sf.keepalive.is_some_and(|k| k.deadline.is_none()) {
+            tcb.send_keepalive_probe();
         }
         if self.sf.joining() {
             // No data, probes or DATA_FIN while joining; it still closes with the rest.
@@ -1056,8 +1089,13 @@ impl SegmentHooks for SubflowHooks<'_> {
     }
     fn on_valid_segment(&mut self, seg: &Segment<'_>) {
         self.sf.valid_data_ack = None;
+        // Any acceptable segment after the first keepalive probe: the path is alive.
+        if self.sf.keepalive.is_some_and(|k| k.sent > 0) {
+            self.sf.keepalive = None;
+        }
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
+        let mut removed = Vec::new();
         for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
             match opt {
                 Err(_) => return,
@@ -1068,6 +1106,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                         fastclose = Some(receiver_key)
                     }
                     Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
+                    Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
                     Ok(
                         MptcpOption::Dss(_)
                         | MptcpOption::Capable(_)
@@ -1156,6 +1195,9 @@ impl SegmentHooks for SubflowHooks<'_> {
         if let Some(backup) = prio.filter(|_| m.state == State::Confirmed) {
             self.sf.peer_backup = backup;
             self.sf.peer_prio = Some(backup);
+        }
+        if m.state == State::Confirmed {
+            self.conn.peer_removed.extend(removed);
         }
         if let Some(c) = capable {
             if let Some(len) = c.data_len {

@@ -73,7 +73,9 @@ pub enum Event {
         id: u8,
         addr: SocketAddr,
     },
-    /// The peer withdrew the address it announced as `id` (REMOVE_ADDR).
+    /// The peer withdrew its address `id` (REMOVE_ADDR): one it announced, or one a subflow's
+    /// handshake carried (0 for the initial subflow). Each subflow to it is probed and kept if
+    /// it answers, else reset (`SubflowDown { Reset }`).
     AddressRemoved {
         id: u8,
     },
@@ -359,7 +361,9 @@ impl<R: CryptoRng> Endpoint<R> {
             c.queued_joins.push(join);
             self.pending_joins.insert(h);
         }
-        self.conns.get_mut(&h).unwrap().next_subflow = next;
+        let c = self.conns.get_mut(&h).unwrap();
+        c.next_subflow = next;
+        c.hooks.signals.cancel_remove(addr_id);
         Ok(id)
     }
 
@@ -436,29 +440,72 @@ impl<R: CryptoRng> Endpoint<R> {
         Ok(())
     }
 
-    /// Retires subflow `s` by FIN exchange. Not implemented yet: checks its arguments only.
-    #[doc(hidden)]
+    /// Retires subflow `s`, which still works, by FIN exchange (RFC 8684 L2114–2116): it gets
+    /// no new data, its TCP retransmissions go on, and once it ends (`SubflowDown`) the data it
+    /// held that is not DATA_ACKed is resent on the others. A queued join is dropped
+    /// (`SubflowDown { Reset }`). Only while another subflow can take over: one that is Active
+    /// (not Joining, Stale or retiring), not under the peer's REMOVE_ADDR keepalive, and has an
+    /// established TCB; a closed window or busy cwnd does not matter. Otherwise `LastSubflow`
+    /// and nothing changes: closing every subflow is `Connection::close`.
     pub fn close_subflow(
         &mut self,
         _now: Instant,
         h: ConnectionHandle,
         s: SubflowId,
     ) -> Result<(), SubflowError> {
-        self.subflow_conn(h, s).map(drop)
+        let c = self.subflow_conn(h, s)?;
+        if !(c.subflows.iter()).any(|o| o.id != s && o.can_replace()) {
+            return Err(SubflowError::LastSubflow);
+        }
+        if let Some(sf) = c.subflows.iter_mut().find(|sf| sf.id == s) {
+            sf.state = SubflowState::Closing;
+            sf.tcb.close();
+        } else {
+            c.queued_joins.retain(|q| q.id != s);
+            (self.events).push_back((h, down(s, CloseReason::Reset, None)));
+        }
+        Ok(())
     }
 
-    /// Withdraws the local IP `local` (REMOVE_ADDR) and resets the subflows that use it. Not
-    /// implemented yet: checks its arguments only.
-    #[doc(hidden)]
+    /// Withdraws the local IP `local`, which is no longer valid (its interface is gone; RFC
+    /// 8684 §3.4.2). Every subflow using it is reset with MP_TCPRST 0x00 T=0, and joins queued
+    /// from it are dropped, each with `SubflowDown { Reset }`; with no subflow left the
+    /// no-subflow wait starts. If the peer has learned `local`'s address ID (the initial IP's
+    /// is 0), a REMOVE_ADDR for it goes once on another Active subflow, when one exists. A later
+    /// `add_subflow` from `local` keeps the ID and drops that REMOVE_ADDR if it has not gone
+    /// out yet. To retire a working path, `close_subflow` it first (make-before-break).
     pub fn remove_address(
         &mut self,
-        _now: Instant,
+        now: Instant,
         h: ConnectionHandle,
         local: IpAddr,
     ) -> Result<(), AddressError> {
         use AddressError as E;
         let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
-        c.local_addrs.id(local).ok_or(E::UnknownAddress).map(drop)
+        let id = c.local_addrs.id(local).ok_or(E::UnknownAddress)?;
+        if c.local_addrs.on_wire(id) {
+            c.hooks.signals.remove(id);
+        }
+        let c = self.conns.get_mut(&h).unwrap();
+        for i in 0..c.subflows.len() {
+            let sf = &c.subflows[i];
+            let ended = matches!(sf.tcb.state(), TcpState::Closed | TcpState::TimeWait);
+            if sf.local.ip() != local || ended {
+                continue;
+            }
+            let last = !others_open(&c.subflows, i);
+            let rst = Some(tcprst(0x00, false));
+            let r = c.subflows[i].tcb.abort_with(CloseReason::Reset, rst, now);
+            Self::report(&mut self.events, h, c, i, r, last, now);
+        }
+        for q in std::mem::take(&mut c.queued_joins) {
+            if q.local == local {
+                (self.events).push_back((h, down(q.id, CloseReason::Reset, None)));
+            } else {
+                c.queued_joins.push(q);
+            }
+        }
+        Ok(())
     }
 
     /// Materializes a join: port, ISN, nonce, demux entry and a Joining subflow whose `Tcb`
@@ -619,6 +666,11 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             i = 0;
         }
+        for id in std::mem::take(&mut c.hooks.peer_removed) {
+            if c.hooks.active() && c.peer_removed(id) {
+                self.events.push_back((h, Event::AddressRemoved { id }));
+            }
+        }
         // Events first: a join this segment completed is Active before `update_health`, so a
         // bare FIN on the same segment retires it (`SubflowUp`, then the Closing path).
         let sf = &mut c.subflows[i];
@@ -680,6 +732,36 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             keep
         });
+    }
+
+    /// After reaction `r` of subflow `i` to a timeout or a local call (`last`: no other subflow
+    /// was open before it): its health, its event and the connection's close.
+    fn report(
+        events: &mut VecDeque<(ConnectionHandle, Event)>,
+        h: ConnectionHandle,
+        c: &mut Connection,
+        i: usize,
+        r: Reaction,
+        last: bool,
+        now: Instant,
+    ) {
+        if let Some(e) = c.update_health(i) {
+            events.push_back((h, e));
+        }
+        let sf = &mut c.subflows[i];
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
+        if i != 0 {
+            let joining = hk.sf.joining();
+            let view = (sf.id, &mut sf.state, &sf.tcb, hk.sf.rst);
+            Self::subflow_event(events, hk.conn, h, view, joining, r);
+        } else {
+            let rst = hk.sf.rst;
+            Self::push_event(events, hk.conn, &mut c.reset, h, r, !last, rst);
+        }
+        Self::update_close(events, &mut hk, &sf.tcb, &mut c.reset, h, now, last);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -917,7 +999,17 @@ impl<R: CryptoRng> Endpoint<R> {
                     payload: &w.payload,
                 };
                 if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                    hk.on_transmitted(&seg, now, sf.tcb.retransmission_timeout());
+                    let rto = sf.tcb.retransmission_timeout();
+                    hk.on_transmitted(&seg, now, rto);
+                    hk.sf.keepalive_sent(sf.tcb.keepalive_pending(), now, rto);
+                    if let Some(j) = hk
+                        .sf
+                        .join
+                        .as_ref()
+                        .filter(|_| w.flags.contains(TcpFlags::SYN))
+                    {
+                        c.local_addrs.sent(j.addr_id);
+                    }
                     if let Some(mptcp) = hk
                         .conn
                         .negotiation
@@ -960,7 +1052,9 @@ impl<R: CryptoRng> Endpoint<R> {
                         let join = (sf.mp.join.as_ref().filter(|_| open))
                             .and_then(|j| j.deadline(c.cfg.r2_data));
                         let strand = sf.mp.strand_at.filter(|_| open);
-                        tcb.into_iter().chain(join).chain(strand)
+                        let keepalive = sf.mp.keepalive.and_then(|k| k.deadline);
+                        let keepalive = keepalive.filter(|_| open);
+                        tcb.into_iter().chain(join).chain(strand).chain(keepalive)
                     })
                     .chain(c.hooks.recovery_deadline())
                     .chain(c.opp_deadline())
@@ -993,6 +1087,11 @@ impl<R: CryptoRng> Endpoint<R> {
                     r = sf
                         .tcb
                         .abort_with(CloseReason::Reset, Some(tcprst(0x04, true)), now);
+                } else if sf.tcb.state() != TcpState::Closed && hk.sf.keepalive_failed(now) {
+                    // The REMOVE_ADDR keepalive went unanswered (M3 spec §3.3, §3.4).
+                    r = sf
+                        .tcb
+                        .abort_with(CloseReason::Reset, Some(tcprst(0x00, false)), now);
                 } else if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
                     r = sf.tcb.on_timeout(now, &mut hk);
                 }
@@ -1011,31 +1110,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     sf.tcb
                         .abort_with(CloseReason::Timeout, Some(tcprst(0x00, true)), now);
                 }
-                if let Some(e) = c.update_health(i) {
-                    self.events.push_back((h, e));
-                }
-                let sf = &mut c.subflows[i];
-                let mut hk = SubflowHooks {
-                    conn: &mut c.hooks,
-                    sf: &mut sf.mp,
-                };
-                if i != 0 {
-                    let joining = hk.sf.joining();
-                    let view = (sf.id, &mut sf.state, &sf.tcb, hk.sf.rst);
-                    Self::subflow_event(&mut self.events, hk.conn, h, view, joining, r);
-                } else {
-                    let rst = hk.sf.rst;
-                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last, rst);
-                }
-                Self::update_close(
-                    &mut self.events,
-                    &mut hk,
-                    &sf.tcb,
-                    &mut c.reset,
-                    h,
-                    now,
-                    last,
-                );
+                Self::report(&mut self.events, h, c, i, r, last, now);
             }
             Self::free_ended(&mut self.demux, h, c);
         }

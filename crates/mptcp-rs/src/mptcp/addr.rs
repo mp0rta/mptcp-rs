@@ -2,25 +2,34 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-/// Our local IPs, indexed by address id. A binding lasts for the connection's life; an id is
-/// reused only for the same IP (RFC 8684 L2043–2051).
-pub(crate) struct LocalAddrs(Vec<IpAddr>);
+/// Our local IPs, indexed by address id, each with whether the peer has learned its id. A
+/// binding lasts for the connection's life; an id is reused only for the same IP (RFC 8684
+/// L2043–2051).
+pub(crate) struct LocalAddrs(Vec<(IpAddr, bool)>);
 
 impl LocalAddrs {
-    /// The initial local IP is id 0.
+    /// The initial local IP is id 0, which the peer knows from the MP_CAPABLE handshake.
     pub fn new(initial: IpAddr) -> Self {
-        Self(vec![initial])
+        Self(vec![(initial, true)])
     }
     pub fn id(&self, ip: IpAddr) -> Option<u8> {
-        (self.0.iter().position(|&a| a == ip)).map(|i| i as u8)
+        (self.0.iter().position(|a| a.0 == ip)).map(|i| i as u8)
     }
     /// `ip`'s id, binding the next one to a new IP; `None` once 256 IPs are bound.
     pub fn bind(&mut self, ip: IpAddr) -> Option<u8> {
         self.id(ip).or_else(|| {
             let id = u8::try_from(self.0.len()).ok()?;
-            self.0.push(ip);
+            self.0.push((ip, false));
             Some(id)
         })
+    }
+    /// An MP_JOIN SYN carrying `id` went out.
+    pub fn sent(&mut self, id: u8) {
+        self.0[usize::from(id)].1 = true;
+    }
+    /// The peer has learned `id`: it may be named in a REMOVE_ADDR.
+    pub fn on_wire(&self, id: u8) -> bool {
+        self.0[usize::from(id)].1
     }
 }
 

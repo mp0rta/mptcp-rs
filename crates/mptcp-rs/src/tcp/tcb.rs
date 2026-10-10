@@ -333,6 +333,8 @@ pub struct Tcb {
     probe_due: bool,
     /// Resend the highest-sequence outstanding segment once (`probe_tail`).
     tail_probe_due: bool,
+    /// `send_keepalive_probe`.
+    keepalive_due: bool,
     /// SWS override timer expired: send what the window allows.
     sws_override: bool,
 }
@@ -419,6 +421,7 @@ impl Tcb {
             retransmit_due: false,
             probe_due: false,
             tail_probe_due: false,
+            keepalive_due: false,
             sws_override: false,
         };
         tcb.eff_mss = tcb.eff_mss_for(None);
@@ -780,6 +783,16 @@ impl Tcb {
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }
+    /// Makes one keepalive probe due: the zero-window probe's shape, zero-length at
+    /// SND.UNA − 1, which the peer answers with an ACK. It goes out at the next `poll_send`
+    /// while synchronized and not in TIME-WAIT, before anything but a RST.
+    pub(crate) fn send_keepalive_probe(&mut self) {
+        self.keepalive_due = true;
+    }
+    /// A keepalive probe is due and has not gone out.
+    pub(crate) fn keepalive_pending(&self) -> bool {
+        self.keepalive_due
+    }
     /// An ACK-only segment is due only to carry a protocol signal (`AckPurpose::SignalOnly`
     /// unless an ACK is due anyway). It goes out only if the hooks add a signal to it.
     pub(crate) fn request_signal_ack(&mut self) {
@@ -965,6 +978,15 @@ impl Tcb {
             return Some(meta);
         }
         if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
+            if std::mem::take(&mut self.keepalive_due) {
+                let wnd = self.wnd_field(h);
+                let seq = self.snd_una.wrapping_add(u32::MAX);
+                let meta = out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd);
+                let n = h.options_for(TcpFlags::ACK, &mut out.options);
+                out.options_len = n + self.write_sacks(&mut out.options[n..]);
+                self.ack_sent();
+                return Some(meta);
+            }
             let fin_unsent = matches!(
                 self.state,
                 TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck

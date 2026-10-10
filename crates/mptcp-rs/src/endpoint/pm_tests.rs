@@ -161,12 +161,11 @@ fn subflow_calls_reject_unknown_ids() {
     for s in [SubflowId::INITIAL, up] {
         assert_eq!(ep.set_local_backup(h, s, true), Ok(()));
     }
-    // A FIN exchange ending in TIME-WAIT has reported `SubflowDown` too. Only `close` leads
-    // there today, so the connection's own `Closed` check is lifted.
-    let (mut ep, h, ended) = stale_fin_then_time_wait(1);
-    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
-    ep.conns.get_mut(&h).unwrap().closed_by_app = false;
-    let now = ms(10_000);
+    // A FIN exchange ending in TIME-WAIT has reported `SubflowDown` too.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    let ended = SubflowId(1);
+    retire_to_time_wait(&mut ep, h, &jsyn, ended, ms(20));
+    let now = ms(30);
     assert_eq!(
         ep.set_backup(now, h, ended, true),
         Err(SubflowError::NoSubflow)
@@ -179,6 +178,9 @@ fn subflow_calls_reject_unknown_ids() {
         ep.close_subflow(now, h, ended),
         Err(SubflowError::NoSubflow)
     );
+    assert!(drain(&mut ep, now).is_empty());
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(!ep.conns[&h].subflows[1].mp.local_backup);
 }
 
 #[test]
@@ -250,8 +252,7 @@ fn rst_options<'a>(
     rsts[0].options.to_vec()
 }
 
-/// M3 spec §3.4, one scenario per row whose path exists (the `remove_address` and keepalive
-/// rows come with REMOVE_ADDR).
+/// M3 spec §3.4, one scenario per row.
 #[test]
 fn our_rst_reason_table() {
     // Joined-subflow option stripping: its first stripped ACK resets it. 0x06/T0.
@@ -343,6 +344,27 @@ fn our_rst_reason_table() {
         rst_options(&out, syn.src),
         tcprst(0x01, false),
         "infinite mapping"
+    );
+
+    // `remove_address`: the local address is gone. 0x00/T0.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    ep.remove_address(ms(20), h, ip(JOIN_IP)).unwrap();
+    let out = from(&drain(&mut ep, ms(20)), JOIN_IP);
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        tcprst(0x00, false),
+        "remove_address"
+    );
+
+    // The peer's REMOVE_ADDR and three unanswered keepalive probes. 0x00/T0.
+    let (mut ep, _, _, jsyn, t, _) = peer_removes_5();
+    let out: Vec<_> = (drive(&mut ep, t, t + Duration::from_secs(30)).into_iter())
+        .map(|p| p.1)
+        .collect();
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        tcprst(0x00, false),
+        "keepalive failure"
     );
 }
 
@@ -1499,4 +1521,455 @@ fn opp_and_repair_skip_backup_while_primary_usable() {
     peer.run(&mut ep, h, t2, t2 + Duration::from_secs(2));
     assert_eq!(peer.received(), data);
     assert!(moved_at(&peer, 0, 1).is_some(), "copied on the backup");
+}
+
+// M3 Task 8: REMOVE_ADDR, `remove_address` and `close_subflow` (M3 spec §3.2–§3.4, §4.1, §4.2).
+
+use crate::mptcp::SubflowState;
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+/// Every REMOVE_ADDR sent among `pkts`: its subflow's source and its ids, in order.
+fn removes(pkts: &[Vec<u8>]) -> Vec<(SocketAddr, Vec<u8>)> {
+    let segs = pkts.iter().map(|p| leak(p.clone()));
+    (segs.flat_map(|s| mptcp_opts(&s).into_iter().map(move |o| (s.src, o))))
+        .filter_map(|(src, o)| match o {
+            MptcpOption::RemoveAddr { ids } => Some((src, ids.iter().collect())),
+            _ => None,
+        })
+        .collect()
+}
+/// `close_subflow(s)` on `jsyn`'s subflow, then the peer ACKs our FIN with its own: TIME-WAIT
+/// and `SubflowDown { Normal }`.
+fn retire_to_time_wait(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    jsyn: &Segment,
+    s: SubflowId,
+    now: Instant,
+) {
+    assert_eq!(ep.close_subflow(now, h, s), Ok(()));
+    let out = on(&drain(ep, now), jsyn);
+    let fin = (out.iter().find(|g| g.flags.contains(TcpFlags::FIN))).expect("our FIN");
+    let opts = data_ack(una(ep, h));
+    let seg = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: fin.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(jsyn, 5001, &opts, &[])
+    };
+    input_at(ep, &seg, now);
+    drain(ep, now);
+    let reason = CloseReason::Normal;
+    let down = Event::SubflowDown {
+        subflow: s,
+        reason,
+        rst: None,
+    };
+    assert_eq!(events(ep), vec![down]);
+    let i = (ep.conns[&h].subflows.iter()).position(|sf| sf.id == s);
+    assert_eq!(
+        ep.conns[&h].subflows[i.unwrap()].tcb.state(),
+        TcpState::TimeWait
+    );
+}
+
+#[test]
+fn remove_address_sends_remove_addr_and_resets() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let now = ms(20);
+    assert_eq!(ep.remove_address(now, h, ip(JOIN_IP)), Ok(()));
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Reset,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    let out = drain(&mut ep, now);
+    // The RST at SND.MAX carries MP_TCPRST 0x00/T0 (M3 spec §3.4).
+    let segs = on(&out, &jsyn);
+    assert_eq!(rst_options(&segs, jsyn.src), tcprst(0x00, false));
+    assert_eq!(segs[0].seq, jsyn.seq.wrapping_add(1));
+    // REMOVE_ADDR for id 1 goes once, on the surviving subflow.
+    assert_eq!(removes(&out), vec![(syn.src, vec![1])]);
+    let later = drain_until(&mut ep, now, now + Duration::from_secs(10));
+    assert_eq!(removes(&later), vec![]);
+    assert!(
+        (ep.conns[&h].subflows.iter()).all(|sf| sf.id != SubflowId(1)),
+        "freed"
+    );
+}
+
+#[test]
+fn remove_address_id0() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let now = ms(20);
+    assert_eq!(ep.remove_address(now, h, ip("10.0.0.1")), Ok(()));
+    assert_eq!(events(&mut ep), vec![initial_down(CloseReason::Reset)]);
+    let out = drain(&mut ep, now);
+    assert_eq!(rst_options(&on(&out, &syn), syn.src), tcprst(0x00, false));
+    assert_eq!(removes(&out), vec![(jsyn.src, vec![0])]);
+    // The connection carries on over subflow 1.
+    ep.connection(h).unwrap().write(&[1; 100]).unwrap();
+    let out = drain(&mut ep, now);
+    assert_eq!(data_on(&out, &jsyn).len(), 1);
+    assert_eq!(state(&ep, h), State::Confirmed);
+}
+
+/// Review Focus 3: only a queued join used the IP, so its id never reached the wire. The join
+/// is dropped with `SubflowDown { Reset }` and no REMOVE_ADDR is sent.
+#[test]
+fn remove_address_unsent_id_sends_nothing() {
+    let (mut ep, h, syn, _) = connected_scaled(1 << 20);
+    let t = Instant::from_nanos(1);
+    let q = (ep.add_subflow(t, h, ip(JOIN_IP), remote(), 1500, false)).unwrap();
+    assert_eq!(ep.remove_address(t, h, ip(JOIN_IP)), Ok(()));
+    let down = Event::SubflowDown {
+        subflow: q,
+        reason: CloseReason::Reset,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    open_window(&mut ep, &syn, h);
+    assert_eq!(state(&ep, h), State::Confirmed);
+    assert!(!signals(&mut ep, h).removing(1));
+    let out = drain_until(&mut ep, ms(10), ms(10_000));
+    assert_eq!(removes(&out), vec![]);
+    assert!(from(&out, JOIN_IP).is_empty(), "the join never starts");
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+#[test]
+fn remove_addr_chunked_26_ids() {
+    let (mut ep, h, syn, _) = confirmed();
+    let ips: Vec<_> = (0..26).map(|i| format!("10.1.0.{i}")).collect();
+    for (i, a) in ips.iter().enumerate() {
+        assert_eq!(join_and_drop(&mut ep, h, ms(10), a).1, i as u8 + 1);
+    }
+    let t = ms(20);
+    for a in &ips {
+        ep.remove_address(t, h, ip(a)).unwrap();
+    }
+    let out = drain(&mut ep, t);
+    let first: Vec<u8> = (1..=25).collect();
+    assert_eq!(removes(&out), vec![(syn.src, first), (syn.src, vec![26])]);
+    // The largest prefix that fits next to DSS12: 12 + 3 + 25 = 40 octets.
+    let segs = on(&out, &syn);
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0].options.len(), 40);
+    for s in &segs {
+        let opts = mptcp_opts(s);
+        assert!(
+            matches!(opts[..], [MptcpOption::Dss(d), MptcpOption::RemoveAddr { .. }]
+                if d.data_ack.is_some() && d.mapping.is_none()),
+            "{opts:?}"
+        );
+    }
+}
+
+#[test]
+fn pending_remove_cancelled_on_reactivation() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (_, id) = join_and_drop(&mut ep, h, ms(10), JOIN_IP);
+    // Both signal-only ACKs of this srtt are used: a REMOVE_ADDR queued now waits.
+    let t = ms(20);
+    for backup in [true, false] {
+        ep.set_backup(t, h, SubflowId::INITIAL, backup).unwrap();
+        assert_eq!(prios_on(&drain(&mut ep, t), &syn), vec![backup]);
+    }
+    ep.remove_address(t, h, ip(JOIN_IP)).unwrap();
+    assert!(drain(&mut ep, t).is_empty(), "held by the rate limit");
+    assert!(signals(&mut ep, h).removing(id));
+    // Reactivated before it went out: cancelled, and the join keeps the id.
+    let (_, jsyn) = join_syn(&mut ep, h, t, JOIN_IP, 1500);
+    assert_eq!(addr_id(&jsyn), id);
+    assert!(!signals(&mut ep, h).removing(id));
+    let out = drain_until(&mut ep, t, t + Duration::from_secs(10));
+    assert_eq!(removes(&out), vec![]);
+}
+
+#[test]
+fn rejoin_after_transmitted_remove_reuses_id() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (_, id) = join_and_drop(&mut ep, h, ms(10), JOIN_IP);
+    ep.remove_address(ms(20), h, ip(JOIN_IP)).unwrap();
+    assert_eq!(removes(&drain(&mut ep, ms(20))), vec![(syn.src, vec![id])]);
+    let t = ms(30);
+    ep.add_subflow(t, h, ip(JOIN_IP), remote(), 1500, false)
+        .unwrap();
+    let out = drain(&mut ep, t);
+    let jsyn = from(&out, JOIN_IP).pop().expect("join SYN");
+    assert_eq!(addr_id(&jsyn), id, "the binding lasts");
+    let later = drain_until(&mut ep, t, t + Duration::from_secs(10));
+    assert_eq!(removes(&out), vec![]);
+    assert_eq!(removes(&later), vec![], "not resent");
+}
+
+/// Two primed Reno paths, subflow 1 joined to the peer's address id 5; the peer's REMOVE_ADDR
+/// for id 5 arrives on subflow 0. Also returns the time and subflow 1's SND.UNA.
+fn peer_removes_5() -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    Segment<'static>,
+    Instant,
+    SeqNum,
+) {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, una1) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    let mut opts = data_ack(una(&ep, h));
+    opts.extend([30, 4, 0x40, 5]);
+    signal_ack(&mut ep, &syn, una0, &opts, t);
+    assert_eq!(events(&mut ep), vec![Event::AddressRemoved { id: 5 }]);
+    (ep, h, syn, jsyn, t, una1)
+}
+/// The times of the keepalive probes (zero-length at SND.UNA − 1) on `jsyn`'s subflow.
+fn probes(out: &[(Instant, Segment)], jsyn: &Segment, una1: SeqNum) -> Vec<Instant> {
+    (out.iter())
+        .filter(|(_, s)| s.src == jsyn.src && s.payload.is_empty())
+        .filter(|(_, s)| s.flags == TcpFlags::ACK && s.seq == una1.wrapping_add(u32::MAX))
+        .map(|p| p.0)
+        .collect()
+}
+fn rto1(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Duration {
+    ep.conns[&h].subflows[1].tcb.retransmission_timeout()
+}
+/// After the peer answered a probe at `at`: no more probes, no RST, no event; subflow 1 stays.
+fn kept(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle, jsyn: &Segment, at: Instant) {
+    let later = drive(ep, at, at + Duration::from_secs(30));
+    assert!(later.iter().all(|(_, s)| s.src != jsyn.src), "{later:?}");
+    assert_eq!(events(ep), vec![]);
+    let sf = &ep.conns[&h].subflows[1];
+    assert_eq!(
+        (sf.state, sf.tcb.state()),
+        (SubflowState::Active, TcpState::Established)
+    );
+}
+
+#[test]
+fn remove_addr_rx_live_path_kept() {
+    let (mut ep, h, _, jsyn, t, una1) = peer_removes_5();
+    let out: Vec<_> = drain(&mut ep, t)
+        .into_iter()
+        .map(|p| (t, leak(p)))
+        .collect();
+    assert_eq!(probes(&out, &jsyn, una1), vec![t]);
+    let at = t + ms_d(10);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, at, una1, head, 65535);
+    kept(&mut ep, h, &jsyn, at);
+}
+
+#[test]
+fn remove_addr_rx_probe_lost_then_reply_kept() {
+    let (mut ep, h, _, jsyn, t, una1) = peer_removes_5();
+    let rto = rto1(&ep, h);
+    // The first probe is lost; the second, one RTO after it, is answered.
+    let out = drive(&mut ep, t, t + rto);
+    assert_eq!(probes(&out, &jsyn, una1), vec![t, t + rto]);
+    let at = t + rto + ms_d(10);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, at, una1, head, 65535);
+    kept(&mut ep, h, &jsyn, at);
+}
+
+#[test]
+fn remove_addr_rx_reply_lost_then_reply_kept() {
+    let (mut ep, h, _, jsyn, t, una1) = peer_removes_5();
+    let rto = rto1(&ep, h);
+    // The peer answers every probe; the first two answers are lost, the third arrives.
+    let out = drive(&mut ep, t, t + 2 * rto);
+    assert_eq!(probes(&out, &jsyn, una1), vec![t, t + rto, t + 2 * rto]);
+    let at = t + 2 * rto + ms_d(10);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, at, una1, head, 65535);
+    kept(&mut ep, h, &jsyn, at);
+}
+
+#[test]
+fn remove_addr_rx_dead_path_reset_after_three() {
+    let (mut ep, h, syn, jsyn, t, una1) = peer_removes_5();
+    let rto = rto1(&ep, h);
+    let mut out = drive(&mut ep, t, t + ms_d(10));
+    // Segments on another subflow do not answer subflow 1's probes.
+    let head = una(&ep, h);
+    peer_ack(
+        &mut ep,
+        &syn,
+        t + ms_d(10),
+        syn.seq.wrapping_add(1),
+        head,
+        1000,
+    );
+    out.extend(drive(&mut ep, t + ms_d(10), t + Duration::from_secs(30)));
+    // Each deadline is its probe's transmission time plus the current RTO.
+    assert_eq!(probes(&out, &jsyn, una1), vec![t, t + rto, t + 2 * rto]);
+    let on1: Vec<_> = out.iter().filter(|(_, s)| s.src == jsyn.src).collect();
+    assert_eq!(on1.len(), 4, "three probes and the RST: {on1:?}");
+    let (at, rst) = on1[3];
+    assert_eq!(
+        (*at, rst.flags, rst.seq, rst.options),
+        (t + 3 * rto, TcpFlags::RST, una1, &tcprst(0x00, false)[..])
+    );
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Reset,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+}
+
+#[test]
+fn remove_addr_rx_unknown_id_ignored() {
+    let (mut ep, h, syn, _) = two_paths(reno, reno);
+    // Id 3 is known only from the table (an earlier ADD_ADDR); 9 not at all.
+    let entry = PeerAddr {
+        advertised: Some((ip("10.0.0.3"), 80)),
+        failed: false,
+    };
+    ep.conns.get_mut(&h).unwrap().peer_addrs.0.insert(3, entry);
+    let mut opts = data_ack(una(&ep, h));
+    opts.extend([30, 5, 0x40, 9, 3]);
+    signal_ack(&mut ep, &syn, syn.seq.wrapping_add(1), &opts, ms(20));
+    assert_eq!(events(&mut ep), vec![Event::AddressRemoved { id: 3 }]);
+    let c = &ep.conns[&h];
+    assert!(c.peer_addrs.0.is_empty(), "the binding is dropped");
+    assert!(c.subflows.iter().all(|sf| sf.mp.keepalive.is_none()));
+    assert!(drain(&mut ep, ms(20)).is_empty());
+}
+
+#[test]
+fn remove_addr_rx_invalid_sequence_ignored() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let mut opts = data_ack(una(&ep, h));
+    opts.extend([30, 4, 0x40, 5]);
+    let ack = syn.seq.wrapping_add(1);
+    // Outside the receive window, and acknowledging what was never sent: dropped (an ACK
+    // answers each), the REMOVE_ADDR with it.
+    let bad_seq = Segment {
+        ack,
+        wnd: 1000,
+        ..peer_data(&syn, 5001u32.wrapping_add(1 << 30), &opts, &[])
+    };
+    let bad_ack = Segment {
+        ack: ack.wrapping_add(1000),
+        wnd: 1000,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    for seg in [bad_seq, bad_ack] {
+        input_at(&mut ep, &seg, ms(20));
+        let out = drain(&mut ep, ms(20));
+        assert!(on(&out, &jsyn).is_empty(), "no probe");
+        assert_eq!(events(&mut ep), vec![]);
+    }
+    assert!(ep.conns[&h].subflows[1].mp.keepalive.is_none());
+}
+
+#[test]
+fn close_subflow_fin_retires() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let now = ms(20);
+    assert_eq!(ep.close_subflow(now, h, SubflowId(1)), Ok(()));
+    assert_eq!(ep.conns[&h].subflows[1].state, SubflowState::Closing);
+    let out = on(&drain(&mut ep, now), &jsyn);
+    assert!(
+        out.iter().any(|g| g.flags.contains(TcpFlags::FIN)),
+        "{out:?}"
+    );
+    assert!(out.iter().all(|g| !g.flags.contains(TcpFlags::RST)));
+    // No new data goes to it.
+    ep.connection(h).unwrap().write(&[1; 3000]).unwrap();
+    let out = drain(&mut ep, now);
+    assert!(data_on(&out, &jsyn).is_empty());
+    assert!(!data_on(&out, &syn).is_empty());
+    // The peer's ACK of our FIN (at SND.UNA, nothing else was sent) with its own FIN ends it:
+    // `SubflowDown { Normal }`.
+    let opts = data_ack(una(&ep, h));
+    let seg = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: jsyn.seq.wrapping_add(2),
+        wnd: 65535,
+        ..peer_data(&jsyn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, ms(30));
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Normal,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+}
+
+#[test]
+fn close_subflow_guard_active_plus_joining() {
+    let (mut ep, h, _, _) = confirmed();
+    let (_, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    drain(&mut ep, ms(20));
+    let sf = &ep.conns[&h].subflows[1];
+    assert_eq!(
+        (sf.state, sf.tcb.state()),
+        (SubflowState::Joining, TcpState::Established)
+    );
+    assert_eq!(
+        ep.close_subflow(ms(30), h, SubflowId::INITIAL),
+        Err(SubflowError::LastSubflow)
+    );
+    let sf = &ep.conns[&h].subflows[0];
+    assert_eq!(
+        (sf.state, sf.tcb.state()),
+        (SubflowState::Active, TcpState::Established)
+    );
+    assert!(drain(&mut ep, ms(30)).is_empty());
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+#[test]
+fn close_subflow_guard_active_plus_stale() {
+    let last = |ep: &mut Endpoint<ChaCha20Rng>, h| {
+        assert_eq!(
+            ep.close_subflow(ms(30), h, SubflowId::INITIAL),
+            Err(SubflowError::LastSubflow)
+        );
+        assert_eq!(ep.conns[&h].subflows[0].state, SubflowState::Active);
+        assert!(drain(ep, ms(30)).is_empty());
+        assert_eq!(events(ep), vec![]);
+    };
+    let (mut ep, h, _, _) = two_paths(reno, reno);
+    // Subflow 1 judged Stale by health (test shortcut).
+    ep.conns.get_mut(&h).unwrap().subflows[1].state = SubflowState::Stale;
+    last(&mut ep, h);
+    // Nor may a retiring subflow take over ...
+    let (mut ep, h, _, _) = two_paths(reno, reno);
+    ep.close_subflow(ms(20), h, SubflowId(1)).unwrap();
+    drain(&mut ep, ms(20));
+    last(&mut ep, h);
+    // ... or one the peer's REMOVE_ADDR is having removed.
+    let (mut ep, h, _, _, t, _) = peer_removes_5();
+    drain(&mut ep, t);
+    last(&mut ep, h);
+}
+
+#[test]
+fn close_subflow_allowed_with_slot_cap_or_zero_window_replacement() {
+    // Subflow 1's own peer window is closed.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, ms(20), jsyn.seq.wrapping_add(1), head, 0);
+    assert!(ep.conns[&h].subflows[1].tcb.peer_window_closed());
+    assert_eq!(ep.close_subflow(ms(20), h, SubflowId::INITIAL), Ok(()));
+    // Subflow 1's mapping slots are all taken.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    ep.connection(h).unwrap().set_nodelay(true);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    for i in 0..1024u32 {
+        ep.connection(h).unwrap().write(&[i as u8]).unwrap();
+        assert_eq!(data_on(&drain(&mut ep, ms(20)), &jsyn).len(), 1);
+    }
+    assert!(ep.conns[&h].subflows[1].mp.tx.is_full());
+    assert_eq!(ep.close_subflow(ms(20), h, SubflowId::INITIAL), Ok(()));
 }

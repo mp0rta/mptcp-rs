@@ -75,12 +75,11 @@ impl Signals {
         }
         true
     }
-    // REMOVE_ADDR send (M3 Task 8).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove(&mut self, id: u8) {
         self.removes.insert(id);
     }
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `id` is in use again: a REMOVE_ADDR for it that has not gone out is dropped (M3 spec
+    /// §4.1).
     pub fn cancel_remove(&mut self, id: u8) {
         self.removes.remove(&id);
     }

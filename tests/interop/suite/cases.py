@@ -12,7 +12,8 @@
   raising AssertionError, events (ordered prefixes of client `event:` lines; the runner requires
   "Closed Normal" itself when the client closes passively, and stops an active closer in
   TIME-WAIT), kernel ("X.Y" minimum, else SKIP), optional aborted ("client" | "server": the case
-  ends in that side's abort, so no transfer completes and the runner expects that side's exit)
+  ends in that side's abort, so no transfer completes and the runner expects that side's exit),
+  optional reset [client addresses whose subflows end in a client RST, see fin_fin_no_rst]
 - watchdog_s; ci (part of the CI subset)
 
 A barrier is a client event name with an optional subflow number: "Connected", "SubflowUp:1".
@@ -20,12 +21,19 @@ A barrier is a client event name with an optional subflow number: "Connected", "
 
 
 def fin_fin_no_rst(r):
-    """At mtun0: no RST, and every subflow carried a FIN from each end. Every case whose client
-    may be stopped in TIME-WAIT needs this check: it is the proof of the FIN exchange."""
+    """At mtun0: no RST, and every subflow carried a FIN from each end; except that a subflow from
+    a client address in expect["reset"] (`remove-address`) ends in a client RST instead. Every
+    case whose client may be stopped in TIME-WAIT needs this check: it is the proof of the FIN
+    exchange."""
     tun = [g for g in r.segs if g.point == "cli"]
-    assert not any(g.flags & 0x04 for g in tun), "RST present"
+    reset = set(r.case["expect"].get("reset", ()))
     for f in {g.flow for g in tun}:
-        fins = {g.direction for g in tun if g.flow == f and g.flags & 0x01}
+        segs = [g for g in tun if g.flow == f]
+        if {a for a, _ in f} & reset:
+            assert any(g.flags & 0x04 and g.direction == "c2s" for g in segs), f"{f}: no client RST"
+            continue
+        assert not any(g.flags & 0x04 for g in segs), f"{f}: RST present"
+        fins = {g.direction for g in segs if g.flags & 0x01}
         assert fins == {"c2s", "s2c"}, f"{f}: FIN only {sorted(fins)}"
 
 
@@ -253,6 +261,52 @@ def failover(name, group, direction, script, cip, extra=()):
     return case
 
 
+def removed(rid, carrier, reset_from=None):
+    """At mtun0: exactly one REMOVE_ADDR, for address id rid, from carrier's subflow; and the client
+    RSTs on reset_from's subflow carry MP_TCPRST 0x00 T=0 (M3 spec §3.4)."""
+    def check(r):
+        rms = [(g.src, o.get("tcp.options.mptcp.addrid")) for g, o in mptcp_with(r, "cli", "c2s", "4")]
+        assert rms == [(carrier, str(rid))], f"REMOVE_ADDR {rms}"
+        if reset_from:
+            rsts = [(o.get("tcp.options.mptcp.rst_reason"), o.get("tcp.options.mptcp.flag_T.flag"))
+                    for g, o in mptcp_with(r, "cli", "c2s", "8") if g.src == reset_from and g.flags & 0x04]
+            assert rsts and set(rsts) == {("0x00", "0")}, f"MP_TCPRST on {reset_from}: {rsts}"
+    return check
+
+
+def remove_address(name, gone, survivor, rid):
+    """`remove-address gone` 1 s after the join is up: the subflow from gone is reset with
+    MP_TCPRST 0x00/T0, REMOVE_ADDR rid goes on survivor's subflow, and the transfer completes there
+    (M3 spec §4.2). Linux counts the REMOVE_ADDR (RmAddr) and the MP_TCPRST (MPRstRx), but not
+    MPTcpExtRmSubflow: our RST, a few µs behind the REMOVE_ADDR, ends the subflow before Linux's
+    path manager acts on the REMOVE_ADDR (observed in the Task 8 run). That contract, the
+    REMOVE_ADDR next to the reset, stays with the library test
+    `remove_address_sends_remove_addr_and_resets` (amendment §5.5)."""
+    sub = 1 if gone == BACKUP else 0
+    case = scripted(name, "remove", "c2s", f"{JOIN}\nat SubflowUp:1 +1000 remove-address {gone}",
+                    send_secs=5, send_rate="8")
+    e = case["expect"]
+    e["reset"] = [gone]
+    e["nstat"].update(MPTcpExtRmAddr=(">=", 1), MPTcpExtMPRstRx=(">=", 1))
+    e["pcap"] += [removed(rid, survivor, reset_from=gone)]
+    e["events"] += [f"SubflowDown SubflowId({sub}) Reset rst=none"]
+    return case
+
+
+def make_before_break():
+    """Make-before-break (M3 spec §4.2): join the new path, `set-backup` the old one, retire it by
+    FIN exchange (`close-subflow`), and once it has ended withdraw its address; the transfer
+    completes on the new path with no RST anywhere."""
+    script = "\n".join([JOIN, "at SubflowUp:1 +1000 set-backup 0 on label=b",
+                        "after b +500 close-subflow 0", f"at SubflowDown:0 +200 remove-address {PRIMARY}"])
+    case = scripted("make-before-break", "re-establishment", "c2s", script, send_secs=6, send_rate="8")
+    e = case["expect"]
+    e["nstat"].update(MPTcpExtMPPrioRx=(">=", 1), MPTcpExtRmAddr=(">=", 1))
+    e["pcap"] += [removed(0, BACKUP)]
+    e["events"] += ["SubflowDown SubflowId(0) Normal"]
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
@@ -272,4 +326,7 @@ CASES = [
     failover("one-of-two-fails-c2s", "link_failure", "c2s", JOIN, BACKUP),
     failover("one-of-two-fails-s2c", "link_failure", "s2c", JOIN, BACKUP),
     failover("one-of-two-fails-bidi", "link_failure", "bidi", JOIN, BACKUP),
+    remove_address("client-remove-joined", BACKUP, PRIMARY, 1),
+    remove_address("client-remove-id0", PRIMARY, BACKUP, 0),
+    make_before_break(),
 ]

@@ -22,8 +22,7 @@ pub(crate) struct Join {
     pub addr_id: u8,
     /// The SYN's B bit: our advertised receive preference (M3 spec §3.6).
     pub backup: bool,
-    /// The peer's address ID from its SYN/ACK (spec §5.6); read by address management (M3).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The peer's address ID from its SYN/ACK (spec §5.6).
     pub peer_addr_id: Option<u8>,
     pub third_ack: ThirdAck,
 }
