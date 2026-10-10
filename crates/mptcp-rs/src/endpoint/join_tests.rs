@@ -2257,7 +2257,7 @@ fn close_two_subflows_fin_fin() {
 /// `1 - k` at once (TIME-WAIT); subflow `k`'s FIN goes unanswered through R1 = 3 RTOs
 /// (`SubflowStale`), then the peer's ACK+FIN puts it in TIME-WAIT: `SubflowDown { Normal }`
 /// and no `SubflowRecovered` after it (a subflow whose FIN is ACKed carries no data again).
-fn stale_fin_then_time_wait(k: usize) {
+fn stale_fin_then_time_wait(k: usize) -> (Endpoint<ChaCha20Rng>, ConnectionHandle, SubflowId) {
     let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
     let (t, _) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
     let (t, una1) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
@@ -2316,6 +2316,7 @@ fn stale_fin_then_time_wait(k: usize) {
             rst: None
         }]
     );
+    (ep, h, id)
 }
 
 #[test]

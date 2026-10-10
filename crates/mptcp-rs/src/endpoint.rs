@@ -365,7 +365,7 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// The connection of a call on subflow `s`, which must be issued and not ended (a queued
-    /// join counts).
+    /// join counts). TIME-WAIT is ended: entering it reported `SubflowDown`.
     fn subflow_conn(
         &mut self,
         h: ConnectionHandle,
@@ -373,7 +373,8 @@ impl<R: CryptoRng> Endpoint<R> {
     ) -> Result<&mut Connection, SubflowError> {
         use SubflowError as E;
         let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
-        let open = |sf: &Subflow| sf.id == s && sf.tcb.state() != TcpState::Closed;
+        let ended = |sf: &Subflow| matches!(sf.tcb.state(), TcpState::Closed | TcpState::TimeWait);
+        let open = |sf: &Subflow| sf.id == s && !ended(sf);
         if !(c.subflows.iter().any(open) || c.queued_joins.iter().any(|q| q.id == s)) {
             return Err(E::NoSubflow);
         }

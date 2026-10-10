@@ -160,6 +160,24 @@ fn subflow_calls_reject_unknown_ids() {
     for s in [SubflowId::INITIAL, up] {
         assert_eq!(ep.set_local_backup(h, s, true), Ok(()));
     }
+    // A FIN exchange ending in TIME-WAIT has reported `SubflowDown` too. Only `close` leads
+    // there today, so the connection's own `Closed` check is lifted.
+    let (mut ep, h, ended) = stale_fin_then_time_wait(1);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+    ep.conns.get_mut(&h).unwrap().closed_by_app = false;
+    let now = ms(10_000);
+    assert_eq!(
+        ep.set_backup(now, h, ended, true),
+        Err(SubflowError::NoSubflow)
+    );
+    assert_eq!(
+        ep.set_local_backup(h, ended, true),
+        Err(SubflowError::NoSubflow)
+    );
+    assert_eq!(
+        ep.close_subflow(now, h, ended),
+        Err(SubflowError::NoSubflow)
+    );
 }
 
 #[test]
