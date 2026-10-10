@@ -2928,6 +2928,52 @@ fn last_live_subflow_down_with_other_in_time_wait_starts_wait() {
     assert_eq!(events(&mut ep), vec![Event::Closed { reason }]);
 }
 
+/// Make-before-break, then close (ruling R31): subflow 1, retired by `close_subflow`, is in
+/// TIME-WAIT when the connection closes passively on subflow 0. `Closed { Normal }` is held
+/// until that TIME-WAIT ends, and `poll_timeout` gives its deadline.
+#[test]
+fn close_after_retire_waits_for_retired_time_wait() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let retired = ms(20);
+    retire_to_time_wait(&mut ep, h, &jsyn, SubflowId(1), retired);
+    let t = ms(30);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().close();
+    let out = on(&drain(&mut ep, t), &syn);
+    let dfin = out.last().expect("DATA_FIN on subflow 0");
+    // The peer DATA_ACKs our DATA_FIN and sends its own with its FIN: subflow 0 to LAST-ACK.
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1));
+    let seg = Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: dfin.seq.wrapping_add(dfin.payload.len() as u32),
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t);
+    let out = on(&drain(&mut ep, t), &syn);
+    let fin = (out.iter().find(|g| g.flags.contains(TcpFlags::FIN))).expect("our FIN");
+    let opts = data_ack(head + 1);
+    let seg = Segment {
+        ack: fin.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(&syn, 5002, &opts, &[])
+    };
+    input_at(&mut ep, &seg, t);
+    drain(&mut ep, t);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
+    assert_eq!(
+        events(&mut ep),
+        vec![],
+        "no Closed while subflow 1 is in TIME-WAIT"
+    );
+    let at = retired + Duration::from_secs(120);
+    assert_eq!(ep.poll_timeout(), Some(at), "the retired subflow's 2·MSL");
+    ep.handle_timeout(at);
+    let reason = CloseReason::Normal;
+    assert_eq!(events(&mut ep), vec![Event::Closed { reason }]);
+    assert!(ep.connection(h).is_none());
+}
+
 /// `abort` discards unread data at once: `read` fails before the endpoint carries it out. Once
 /// `Closed` was reported `abort` does nothing, so unread data stays readable.
 #[test]

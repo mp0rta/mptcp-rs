@@ -110,7 +110,7 @@ class Judge(unittest.TestCase):
         self.assertIsNone(run_suite.lost("listening on mtun0\n"))
         self.assertIsNone(run_suite.lost("10 packets captured\n"))
 
-    def test_active_closer_is_first_fin_of_last_closing_subflow(self):
+    def test_active_closer_is_first_fin_of_any_subflow(self):
         import run_suite
         FIN = 0x01
 
@@ -120,12 +120,19 @@ class Judge(unittest.TestCase):
             g = decode.Seg(t, "cli", "a", "b", sport, 5201, flags, seq, ack, 0, 0, [], [])
             g.direction = direction
             return g
-        # A retired subflow closed by the client, then the server closes the last one first.
+        # A retired subflow closed by the client (TIME-WAIT), then the server closes the last one
+        # first: since R31 `Closed` waits for that TIME-WAIT, so the client is an active closer.
         segs = [seg(1, 1, "c2s"), seg(1.1, 1, "s2c"), seg(5, 2, "s2c"), seg(5.1, 2, "c2s", ack=8)]
-        self.assertFalse(run_suite.active_closer(segs))
-        self.assertTrue(run_suite.active_closer(segs[:2] + [seg(5, 2, "c2s"), seg(5.1, 2, "s2c")]))
+        self.assertTrue(run_suite.active_closer(segs))
+        # The server closes every subflow first: passive on all of them.
+        passive = [seg(1, 1, "s2c"), seg(1.1, 1, "c2s", ack=8)] + segs[2:]
+        self.assertFalse(run_suite.active_closer(passive))
+        # Crossing FINs on a subflow that is not the last to close; the last one closes passively.
+        crossed = [seg(5, 1, "s2c"), seg(5.02, 2, "s2c"), seg(5.05, 1, "c2s"), seg(5.1, 2, "c2s", ack=8)]
+        self.assertTrue(run_suite.active_closer(crossed))
+        self.assertTrue(run_suite.active_closer(passive[:2] + [seg(5, 2, "c2s"), seg(5.1, 2, "s2c")]))
         # Simultaneous close: the server's FIN reached mtun0 first, the client's does not ACK it.
-        self.assertTrue(run_suite.active_closer(segs[:3] + [seg(5.1, 2, "c2s")]))
+        self.assertTrue(run_suite.active_closer(passive[:3] + [seg(5.1, 2, "c2s")]))
         self.assertFalse(run_suite.active_closer([seg(1, 1, "c2s", ACK)]))
         self.assertFalse(run_suite.active_closer([]))
 
