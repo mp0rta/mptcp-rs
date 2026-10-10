@@ -172,8 +172,12 @@ fn run(a: Args) -> Result<String, String> {
             Some(path) => Some(EventLog::create(path, start).map_err(io_err("event log"))?),
             None => None,
         },
+        complete: false,
     };
     drv.clock("start");
+    // The suite stops an active closer in TIME-WAIT with SIGTERM: it still reports an unmet
+    // directive and ends the event log.
+    tun::catch_sigterm();
 
     let mut pkt = vec![0u8; 65535];
     let mut rbuf = vec![0u8; 65536];
@@ -182,6 +186,13 @@ fn run(a: Args) -> Result<String, String> {
     let mut st = State::default();
     let mut resume_read = None;
     loop {
+        if tun::sigterm() {
+            if let Some(d) = drv.script.unmet() {
+                eprintln!("script: unmet {d}");
+            }
+            drop(drv); // the event log's end clock
+            tun::die_of_sigterm();
+        }
         if start.elapsed() > Duration::from_secs(900) {
             return Err("connection timed out".into());
         }
@@ -218,6 +229,12 @@ fn run(a: Args) -> Result<String, String> {
         let elapsed = start.elapsed();
         for action in drv.script.due(elapsed) {
             drv.act(&mut ep, h, now(start), &action, &mut st)?;
+        }
+        // Every directive has run: the suite requires this line (M3 spec §5.3).
+        if !drv.complete && drv.script.unmet().is_none() {
+            drv.complete = true;
+            println!("script: complete");
+            drv.log("script", "complete");
         }
         // After a normal close the connection is gone unless data is still unread.
         if st.drives(ep.connection(h).is_some()) {
@@ -309,7 +326,6 @@ fn run(a: Args) -> Result<String, String> {
             write_packet(&tun, &pkt[..n])?;
         }
         if st.done {
-            drv.clock("end");
             if let Some(d) = drv.script.unmet() {
                 return Err(format!("script: unmet {d}"));
             }
@@ -501,6 +517,8 @@ struct Driver {
     script: Script,
     subs: Vec<(SubflowId, IpAddr, SocketAddr, u16, bool)>,
     log: Option<EventLog>,
+    /// `script: complete` was printed.
+    complete: bool,
 }
 
 impl Driver {
@@ -598,7 +616,8 @@ impl Driver {
 
 /// `--event-log`: JSON lines, each with CLOCK_REALTIME epoch time (`realtime`) and the
 /// monotonic time since the client started (`rel`); the start and end lines pair the two
-/// clocks, so a drift between them shows (M3 spec §5.3).
+/// clocks, so a drift between them shows (M3 spec §5.3). The end line is written on drop, so
+/// every exit has one.
 struct EventLog {
     file: std::fs::File,
     start: std::time::Instant,
@@ -619,6 +638,12 @@ impl EventLog {
             self.file,
             "{{\"realtime\": {realtime:.6}, \"rel\": {rel:.6}, {fields}}}"
         );
+    }
+}
+
+impl Drop for EventLog {
+    fn drop(&mut self) {
+        self.line("\"clock\": \"end\"");
     }
 }
 

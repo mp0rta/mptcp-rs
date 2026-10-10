@@ -220,6 +220,11 @@ def judge(r):
         e = {**e, "pcap": e["pcap"] + [fin_fin_no_rst]}  # the proof of the FIN exchange
     elif r.rc[0] == 0 and not aborted and "Closed Normal" not in r.events:
         why.append("passive close without Closed Normal")
+    # Every scenario directive ran (amendment §5.3); the client prints this line once they all
+    # have, also when it is later stopped in TIME-WAIT, and `script: unmet …` if stopped short.
+    if not re.search(r"^script: complete$", r.client, re.M):
+        unmet = re.search(r"^(?:mptcp-rs-tun: )?script: unmet (.*)$", r.client, re.M)
+        why.append(f"script: unmet {unmet[1]}" if unmet else "script: no `script: complete` line")
     if aborted:
         pass
     elif cm and sm:
