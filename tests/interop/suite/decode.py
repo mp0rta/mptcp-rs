@@ -47,9 +47,13 @@ def _flat(obj):
 
 
 def _segs(pcap, point):
-    out = subprocess.run(["tshark", "-r", str(pcap), "-Y", "tcp && !icmp && !icmpv6", "-T", "json", "-J", "frame ip ipv6 tcp",
-                          "--disable-protocol", "iperf3", "-o", "tcp.analyze_sequence_numbers:FALSE",
-                          "-o", "mptcp.analyze_mptcp:FALSE"], check=True, capture_output=True, text=True).stdout
+    p = subprocess.run(["tshark", "-r", str(pcap), "-Y", "tcp && !icmp && !icmpv6", "-T", "json", "-J", "frame ip ipv6 tcp",
+                        "--disable-protocol", "iperf3", "-o", "tcp.analyze_sequence_numbers:FALSE",
+                        "-o", "mptcp.analyze_mptcp:FALSE"], capture_output=True, text=True)
+    if p.returncode:
+        size = pcap.stat().st_size if pcap.exists() else None
+        raise RuntimeError(f"tshark -r {pcap} ({size} bytes): exit {p.returncode}: {p.stderr.strip()}")
+    out = p.stdout
     # Objects become tuples of pairs: tshark repeats a key once per option instance.
     for p in json.loads(out, object_pairs_hook=tuple):
         layers = _get(_get(p, "_source"), "layers")
