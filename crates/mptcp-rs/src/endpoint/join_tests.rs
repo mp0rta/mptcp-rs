@@ -2319,6 +2319,64 @@ fn simultaneous_close_on_last_subflow_closes_after_its_time_wait() {
     assert_eq!(at, t + Duration::from_secs(120), "2·MSL");
 }
 
+/// The reverse order (ruling R31): subflow 1 enters TIME-WAIT first (active close), then
+/// subflow 0 ends from LAST-ACK (passive close). Every subflow must be closed, TIME-WAIT
+/// included, before `Closed`: it follows subflow 1's TIME-WAIT, as in the order above.
+#[test]
+fn passive_close_after_time_wait_closes_after_that_time_wait() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let (t, una0) = prime(&mut ep, h, &syn, SubflowId(0), ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, SubflowId(1), t, 10);
+    events(&mut ep);
+    let head = una(&ep, h);
+    ep.connection(h).unwrap().close();
+    drain(&mut ep, t);
+    let t = t + ms_d(10);
+    let fin_seg = |s: &Segment<'static>, opts: &'static [u8], ack| Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack,
+        wnd: 65535,
+        ..peer_data(s, 5001, opts, &[])
+    };
+    // The peer's FIN on subflow 0 DATA_ACKs our DATA_FIN: subflow 0 answers with its FIN
+    // (LAST-ACK), subflow 1 sends its FIN first (FIN-WAIT-1).
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1)).leak();
+    input_at(&mut ep, &fin_seg(&syn, opts, una0), t);
+    let out = drain(&mut ep, t);
+    let fin = |s: &Segment| s.flags.contains(TcpFlags::FIN);
+    let fin0 = (on(&out, &syn).into_iter()).find(fin).expect("FIN 0");
+    let fin1 = (on(&out, &jsyn).into_iter()).find(fin).expect("FIN 1");
+    let dack = data_ack(head + 1).leak();
+    input_at(&mut ep, &fin_seg(&jsyn, dack, fin1.seq.wrapping_add(1)), t);
+    drain(&mut ep, t);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+    let seg = Segment {
+        ack: fin0.seq.wrapping_add(1),
+        wnd: 65535,
+        ..peer_data(&syn, 5002, dack, &[])
+    };
+    input_at(&mut ep, &seg, t);
+    drain(&mut ep, t);
+    assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Normal,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), [down], "no Closed while in TIME-WAIT");
+    let at = t + Duration::from_secs(120);
+    assert_eq!(ep.poll_timeout(), Some(at), "the TIME-WAIT's 2·MSL");
+    ep.handle_timeout(t + Duration::from_secs(119));
+    assert_eq!(events(&mut ep), []);
+    ep.handle_timeout(at);
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert_eq!(events(&mut ep), [closed]);
+    assert!(ep.connection(h).is_none());
+    assert!(ep.conns.is_empty() && ep.demux.is_empty());
+}
+
 /// Both DATA_FINs are DATA_ACKed and both subflows send their FIN. The peer answers subflow
 /// `1 - k` at once (TIME-WAIT); subflow `k`'s FIN goes unanswered through R1 = 3 RTOs
 /// (`SubflowStale`), then the peer's ACK+FIN puts it in TIME-WAIT: `SubflowDown { Normal }`

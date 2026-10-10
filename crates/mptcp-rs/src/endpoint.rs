@@ -736,6 +736,7 @@ impl<R: CryptoRng> Endpoint<R> {
         if let Some(e) = c.update_health(i) {
             self.events.push_back((h, e));
         }
+        let time_wait = time_wait(c);
         let sf = &mut c.subflows[i];
         let mut hk = SubflowHooks {
             conn: &mut c.hooks,
@@ -749,6 +750,7 @@ impl<R: CryptoRng> Endpoint<R> {
             h,
             now,
             last,
+            time_wait,
         );
         c.update_recovery(now);
         if fell_back {
@@ -800,6 +802,7 @@ impl<R: CryptoRng> Endpoint<R> {
         if let Some(e) = c.update_health(i) {
             events.push_back((h, e));
         }
+        let time_wait = time_wait(c);
         let sf = &mut c.subflows[i];
         let mut hk = SubflowHooks {
             conn: &mut c.hooks,
@@ -813,7 +816,16 @@ impl<R: CryptoRng> Endpoint<R> {
             let rst = hk.sf.rst;
             Self::push_event(events, hk.conn, &mut c.reset, h, r, !last, rst);
         }
-        Self::update_close(events, &mut hk, &sf.tcb, &mut c.reset, h, now, last);
+        Self::update_close(
+            events,
+            &mut hk,
+            &sf.tcb,
+            &mut c.reset,
+            h,
+            now,
+            last,
+            time_wait,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -825,8 +837,9 @@ impl<R: CryptoRng> Endpoint<R> {
         h: ConnectionHandle,
         now: Instant,
         last: bool,
+        time_wait: bool,
     ) {
-        if let Some(reason) = hk.update_close(tcb, now, last) {
+        if let Some(reason) = hk.update_close(tcb, now, last, time_wait) {
             *reset |= reason != CloseReason::Normal;
             events.push_back((h, Event::Closed { reason }));
         }
@@ -1096,8 +1109,7 @@ impl<R: CryptoRng> Endpoint<R> {
             .filter(|c| !c.detached)
             .filter_map(|c| {
                 // A Closed TCB's deadline frees the connection, which waits for TIME-WAIT.
-                let time_wait = (c.subflows.iter()).any(|sf| sf.tcb.state() == TcpState::TimeWait);
-                let free = !(c.hooks.retained() || time_wait);
+                let free = !(c.hooks.retained() || time_wait(c));
                 c.subflows
                     .iter()
                     .flat_map(|sf| {
@@ -1223,6 +1235,11 @@ fn min_mtu(local: IpAddr, remote: IpAddr) -> Option<u16> {
 /// Some subflow other than `subflows[i]` is open (not `Subflow::ended`).
 fn others_open(subflows: &[Subflow], i: usize) -> bool {
     (subflows.iter().enumerate()).any(|(j, s)| j != i && !s.ended())
+}
+
+/// Some subflow of `c` is in TIME-WAIT.
+fn time_wait(c: &Connection) -> bool {
+    (c.subflows.iter()).any(|sf| sf.tcb.state() == TcpState::TimeWait)
 }
 
 /// `Closed` was reported, or (a `close` in SYN-SENT) is due without further input.

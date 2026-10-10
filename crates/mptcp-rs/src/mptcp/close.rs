@@ -86,12 +86,14 @@ impl ConnectionHooks {
 }
 
 impl SubflowHooks<'_> {
-    /// `last`: no other subflow of the connection is open.
+    /// `last`: no other subflow of the connection is open. `time_wait`: some subflow is in
+    /// TIME-WAIT, which holds a normal close (`Closed` once every TCB is Closed).
     pub fn update_close(
         &mut self,
         tcb: &Tcb,
         now: Instant,
         last: bool,
+        time_wait: bool,
     ) -> Option<crate::tcp::CloseReason> {
         let d = self.conn.data.as_mut().filter(|d| !d.fallback)?;
         if d.close.closed {
@@ -111,7 +113,10 @@ impl SubflowHooks<'_> {
             d.recovery_at = None;
             d.close.at = None;
             if d.close.acked && d.close.peer_acked {
-                Some(crate::tcp::CloseReason::Normal)
+                // Spec rev9: CLOSED once all subflows are closed, TIME-WAIT included (R31);
+                // the TIME-WAIT's expiry reports it. No no-subflow wait meanwhile.
+                d.close.no_subflow_at = None;
+                (!time_wait).then_some(crate::tcp::CloseReason::Normal)
             } else {
                 let at = d
                     .close
