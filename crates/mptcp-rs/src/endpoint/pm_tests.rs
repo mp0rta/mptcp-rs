@@ -1725,10 +1725,11 @@ fn peer_removes_5() -> (
     assert_eq!(events(&mut ep), vec![Event::AddressRemoved { id: 5 }]);
     (ep, h, syn, jsyn, t, una1)
 }
-/// The times of the keepalive probes (zero-length at SND.UNA − 1) on `jsyn`'s subflow.
+/// The times of the keepalive probes on `jsyn`'s subflow: the zero-window probe's shape,
+/// zero-length at SND.UNA − 1 with no options.
 fn probes(out: &[(Instant, Segment)], jsyn: &Segment, una1: SeqNum) -> Vec<Instant> {
     (out.iter())
-        .filter(|(_, s)| s.src == jsyn.src && s.payload.is_empty())
+        .filter(|(_, s)| s.src == jsyn.src && s.payload.is_empty() && s.options.is_empty())
         .filter(|(_, s)| s.flags == TcpFlags::ACK && s.seq == una1.wrapping_add(u32::MAX))
         .map(|p| p.0)
         .collect()
@@ -1972,4 +1973,79 @@ fn close_subflow_allowed_with_slot_cap_or_zero_window_replacement() {
     }
     assert!(ep.conns[&h].subflows[1].mp.tx.is_full());
     assert_eq!(ep.close_subflow(ms(20), h, SubflowId::INITIAL), Ok(()));
+}
+
+/// A join still in SYN-SENT is deleted (RFC 9293 §3.10.4: nothing is sent) and reported at
+/// once, like a queued join; later input frees it without a second event.
+#[test]
+fn close_subflow_syn_sent_join_reports_down() {
+    let (mut ep, h, syn, _) = confirmed();
+    let (id, _) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    assert_eq!(ep.close_subflow(ms(20), h, id), Ok(()));
+    let down = Event::SubflowDown {
+        subflow: id,
+        reason: CloseReason::Reset,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &syn, ms(30), syn.seq.wrapping_add(1), head, 1000);
+    let out = drive(&mut ep, ms(30), ms(10_000));
+    assert!(
+        out.iter().all(|(_, g)| g.src.ip() != ip(JOIN_IP)),
+        "{out:?}"
+    );
+    assert_eq!(events(&mut ep), vec![]);
+    assert!(ep.conns[&h].subflows.iter().all(|sf| sf.id != id), "freed");
+}
+
+/// M3 spec §4.2: a retiring subflow keeps retransmitting its own data, and the data it holds
+/// that is not DATA_ACKed goes out on the other subflow; the transfer completes byte-exact. A
+/// retiring subflow's copy is not a live copy (only Active ones are), so the connection's
+/// data-retransmission timer (rule 5) resends its head before the subflow ends at R2, which
+/// then reports `SubflowDown { Timeout }`.
+#[test]
+fn close_subflow_reinjects_on_end() {
+    let n = 200_000;
+    let (mut ep, h, mut peer, t, head, data) = two_paths_primed(Duration::from_secs(3), n);
+    peer.drop[1] = true;
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    for p in drain(&mut ep, t) {
+        peer.take(t, leak(p));
+    }
+    let on1 = |peer: &Peer| -> Vec<Segment<'static>> {
+        (peer.sent.iter())
+            .filter(|(i, s)| *i == 1 && !s.payload.is_empty())
+            .map(|p| p.1.clone())
+            .collect()
+    };
+    let before = on1(&peer);
+    assert!(!before.is_empty(), "data in flight on subflow 1");
+    let max_end = (before.iter().map(end)).reduce(|m, e| if e.gt(m) { e } else { m });
+    let max_end = max_end.unwrap();
+    assert_eq!(ep.close_subflow(t, h, SubflowId(1)), Ok(()));
+    let done = peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+    let r2 = t + Duration::from_secs(3);
+    let moved = moved_at(&peer, 1, 0).expect("re-sent on subflow 0");
+    assert!(moved < r2 && done < r2, "{moved:?} {done:?}");
+    let after = on1(&peer).split_off(before.len());
+    assert!(!after.is_empty(), "retransmissions continue while Closing");
+    assert!(
+        after.iter().all(|s| end(s).le(max_end)),
+        "no new data on the retiring subflow"
+    );
+    // Its path is dead: it ends at R2.
+    let out = drive(&mut ep, done, t + Duration::from_secs(30));
+    assert!(
+        out.iter()
+            .any(|(at, g)| *at == r2 && g.flags.contains(TcpFlags::RST))
+    );
+    let down = Event::SubflowDown {
+        subflow: SubflowId(1),
+        reason: CloseReason::Timeout,
+        rst: None,
+    };
+    assert_eq!(events(&mut ep), vec![down]);
 }

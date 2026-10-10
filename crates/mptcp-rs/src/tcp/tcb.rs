@@ -784,7 +784,7 @@ impl Tcb {
         self.ack_due = true;
     }
     /// Makes one keepalive probe due: the zero-window probe's shape, zero-length at
-    /// SND.UNA − 1, which the peer answers with an ACK. It goes out at the next `poll_send`
+    /// SND.UNA − 1 with no options, which the peer answers with an ACK. It goes out at the next `poll_send`
     /// while synchronized and not in TIME-WAIT, before anything but a RST.
     pub(crate) fn send_keepalive_probe(&mut self) {
         self.keepalive_due = true;
@@ -979,13 +979,11 @@ impl Tcb {
         }
         if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
             if std::mem::take(&mut self.keepalive_due) {
+                // The peer drops it unprocessed (below its window) and answers with an ACK, so
+                // it carries no options and answers nothing: a due ACK stays due.
                 let wnd = self.wnd_field(h);
                 let seq = self.snd_una.wrapping_add(u32::MAX);
-                let meta = out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd);
-                let n = h.options_for(TcpFlags::ACK, &mut out.options);
-                out.options_len = n + self.write_sacks(&mut out.options[n..]);
-                self.ack_sent();
-                return Some(meta);
+                return Some(out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd));
             }
             let fin_unsent = matches!(
                 self.state,

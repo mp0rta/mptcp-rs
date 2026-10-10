@@ -442,14 +442,14 @@ impl<R: CryptoRng> Endpoint<R> {
 
     /// Retires subflow `s`, which still works, by FIN exchange (RFC 8684 L2114–2116): it gets
     /// no new data, its TCP retransmissions go on, and once it ends (`SubflowDown`) the data it
-    /// held that is not DATA_ACKed is resent on the others. A queued join is dropped
-    /// (`SubflowDown { Reset }`). Only while another subflow can take over: one that is Active
+    /// held that is not DATA_ACKed is resent on the others. A queued join, or one still in
+    /// SYN-SENT, is dropped (`SubflowDown { Reset }`). Only while another subflow can take over: one that is Active
     /// (not Joining, Stale or retiring), not under the peer's REMOVE_ADDR keepalive, and has an
     /// established TCB; a closed window or busy cwnd does not matter. Otherwise `LastSubflow`
     /// and nothing changes: closing every subflow is `Connection::close`.
     pub fn close_subflow(
         &mut self,
-        _now: Instant,
+        now: Instant,
         h: ConnectionHandle,
         s: SubflowId,
     ) -> Result<(), SubflowError> {
@@ -457,11 +457,23 @@ impl<R: CryptoRng> Endpoint<R> {
         if !(c.subflows.iter()).any(|o| o.id != s && o.can_replace()) {
             return Err(SubflowError::LastSubflow);
         }
-        if let Some(sf) = c.subflows.iter_mut().find(|sf| sf.id == s) {
-            sf.state = SubflowState::Closing;
-            sf.tcb.close();
-        } else {
-            c.queued_joins.retain(|q| q.id != s);
+        let dropped = match c.subflows.iter_mut().find(|sf| sf.id == s) {
+            // RFC 9293 §3.10.4: CLOSE in SYN-SENT deletes the TCB, sending nothing.
+            Some(sf) if sf.tcb.state() == TcpState::SynSent => {
+                sf.tcb.delete(now);
+                true
+            }
+            Some(sf) => {
+                sf.state = SubflowState::Closing;
+                sf.tcb.close();
+                false
+            }
+            None => {
+                c.queued_joins.retain(|q| q.id != s);
+                true
+            }
+        };
+        if dropped {
             (self.events).push_back((h, down(s, CloseReason::Reset, None)));
         }
         Ok(())
