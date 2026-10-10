@@ -168,9 +168,10 @@ fn close_in_syn_sent_reports_and_frees() {
 #[test]
 fn connect_validates_arguments() {
     let mut ep = endpoint(7);
-    let small = |mtu| ConnectConfig {
-        mtu,
-        ..ConnectConfig::default()
+    let small = |mtu| {
+        let mut cfg = ConnectConfig::default();
+        cfg.mtu = mtu;
+        cfg
     };
     let c = |ep: &mut mptcp_rs::Endpoint<_>, v6, mtu| {
         ep.connect(t(1), local_ip(v6), peer_addr(v6), small(mtu))
@@ -180,19 +181,13 @@ fn connect_validates_arguments() {
     assert_eq!(c(&mut ep, true, 1279).err(), Some(ConnectError::InvalidMtu));
     assert!(c(&mut ep, true, 1280).is_ok());
     for (send_buffer, recv_buffer) in [(0, 1), (1, 0), ((1 << 30) + 1, 1), (1, (1 << 30) + 1)] {
-        let cfg = ConnectConfig {
-            send_buffer,
-            recv_buffer,
-            ..ConnectConfig::default()
-        };
+        let mut cfg = ConnectConfig::default();
+        (cfg.send_buffer, cfg.recv_buffer) = (send_buffer, recv_buffer);
         let r = ep.connect(t(1), local_ip(false), peer_addr(false), cfg);
         assert_eq!(r.err(), Some(ConnectError::InvalidBuffer));
     }
-    let max = ConnectConfig {
-        send_buffer: 1 << 30,
-        recv_buffer: 1 << 30,
-        ..ConnectConfig::default()
-    };
+    let mut max = ConnectConfig::default();
+    (max.send_buffer, max.recv_buffer) = (1 << 30, 1 << 30);
     assert!(
         ep.connect(t(1), local_ip(false), peer_addr(false), max)
             .is_ok()

@@ -4,3 +4,4 @@ cli.log
 srv.log
 
 /artifacts/
+__pycache__/

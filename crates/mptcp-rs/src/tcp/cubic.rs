@@ -207,7 +207,8 @@ impl CongestionControl for Cubic {
 
     /// §4.6 multiplicative decrease with §4.7 fast convergence; §4.8 for an RTO. Either ends
     /// HyStart++ (RFC 9406 §4.2: loss in slow start or CSS), and a new congestion avoidance
-    /// stage starts after it.
+    /// stage starts after it. `Penalized` (M3 spec §2.5) is the §4.6 decrease without fast
+    /// recovery: cwnd = ssthresh at once, never above the old cwnd.
     fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
         let smss = f64::from(self.smss);
         self.hystart = None;
@@ -224,7 +225,7 @@ impl CongestionControl for Cubic {
             self.ssthresh = ((base * BETA.0 / BETA.1) as u32).max(2 * self.smss);
         }
         match ev {
-            CongestionEvent::FastRetransmit => {
+            CongestionEvent::FastRetransmit | CongestionEvent::Penalized => {
                 // §4.7: W_max = cwnd·(1 + β_cubic)/2 when below the last W_max.
                 self.w_max = if self.cwnd < self.w_max {
                     self.cwnd * 17.0 / 20.0
@@ -233,8 +234,14 @@ impl CongestionControl for Cubic {
                 };
                 self.plan_from_start = false;
                 self.cwnd_prior = self.cwnd;
-                // RFC 5681 §3.2 step 3 inflation on top of ssthresh.
-                self.cwnd = f64::from(self.ssthresh) + 3.0 * smss;
+                if ev == CongestionEvent::Penalized {
+                    // Slow start ends: ssthresh is the new cwnd.
+                    self.cwnd = self.cwnd.min(f64::from(self.ssthresh)).floor();
+                    self.ssthresh = self.cwnd as u32;
+                } else {
+                    // RFC 5681 §3.2 step 3 inflation on top of ssthresh.
+                    self.cwnd = f64::from(self.ssthresh) + 3.0 * smss;
+                }
             }
             CongestionEvent::Rto => {
                 // A repeated RTO finds cwnd already at the loss window: no reduction, so
@@ -988,5 +995,83 @@ mod tests {
             at(ms(36_000)),
         );
         assert_eq!(c.w_max, reached);
+    }
+
+    // M3 §2.5: `Penalized` is the §4.6 decrease without recovery.
+
+    /// In the Reno-friendly region (`cubic_reno_friendly_region`'s 1 ms path) 200 ACKs after a
+    /// loss at 10 000: cwnd = W_est.
+    fn in_ca() -> Cubic {
+        let mut c = grown(10_000);
+        c.on_congestion(CongestionEvent::FastRetransmit, 10_000, T0);
+        c.on_recovery_ack(RecoveryAck::Full { in_flight: 10_000 });
+        for i in 0..200 {
+            c.on_ack(&ack(
+                SMSS,
+                Some(ms(1)),
+                0,
+                at(Duration::from_micros(100 * i)),
+            ));
+        }
+        c
+    }
+
+    #[test]
+    fn penalized_halves_and_resets_epoch() {
+        let (mut p, mut r) = (in_ca(), in_ca());
+        let before = p.cwnd;
+        let flight = p.cwnd();
+        assert_eq!(p.epoch.unwrap().w_est, before);
+        let now = at(ms(20));
+        p.on_congestion(CongestionEvent::Penalized, flight, now);
+        assert!(p.epoch.is_none() && !p.plan_from_start);
+        let ssthresh = (u64::from(flight) * 7 / 10) as u32;
+        assert_eq!((p.cwnd(), p.ssthresh), (ssthresh, ssthresh));
+        assert_eq!(p.cwnd_prior, before);
+        // The reference: the same decrease after a loss, whose recovery ends at cwnd = ssthresh.
+        r.on_congestion(CongestionEvent::FastRetransmit, flight, now);
+        r.on_recovery_ack(RecoveryAck::Full { in_flight: flight });
+        assert_eq!((r.cwnd(), r.w_max), (p.cwnd(), p.w_max));
+        for i in 1..=50 {
+            let t = now + Duration::from_micros(100 * i);
+            p.on_ack(&ack(SMSS, Some(ms(1)), flight, t));
+            r.on_ack(&ack(SMSS, Some(ms(1)), flight, t));
+            assert!(p.cwnd <= r.cwnd, "ACK {i}: {} above {}", p.cwnd, r.cwnd);
+            assert!(p.cwnd < 0.9 * before, "ACK {i}: back to the old W_est");
+        }
+    }
+
+    #[test]
+    fn penalized_ends_slow_start_and_hystart() {
+        let mut c = hy();
+        round(&mut c, ms(100));
+        assert_eq!((c.cwnd(), c.ssthresh), (13_000, u32::MAX));
+        c.on_congestion(CongestionEvent::Penalized, 13_000, T0);
+        assert!(c.hystart.is_none());
+        assert_eq!((c.cwnd(), c.ssthresh), (9100, 9100));
+        // The next ACK is congestion avoidance, not + SMSS.
+        c.on_ack(&ack(SMSS, Some(ms(100)), 8 * SMSS, T0));
+        assert!(c.epoch.is_some());
+        assert!(c.cwnd() < 9100 + SMSS / 2, "{}", c.cwnd());
+    }
+
+    #[test]
+    fn penalized_min_clamp_never_raises() {
+        // cwnd at 2·SMSS: a lost SYN's one-segment IW after one ACK.
+        let mut c = Cubic::new();
+        c.init(SMSS, true);
+        c.on_ack(&ack(SMSS, None, 0, T0));
+        assert_eq!(c.cwnd(), 2 * SMSS);
+        c.on_congestion(CongestionEvent::Penalized, 2 * SMSS, T0);
+        assert!(c.cwnd() <= 2 * SMSS);
+        // At one SMSS the 2·SMSS floor of ssthresh would raise it.
+        let mut c = Cubic::new();
+        c.init(SMSS, true);
+        c.on_congestion(CongestionEvent::Penalized, SMSS, T0);
+        assert_eq!(c.cwnd(), SMSS);
+        let mut r = Reno::new();
+        r.init(SMSS, true);
+        r.on_congestion(CongestionEvent::Penalized, SMSS, T0);
+        assert_eq!(r.cwnd(), SMSS);
     }
 }

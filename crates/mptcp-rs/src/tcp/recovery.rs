@@ -79,6 +79,10 @@ impl NewReno {
         DupAck::FastRetransmit
     }
 
+    pub(crate) fn in_recovery(&self) -> bool {
+        self.in_recovery
+    }
+
     fn passes_recover(&self, seq: SeqNum) -> bool {
         self.recover.is_none_or(|r| seq.gt(r))
     }

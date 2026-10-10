@@ -18,23 +18,42 @@ pub(crate) struct SubflowSnapshot {
     pub new_budget: SendBudget,
     /// For the head reinjection candidate; zero when nothing is queued.
     pub reinject_budget: SendBudget,
+    /// For the opportunistic candidate (M3 §2.4), computed like `reinject_budget`; zero when
+    /// there is none or this subflow is not an eligible target.
+    pub opp_budget: SendBudget,
     /// Smoothed RTT, or the initial RTO before the first sample.
     pub srtt: Duration,
     /// Why the subflow is in an app-limited interval, if it is: its ACK samples then say
     /// nothing about path capacity.
     pub app_limited: Option<AppLimited>,
+    /// The effective transmit-backup: local or peer-requested (M3 §4.2).
+    pub backup: bool,
+    /// Active, and the peer is not advertising a zero subflow window (M3 §4.5).
+    pub usable: bool,
 }
 
 pub(crate) struct Pending<'a> {
     /// Unassigned data within the connection-level window.
     pub new_bytes: u64,
     pub reinject: &'a ReinjectQueue,
+    /// The opportunistic candidate `(dsn, len)` (M3 §2.2); only while `new_bytes == 0`.
+    pub opportunistic: Option<(u64, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Payload {
-    New { bytes: u32 },
-    Reinject { dsn: u64, len: u32 },
+    New {
+        bytes: u32,
+    },
+    Reinject {
+        dsn: u64,
+        len: u32,
+    },
+    /// A copy of the blocking run on another subflow (M3 §2.3).
+    Opportunistic {
+        dsn: u64,
+        len: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,14 +68,26 @@ pub(crate) enum Plan {
 /// A health fact about one subflow (spec §4 rule 3), from its `rto_streak`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HealthEvent {
-    RtoFired { subflow: SubflowId, n: u32 },
-    Progress { subflow: SubflowId },
+    RtoFired {
+        subflow: SubflowId,
+        n: u32,
+    },
+    Progress {
+        subflow: SubflowId,
+    },
+    /// An opportunistic copy of the run `subflow` holds at `send.una` went to another usable
+    /// subflow (M3 §2.5).
+    HeadBlocked {
+        subflow: SubflowId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HealthVerdict {
     Keep,
     Stale,
+    /// Reduce the subflow's cwnd (`CongestionEvent::Penalized`).
+    Penalize,
 }
 
 /// MinRTT's `on_health` threshold (spec §4 rule 4): Stale on the first R1 event.
@@ -71,15 +102,20 @@ pub(crate) trait Scheduler: Send {
     fn on_assigned(&mut self, _subflow: SubflowId, _bytes: u32, _reinject: bool) {}
 }
 
-/// Lowest `srtt` among Active subflows with budget; queued reinjection first.
+/// Lowest `srtt` among usable subflows with budget, backup subflows only while no non-backup
+/// subflow is usable (M3 §4.5); queued reinjection first, then New, then the opportunistic
+/// candidate.
 pub(crate) struct MinRtt;
 
 impl Scheduler for MinRtt {
     fn plan(&mut self, _now: Instant, pending: &Pending<'_>, subflows: &[SubflowSnapshot]) -> Plan {
+        let usable = |s: &&SubflowSnapshot| s.state == SubflowState::Active && s.usable;
+        let primary = subflows.iter().filter(usable).any(|s| !s.backup);
         let best = |budget: fn(&SubflowSnapshot) -> SendBudget| {
             subflows
                 .iter()
-                .filter(|s| s.state == SubflowState::Active && budget(s).bytes() > 0)
+                .filter(usable)
+                .filter(|s| !(s.backup && primary) && budget(s).bytes() > 0)
                 .min_by_key(|s| s.srtt)
                 .map(|s| (s.id, budget(s).bytes() as u32))
         };
@@ -90,10 +126,22 @@ impl Scheduler for MinRtt {
                 return Plan::Send { subflow, payload };
             }
         }
-        match best(|s| s.new_budget).filter(|_| pending.new_bytes > 0) {
-            Some((subflow, bytes)) => Plan::Send {
+        if pending.new_bytes > 0 {
+            return match best(|s| s.new_budget) {
+                Some((subflow, bytes)) => Plan::Send {
+                    subflow,
+                    payload: Payload::New { bytes },
+                },
+                None => Plan::Idle,
+            };
+        }
+        match pending.opportunistic.zip(best(|s| s.opp_budget)) {
+            Some(((dsn, len), (subflow, bytes))) => Plan::Send {
                 subflow,
-                payload: Payload::New { bytes },
+                payload: Payload::Opportunistic {
+                    dsn,
+                    len: bytes.min(len),
+                },
             },
             None => Plan::Idle,
         }
@@ -101,6 +149,7 @@ impl Scheduler for MinRtt {
     fn on_health(&mut self, ev: &HealthEvent, _: &[SubflowSnapshot]) -> HealthVerdict {
         match ev {
             HealthEvent::RtoFired { n, .. } if *n >= R1 => HealthVerdict::Stale,
+            HealthEvent::HeadBlocked { .. } => HealthVerdict::Penalize,
             _ => HealthVerdict::Keep,
         }
     }
@@ -234,7 +283,7 @@ mod tests {
         }
     }
     fn snap(
-        id: u8,
+        id: u32,
         state: SubflowState,
         srtt_ms: u64,
         new: SendBudget,
@@ -245,18 +294,37 @@ mod tests {
             state,
             new_budget: new,
             reinject_budget: re,
+            opp_budget: NONE,
             srtt: Duration::from_millis(srtt_ms),
             app_limited: None,
+            backup: false,
+            usable: state == SubflowState::Active,
         }
     }
     fn plan(q: &ReinjectQueue, new_bytes: u64, subflows: &[SubflowSnapshot]) -> Plan {
+        plan_opp(q, new_bytes, None, subflows)
+    }
+    fn plan_opp(
+        q: &ReinjectQueue,
+        new_bytes: u64,
+        opportunistic: Option<(u64, u32)>,
+        subflows: &[SubflowSnapshot],
+    ) -> Plan {
         let pending = Pending {
             new_bytes,
             reinject: q,
+            opportunistic,
         };
         MinRtt.plan(Instant::from_nanos(0), &pending, subflows)
     }
-    fn send(id: u8, payload: Payload) -> Plan {
+    /// `snap` with opportunistic budget `opp` and no other budget.
+    fn opp_snap(id: u32, state: SubflowState, srtt_ms: u64, opp: SendBudget) -> SubflowSnapshot {
+        SubflowSnapshot {
+            opp_budget: opp,
+            ..snap(id, state, srtt_ms, NONE, NONE)
+        }
+    }
+    fn send(id: u32, payload: Payload) -> Plan {
         Plan::Send {
             subflow: SubflowId(id),
             payload,
@@ -519,5 +587,161 @@ mod tests {
             subflow: SubflowId(0),
         };
         assert_eq!(MinRtt.on_health(&progress, &subflows), HealthVerdict::Keep);
+    }
+
+    #[test]
+    fn minrtt_opportunistic_after_new() {
+        let b = budget(1000, 2, 0);
+        let mut subflows = [SubflowSnapshot {
+            opp_budget: b,
+            ..snap(0, Active, 10, b, NONE)
+        }];
+        let opp = Some((0, 3000));
+        let q = ReinjectQueue::new(0);
+        assert_eq!(
+            plan_opp(&q, 5000, opp, &subflows),
+            send(0, Payload::New { bytes: 2000 })
+        );
+        // With new bytes pending, no Opportunistic even when no subflow has New budget.
+        subflows[0].new_budget = NONE;
+        assert_eq!(plan_opp(&q, 5000, opp, &subflows), Plan::Idle);
+        assert_eq!(
+            plan_opp(&q, 0, opp, &subflows),
+            send(0, Payload::Opportunistic { dsn: 0, len: 2000 })
+        );
+        // The reinjection head comes first.
+        let mut q = ReinjectQueue::new(0);
+        q.insert(0, 100);
+        subflows[0].reinject_budget = budget(1000, 0, 100);
+        assert_eq!(
+            plan_opp(&q, 0, opp, &subflows),
+            send(0, Payload::Reinject { dsn: 0, len: 100 })
+        );
+    }
+
+    #[test]
+    fn minrtt_opportunistic_lowest_srtt_target() {
+        let q = ReinjectQueue::new(0);
+        let mut subflows = [
+            opp_snap(0, Active, 30, budget(1000, 3, 0)),
+            opp_snap(1, Active, 10, budget(1000, 2, 0)),
+            // Lower srtt, but not an eligible target: no opportunistic budget.
+            snap(2, Active, 5, budget(1000, 9, 0), budget(1000, 9, 0)),
+            opp_snap(3, Stale, 1, budget(1000, 9, 0)),
+        ];
+        let opp = Some((500, 1500));
+        assert_eq!(
+            plan_opp(&q, 0, opp, &subflows),
+            send(
+                1,
+                Payload::Opportunistic {
+                    dsn: 500,
+                    len: 1500
+                }
+            )
+        );
+        subflows[1].opp_budget = budget(1000, 1, 0);
+        assert_eq!(
+            plan_opp(&q, 0, opp, &subflows),
+            send(
+                1,
+                Payload::Opportunistic {
+                    dsn: 500,
+                    len: 1000
+                }
+            )
+        );
+        subflows[1].opp_budget = NONE;
+        assert_eq!(
+            plan_opp(&q, 0, opp, &subflows),
+            send(
+                0,
+                Payload::Opportunistic {
+                    dsn: 500,
+                    len: 1500
+                }
+            )
+        );
+        assert_eq!(plan_opp(&q, 0, None, &subflows), Plan::Idle);
+    }
+
+    #[test]
+    fn minrtt_backup_only_when_no_usable_primary() {
+        let b = budget(1000, 2, 0);
+        let mut q = ReinjectQueue::new(0);
+        let backup = SubflowSnapshot {
+            backup: true,
+            opp_budget: b,
+            ..snap(1, Active, 5, b, b)
+        };
+        // The primary is usable but has no budget (cwnd, pacing): nothing spills onto the
+        // faster backup, for any payload.
+        let mut subflows = [
+            SubflowSnapshot {
+                opp_budget: NONE,
+                ..snap(0, Active, 30, NONE, NONE)
+            },
+            backup,
+        ];
+        let opp = Some((0, 3000));
+        assert_eq!(plan(&q, 5000, &subflows), Plan::Idle);
+        assert_eq!(plan_opp(&q, 0, opp, &subflows), Plan::Idle);
+        q.insert(0, 100);
+        assert_eq!(plan(&q, 0, &subflows), Plan::Idle);
+        // With budget, the primary is taken although the backup's srtt is lower.
+        subflows[0] = snap(0, Active, 30, b, b);
+        assert_eq!(
+            plan(&q, 0, &subflows),
+            send(0, Payload::Reinject { dsn: 0, len: 100 })
+        );
+        // Unusable primaries (zero window, or not Active) hand every payload to the backup.
+        for primary in [
+            SubflowSnapshot {
+                usable: false,
+                ..snap(0, Active, 30, NONE, NONE)
+            },
+            snap(0, Stale, 30, NONE, NONE),
+        ] {
+            subflows[0] = primary;
+            assert_eq!(
+                plan(&q, 0, &subflows),
+                send(1, Payload::Reinject { dsn: 0, len: 100 })
+            );
+            let q = ReinjectQueue::new(0);
+            assert_eq!(
+                plan(&q, 5000, &subflows),
+                send(1, Payload::New { bytes: 2000 })
+            );
+            assert_eq!(
+                plan_opp(&q, 0, opp, &subflows),
+                send(1, Payload::Opportunistic { dsn: 0, len: 2000 })
+            );
+        }
+        // Among backups, the lowest srtt.
+        let slow = SubflowSnapshot {
+            id: SubflowId(2),
+            srtt: Duration::from_millis(50),
+            ..backup
+        };
+        let q = ReinjectQueue::new(0);
+        assert_eq!(
+            plan(&q, 5000, &[slow, subflows[0], backup]),
+            send(1, Payload::New { bytes: 2000 })
+        );
+    }
+
+    #[test]
+    fn minrtt_health_penalize_on_head_blocked() {
+        let subflows = [
+            snap(0, Active, 10, NONE, NONE),
+            snap(1, Active, 30, NONE, NONE),
+        ];
+        let blocked = HealthEvent::HeadBlocked {
+            subflow: SubflowId(1),
+        };
+        assert_eq!(
+            MinRtt.on_health(&blocked, &subflows),
+            HealthVerdict::Penalize
+        );
     }
 }

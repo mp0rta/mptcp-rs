@@ -8,17 +8,28 @@
 //! Time ([`Instant`]) and randomness (a [`rand_core::CryptoRng`]) are injected, and the
 //! crate contains no `unsafe` code.
 //!
-//! # Scope at 0.0.1
+//! # Scope at 0.1.0
 //!
 //! Client role only. Implemented: MP_CAPABLE, DSS and DATA_ACK, MP_JOIN with multiple
-//! subflows, a MinRTT scheduler with reinjection, stale-subflow detection, fallback to TCP
-//! (including the infinite mapping) and MP_FASTCLOSE receive; CUBIC with HyStart++ and
-//! pacing, and SACK-based loss recovery; plain TCP connections.
+//! subflows over IPv4 and IPv6 (including mixed families), a MinRTT scheduler with
+//! reinjection, opportunistic retransmission and penalization, stale-subflow detection,
+//! fallback to TCP (including the infinite mapping); CUBIC with HyStart++ and pacing, and
+//! SACK-based loss recovery; plain TCP connections.
 //!
-//! Not implemented yet: the server role, ADD_ADDR/REMOVE_ADDR path management,
-//! MP_PRIO/backup subflows, sending MP_TCPRST or MP_FASTCLOSE, MPTCP checksums, MP_FAIL and
-//! RACK-TLP. Known limitation: if one path blackholes while data is outstanding on it, the
-//! healthy path can stall until that subflow is declared stale (see the README).
+//! Path management is driven by the application: [`Endpoint::add_subflow`] joins a new path
+//! (optionally with the backup bit), [`Endpoint::set_backup`] sends MP_PRIO,
+//! [`Endpoint::set_local_backup`] changes only the local transmit policy,
+//! [`Endpoint::close_subflow`] retires a subflow gracefully and
+//! [`Endpoint::remove_address`] sends REMOVE_ADDR and resets the subflows on that address.
+//! Received ADD_ADDR (with echo), REMOVE_ADDR and MP_PRIO surface as
+//! [`Event::AddressAnnounced`], [`Event::AddressRemoved`] and [`Event::PeerPriority`], and
+//! MP_TCPRST reasons arrive in [`Event::SubflowDown`]. [`Connection::abort`] sends
+//! MP_FASTCLOSE; MP_FASTCLOSE is also honoured on receive.
+//!
+//! Not implemented yet: the server role, MPTCP checksums, MP_FAIL and RACK-TLP. Known
+//! limitations: an application with no data left to send can still wait for a blackholed
+//! subflow to be declared stale, and backup failover waits for the primary to become
+//! unusable (see the README).
 //!
 //! # Usage
 //!
@@ -32,7 +43,8 @@
 //! - [`Endpoint::poll_event`] for [`Event`]s such as `Connected`, `SubflowUp` and `Closed`;
 //! - [`Endpoint::connection`] for the [`Connection`], to [`write`](Connection::write),
 //!   [`read`](Connection::read) and [`close`](Connection::close);
-//! - [`Endpoint::add_subflow`] to join another local address once connected.
+//! - [`Endpoint::add_subflow`] to join another local address once connected (see above for
+//!   the other path-management calls).
 //!
 //! ```
 //! use mptcp_rs::{ConnectConfig, Endpoint, Instant};
@@ -64,7 +76,12 @@ mod time;
 pub mod wire;
 
 pub use connection::{Connection, ReadError, WriteError};
-pub use endpoint::{AddSubflowError, ConnectError, ConnectionHandle, Endpoint, Event};
+pub use endpoint::{
+    AddSubflowError, AddressError, ConnectError, ConnectionHandle, Endpoint, Event, MpTcpRst,
+    SubflowError,
+};
+#[doc(hidden)]
+pub use mptcp::DebugStats;
 pub use mptcp::SubflowId;
 pub use seq::SeqNum;
 pub use tcp::{CloseReason, ConnectConfig};

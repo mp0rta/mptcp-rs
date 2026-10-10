@@ -17,6 +17,32 @@ fn drain(ep: &mut Endpoint<ChaCha20Rng>, now: Instant) -> Vec<Vec<u8>> {
     out
 }
 
+/// A well-formed-header option of one of the new subtypes (ADD_ADDR, REMOVE_ADDR, MP_PRIO,
+/// MP_TCPRST): `sel` picks subtype and length, `b` fills the rest.
+fn synth(sel: u8, b: &[u8]) -> Vec<u8> {
+    let n = usize::from(sel / 4);
+    let (st, len) = match sel % 4 {
+        0 => (3, [8, 10, 16, 18, 20, 22, 28, 30][n % 8]),
+        1 => (4, 4 + n % 37),
+        2 => (5, 3),
+        _ => (8, 4),
+    };
+    let mut o = vec![0; len];
+    for (i, x) in o[2..].iter_mut().enumerate() {
+        *x = b.get(i).copied().unwrap_or(0);
+    }
+    o[0] = 30;
+    o[1] = len as u8;
+    // E=1 exactly for the lengths without an HMAC.
+    let low = if st == 3 {
+        o[2] & 0x0e | u8::from(matches!(len, 8 | 10 | 20 | 22))
+    } else {
+        o[2] & 0x0f
+    };
+    o[2] = st << 4 | low;
+    o
+}
+
 fuzz_target!(|data: &[u8]| {
     let now = Instant::from_nanos(1_000_000_000);
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
@@ -96,7 +122,7 @@ fuzz_target!(|data: &[u8]| {
             const PEER_NONCE: u32 = 0xb1b2_b3b4;
             let peer_key = 0x0102_0304_0506_0708;
             let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 8, 2));
-            let id = ep.add_subflow(now, h, ip, 1500).unwrap();
+            let id = ep.add_subflow(now, h, ip, remote, 1500, false).unwrap();
             let pkts = drain(&mut ep, now);
             let mut segs = pkts.iter().map(|p| parse(p).unwrap());
             let jsyn = segs.find(|s| s.src.ip() == ip).expect("join SYN");
@@ -176,6 +202,17 @@ fuzz_target!(|data: &[u8]| {
             let olen = olen.min(r.len());
             let plen = plen.min(r.len() - olen);
             let (opts, r) = r.split_at(olen);
+            // Flag bit 7 of the length byte swaps the options for a synthesized new-subtype one,
+            // NOP-padded to 4 bytes.
+            let synthed = match opts.split_first() {
+                Some((&sel, body)) if d[6] & 0x80 != 0 => {
+                    let mut o = synth(sel, body);
+                    o.resize(o.len().next_multiple_of(4), 1);
+                    Some(o)
+                }
+                _ => None,
+            };
+            let opts = synthed.as_deref().unwrap_or(opts);
             let (payload, r) = r.split_at(plen);
             rest = r;
             let on_join = d[4] & 0x80 != 0;

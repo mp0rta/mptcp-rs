@@ -9,7 +9,7 @@ use rangemap::RangeSet;
 
 use super::cc::{AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck};
 use super::cubic::Cubic;
-use super::hooks::Hooks;
+use super::hooks::{AckPurpose, Hooks};
 use super::recovery::{DupAck, NewAck, NewReno};
 use super::rtt::{INITIAL_RTO, RttEstimator};
 use super::sack::{DupAck as SackDupAck, Sack};
@@ -34,7 +34,9 @@ const MAX_OOO_RANGES: usize = 64;
 const MSL: Duration = Duration::from_secs(60);
 
 /// Per-connection settings (spec §3; R2 is settable per connection, RFC 9293 MUST-21).
+/// Build it from `ConnectConfig::default()` and assign the fields to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectConfig {
     pub mtu: u16,
     /// Octets received in order and not yet read, which bounds the window offered. Memory
@@ -86,6 +88,7 @@ pub enum TcpState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
     Normal,
     Reset,
@@ -93,6 +96,8 @@ pub enum CloseReason {
     /// The peer fell back to TCP (infinite mapping) while another subflow held data not yet
     /// acknowledged at connection level: that data can no longer be delivered.
     FallbackDataLoss,
+    /// The application aborted the connection (`Connection::abort`).
+    Aborted,
 }
 
 /// What the caller must report after an input. Every `Closed(_)` is returned exactly once.
@@ -318,11 +323,18 @@ pub struct Tcb {
     // Segments due at the next `poll_send`.
     syn_due: bool,
     ack_due: bool,
-    /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`.
-    rst_due: Option<SeqNum>,
+    /// An ACK only to carry a protocol signal (`request_signal_ack`).
+    signal_ack_due: bool,
+    /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`, or ending this TCB, with
+    /// the protocol option it carries.
+    rst_due: Option<(SeqNum, Option<[u8; 4]>)>,
     /// Resend one segment at SND.UNA (RTO, fast retransmit, partial ACK).
     retransmit_due: bool,
     probe_due: bool,
+    /// Resend the highest-sequence outstanding segment once (`probe_tail`).
+    tail_probe_due: bool,
+    /// `send_keepalive_probe`.
+    keepalive_due: bool,
     /// SWS override timer expired: send what the window allows.
     sws_override: bool,
 }
@@ -404,9 +416,12 @@ impl Tcb {
             closed_at: None,
             syn_due: true,
             ack_due: false,
+            signal_ack_due: false,
             rst_due: None,
             retransmit_due: false,
             probe_due: false,
+            tail_probe_due: false,
+            keepalive_due: false,
             sws_override: false,
         };
         tcb.eff_mss = tcb.eff_mss_for(None);
@@ -450,7 +465,11 @@ impl Tcb {
             options: &opts[..n],
             payload: &[],
         };
-        assert_eq!(tcb.on_segment_syn_sent(&synack, now), Reaction::Established);
+        let h = &mut super::PlainHooks::new(cfg);
+        assert_eq!(
+            tcb.on_segment_syn_sent(&synack, now, h),
+            Reaction::Established
+        );
         tcb
     }
 
@@ -494,7 +513,7 @@ impl Tcb {
         match self.state {
             TcpState::Closed => Reaction::None,
             TcpState::SynSent => {
-                let r = self.on_segment_syn_sent(seg, now);
+                let r = self.on_segment_syn_sent(seg, now, h);
                 if r == Reaction::Established {
                     h.on_valid_segment(seg);
                     // §3.10.7.3: text and FIN on the SYN/ACK are processed once ESTABLISHED,
@@ -744,13 +763,40 @@ impl Tcb {
     pub(crate) fn reset_pending(&self) -> bool {
         self.rst_due.is_some()
     }
-    /// RFC 9293 §3.10.5 ABORT: a RST `<SEQ=SND.MAX>` is due and the TCB is Closed.
-    pub(crate) fn abort(&mut self, reason: CloseReason, now: Instant) -> Reaction {
-        self.rst_due = Some(self.snd_max);
+    /// RFC 9293 §3.10.5 ABORT: a RST `<SEQ=SND.MAX>` carrying `rst_option` is due and the TCB
+    /// is Closed.
+    pub(crate) fn abort_with(
+        &mut self,
+        reason: CloseReason,
+        rst_option: Option<[u8; 4]>,
+        now: Instant,
+    ) -> Reaction {
+        self.rst_due = Some((self.snd_max, rst_option));
         self.terminate(reason, now)
+    }
+    /// RFC 9293 §3.10.5 ABORT whose RST, if any, the caller sends: the TCB is Closed with
+    /// `Aborted`. Returns SND.MAX, that RST's sequence number.
+    pub(crate) fn delete(&mut self, now: Instant) -> SeqNum {
+        self.terminate(CloseReason::Aborted, now);
+        self.snd_max
     }
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
+    }
+    /// Makes one keepalive probe due: the zero-window probe's shape, zero-length at
+    /// SND.UNA − 1 with no options, which the peer answers with an ACK. It goes out at the next `poll_send`
+    /// while synchronized and not in TIME-WAIT, before anything but a RST.
+    pub(crate) fn send_keepalive_probe(&mut self) {
+        self.keepalive_due = true;
+    }
+    /// A keepalive probe is due and has not gone out.
+    pub(crate) fn keepalive_pending(&self) -> bool {
+        self.keepalive_due
+    }
+    /// An ACK-only segment is due only to carry a protocol signal (`AckPurpose::SignalOnly`
+    /// unless an ACK is due anyway). It goes out only if the hooks add a signal to it.
+    pub(crate) fn request_signal_ack(&mut self) {
+        self.signal_ack_due = true;
     }
     pub(crate) fn retransmission_timeout(&self) -> Duration {
         self.rtt.rto()
@@ -767,6 +813,71 @@ impl Tcb {
     /// Consecutive RTO expirations since SND.UNA last advanced (0 after an advance).
     pub(crate) fn rto_streak(&self) -> u32 {
         self.rto_streak
+    }
+    /// The tail loss probe time for the data up to relative SSN `end` (M3 spec §2.3, after
+    /// RFC 8985 §7.2): once all of it is sent, nothing else waits to be sent, it is not all
+    /// acknowledged and no loss recovery or RTO runs, the last data transmission plus
+    /// PTO = 2·SRTT (the initial RTO before a sample), at most the RTO.
+    pub(crate) fn tail_probe_at(&self, end: u32) -> Option<Instant> {
+        let end = self.iss.wrapping_add(end);
+        let pto = self
+            .rtt
+            .srtt()
+            .map_or(INITIAL_RTO, |s| s * 2)
+            .min(self.rtt.rto());
+        (end.le(self.snd_max)
+            && self.snd_una.lt(end)
+            && self.snd_nxt == self.snd_max
+            && !self.unsent
+            && !self.retransmit_due
+            && self.rto_streak == 0
+            && !self.sack.in_recovery()
+            && !self.recovery.in_recovery())
+        .then_some(self.last_data_sent? + pto)
+    }
+    /// SND.UNA has reached relative SSN `end`.
+    pub(crate) fn acked_to(&self, end: u32) -> bool {
+        self.iss.wrapping_add(end).le(self.snd_una)
+    }
+    /// The later of the last SND.UNA advance and the start of the current flight (the R2 base);
+    /// `None` with nothing outstanding.
+    pub(crate) fn silence_since(&self) -> Option<Instant> {
+        self.r2_since
+    }
+    /// Makes one tail loss probe due (RFC 8985 §7.3, no new data to send): the
+    /// highest-sequence outstanding segment again, regardless of cwnd, without changing cwnd,
+    /// ssthresh or recovery state. Dropped if a retransmission or recovery starts first.
+    pub(crate) fn probe_tail(&mut self) {
+        self.tail_probe_due = true;
+    }
+    /// Start of the tail probe's segment, while one is due and still applies.
+    fn tail_probe_seq(&self) -> Option<SeqNum> {
+        if !self.tail_probe_due
+            || self.retransmit_due
+            || self.snd_nxt != self.snd_max
+            || self.sack.in_recovery()
+            || self.recovery.in_recovery()
+        {
+            return None;
+        }
+        let start = (self.sent.len().checked_sub(2)).map_or(self.snd_una, |i| self.sent[i].end);
+        let start = if start.lt(self.snd_una) {
+            self.snd_una
+        } else {
+            start
+        };
+        (self.data_len(start, self.snd_max) > 0).then_some(start)
+    }
+    /// A multipath penalty (M3 spec §2.5): `CongestionEvent::Penalized` with FlightSize, unless
+    /// loss recovery or an RTO backoff (an RTO since SND.UNA last advanced) already decreased
+    /// cwnd. Returns whether it applied.
+    pub(crate) fn penalize(&mut self, now: Instant) -> bool {
+        if self.rto_streak > 0 || self.sack.in_recovery() || self.recovery.in_recovery() {
+            return false;
+        }
+        self.cc
+            .on_congestion(CongestionEvent::Penalized, self.in_flight(), now);
+        true
     }
     #[cfg(test)]
     pub(crate) fn set_r2_data(&mut self, r2: Duration) {
@@ -840,8 +951,13 @@ impl Tcb {
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
     ) -> Option<SentMeta> {
-        if let Some(seq) = self.rst_due.take() {
-            return Some(out.start(seq, SeqNum(0), TcpFlags::RST, 0));
+        if let Some((seq, option)) = self.rst_due.take() {
+            let meta = out.start(seq, SeqNum(0), TcpFlags::RST, 0);
+            if let Some(o) = option {
+                out.options[..4].copy_from_slice(&o);
+                out.options_len = 4;
+            }
+            return Some(meta);
         }
         if self.state == TcpState::Closed {
             return None;
@@ -862,6 +978,13 @@ impl Tcb {
             return Some(meta);
         }
         if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
+            if std::mem::take(&mut self.keepalive_due) {
+                // The peer drops it unprocessed (below its window) and answers with an ACK, so
+                // it carries no options and answers nothing: a due ACK stays due.
+                let wnd = self.wnd_field(h);
+                let seq = self.snd_una.wrapping_add(u32::MAX);
+                return Some(out.start(seq, self.rcv_nxt, TcpFlags::ACK, wnd));
+            }
             let fin_unsent = matches!(
                 self.state,
                 TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
@@ -885,7 +1008,7 @@ impl Tcb {
             let seq = if self.retransmit_due {
                 self.snd_una
             } else {
-                rxt.map_or(self.snd_nxt, |r| r.0)
+                (self.tail_probe_seq()).unwrap_or_else(|| rxt.map_or(self.snd_nxt, |r| r.0))
             };
             let ssn = self.rel(seq);
             let has_data =
@@ -923,14 +1046,28 @@ impl Tcb {
                 self.ack_due = true;
             }
         }
-        if self.ack_due {
+        if self.ack_due || self.signal_ack_due {
+            let purpose = if self.ack_due {
+                AckPurpose::Ordinary
+            } else {
+                AckPurpose::SignalOnly
+            };
+            self.signal_ack_due = false;
+            // Protocol options, then signals, then SACK blocks in what is left (M3 spec §3.2).
+            let limit = usize::from(self.mss_option()).min(out.options.len());
+            let n = h.options_for(TcpFlags::ACK, &mut out.options);
+            let room = limit.saturating_sub(n);
+            let k = h.ack_signals(purpose, room, &mut out.options[n..limit.max(n)]);
+            if purpose == AckPurpose::SignalOnly && k == 0 {
+                return None;
+            }
+            let n = n + k;
             let wnd = self.wnd_field(h);
             // SND.MAX, not a pulled-back SND.NXT: a SEQ below the peer's RCV.NXT would make
             // the ACK unacceptable to it (RFC 9293 Table 6).
             let meta = out.start(self.snd_max, self.rcv_nxt, TcpFlags::ACK, wnd);
-            let limit = usize::from(self.mss_option()).min(out.options.len());
-            let n = h.options_for(TcpFlags::ACK, &mut out.options);
             out.options_len = n + self.write_sacks(&mut out.options[n..limit.max(n)]);
+            h.ack_emitted();
             self.ack_sent();
             return Some(meta);
         }
@@ -980,7 +1117,7 @@ impl Tcb {
 
     /// RFC 9293 §3.10.7.3. A segment without ACK is dropped: a RST without ACK by the RFC's
     /// rule, a bare SYN because this client does not support simultaneous open.
-    fn on_segment_syn_sent(&mut self, seg: &Segment, now: Instant) -> Reaction {
+    fn on_segment_syn_sent(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         let rst = seg.flags.contains(TcpFlags::RST);
         if !seg.flags.contains(TcpFlags::ACK) {
             return Reaction::None;
@@ -988,11 +1125,12 @@ impl Tcb {
         // Acceptable iff SND.UNA (= ISS here) < SEG.ACK =< SND.NXT.
         if seg.ack.le(self.iss) || seg.ack.gt(self.snd_nxt) {
             if !rst {
-                self.rst_due = Some(seg.ack);
+                self.rst_due = Some((seg.ack, None));
             }
             return Reaction::None;
         }
         if rst {
+            h.on_reset(seg);
             return self.terminate(CloseReason::Reset, now);
         }
         if !seg.flags.contains(TcpFlags::SYN) {
@@ -1062,11 +1200,10 @@ impl Tcb {
         if seg.flags.contains(TcpFlags::RST) {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
+                // Even when the hooks ask for a reset (MP_FASTCLOSE on it): a RST is never
+                // answered (RFC 9293 §3.10.7).
                 h.on_valid_segment(seg);
-                if h.reset_requested() {
-                    self.rst_due = Some(self.snd_max);
-                    return self.terminate(CloseReason::Reset, now);
-                }
+                h.on_reset(seg);
                 return self.on_reset(now);
             }
             self.ack_due |= off > 0 && (off as u32) < self.rcv_wnd();
@@ -1079,8 +1216,7 @@ impl Tcb {
             if seg.flags.contains(TcpFlags::ACK) && !seg.ack.gt(self.snd_max) {
                 h.on_valid_segment(seg);
                 if h.reset_requested() {
-                    self.rst_due = Some(self.snd_max);
-                    return self.terminate(CloseReason::Reset, now);
+                    return self.abort_with(CloseReason::Reset, h.reset_option(), now);
                 }
             }
             self.time_wait_at = Some(now + 2 * MSL);
@@ -1141,8 +1277,7 @@ impl Tcb {
             self.on_text(seg, now, h);
         }
         if h.reset_requested() {
-            self.rst_due = Some(self.snd_max);
-            return self.terminate(CloseReason::Reset, now);
+            return self.abort_with(CloseReason::Reset, h.reset_option(), now);
         }
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         // Trim sequence-space controls to the receive window too (RFC 9293 §3.10.7.4).
@@ -1338,8 +1473,8 @@ impl Tcb {
         }
         h.on_valid_segment(seg);
         if h.reset_requested() {
-            self.rst_due = Some(self.snd_max);
-            return ControlFlow::Break(self.terminate(CloseReason::Reset, now));
+            let r = self.abort_with(CloseReason::Reset, h.reset_option(), now);
+            return ControlFlow::Break(r);
         }
         // RFC 6675 §5: the scoreboard first (Update), from SND.UNA before this ACK.
         let (sacked_new, sack_newest) = if self.sack_permitted {
@@ -1598,6 +1733,15 @@ impl Tcb {
             }
             return Some(meta);
         }
+        if let Some(seq) = self.tail_probe_seq() {
+            self.tail_probe_due = false;
+            let len = self.data_len(seq, self.snd_max).min(mss);
+            let meta = self.write_data(seq, len, false, now, h, out)?;
+            self.rtt_timed = None;
+            self.on_data_sent(seq, &meta, now, true);
+            return Some(meta);
+        }
+        self.tail_probe_due = false;
         let idle = in_flight == 0;
 
         // RFC 9293 §3.8.6.1 (a FIN waits for the window like data); never armed while data is

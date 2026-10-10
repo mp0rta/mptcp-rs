@@ -54,12 +54,24 @@ impl ConnectionHooks {
             .as_ref()
             .is_some_and(|d| !d.fallback && !d.close.closed)
     }
+    /// Our DATA_FIN is DATA_ACKed and the peer's has arrived (our DATA_ACK for it may still be
+    /// due): the connection is ending, not losing a path.
+    pub fn data_closed(&self) -> bool {
+        (self.data.as_ref()).is_some_and(|d| d.close.acked && d.recv.eof())
+    }
     /// `add_subflow` on a Confirmed connection: the join starts at once, so the no-subflow
     /// wait ends (spec §5.5).
     pub fn cancel_no_subflow_wait(&mut self) {
         if let Some(d) = &mut self.data {
             d.close.no_subflow_at = None;
         }
+    }
+    /// `Connection::abort`: the data level ends with no `Closed` of its own. Returns the peer's
+    /// key when the RSTs carry MP_FASTCLOSE (MPTCP, not fallen back).
+    pub fn abort(&mut self) -> Option<u64> {
+        let d = self.data.as_mut().filter(|d| !d.fallback)?;
+        d.close.closed = true;
+        self.negotiation.as_ref()?.peer_key
     }
     pub fn close(&mut self) -> bool {
         if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
@@ -74,12 +86,14 @@ impl ConnectionHooks {
 }
 
 impl SubflowHooks<'_> {
-    /// `last`: no other subflow of the connection is open.
+    /// `last`: no other subflow of the connection is open. `time_wait`: some subflow is in
+    /// TIME-WAIT, which holds a normal close (`Closed` once every TCB is Closed).
     pub fn update_close(
         &mut self,
         tcb: &Tcb,
         now: Instant,
         last: bool,
+        time_wait: bool,
     ) -> Option<crate::tcp::CloseReason> {
         let d = self.conn.data.as_mut().filter(|d| !d.fallback)?;
         if d.close.closed {
@@ -99,7 +113,10 @@ impl SubflowHooks<'_> {
             d.recovery_at = None;
             d.close.at = None;
             if d.close.acked && d.close.peer_acked {
-                Some(crate::tcp::CloseReason::Normal)
+                // Spec rev9: CLOSED once all subflows are closed, TIME-WAIT included (R31);
+                // the TIME-WAIT's expiry reports it. No no-subflow wait meanwhile.
+                d.close.no_subflow_at = None;
+                (!time_wait).then_some(crate::tcp::CloseReason::Normal)
             } else {
                 let at = d
                     .close

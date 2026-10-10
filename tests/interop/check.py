@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Assert wire acceptance, using raw (not Wireshark-relative) MPTCP numbers."""
+import bisect
 import csv
 import io
 import hashlib
@@ -39,16 +40,19 @@ rows = capture("server.pcap") + (capture("server-b.pcap") if m2 else [])
 rows.sort(key=lambda r: float(r[0]))
 assert rows, "empty pcap"
 flow = lambda r: frozenset([(r[1], r[20]), (r[19], r[21])])
+def first_dsn(side):
+    """IDSN + 1 of `side`, from its MP_CAPABLE sender key."""
+    keys = {int(r[17]) for r in rows if r[1] in side and r[17]}
+    assert len(keys) == 1, f"ambiguous MP_CAPABLE sender key for {'/'.join(sorted(side))}"
+    digest = hashlib.sha256(keys.pop().to_bytes(8, "big")).digest()
+    return (int.from_bytes(digest[-8:], "big") + 1) % (1 << 64)
 def data_fin_acked(side, n):
     """Time of the first DATA_ACK covering `side`'s DATA_FIN (which must end at IDSN+1+n+1)."""
     src = "/".join(sorted(side))
     fins = [r for r in rows if r[1] in side and r[12] == "1"]
     assert fins, f"missing DATA_FIN from {src}"
     # DLL already includes DATA_FIN's sequence-space byte.
-    keys = {int(r[17]) for r in rows if r[1] in side and r[17]}
-    assert len(keys) == 1, f"ambiguous MP_CAPABLE sender key for {src}"
-    digest = hashlib.sha256(keys.pop().to_bytes(8, "big")).digest()
-    initial = (int.from_bytes(digest[-8:], "big") + 1) % (1 << 64)
+    initial = first_dsn(side)
     expected_end = (initial + n + 1) % (1 << 64)
     acked = []
     for fin in fins:
@@ -139,8 +143,10 @@ if scenario.startswith("m2-blackhole-"):
     # c2s: the client sends, so its RTOs must mark exactly the blackholed subflow Stale.
     # s2c: the client only ACKs; a Stale may not occur, but never on the other subflow.
     assert stale == {holed} if want_s2c == "0" else stale <= {holed}, f"Stale {stale}, blackholed {holed}"
-    rules = (out / "client-rules.txt").read_text()
-    assert re.search(r"\[[1-9][0-9]*:[0-9]+\] -A BLACKHOLE -j DROP", rules), "blackhole dropped nothing"
+    # Each direction is dropped where it arrives: the client's FORWARD, the server's INPUT.
+    for side in ["client", "server"]:
+        rules = (out / f"{side}-rules.txt").read_text()
+        assert re.search(r"\[[1-9][0-9]*:[0-9]+\] -A BLACKHOLE -j DROP", rules), f"{side} blackhole dropped nothing"
 if scenario == "m2-mtu":
     big = "ip.len > 1280 || ip.flags.mf == 1 || ip.frag_offset > 0"
     assert count("server-b.pcap", big) == 0, "packet over 1280 octets or fragment on the B link"
@@ -181,4 +187,56 @@ if scenario.startswith("zero-"):
     assert any(r[1] != receiver and float(r[0]) > float(reply[0]) and int(r[4]) > 1 for r in wire), "bulk transfer did not resume after probe response"
     rules = (out / "client-rules.txt").read_text()
     assert re.search(r"\[1:[0-9]+\] -A REOPEN -j DROP", rules), "exactly one reopening update must be dropped"
+if scenario == "m2-blackhole-b" and want_s2c == "0":
+    # M3 spec §2.6: the head-of-line stall while path B is blackholed. DSNs and DATA_ACKs are
+    # offsets from the client's IDSN + 1; Linux's 32-bit DATA_ACKs are promoted to 64 bits.
+    bh = (out / "blackhole.log").read_text()
+    on = float(re.search(r"^drop-on (\S+)", bh, re.M)[1])
+    off = float(re.search(r"^drop-off (\S+)", bh, re.M)[1])
+    base = first_dsn(cips)
+    rel = lambda v: (int(v) - base) % (1 << 64)
+    # Cumulative DATA_ACK advances seen by the server: (time, offset).
+    acks, cur = [], 0
+    for r in rows:
+        if r[1] == SRV and r[14]:
+            a = rel(r[14]) if r[15] == "1" else cur + ((int(r[14]) - base - cur + (1 << 31)) % (1 << 32) - (1 << 31))
+            if a > cur:
+                acks.append((float(r[0]), a))
+                cur = a
+    # The client's mappings, from its TUN: the highest mapped end over time, and each mapping
+    # start's first subflow (its original assignment).
+    tun = capture("tun.pcap")
+    sent, hi, first_on = [], 0, {}
+    for r in tun:
+        if r[1] in cips and r[13] and int(r[4] or 0) > 0:
+            assert r[16] == "1", "the client maps 64-bit DSNs"
+            start = rel(r[13])
+            end = start + int(r[11])
+            first_on.setdefault(start, (r[1], end))
+            if end > hi:
+                hi = end
+                sent.append((float(r[0]), hi))
+    sent_t = [t for t, _ in sent]
+    outstanding = lambda t, a: (i := bisect.bisect_right(sent_t, t)) > 0 and sent[i - 1][1] > a
+    # Primary metric: the longest interval without DATA_ACK advance while data is outstanding,
+    # for intervals inside or crossing the blackhole window.
+    hol_gap = max((t1 - t0 for (t0, a0), (t1, _) in zip(acks, acks[1:]) if t1 > on and t0 < off and outstanding(t0, a0)), default=0.0)
+    # Witness: path A delivers, inside the window, DSNs whose original mapping was on B.
+    b_orig = sorted((st, e) for st, (src, e) in first_on.items() if src == "10.0.8.2")
+    starts, ends, m = [st for st, _ in b_orig], [], 0
+    for _, e in b_orig:
+        m = max(m, e)
+        ends.append(m)
+    from_b = lambda st, e: (i := bisect.bisect_left(starts, e)) > 0 and ends[i - 1] > st
+    witness = any(
+        on <= float(r[0]) <= off and from_b(rel(r[13]), rel(r[13]) + int(r[11]))
+        for r in rows if r[1] == "10.0.9.2" and r[13] and int(r[4] or 0) > 0
+    )
+    a_sends = [float(r[0]) for r in tun if r[1] == "10.0.9.2" and int(r[4] or 0) > 0]
+    send_gap_a = max((t1 - t0 for t0, t1 in zip(a_sends, a_sends[1:]) if t1 > on and t0 < off), default=0.0)
+    st = re.search(r"^stats: opp_triggers=(\d+) opp_episodes=(\d+) penalties=(\d+) opp_bytes=(\d+) app_blocked_ms=(\d+)$", client, re.M)
+    assert st, "no stats line from the client"
+    print(f"hol: hol_gap_s={hol_gap:.3f} witness_ok={int(witness)} send_gap_a_s={send_gap_a:.3f} app_blocked_s={int(st[5]) / 1000:.3f} triggers={st[1]} episodes={st[2]} penalties={st[3]} dup_bytes={st[4]}")
+    assert hol_gap <= 1.0, f"HOL stall {hol_gap:.3f} s > 1 s"
+    assert witness, "path A carried no DSN originally mapped on B"
 print(f"PASS {scenario}: {c2s} bytes c2s, {s2c} bytes s2c, EOF, FIN/FIN, {no_rst}")

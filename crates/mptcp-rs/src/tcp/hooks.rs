@@ -5,6 +5,15 @@ use std::collections::{BTreeMap, VecDeque};
 
 use super::tcb::ConnectConfig;
 
+/// Why an ACK-only segment goes out (M3 spec §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckPurpose {
+    /// TCP or the protocol needed an ACK anyway.
+    Ordinary,
+    /// Only to carry a protocol signal (`Tcb::request_signal_ack`).
+    SignalOnly,
+}
+
 /// Send-side data source. Relative SSN: the first data octet is 1 (spec §5.3).
 pub trait SendBuf {
     /// Calls `f` with the contiguous run of buffered bytes starting at `rel_ssn`, at most `max`
@@ -57,12 +66,27 @@ pub trait SegmentHooks {
     fn reset_requested(&self) -> bool {
         false
     }
+    /// The option carried by the RST that `reset_requested` makes due (4 octets, aligned).
+    fn reset_option(&self) -> Option<[u8; 4]> {
+        None
+    }
+    /// An acceptable RST, SYN-SENT included, before the TCB is torn down.
+    fn on_reset(&mut self, _seg: &crate::wire::packet::Segment<'_>) {}
 
     /// Protocol options first; return a word-aligned length, using NOP padding.
     /// The remaining option space is available for TCP SACK blocks.
     fn options_for(&mut self, _flags: crate::wire::packet::TcpFlags, _out: &mut [u8]) -> usize {
         0
     }
+
+    /// Signals for an ACK-only segment, after `options_for`'s options and before SACK blocks:
+    /// at most `room` octets into `out`. Called only for an ACK about to go out, never for a
+    /// data segment, probe or RST; nothing is consumed until `ack_emitted`.
+    fn ack_signals(&mut self, _purpose: AckPurpose, _room: usize, _out: &mut [u8]) -> usize {
+        0
+    }
+    /// The ACK the last `ack_signals` filled went out.
+    fn ack_emitted(&mut self) {}
 
     /// Reserved data layout, including padding (may exceed the initial wire layout).
     fn data_option_len(&self) -> usize {

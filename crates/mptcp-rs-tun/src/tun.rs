@@ -2,7 +2,40 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+static SIGTERM: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigterm(_: libc::c_int) {
+    SIGTERM.store(true, Ordering::Relaxed);
+}
+
+/// SIGTERM only sets a flag (`sigterm`), so the caller can report before exiting; a blocking
+/// `wait_readable` returns early (ppoll is never restarted).
+pub fn catch_sigterm() {
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            on_sigterm as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        )
+    };
+}
+
+pub fn sigterm() -> bool {
+    SIGTERM.load(Ordering::Relaxed)
+}
+
+/// Ends the process by SIGTERM after all (the default action), so its exit status says so.
+pub fn die_of_sigterm() -> ! {
+    // SAFETY: restoring the default disposition and raising a signal at ourselves.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::raise(libc::SIGTERM);
+    }
+    std::process::exit(128 + libc::SIGTERM)
+}
 
 // libc 0.2 has no TUNSETIFF: _IOW('T', 202, int) = 0x400454ca on Linux.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;

@@ -20,8 +20,9 @@ pub(crate) struct Join {
     pub peer_nonce: Option<u32>,
     /// Our address ID for the subflow's local IP.
     pub addr_id: u8,
-    /// The peer's address ID from its SYN/ACK (spec §5.6); read by address management (M3).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The SYN's B bit: our advertised receive preference (M3 spec §3.6).
+    pub backup: bool,
+    /// The peer's address ID from its SYN/ACK (spec §5.6).
     pub peer_addr_id: Option<u8>,
     pub third_ack: ThirdAck,
 }
@@ -41,11 +42,12 @@ pub(crate) enum ThirdAck {
 }
 
 impl Join {
-    pub fn new(local_nonce: u32, addr_id: u8) -> Self {
+    pub fn new(local_nonce: u32, addr_id: u8, backup: bool) -> Self {
         Self {
             local_nonce,
             peer_nonce: None,
             addr_id,
+            backup,
             peer_addr_id: None,
             third_ack: ThirdAck::NotYet,
         }
@@ -72,7 +74,7 @@ impl Join {
             return Reaction::None;
         };
         if now >= *since + r2 {
-            return tcb.abort(CloseReason::Timeout, now);
+            return tcb.abort_with(CloseReason::Timeout, Some(super::tcprst(0x00, true)), now);
         }
         if now >= *at {
             *interval = (*interval * 2).min(MAX_INTERVAL);
@@ -84,16 +86,16 @@ impl Join {
 }
 
 impl SubflowHooks<'_> {
-    /// The MP_JOIN option while joining (`None` once done): SYN length 12, B=0; every ACK the
-    /// subflow sends carries the third-ACK form (length 24, HMAC-A) and no DSS, so whichever
-    /// ACK goes out first repairs a lost third ACK (RFC 8684 L1233–1234).
+    /// The MP_JOIN option while joining (`None` once done): SYN length 12 with our B bit; every
+    /// ACK the subflow sends carries the third-ACK form (length 24, HMAC-A) and no DSS, so
+    /// whichever ACK goes out first repairs a lost third ACK (RFC 8684 L1233–1234).
     pub(super) fn join_options(&self, flags: TcpFlags, out: &mut [u8]) -> Option<usize> {
         let j = self.sf.join.as_ref().filter(|j| j.joining())?;
         let m = self.conn.negotiation.as_ref()?;
         let peer_key = m.peer_key?;
         let option = if flags.contains(TcpFlags::SYN) {
             MpJoin::Syn {
-                backup: false,
+                backup: j.backup,
                 addr_id: j.addr_id,
                 token: key_token_idsn(peer_key).0,
                 nonce: j.local_nonce,
@@ -134,11 +136,11 @@ impl SubflowHooks<'_> {
             match opt {
                 Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
                     Ok(MptcpOption::Join(MpJoin::SynAck {
+                        backup,
                         addr_id,
                         hmac64,
                         nonce,
-                        ..
-                    })) if synack.is_none() => synack = Some((addr_id, hmac64, nonce)),
+                    })) if synack.is_none() => synack = Some((backup, addr_id, hmac64, nonce)),
                     _ => valid = false,
                 },
                 Ok(TcpOpt::WindowScale(s)) => self.sf.peer_scale = s.min(14),
@@ -151,11 +153,17 @@ impl SubflowHooks<'_> {
             u64::from_be_bytes(mac[..8].try_into().unwrap())
         };
         match synack.filter(|_| valid) {
-            Some((addr_id, hmac64, nonce)) if hmac64 == expected(nonce) => {
+            Some((backup, addr_id, hmac64, nonce)) if hmac64 == expected(nonce) => {
                 j.peer_nonce = Some(nonce);
                 j.peer_addr_id = Some(addr_id);
+                // The peer's initial request (M3 spec §3.3); MP_PRIO changes it.
+                self.sf.peer_backup = backup;
             }
-            _ => self.sf.reset = true,
+            _ => {
+                self.sf.reset = true;
+                self.sf.reset_option = Some(super::tcprst(0x01, false));
+                self.sf.join_failed = Some(None);
+            }
         }
     }
 

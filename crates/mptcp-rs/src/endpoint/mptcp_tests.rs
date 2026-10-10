@@ -757,7 +757,7 @@ fn conflicting_mapping_resets_only_after_tcp_validity() {
     input(&mut ep, &seg);
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
@@ -772,7 +772,7 @@ fn unmapped_byte_bound_resets_subflow() {
     input(&mut ep, &peer_data(&syn, 5005, &[], b"e"));
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
@@ -1975,14 +1975,29 @@ fn fastclose_valid_key_closes_once_on_ack_or_rst_after_tcp_validation() {
                         }
                     ))
                 );
-                let bytes = transmit(&mut ep, Instant::from_nanos(3));
-                assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
+                // A RST is never answered (RFC 9293 §3.10.7); an ACK carrying it is.
+                let mut buf = [0; 1500];
+                let out = ep.poll_transmit(Instant::from_nanos(3), &mut buf);
+                let rst = out.map(|n| packet::parse(&buf[..n]).unwrap().flags);
+                let want = (flags == TcpFlags::ACK).then_some(TcpFlags::RST);
+                assert_eq!(rst, want, "{flags:?}");
                 input(&mut ep, &seg);
                 assert_eq!(ep.poll_event(), None);
             } else {
-                assert_eq!(ep.poll_event(), None);
+                // A RST without a valid key is an ordinary RST: the no-subflow wait starts.
+                let down = (flags == TcpFlags::RST).then(|| (h, initial_down(CloseReason::Reset)));
+                assert_eq!(ep.poll_event(), down);
             }
         }
+    }
+}
+
+/// The initial subflow's `SubflowDown` as the last one: the no-subflow wait starts.
+fn initial_down(reason: CloseReason) -> Event {
+    Event::SubflowDown {
+        subflow: SubflowId::INITIAL,
+        reason,
+        rst: None,
     }
 }
 
@@ -1999,7 +2014,7 @@ fn ordinary_rst_keeps_data_until_no_subflow_timeout() {
             ..peer_data(&syn, 5001, &[], &[])
         },
     );
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     ep.handle_timeout(Instant::from_nanos(3));
     assert!(ep.connection(h).is_some());
     assert_eq!(
@@ -2151,7 +2166,10 @@ fn bare_tcp_fin_retires_subflow_without_data_eof_or_new_assignments() {
         ..peer_data(&syn, 5002, &[], &[])
     };
     input(&mut ep, &ack);
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(
+        ep.poll_event(),
+        Some((h, initial_down(CloseReason::Normal)))
+    );
     assert_eq!(ep.connection(h).unwrap().write(b"more"), Ok(4));
     let at = ep.poll_timeout().unwrap();
     assert_eq!(at, Instant::from_nanos(2) + Duration::from_secs(60));
@@ -2401,6 +2419,14 @@ fn fastclose_reset_survives_timeout_drive() {
             ))
         );
         let now = Instant::from_nanos(3);
+        if flags == TcpFlags::RST {
+            // A RST is never answered (RFC 9293 §3.10.7): nothing is due, the TCB is freed.
+            assert!(ep.poll_transmit(now, &mut [0; 1500]).is_none());
+            ep.handle_timeout(now);
+            assert!(ep.connection(h).is_none());
+            assert_eq!((ep.poll_timeout(), ep.poll_event()), (None, None));
+            continue;
+        }
         ep.handle_timeout(now);
         assert!(ep.poll_transmit(now, &mut [0; 20]).is_none());
         ep.handle_timeout(now);
@@ -2489,13 +2515,23 @@ fn connected_with(
     cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
     sack: bool,
 ) -> Connected {
+    connected_between("10.0.0.1", "10.0.0.2:80", cap, cc, sack)
+}
+/// `connected_with`, from `local` to `remote`.
+fn connected_between(
+    local: &str,
+    remote: &str,
+    cap: u32,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+    sack: bool,
+) -> Connected {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
     ep.cc = cc;
     let h = ep
         .connect_mptcp(
             Instant::from_nanos(0),
-            "10.0.0.1".parse().unwrap(),
-            "10.0.0.2:80".parse().unwrap(),
+            local.parse().unwrap(),
+            remote.parse().unwrap(),
             ConnectConfig {
                 recv_buffer: cap,
                 ..ConnectConfig::default()
@@ -2728,7 +2764,7 @@ fn snapshot_is_side_effect_free() {
         a.conns
             .get_mut(&h)
             .unwrap()
-            .build_snapshots(now, head, 1500);
+            .build_snapshots(now, head, None, 1500);
     }
     let snapshot = a.conns[&h].snapshots()[0];
     assert!(snapshot.new_budget.bytes() > 0 && snapshot.reinject_budget.bytes() > 0);
@@ -2770,7 +2806,7 @@ fn rogue_scheduler_plan_rejected() {
     assert_eq!(log.lock().unwrap().plans.len(), 3);
     // ... and a plan naming it is rejected by validation (as with a second, Active subflow).
     let c = ep.conns.get_mut(&h).unwrap();
-    c.build_snapshots(now, None, 1500);
+    c.build_snapshots(now, None, None, 1500);
     let snapshot = c.snapshots()[0];
     let plan = Plan::Send {
         subflow: SubflowId(0),
@@ -2779,12 +2815,15 @@ fn rogue_scheduler_plan_rejected() {
         },
     };
     assert!(snapshot.new_budget.bytes() > 0);
-    assert_eq!(crate::mptcp::accept_plan(plan, &[snapshot], None), None);
+    assert_eq!(
+        crate::mptcp::accept_plan(plan, &[snapshot], None, None),
+        None
+    );
     let active = SubflowSnapshot {
         state: SubflowState::Active,
         ..snapshot
     };
-    assert!(crate::mptcp::accept_plan(plan, &[active], None).is_some());
+    assert!(crate::mptcp::accept_plan(plan, &[active], None, None).is_some());
     c.subflows[0].state = SubflowState::Active;
     assert!(
         log.lock().unwrap().assigned.is_empty(),
@@ -2951,7 +2990,7 @@ fn rule5_recovers_while_new_data_waits_on_nagle() {
     ep.handle_timeout(deadline);
     let c = ep.conns.get_mut(&h).unwrap();
     let head_candidate = c.reinject_head();
-    c.build_snapshots(deadline, head_candidate, 1500);
+    c.build_snapshots(deadline, head_candidate, None, 1500);
     let s = c.snapshots()[0];
     assert_eq!(
         s.new_budget.bytes(),
@@ -3030,7 +3069,7 @@ fn full_mapping_slots_zero_budgets() {
     assert_eq!(log.lock().unwrap().plans.len(), plans, "plan is not called");
     let head = una(&ep, h);
     let c = ep.conns.get_mut(&h).unwrap();
-    c.build_snapshots(now, Some((head, 1)), 1500);
+    c.build_snapshots(now, Some((head, 1)), None, 1500);
     let s = c.snapshots()[0];
     assert_eq!((s.new_budget, s.reinject_budget), Default::default());
     assert_eq!(ep.conns[&h].hooks.assign_failures, 0);
@@ -3106,7 +3145,7 @@ fn rogue_reinject_outside_head_rejected() {
     let c = ep.conns.get_mut(&h).unwrap();
     let candidate = c.reinject_head();
     assert_eq!(candidate, Some((head, 2864)));
-    c.build_snapshots(deadline, candidate, 1500);
+    c.build_snapshots(deadline, candidate, None, 1500);
     let snapshot = c.snapshots()[0];
     assert!(
         snapshot.reinject_budget.bytes() >= 1,
@@ -3144,10 +3183,10 @@ fn rogue_reinject_outside_head_rejected() {
         payload: Payload::Reinject { dsn: head, len },
     };
     assert_eq!(
-        crate::mptcp::accept_plan(reinject(2865), &[wide], candidate),
+        crate::mptcp::accept_plan(reinject(2865), &[wide], candidate, None),
         None
     );
-    assert!(crate::mptcp::accept_plan(reinject(2864), &[wide], candidate).is_some());
+    assert!(crate::mptcp::accept_plan(reinject(2864), &[wide], candidate, None).is_some());
     // MinRTT restored: the head itself is reinjected.
     *rogue.lock().unwrap() = None;
     let out = drain(&mut ep, deadline);
@@ -3318,10 +3357,10 @@ fn endpoint_poll_timeout_wakes_paced_subflow() {
 fn paced_subflow_budget_zero_reaches_scheduler() {
     let (mut ep, h, _, head, _) = paced_first_segment(3 * 1432);
     let c = ep.conns.get_mut(&h).unwrap();
-    c.build_snapshots(T0, Some((head, 1432)), 1500);
+    c.build_snapshots(T0, Some((head, 1432)), None, 1500);
     let s = c.snapshots()[0];
     assert_eq!((s.new_budget, s.reinject_budget), Default::default());
-    c.build_snapshots(release(), Some((head, 1432)), 1500);
+    c.build_snapshots(release(), Some((head, 1432)), None, 1500);
     let s = c.snapshots()[0];
     assert_eq!(
         (s.new_budget.bytes(), s.reinject_budget.bytes()),
@@ -3452,7 +3491,7 @@ fn idle_scheduler_marks_not_scheduled() {
     assert!(drain(&mut ep, now).is_empty());
     assert_eq!(app_limited_reason(&ep, h), Some(AppLimited::NotScheduled));
     let c = ep.conns.get_mut(&h).unwrap();
-    c.build_snapshots(now, None, 1500);
+    c.build_snapshots(now, None, None, 1500);
     assert_eq!(c.snapshots()[0].app_limited, Some(AppLimited::NotScheduled));
     *rogue.lock().unwrap() = None;
     assert!(!drain(&mut ep, now).is_empty());
