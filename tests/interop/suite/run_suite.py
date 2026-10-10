@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import cases
+from cases import fin_fin_no_rst
 import decode
 
 LINKS = range(1, 5)
@@ -143,8 +144,13 @@ def run_case(case, out):
             r.errors.append(f"barrier {barrier} never reached for {label}")
             return
         time.sleep(max(0, t + ms / 1000 - time.time()))
-        r.marks.append((label, time.time()))
-        act()
+        t = time.time()
+        try:
+            act()
+        except Exception as err:  # a stimulus that did not happen fails the case
+            r.errors.append(f"{label} failed: {err}")
+            return
+        r.marks.append((label, t))
 
     def window(i, secs):
         drop(i, "-I")
@@ -193,17 +199,16 @@ def run_case(case, out):
 def judge(r):
     """Judgement (a)-(d) of amendment §5.5: the list of failure reasons."""
     case, e, why = r.case, r.case["expect"], list(r.errors)
-    # (a) transfer: byte-exact, in the case's direction(s), both ends exit cleanly. A client
-    # stopped in TIME-WAIT printed no totals: it closed only after verifying the server's bytes to
-    # EOF, and the server read its DATA_FIN only after verifying every client byte.
+    # (a) transfer: byte-exact, in the case's direction(s), both ends exit cleanly. The client's
+    # counts are from its `closing:` line (printed when it closes, so also before a TIME-WAIT stop).
     if r.watchdog:
         why.append(f"watchdog {case['watchdog_s']} s")
     if r.rc != (-15 if r.time_wait else 0, 0):
         why.append(f"exit client={r.rc[0]} server={r.rc[1]}")
-    cm = re.search(r"^ok: sent (\d+) bytes, verified (\d+) bytes, eof=true$", r.client, re.M)
+    cm = re.search(r"^closing: sent (\d+) bytes, verified (\d+) bytes$", r.client, re.M)
     sm = re.search(r"^server ok: received (\d+) sent (\d+) ", r.server, re.M)
-    if r.time_wait and sm:
-        cm = sm
+    if r.time_wait and fin_fin_no_rst not in e["pcap"]:
+        e = {**e, "pcap": e["pcap"] + [fin_fin_no_rst]}  # the proof of the FIN exchange
     elif r.rc[0] == 0 and "Closed Normal" not in r.events:
         why.append("passive close without Closed Normal")
     if cm and sm:

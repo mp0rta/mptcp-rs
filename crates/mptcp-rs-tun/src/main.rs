@@ -226,6 +226,11 @@ fn run(a: Args) -> Result<String, String> {
                 return Err(format!("premature EOF after {} of {e} bytes", st.verified));
             }
             if !st.closing && st.send_done(&a, start.elapsed()) && st.recv_done(&a) {
+                // The suite may stop an active closer in TIME-WAIT, before the `ok:` line.
+                println!(
+                    "closing: sent {} bytes, verified {} bytes",
+                    st.sent, st.verified
+                );
                 conn.close();
                 st.closing = true;
             }
