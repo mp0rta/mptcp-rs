@@ -1,8 +1,9 @@
 //! M3 API groundwork (M3 spec §4): subflow and address ids, the C=1 rule, the last initial
-//! subflow's `SubflowDown` and argument checks of the path-management calls. A child of
-//! `join_tests`, whose helpers it reuses.
+//! subflow's `SubflowDown` and argument checks of the path-management calls; MP_TCPRST on the
+//! RSTs we send and receive (M3 spec §3.3, §3.4). A child of `join_tests`, whose helpers it
+//! reuses.
 use super::*;
-use crate::endpoint::{AddressError, SubflowError};
+use crate::endpoint::{AddressError, MpTcpRst, SubflowError};
 use crate::mptcp::addr::PeerAddr;
 
 fn addr_id(jsyn: &Segment) -> u8 {
@@ -231,4 +232,266 @@ fn connect_config_default_then_assign() {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
     let h = ep.connect_mptcp(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg);
     assert_eq!(ep.conns[&h.unwrap()].cfg.mtu, 1400);
+}
+
+/// MP_TCPRST wire bytes: kind 30, length 4, subtype 8 with the T flag, reason.
+fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
+    [30, 4, 0x80 | u8::from(transient), reason]
+}
+/// The options of the only RST from `src` among `segs`.
+fn rst_options<'a>(
+    segs: impl IntoIterator<Item = &'a Segment<'static>>,
+    src: SocketAddr,
+) -> Vec<u8> {
+    let rsts: Vec<_> = (segs.into_iter())
+        .filter(|s| s.src == src && s.flags.contains(TcpFlags::RST))
+        .collect();
+    assert_eq!(rsts.len(), 1, "one RST from {src}");
+    rsts[0].options.to_vec()
+}
+
+/// M3 spec §3.4, one scenario per row whose path exists (the `remove_address` and keepalive
+/// rows come with REMOVE_ADDR).
+#[test]
+fn our_rst_reason_table() {
+    // Joined-subflow option stripping: its first stripped ACK resets it. 0x06/T0.
+    let (mut ep, h, _, jsyn) = two_paths(reno, reno);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().write(&[7; 1000]).unwrap();
+    let seg = data_on(&drain(&mut ep, ms(20)), &jsyn).remove(0);
+    let stripped = Segment {
+        ack: end(&seg),
+        ..peer_data(&jsyn, 5001, &[], &[])
+    };
+    input_at(&mut ep, &stripped, ms(30));
+    let out = on(&drain(&mut ep, ms(30)), &jsyn);
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        tcprst(0x06, false),
+        "stripping"
+    );
+
+    // Invalid MP_JOIN in the SYN/ACK (bad HMAC). 0x01/T0.
+    let (mut ep, h, _, _) = confirmed();
+    let (_, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, Some(1));
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    let out = from(&drain(&mut ep, ms(20)), JOIN_IP);
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        tcprst(0x01, false),
+        "bad SYN/ACK"
+    );
+
+    // Ruling R18: subflow 1 holds data the peer DATA_ACKed on subflow 0 but never TCP-ACKs;
+    // once both DATA_FINs are DATA_ACKed it is reset. 0x04/T1.
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    let head = una(&ep, h);
+    pin(&mut ep, h, Some(SubflowId(1)));
+    ep.connection(h).unwrap().write(&[7; 1000]).unwrap();
+    assert_eq!(data_on(&drain(&mut ep, ms(20)), &jsyn).len(), 1);
+    pin(&mut ep, h, None);
+    ep.connection(h).unwrap().close();
+    let out = drain(&mut ep, ms(20));
+    let dfin = (on(&out, &syn).into_iter().find(data_fin)).expect("DATA_FIN on subflow 0");
+    let opts = fin_option(peer_dsn(), 0, 1, Some(head + 1001));
+    let seg = Segment {
+        ack: dfin.seq,
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &opts, &[])
+    };
+    input_at(&mut ep, &seg, ms(30));
+    let out: Vec<_> = drive(&mut ep, ms(30), ms(5000))
+        .into_iter()
+        .map(|p| p.1)
+        .collect();
+    assert_eq!(rst_options(&out, jsyn.src), tcprst(0x04, true), "R18");
+
+    // Data R2 on a joined subflow. 0x00/T1.
+    let (mut ep, h, mut peer, t, _, data) = two_paths_primed(Duration::from_secs(3), 50_000);
+    peer.drop[1] = true;
+    ep.connection(h).unwrap().write(&data).unwrap();
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    let out: Vec<_> = (peer.sent.iter()).map(|p| p.1.clone()).collect();
+    assert_eq!(
+        rst_options(&out, peer.syns[1].src),
+        tcprst(0x00, true),
+        "data R2"
+    );
+
+    // Third-ACK give-up at R2. 0x00/T1.
+    let (mut ep, h, _, _) = confirmed();
+    ep.conns.get_mut(&h).unwrap().cfg.r2_data = Duration::from_secs(5);
+    let (_, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    let out: Vec<_> = drive(&mut ep, ms(20), ms(20_000))
+        .into_iter()
+        .map(|p| p.1)
+        .collect();
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        tcprst(0x00, true),
+        "third-ACK give-up"
+    );
+
+    // A received infinite mapping resets the other subflows. 0x01/T0.
+    let (mut ep, _, syn, jsyn) = two_paths(reno, reno);
+    peer_infinite_mapping(&mut ep, &jsyn, ms(20));
+    let out = on(&drain(&mut ep, ms(20)), &syn);
+    assert_eq!(
+        rst_options(&out, syn.src),
+        tcprst(0x01, false),
+        "infinite mapping"
+    );
+}
+
+/// A RST answering the join SYN: with MP_TCPRST T=0, T=1 or none it ends the subflow and the
+/// join failure is recorded with what it carried; without ACK it is not acceptable in
+/// SYN-SENT (RFC 9293 §3.10.7.3) and changes nothing.
+#[test]
+fn syn_sent_rst_t0_t1_none_unacceptable() {
+    let t0 = MpTcpRst {
+        reason: 0x03,
+        transient: false,
+    };
+    let t1 = MpTcpRst {
+        reason: 0x02,
+        transient: true,
+    };
+    let rst = |jsyn: &Segment, opt: Option<MpTcpRst>, flags| {
+        let opts = opt.map_or(vec![], |r| tcprst(r.reason, r.transient).to_vec());
+        Segment {
+            flags,
+            ..peer_data(jsyn, 0, opts.leak(), &[])
+        }
+    };
+    let ra = TcpFlags::RST | TcpFlags::ACK;
+    for (opt, flags, accepted) in [
+        (Some(t0), ra, true),
+        (Some(t1), ra, true),
+        (None, ra, true),
+        (Some(t0), TcpFlags::RST, false),
+    ] {
+        // The record, read before the endpoint frees the subflow.
+        let (mut ep, h, _, _) = confirmed();
+        let (id, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+        let c = ep.conns.get_mut(&h).unwrap();
+        let sf = c.subflows.iter_mut().find(|s| s.id == id).unwrap();
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
+        sf.tcb.on_segment(&rst(&jsyn, opt, flags), ms(20), &mut hk);
+        assert_eq!(
+            sf.mp.join_failed,
+            accepted.then_some(opt),
+            "{opt:?} {flags:?}"
+        );
+        assert_eq!(sf.tcb.state() == TcpState::Closed, accepted);
+        // The event, through the endpoint.
+        let (mut ep, h, _, _) = confirmed();
+        let (id, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+        input_at(&mut ep, &rst(&jsyn, opt, flags), ms(20));
+        let down = Event::SubflowDown {
+            subflow: id,
+            reason: CloseReason::Reset,
+            rst: opt,
+        };
+        let want = if accepted { vec![down] } else { vec![] };
+        assert_eq!(events(&mut ep), want, "{opt:?} {flags:?}");
+    }
+}
+
+#[test]
+fn joined_rst_reason_surfaced_in_subflow_down() {
+    // Linux refusing a join (M3 suite probe): a bare RST at RCV.NXT after our third ACK.
+    let (mut ep, h, _, _) = confirmed();
+    let (id, jsyn) = join_syn(&mut ep, h, ms(10), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(20));
+    assert_eq!(from(&drain(&mut ep, ms(20)), JOIN_IP).len(), 1, "third ACK");
+    let opt = tcprst(0x03, false);
+    let refuse = Segment {
+        flags: TcpFlags::RST,
+        ..peer_data(&jsyn, 5001, &opt, &[])
+    };
+    input_at(&mut ep, &refuse, ms(30));
+    let rst = Some(MpTcpRst {
+        reason: 0x03,
+        transient: false,
+    });
+    let reason = CloseReason::Reset;
+    let subflow = id;
+    assert_eq!(
+        events(&mut ep),
+        vec![Event::SubflowDown {
+            subflow,
+            reason,
+            rst
+        }]
+    );
+    // An Active joined subflow, then the last (initial) one.
+    let (mut ep, _, syn, jsyn) = two_paths(reno, reno);
+    for (s, subflow, reason) in [
+        (&jsyn, SubflowId(1), 0x05),
+        (&syn, SubflowId::INITIAL, 0x00),
+    ] {
+        let opt = tcprst(reason, true);
+        let seg = Segment {
+            options: &opt,
+            ..rst_on(s)
+        };
+        input_at(&mut ep, &seg, ms(30));
+        let rst = Some(MpTcpRst {
+            reason,
+            transient: true,
+        });
+        let reason = CloseReason::Reset;
+        assert_eq!(
+            events(&mut ep),
+            vec![Event::SubflowDown {
+                subflow,
+                reason,
+                rst
+            }]
+        );
+    }
+}
+
+/// RSTs answering segments with no TCB carry no MPTCP option, also on a 4-tuple whose
+/// subflow we reset with MP_TCPRST.
+#[test]
+fn no_tcb_rst_has_no_mptcp_option() {
+    let (mut ep, h, _, _) = confirmed();
+    let stray = Segment {
+        src: "10.0.9.9:80".parse().unwrap(),
+        dst: "10.0.0.1:40000".parse().unwrap(),
+        seq: SeqNum(1),
+        ack: SeqNum(77),
+        flags: TcpFlags::ACK,
+        wnd: 1000,
+        options: &[],
+        payload: b"x",
+    };
+    input_at(&mut ep, &stray, ms(10));
+    let out: Vec<_> = drain(&mut ep, ms(10)).into_iter().map(leak).collect();
+    assert_eq!(
+        rst_options(&out, stray.dst),
+        Vec::<u8>::new(),
+        "unknown 4-tuple"
+    );
+    // A bad SYN/ACK resets the join with MP_TCPRST; its retransmission finds no TCB.
+    let (_, jsyn) = join_syn(&mut ep, h, ms(20), JOIN_IP, 1500);
+    let opts = synack_opts(&ep, h, &jsyn, 7, Some(1));
+    synack(&mut ep, &jsyn, &opts, ms(30));
+    let out = from(&drain(&mut ep, ms(30)), JOIN_IP);
+    assert_eq!(rst_options(&out, jsyn.src), tcprst(0x01, false));
+    synack(&mut ep, &jsyn, &opts, ms(40));
+    let out = from(&drain(&mut ep, ms(40)), JOIN_IP);
+    assert_eq!(
+        rst_options(&out, jsyn.src),
+        Vec::<u8>::new(),
+        "freed join 4-tuple"
+    );
 }

@@ -359,9 +359,15 @@ impl State {
                 Event::FellBack => eprintln!("event: FellBack"),
                 Event::SubflowUp { subflow } => eprintln!("event: SubflowUp {subflow:?} +{t:.3}s"),
                 Event::SubflowDown {
-                    subflow, reason, ..
+                    subflow,
+                    reason,
+                    rst,
+                    ..
                 } => {
-                    eprintln!("event: SubflowDown {subflow:?} {reason:?} +{t:.3}s")
+                    let rst = rst.map_or("none".into(), |r| {
+                        format!("0x{:02x}/T{}", r.reason, u8::from(r.transient))
+                    });
+                    eprintln!("event: SubflowDown {subflow:?} {reason:?} rst={rst} +{t:.3}s")
                 }
                 Event::SubflowStale { subflow } => {
                     eprintln!("event: SubflowStale {subflow:?} +{t:.3}s")

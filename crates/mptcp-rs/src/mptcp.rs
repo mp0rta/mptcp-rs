@@ -64,6 +64,14 @@ pub(crate) struct ConnectionHooks {
     sws_mss: u16,
 }
 
+/// MP_TCPRST option bytes for our RSTs (M3 spec §3.4).
+pub(crate) fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
+    let mut out = [0; 4];
+    let option = MptcpOption::TcpRst { transient, reason };
+    mptcp::encode(&option, &mut out).expect("MP_TCPRST is 4 octets");
+    out
+}
+
 /// Subflows per connection (M2: snapshot buffer capacity).
 pub(crate) const SUBFLOW_CAP: usize = 8;
 
@@ -321,7 +329,7 @@ impl Connection {
         // Ruling R18 (RFC 8684 L1600–1611): once both DATA_FINs are DATA_ACKed, a subflow
         // still holding TCP data holds only data that is DATA_ACKed (delivered via another
         // subflow). If it is not TCP-ACKed within one un-backed-off RTO it never needs to be,
-        // so `Endpoint::handle_timeout` resets the subflow then (plain RST: MP_TCPRST is M3).
+        // so `Endpoint::handle_timeout` resets the subflow then.
         let closing = !d.fallback && d.close.acked && d.close.peer_acked;
         for sf in &mut self.subflows {
             if closing && sf.tcb.state() != TcpState::Closed && sf.tcb.unacked_data() {
@@ -456,7 +464,7 @@ impl Connection {
         {
             sf.state = SubflowState::Active;
         }
-        self.abort_all(now, (!lost).then_some(i));
+        self.abort_all(now, (!lost).then_some(i), Some(tcprst(0x01, false)));
         for (_, sf) in (self.subflows.iter_mut().enumerate()).filter(|&(j, _)| j != i) {
             sf.mp.tx.clear();
         }
@@ -464,11 +472,18 @@ impl Connection {
         lost
     }
 
-    /// Resets every open subflow except `except` (MP_FASTCLOSE, fallback).
-    pub(crate) fn abort_all(&mut self, now: Instant, except: Option<usize>) {
+    /// Resets every open subflow except `except` (MP_FASTCLOSE, fallback), each RST carrying
+    /// `rst_option`.
+    pub(crate) fn abort_all(
+        &mut self,
+        now: Instant,
+        except: Option<usize>,
+        rst_option: Option<[u8; 4]>,
+    ) {
         for (j, sf) in self.subflows.iter_mut().enumerate() {
             if Some(j) != except && sf.tcb.state() != TcpState::Closed {
-                sf.tcb.abort(crate::tcp::CloseReason::Reset, now);
+                sf.tcb
+                    .abort_with(crate::tcp::CloseReason::Reset, rst_option, now);
             }
         }
     }
@@ -825,7 +840,8 @@ impl SendBuf for SubflowHooks<'_> {
                             // a join was started: it alone is reset (RFC 8684 L2313–2328,
                             // spec §5.2).
                             Some(false) if self.sf.join.is_some() || self.conn.joined_ever => {
-                                self.sf.reset = true
+                                self.sf.reset = true;
+                                self.sf.reset_option = Some(tcprst(0x06, false));
                             }
                             Some(false) => {
                                 let m = self.conn.negotiation.as_mut().unwrap();
@@ -1162,6 +1178,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         {
             if self.sf.join.is_some() || self.conn.joined_ever {
                 self.sf.reset = true;
+                self.sf.reset_option = Some(tcprst(0x06, false));
                 return;
             }
             d.fall_back(self.sf, m, false);
@@ -1178,6 +1195,24 @@ impl SegmentHooks for SubflowHooks<'_> {
     }
     fn reset_requested(&self) -> bool {
         self.conn.fast_closed || (self.conn.data.is_some() && self.sf.reset)
+    }
+    fn reset_option(&self) -> Option<[u8; 4]> {
+        self.sf.reset_option.filter(|_| !self.conn.fast_closed)
+    }
+    fn on_reset(&mut self, seg: &Segment<'_>) {
+        let rst = walk(seg.options).find_map(|o| match o {
+            Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
+                Ok(MptcpOption::TcpRst { transient, reason }) => {
+                    Some(crate::MpTcpRst { reason, transient })
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        self.sf.rst = rst;
+        if self.sf.joining() {
+            self.sf.join_failed = Some(rst);
+        }
     }
     fn receipt_advanced(&mut self, ssn: u32) {
         if self.conn.data.is_some() {

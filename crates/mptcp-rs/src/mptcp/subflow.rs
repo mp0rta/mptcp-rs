@@ -56,6 +56,8 @@ pub(crate) struct SubflowMp {
     pub rx: RxMaps,
     pub unmapped: usize,
     pub reset: bool,
+    /// The MP_TCPRST the RST that `reset` makes due carries (M3 spec §3.4).
+    pub reset_option: Option<[u8; 4]>,
     pub dss_confirmed: bool,
     pub tcp_acked_dsn: u64,
     pub tcp_acked_ssn: Option<u32>,
@@ -97,6 +99,11 @@ pub(crate) struct SubflowMp {
     /// Reset deadline while both DATA_FINs are DATA_ACKed and this subflow still holds TCP
     /// data (`Connection::update_recovery`).
     pub strand_at: Option<Instant>,
+    /// The MP_TCPRST of the acceptable peer RST that ended it (`None`: none, or no RST).
+    pub rst: Option<crate::MpTcpRst>,
+    /// A join ended by an acceptable peer RST while SYN-SENT or Joining, with that RST's
+    /// MP_TCPRST (M3 spec §3.3 failed mark).
+    pub join_failed: Option<Option<crate::MpTcpRst>>,
 }
 
 impl SubflowMp {
@@ -106,6 +113,7 @@ impl SubflowMp {
             rx: RxMaps::new(1024),
             unmapped: 0,
             reset: false,
+            reset_option: None,
             dss_confirmed: false,
             tcp_acked_dsn: 0,
             tcp_acked_ssn: None,
@@ -127,6 +135,8 @@ impl SubflowMp {
             penalized_at: None,
             opp_demand: false,
             strand_at: None,
+            rst: None,
+            join_failed: None,
         }
     }
     /// A joined subflow whose MP_JOIN handshake is not complete.

@@ -12,7 +12,7 @@ use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
 use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
 use crate::mptcp::{
-    Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState,
+    Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState, tcprst,
 };
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
@@ -491,7 +491,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     && state == State::Confirmed
                     && self.start_join(now, h, q).is_ok())
                 {
-                    (self.events).push_back((h, down(subflow, CloseReason::Reset)));
+                    (self.events).push_back((h, down(subflow, CloseReason::Reset, None)));
                 }
             }
             if !kept.is_empty() {
@@ -571,7 +571,7 @@ impl<R: CryptoRng> Endpoint<R> {
         let r = sf.tcb.on_segment(&seg, now, &mut hk);
         // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
         if c.hooks.fast_closed {
-            c.abort_all(now, Some(i));
+            c.abort_all(now, Some(i), None);
         }
         let mut fell_back = std::mem::take(&mut c.hooks.fallback_event);
         if fell_back {
@@ -588,10 +588,11 @@ impl<R: CryptoRng> Endpoint<R> {
         let sf = &mut c.subflows[i];
         if i != 0 {
             let joining = sf.mp.joining();
-            let view = (sf.id, &mut sf.state, &sf.tcb);
+            let view = (sf.id, &mut sf.state, &sf.tcb, sf.mp.rst);
             Self::subflow_event(&mut self.events, &c.hooks, h, view, joining, r);
         } else if r != Reaction::None {
-            Self::push_event(&mut self.events, &c.hooks, &mut c.reset, h, r, !last);
+            let rst = sf.mp.rst;
+            Self::push_event(&mut self.events, &c.hooks, &mut c.reset, h, r, !last, rst);
         }
         if let Some(e) = c.update_health(i) {
             self.events.push_back((h, e));
@@ -666,7 +667,7 @@ impl<R: CryptoRng> Endpoint<R> {
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         hooks: &ConnectionHooks,
         h: ConnectionHandle,
-        (subflow, state, tcb): (SubflowId, &mut SubflowState, &Tcb),
+        (subflow, state, tcb, rst): (SubflowId, &mut SubflowState, &Tcb, Option<MpTcpRst>),
         joining: bool,
         r: Reaction,
     ) {
@@ -678,7 +679,7 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         if let Some(reason) = reason {
             if !hooks.fast_closed {
-                events.push_back((h, down(subflow, reason)));
+                events.push_back((h, down(subflow, reason, rst)));
             }
         } else if *state == SubflowState::Joining && !joining {
             *state = SubflowState::Active;
@@ -696,6 +697,7 @@ impl<R: CryptoRng> Endpoint<R> {
         h: ConnectionHandle,
         r: Reaction,
         others_open: bool,
+        rst: Option<MpTcpRst>,
     ) {
         match r {
             Reaction::None => {}
@@ -709,7 +711,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 if hooks.active() {
                     let carries_on = others_open || !hooks.data_closed();
                     if carries_on && hooks.retained() && !hooks.fast_closed {
-                        events.push_back((h, down(SubflowId::INITIAL, reason)));
+                        events.push_back((h, down(SubflowId::INITIAL, reason, rst)));
                     }
                     return;
                 }
@@ -901,7 +903,9 @@ impl<R: CryptoRng> Endpoint<R> {
                 let mut r = Reaction::None;
                 if hk.sf.strand_at.is_some_and(|t| t <= now) && sf.tcb.state() != TcpState::Closed {
                     // Like a FIN exchange's end, a joined subflow reports `SubflowDown`.
-                    r = sf.tcb.abort(CloseReason::Reset, now);
+                    r = sf
+                        .tcb
+                        .abort_with(CloseReason::Reset, Some(tcprst(0x04, true)), now);
                 } else if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
                     r = sf.tcb.on_timeout(now, &mut hk);
                 }
@@ -917,7 +921,8 @@ impl<R: CryptoRng> Endpoint<R> {
                     && r == Reaction::Closed(CloseReason::Timeout)
                     && !sf.tcb.reset_pending()
                 {
-                    sf.tcb.abort(CloseReason::Timeout, now);
+                    sf.tcb
+                        .abort_with(CloseReason::Timeout, Some(tcprst(0x00, true)), now);
                 }
                 if let Some(e) = c.update_health(i) {
                     self.events.push_back((h, e));
@@ -929,10 +934,11 @@ impl<R: CryptoRng> Endpoint<R> {
                 };
                 if i != 0 {
                     let joining = hk.sf.joining();
-                    let view = (sf.id, &mut sf.state, &sf.tcb);
+                    let view = (sf.id, &mut sf.state, &sf.tcb, hk.sf.rst);
                     Self::subflow_event(&mut self.events, hk.conn, h, view, joining, r);
                 } else {
-                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last);
+                    let rst = hk.sf.rst;
+                    Self::push_event(&mut self.events, hk.conn, &mut c.reset, h, r, !last, rst);
                 }
                 Self::update_close(
                     &mut self.events,
@@ -964,7 +970,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 }
             }
             for q in c.queued_joins.drain(..) {
-                events.push_back((h, down(q.id, CloseReason::Reset)));
+                events.push_back((h, down(q.id, CloseReason::Reset, None)));
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && c.hooks.has_unread();
@@ -973,9 +979,8 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 }
 
-/// `SubflowDown` for an end without a peer MP_TCPRST.
-fn down(subflow: SubflowId, reason: CloseReason) -> Event {
-    let rst = None;
+/// `SubflowDown`; `rst`: the MP_TCPRST of the peer RST that ended the subflow.
+fn down(subflow: SubflowId, reason: CloseReason, rst: Option<MpTcpRst>) -> Event {
     Event::SubflowDown {
         subflow,
         reason,

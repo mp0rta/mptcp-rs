@@ -61,8 +61,20 @@ def joins(name, n, direction):
     }
 
 
+def refused_join():
+    """`limits set subflows 0`: Linux answers the join's third ACK with a RST carrying MP_TCPRST
+    0x03 T=0 (probe `refused_join_rst_reason`), which the client reports in `SubflowDown`."""
+    case = joins("refused-join-mptcp-rst", 1, "s2c")
+    case["server"]["pm"] = ["limits set subflows 0 add_addr_accepted 0"]
+    case["client"]["send_secs"] = 4
+    case["expect"].update(nstat={"MPTcpExtMPCapableSYNRX": 1, "MPTcpExtMPJoinSynRx": 1},
+                          pcap=[], events=["Connected mptcp=true", "SubflowDown SubflowId(1) Reset rst=0x03/T0"])
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
     joins("two-joins", 2, "bidi"),
+    refused_join(),
 ]

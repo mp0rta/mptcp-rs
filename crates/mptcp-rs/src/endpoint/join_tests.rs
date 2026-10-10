@@ -362,7 +362,7 @@ fn refused(answer: impl FnOnce(&mut Endpoint<ChaCha20Rng>, ConnectionHandle, &Se
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].flags, TcpFlags::RST);
         assert_eq!(out[0].seq, jsyn.seq.wrapping_add(1));
-        assert!(mpc(out[0].options).is_empty());
+        assert_eq!(out[0].options, [30, 4, 0x80, 0x01], "MP_TCPRST 0x01/T0");
     } else {
         assert!(out.is_empty(), "a RST is not answered");
     }

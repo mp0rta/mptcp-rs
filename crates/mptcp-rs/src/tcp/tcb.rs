@@ -323,8 +323,9 @@ pub struct Tcb {
     // Segments due at the next `poll_send`.
     syn_due: bool,
     ack_due: bool,
-    /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`.
-    rst_due: Option<SeqNum>,
+    /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`, or ending this TCB, with
+    /// the protocol option it carries.
+    rst_due: Option<(SeqNum, Option<[u8; 4]>)>,
     /// Resend one segment at SND.UNA (RTO, fast retransmit, partial ACK).
     retransmit_due: bool,
     probe_due: bool,
@@ -458,7 +459,11 @@ impl Tcb {
             options: &opts[..n],
             payload: &[],
         };
-        assert_eq!(tcb.on_segment_syn_sent(&synack, now), Reaction::Established);
+        let h = &mut super::PlainHooks::new(cfg);
+        assert_eq!(
+            tcb.on_segment_syn_sent(&synack, now, h),
+            Reaction::Established
+        );
         tcb
     }
 
@@ -502,7 +507,7 @@ impl Tcb {
         match self.state {
             TcpState::Closed => Reaction::None,
             TcpState::SynSent => {
-                let r = self.on_segment_syn_sent(seg, now);
+                let r = self.on_segment_syn_sent(seg, now, h);
                 if r == Reaction::Established {
                     h.on_valid_segment(seg);
                     // §3.10.7.3: text and FIN on the SYN/ACK are processed once ESTABLISHED,
@@ -752,9 +757,15 @@ impl Tcb {
     pub(crate) fn reset_pending(&self) -> bool {
         self.rst_due.is_some()
     }
-    /// RFC 9293 §3.10.5 ABORT: a RST `<SEQ=SND.MAX>` is due and the TCB is Closed.
-    pub(crate) fn abort(&mut self, reason: CloseReason, now: Instant) -> Reaction {
-        self.rst_due = Some(self.snd_max);
+    /// RFC 9293 §3.10.5 ABORT: a RST `<SEQ=SND.MAX>` carrying `rst_option` is due and the TCB
+    /// is Closed.
+    pub(crate) fn abort_with(
+        &mut self,
+        reason: CloseReason,
+        rst_option: Option<[u8; 4]>,
+        now: Instant,
+    ) -> Reaction {
+        self.rst_due = Some((self.snd_max, rst_option));
         self.terminate(reason, now)
     }
     pub(crate) fn request_ack(&mut self) {
@@ -913,8 +924,13 @@ impl Tcb {
         h: &mut impl Hooks,
         out: &mut SegmentWriter,
     ) -> Option<SentMeta> {
-        if let Some(seq) = self.rst_due.take() {
-            return Some(out.start(seq, SeqNum(0), TcpFlags::RST, 0));
+        if let Some((seq, option)) = self.rst_due.take() {
+            let meta = out.start(seq, SeqNum(0), TcpFlags::RST, 0);
+            if let Some(o) = option {
+                out.options[..4].copy_from_slice(&o);
+                out.options_len = 4;
+            }
+            return Some(meta);
         }
         if self.state == TcpState::Closed {
             return None;
@@ -1053,7 +1069,7 @@ impl Tcb {
 
     /// RFC 9293 §3.10.7.3. A segment without ACK is dropped: a RST without ACK by the RFC's
     /// rule, a bare SYN because this client does not support simultaneous open.
-    fn on_segment_syn_sent(&mut self, seg: &Segment, now: Instant) -> Reaction {
+    fn on_segment_syn_sent(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         let rst = seg.flags.contains(TcpFlags::RST);
         if !seg.flags.contains(TcpFlags::ACK) {
             return Reaction::None;
@@ -1061,11 +1077,12 @@ impl Tcb {
         // Acceptable iff SND.UNA (= ISS here) < SEG.ACK =< SND.NXT.
         if seg.ack.le(self.iss) || seg.ack.gt(self.snd_nxt) {
             if !rst {
-                self.rst_due = Some(seg.ack);
+                self.rst_due = Some((seg.ack, None));
             }
             return Reaction::None;
         }
         if rst {
+            h.on_reset(seg);
             return self.terminate(CloseReason::Reset, now);
         }
         if !seg.flags.contains(TcpFlags::SYN) {
@@ -1136,9 +1153,9 @@ impl Tcb {
             let off = self.rcv_nxt.distance(seg.seq);
             if off == 0 {
                 h.on_valid_segment(seg);
+                h.on_reset(seg);
                 if h.reset_requested() {
-                    self.rst_due = Some(self.snd_max);
-                    return self.terminate(CloseReason::Reset, now);
+                    return self.abort_with(CloseReason::Reset, h.reset_option(), now);
                 }
                 return self.on_reset(now);
             }
@@ -1152,8 +1169,7 @@ impl Tcb {
             if seg.flags.contains(TcpFlags::ACK) && !seg.ack.gt(self.snd_max) {
                 h.on_valid_segment(seg);
                 if h.reset_requested() {
-                    self.rst_due = Some(self.snd_max);
-                    return self.terminate(CloseReason::Reset, now);
+                    return self.abort_with(CloseReason::Reset, h.reset_option(), now);
                 }
             }
             self.time_wait_at = Some(now + 2 * MSL);
@@ -1214,8 +1230,7 @@ impl Tcb {
             self.on_text(seg, now, h);
         }
         if h.reset_requested() {
-            self.rst_due = Some(self.snd_max);
-            return self.terminate(CloseReason::Reset, now);
+            return self.abort_with(CloseReason::Reset, h.reset_option(), now);
         }
         let seg_end = seg.seq.wrapping_add(seg.payload.len() as u32);
         // Trim sequence-space controls to the receive window too (RFC 9293 §3.10.7.4).
@@ -1411,8 +1426,8 @@ impl Tcb {
         }
         h.on_valid_segment(seg);
         if h.reset_requested() {
-            self.rst_due = Some(self.snd_max);
-            return ControlFlow::Break(self.terminate(CloseReason::Reset, now));
+            let r = self.abort_with(CloseReason::Reset, h.reset_option(), now);
+            return ControlFlow::Break(r);
         }
         // RFC 6675 §5: the scoreboard first (Update), from SND.UNA before this ACK.
         let (sacked_new, sack_newest) = if self.sack_permitted {

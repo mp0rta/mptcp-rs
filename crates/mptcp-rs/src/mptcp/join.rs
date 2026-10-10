@@ -72,7 +72,7 @@ impl Join {
             return Reaction::None;
         };
         if now >= *since + r2 {
-            return tcb.abort(CloseReason::Timeout, now);
+            return tcb.abort_with(CloseReason::Timeout, Some(super::tcprst(0x00, true)), now);
         }
         if now >= *at {
             *interval = (*interval * 2).min(MAX_INTERVAL);
@@ -155,7 +155,10 @@ impl SubflowHooks<'_> {
                 j.peer_nonce = Some(nonce);
                 j.peer_addr_id = Some(addr_id);
             }
-            _ => self.sf.reset = true,
+            _ => {
+                self.sf.reset = true;
+                self.sf.reset_option = Some(super::tcprst(0x01, false));
+            }
         }
     }
 
