@@ -47,7 +47,7 @@ jobs:
   # M3 Interop Suite against the runner's kernel MPTCP (amendment §5.7). Docker does not pin the
   # kernel, so the probe step fails loudly when a feature the suite uses is missing.
   interop-suite:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04  # kernel 7.0, the suite's reference series
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
