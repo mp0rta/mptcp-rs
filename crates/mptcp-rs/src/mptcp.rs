@@ -1,4 +1,5 @@
 //! MPTCP negotiation, MP_JOIN subflows, data transfer, recovery and closure.
+pub(crate) mod addr;
 mod close;
 pub(crate) mod data;
 mod join;

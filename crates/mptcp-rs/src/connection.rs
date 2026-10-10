@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
 use crate::mptcp::{DebugStats, Episode, Repair, Subflow, SubflowId};
 use crate::tcp::{ConnectConfig, TcpState};
 
@@ -9,11 +10,13 @@ pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
 /// `write` failed because the connection is closed (by `close`, a reset or a timeout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteError {
     Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReadError {
     /// No data yet and no FIN from the peer.
     WouldBlock,
@@ -38,9 +41,11 @@ pub struct Connection {
     /// Joins waiting for the connection to be Confirmed (RFC 8684 L884–887).
     pub(crate) queued_joins: Vec<QueuedJoin>,
     /// The next subflow ID; IDs are never reused within a connection.
-    pub(crate) next_subflow: u8,
-    /// Local IPs by address ID: the initial one is 0 (spec §5.6).
-    pub(crate) addr_ids: Vec<IpAddr>,
+    pub(crate) next_subflow: u32,
+    /// Our local IPs by address ID: the initial one is 0 (M3 spec §4.1).
+    pub(crate) local_addrs: LocalAddrs,
+    /// The peer's announced addresses (M3 spec §3.3).
+    pub(crate) peer_addrs: PeerAddrs,
     /// The opportunistic retransmission episode, if one runs (M3 spec §2.3).
     pub(crate) opp: Option<Episode>,
     /// Head repair and bounded lookahead (M3 spec §2.7).
@@ -51,7 +56,10 @@ pub struct Connection {
 pub(crate) struct QueuedJoin {
     pub id: SubflowId,
     pub local: IpAddr,
+    pub remote: SocketAddr,
     pub mtu: u16,
+    /// `local`'s address ID, bound by `add_subflow`.
+    pub addr_id: u8,
 }
 
 impl Connection {
@@ -105,6 +113,10 @@ impl Connection {
         }
         self.subflows[0].tcb.close();
     }
+
+    /// Tears the connection down at once (MP_FASTCLOSE). Not implemented yet: does nothing.
+    #[doc(hidden)]
+    pub fn abort(&mut self) {}
 
     /// Opportunistic retransmission counters, for test drivers; not a stable API.
     #[doc(hidden)]

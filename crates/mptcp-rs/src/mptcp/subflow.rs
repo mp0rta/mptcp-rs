@@ -9,10 +9,10 @@ use crate::tcp::Tcb;
 use crate::time::Instant;
 use crate::wire::mptcp;
 
-/// Identifies a subflow within its connection. The initial subflow is `SubflowId(0)`, which
-/// is also its address ID.
+/// Identifies a subflow within its connection: allocated in increasing order and never
+/// reused. The initial subflow is `SubflowId(0)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SubflowId(pub(crate) u8);
+pub struct SubflowId(pub(crate) u32);
 
 impl SubflowId {
     /// The initial subflow, the one `connect_mptcp` opens.

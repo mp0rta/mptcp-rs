@@ -54,6 +54,11 @@ impl ConnectionHooks {
             .as_ref()
             .is_some_and(|d| !d.fallback && !d.close.closed)
     }
+    /// Our DATA_FIN is DATA_ACKed and the peer's has arrived (our DATA_ACK for it may still be
+    /// due): the connection is ending, not losing a path.
+    pub fn data_closed(&self) -> bool {
+        (self.data.as_ref()).is_some_and(|d| d.close.acked && d.recv.eof())
+    }
     /// `add_subflow` on a Confirmed connection: the join starts at once, so the no-subflow
     /// wait ends (spec §5.5).
     pub fn cancel_no_subflow_wait(&mut self) {

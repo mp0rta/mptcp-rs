@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CongestionEvent {
     FastRetransmit,
     Rto,

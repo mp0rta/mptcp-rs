@@ -275,7 +275,7 @@ mod tests {
         }
     }
     fn snap(
-        id: u8,
+        id: u32,
         state: SubflowState,
         srtt_ms: u64,
         new: SendBudget,
@@ -308,13 +308,13 @@ mod tests {
         MinRtt.plan(Instant::from_nanos(0), &pending, subflows)
     }
     /// `snap` with opportunistic budget `opp` and no other budget.
-    fn opp_snap(id: u8, state: SubflowState, srtt_ms: u64, opp: SendBudget) -> SubflowSnapshot {
+    fn opp_snap(id: u32, state: SubflowState, srtt_ms: u64, opp: SendBudget) -> SubflowSnapshot {
         SubflowSnapshot {
             opp_budget: opp,
             ..snap(id, state, srtt_ms, NONE, NONE)
         }
     }
-    fn send(id: u8, payload: Payload) -> Plan {
+    fn send(id: u32, payload: Payload) -> Plan {
         Plan::Send {
             subflow: SubflowId(id),
             payload,

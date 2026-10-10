@@ -64,7 +64,10 @@ mod time;
 pub mod wire;
 
 pub use connection::{Connection, ReadError, WriteError};
-pub use endpoint::{AddSubflowError, ConnectError, ConnectionHandle, Endpoint, Event};
+pub use endpoint::{
+    AddSubflowError, AddressError, ConnectError, ConnectionHandle, Endpoint, Event, MpTcpRst,
+    SubflowError,
+};
 #[doc(hidden)]
 pub use mptcp::DebugStats;
 pub use mptcp::SubflowId;

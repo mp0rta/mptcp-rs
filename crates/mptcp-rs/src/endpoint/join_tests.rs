@@ -9,6 +9,10 @@ use crate::wire::mptcp::MpJoin;
 const JOIN_IP: &str = "10.0.1.1";
 const PEER_NONCE: u32 = 0xb1b2_b3b4;
 
+/// The initial subflow's remote (`open`).
+fn remote() -> SocketAddr {
+    "10.0.0.2:80".parse().unwrap()
+}
 fn ms(n: u64) -> Instant {
     Instant::from_nanos(n * 1_000_000)
 }
@@ -70,7 +74,9 @@ fn join_syn(
     ip: &str,
     mtu: u16,
 ) -> (SubflowId, Segment<'static>) {
-    let id = ep.add_subflow(now, h, ip.parse().unwrap(), mtu).unwrap();
+    let id = ep
+        .add_subflow(now, h, ip.parse().unwrap(), remote(), mtu, false)
+        .unwrap();
     let syn = from(&drain(ep, now), ip).pop().expect("join SYN");
     (id, syn)
 }
@@ -364,7 +370,8 @@ fn refused(answer: impl FnOnce(&mut Endpoint<ChaCha20Rng>, ConnectionHandle, &Se
         events(&mut ep),
         vec![Event::SubflowDown {
             subflow: id,
-            reason: CloseReason::Reset
+            reason: CloseReason::Reset,
+            rst: None
         }]
     );
     assert_eq!(state(&ep, h), State::Confirmed);
@@ -447,7 +454,8 @@ fn join_third_ack_gives_up_at_r2() {
         events(&mut ep),
         vec![Event::SubflowDown {
             subflow: id,
-            reason: CloseReason::Timeout
+            reason: CloseReason::Timeout,
+            rst: None
         }]
     );
     ep.handle_timeout(s(6));
@@ -463,7 +471,10 @@ fn add_subflow_errors() {
     let (mut ep, h, syn, _) = connected_scaled(1 << 20);
     assert_eq!(state(&ep, h), State::PreConfirmed);
     let t = Instant::from_nanos(1);
-    assert_eq!(ep.add_subflow(t, h, ip(JOIN_IP), 1500), Ok(SubflowId(1)));
+    assert_eq!(
+        ep.add_subflow(t, h, ip(JOIN_IP), remote(), 1500, false),
+        Ok(SubflowId(1))
+    );
     assert!(from(&drain(&mut ep, t), JOIN_IP).is_empty());
     assert_eq!(ep.conns[&h].subflows.len(), 1);
     open_window(&mut ep, &syn, h);
@@ -475,7 +486,7 @@ fn add_subflow_errors() {
     let h = open(&mut ep);
     let syn = leak(transmit(&mut ep, ms(0)));
     assert_eq!(
-        ep.add_subflow(ms(0), h, ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(0), h, ip(JOIN_IP), remote(), 1500, false),
         Ok(SubflowId(1))
     );
     reply(
@@ -489,17 +500,18 @@ fn add_subflow_errors() {
     let ev = events(&mut ep);
     assert!(ev.contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     assert_eq!(
-        ep.add_subflow(ms(1), h, ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(1), h, ip(JOIN_IP), remote(), 1500, false),
         Err(PeerForbidsJoin)
     );
     let dss = data_ack(una(&ep, h));
     input_at(&mut ep, &peer_data(&syn, 5001, &dss, &[]), ms(2));
     assert_eq!(state(&ep, h), State::Confirmed);
     assert_eq!(
-        ep.add_subflow(ms(2), h, ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(2), h, ip(JOIN_IP), remote(), 1500, false),
         Err(PeerForbidsJoin)
     );
     assert!(from(&drain(&mut ep, ms(2)), JOIN_IP).is_empty());
@@ -508,16 +520,20 @@ fn add_subflow_errors() {
     let h = open(&mut ep);
     let syn = leak(transmit(&mut ep, ms(0)));
     assert_eq!(
-        ep.add_subflow(ms(0), h, ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(0), h, ip(JOIN_IP), remote(), 1500, false),
         Ok(SubflowId(1))
     );
     reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
     assert!(from(&drain(&mut ep, ms(1)), JOIN_IP).is_empty());
     assert!(events(&mut ep).contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
-    assert_eq!(ep.add_subflow(ms(1), h, ip(JOIN_IP), 1500), Err(NotMptcp));
+    assert_eq!(
+        ep.add_subflow(ms(1), h, ip(JOIN_IP), remote(), 1500, false),
+        Err(NotMptcp)
+    );
     // Plain TCP.
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
     let h = ep
@@ -528,29 +544,48 @@ fn add_subflow_errors() {
             ConnectConfig::default(),
         )
         .unwrap();
-    assert_eq!(ep.add_subflow(ms(0), h, ip(JOIN_IP), 1500), Err(NotMptcp));
     assert_eq!(
-        ep.add_subflow(ms(0), ConnectionHandle(99), ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(0), h, ip(JOIN_IP), remote(), 1500, false),
+        Err(NotMptcp)
+    );
+    assert_eq!(
+        ep.add_subflow(
+            ms(0),
+            ConnectionHandle(99),
+            ip(JOIN_IP),
+            remote(),
+            1500,
+            false
+        ),
         Err(NoConnection)
     );
     // Confirmed: address family, MTU, the subflow cap, then close.
     let (mut ep, h, _, _) = confirmed();
     assert_eq!(
-        ep.add_subflow(ms(5), h, ip("fd00::1"), 1500),
+        ep.add_subflow(ms(5), h, ip("fd00::1"), remote(), 1500, false),
         Err(FamilyMismatch)
     );
-    assert_eq!(ep.add_subflow(ms(5), h, ip(JOIN_IP), 67), Err(InvalidMtu));
+    assert_eq!(
+        ep.add_subflow(ms(5), h, ip(JOIN_IP), remote(), 67, false),
+        Err(InvalidMtu)
+    );
     for i in 1..8 {
-        assert_eq!(ep.add_subflow(ms(5), h, ip(JOIN_IP), 68), Ok(SubflowId(i)));
+        assert_eq!(
+            ep.add_subflow(ms(5), h, ip(JOIN_IP), remote(), 68, false),
+            Ok(SubflowId(i))
+        );
     }
     assert_eq!(
-        ep.add_subflow(ms(5), h, ip(JOIN_IP), 1500),
+        ep.add_subflow(ms(5), h, ip(JOIN_IP), remote(), 1500, false),
         Err(TooManySubflows)
     );
     assert_eq!(from(&drain(&mut ep, ms(5)), JOIN_IP).len(), 7);
     let (mut ep, h, _, _) = confirmed();
     ep.connection(h).unwrap().close();
-    assert_eq!(ep.add_subflow(ms(5), h, ip(JOIN_IP), 1500), Err(Closed));
+    assert_eq!(
+        ep.add_subflow(ms(5), h, ip(JOIN_IP), remote(), 1500, false),
+        Err(Closed)
+    );
     assert!(from(&drain(&mut ep, ms(5)), JOIN_IP).is_empty());
 }
 
@@ -1256,7 +1291,8 @@ fn standalone_data_fin_moves_to_surviving_subflow() {
     input_at(&mut ep, &rst, t1);
     assert!(events(&mut ep).contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     let mut resent = Vec::new();
     while let Some(due) = ep
@@ -1341,7 +1377,8 @@ fn joined_subflow_stripping_resets_only_it() {
     let ev = events(&mut ep);
     assert!(ev.contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     assert!(!ev.contains(&Event::FellBack), "{ev:?}");
     assert_eq!(state(&ep, h), State::Confirmed);
@@ -1830,6 +1867,7 @@ fn r2_teardown_reinjects() {
     let down = Event::SubflowDown {
         subflow: SubflowId(1),
         reason: CloseReason::Timeout,
+        rst: None,
     };
     assert_eq!(ev, vec![down], "R2 before R1: no Stale");
     let rst = |p: &(usize, Segment)| p.0 == 1 && p.1.flags.contains(TcpFlags::RST);
@@ -1919,7 +1957,8 @@ fn reinjection_dedup_against_inflight_copy() {
     input_at(&mut ep, &rst, stale + Duration::from_millis(1));
     assert!(events(&mut ep).contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     let d = ep.conns[&h].hooks.data.as_ref().unwrap();
     assert_eq!(d.reinject.total_len(), 0, "not queued twice");
@@ -1952,7 +1991,8 @@ fn joined_subflow_stripping_via_dup_ack_resets_only_it() {
     let ev = events(&mut ep);
     assert!(ev.contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     assert!(!ev.contains(&Event::FellBack), "{ev:?}");
     assert_eq!(state(&ep, h), State::Confirmed);
@@ -2254,7 +2294,7 @@ fn stale_fin_then_time_wait(k: usize) {
     answer(&mut ep, 1 - k, t);
     drain(&mut ep, t);
     events(&mut ep);
-    let id = SubflowId(k as u8);
+    let id = SubflowId(k as u32);
     let mut t = t;
     for _ in 0..10 {
         if ep.conns[&h].subflows[k].state == SubflowState::Stale {
@@ -2272,7 +2312,8 @@ fn stale_fin_then_time_wait(k: usize) {
         events(&mut ep),
         vec![Event::SubflowDown {
             subflow: id,
-            reason
+            reason,
+            rst: None
         }]
     );
 }
@@ -2344,6 +2385,7 @@ fn initial_subflow_rst_is_subflow_down() {
     let down = Event::SubflowDown {
         subflow: SubflowId::INITIAL,
         reason: CloseReason::Reset,
+        rst: None,
     };
     assert_eq!(events(&mut ep), vec![down]);
     peer.reset[0] = true;
@@ -2516,7 +2558,8 @@ fn stripping_after_join_history_resets_not_fallback() {
     input_at(&mut ep, &rst_on(&jsyn), ms(31));
     assert!(events(&mut ep).contains(&Event::SubflowDown {
         subflow: SubflowId(1),
-        reason: CloseReason::Reset
+        reason: CloseReason::Reset,
+        rst: None
     }));
     // Subflow 0's window opens; its first data is ACKed without any MPTCP option.
     peer_ack(
@@ -2647,7 +2690,8 @@ fn bare_fin_on_join_confirming_ack_retires_subflow() {
         events(&mut ep),
         vec![Event::SubflowDown {
             subflow: id,
-            reason
+            reason,
+            rst: None
         }]
     );
     let (ev, t) = loop {
@@ -2731,7 +2775,7 @@ fn last_subflow_lost_then_add_subflow_resumes() {
     assert!(!data_on(&drain(&mut ep, t), &syn).is_empty(), "lost");
     // The only subflow is reset: the 60 s wait starts, its data stays queued.
     input_at(&mut ep, &rst_on(&syn), t);
-    assert!(events(&mut ep).is_empty());
+    assert_eq!(events(&mut ep), vec![initial_down(CloseReason::Reset)]);
     assert_eq!(ep.poll_timeout(), Some(t + Duration::from_secs(60)));
     assert_eq!(queue_first(&ep, h).map(|q| q.0), Some(head));
     // A new subflow 5 s later resumes the transfer at once.
@@ -2759,7 +2803,9 @@ fn initial_lost_before_confirmed_with_queued_join_times_out() {
     let (mut ep, h, syn, _) = connected_scaled(1 << 20);
     assert_eq!(state(&ep, h), State::PreConfirmed);
     let join_ip: IpAddr = JOIN_IP.parse().unwrap();
-    let id = ep.add_subflow(ms(1), h, join_ip, 1500).unwrap();
+    let id = ep
+        .add_subflow(ms(1), h, join_ip, remote(), 1500, false)
+        .unwrap();
     assert!(drain(&mut ep, ms(1)).is_empty(), "queued");
     input_at(&mut ep, &rst_on(&syn), ms(2));
     let mut ev = Vec::new();
@@ -2779,14 +2825,15 @@ fn initial_lost_before_confirmed_with_queued_join_times_out() {
     let timeout = Event::Closed {
         reason: CloseReason::Timeout,
     };
-    assert_eq!(ev[0], timeout);
+    assert_eq!(ev[1], timeout);
     drain(&mut ep, now);
     ev.extend(events(&mut ep));
     let down = Event::SubflowDown {
         subflow: id,
         reason: CloseReason::Reset,
+        rst: None,
     };
-    assert_eq!(ev, vec![timeout, down]);
+    assert_eq!(ev, vec![initial_down(CloseReason::Reset), timeout, down]);
 }
 
 #[test]
@@ -2926,7 +2973,8 @@ fn bare_fin_then_late_data_fin_on_only_subflow() {
     let timeout = Event::Closed {
         reason: CloseReason::Timeout,
     };
-    assert_eq!(events(&mut ep), vec![timeout]);
+    let down = initial_down(CloseReason::Normal);
+    assert_eq!(events(&mut ep), vec![down, timeout]);
 }
 
 #[test]
@@ -2953,6 +3001,7 @@ fn initial_subflow_r2_resets_once_joined() {
     let down = Event::SubflowDown {
         subflow: SubflowId::INITIAL,
         reason: CloseReason::Timeout,
+        rst: None,
     };
     assert_eq!(events(&mut ep), vec![down], "R2 before R1: no Stale");
     let rst = |p: &(usize, Segment)| p.0 == 0 && p.1.flags.contains(TcpFlags::RST);
@@ -3141,10 +3190,12 @@ fn stranded_subflow_reset_once_both_data_fins_acked() {
     let down0 = Event::SubflowDown {
         subflow: SubflowId::INITIAL,
         reason: CloseReason::Normal,
+        rst: None,
     };
     let down = Event::SubflowDown {
         subflow: SubflowId(1),
         reason: CloseReason::Reset,
+        rst: None,
     };
     let closed = Event::Closed {
         reason: CloseReason::Normal,
@@ -3971,7 +4022,7 @@ fn pinned(
     sf: u8,
     data: &[u8],
 ) {
-    pin(ep, h, Some(SubflowId(sf)));
+    pin(ep, h, Some(SubflowId(sf.into())));
     assert_eq!(ep.connection(h).unwrap().write(data), Ok(data.len()));
     for seg in data_on(&drain(ep, t), &peer.syns[usize::from(sf)].clone()) {
         peer.take(t, seg);
@@ -4355,3 +4406,7 @@ fn repair_and_episode_probe_share_one_tail_probe() {
     let c = &ep.conns[&h];
     assert!(c.repair.probe.is_none() && c.opp.as_ref().is_none_or(|e| e.probed));
 }
+
+// M3 Task 4: path-management API groundwork, reusing the helpers above.
+#[path = "pm_tests.rs"]
+mod pm_tests;

@@ -118,19 +118,15 @@ fn run(a: Args) -> Result<String, String> {
     } else {
         Endpoint::connect
     };
-    let cfg = ConnectConfig {
-        recv_buffer: if a.pause_read.is_zero() {
-            ConnectConfig::default().recv_buffer
-        } else {
-            16384
-        },
-        ..ConnectConfig::default()
-    };
+    let mut cfg = ConnectConfig::default();
+    if !a.pause_read.is_zero() {
+        cfg.recv_buffer = 16384;
+    }
     let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
         .map_err(|e| format!("connect: {e:?}"))?;
     // Queued until the connection is Confirmed, then started at the next poll.
     for &(ip, mtu) in &a.joins {
-        let id = (ep.add_subflow(now(start), h, ip, mtu))
+        let id = (ep.add_subflow(now(start), h, ip, a.remote, mtu, false))
             .map_err(|e| format!("add_subflow {ip}: {e:?}"))?;
         eprintln!("join: {id:?} local {ip} mtu {mtu}");
     }
@@ -220,6 +216,7 @@ fn run(a: Args) -> Result<String, String> {
                     }
                     Err(ReadError::WouldBlock) => break,
                     Err(ReadError::Reset) => return Err("connection reset by peer".into()),
+                    Err(e) => return Err(format!("read: {e:?}")),
                 }
             }
             if let Some(e) = a.expect.filter(|e| st.eof && st.verified < *e) {
@@ -361,7 +358,9 @@ impl State {
             match ev {
                 Event::FellBack => eprintln!("event: FellBack"),
                 Event::SubflowUp { subflow } => eprintln!("event: SubflowUp {subflow:?} +{t:.3}s"),
-                Event::SubflowDown { subflow, reason } => {
+                Event::SubflowDown {
+                    subflow, reason, ..
+                } => {
                     eprintln!("event: SubflowDown {subflow:?} {reason:?} +{t:.3}s")
                 }
                 Event::SubflowStale { subflow } => {
@@ -390,6 +389,7 @@ impl State {
                         self.sent, self.verified
                     ));
                 }
+                other => eprintln!("event: {other:?}"),
             }
         }
         Ok(())

@@ -122,7 +122,7 @@ fuzz_target!(|data: &[u8]| {
             const PEER_NONCE: u32 = 0xb1b2_b3b4;
             let peer_key = 0x0102_0304_0506_0708;
             let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 8, 2));
-            let id = ep.add_subflow(now, h, ip, 1500).unwrap();
+            let id = ep.add_subflow(now, h, ip, remote, 1500, false).unwrap();
             let pkts = drain(&mut ep, now);
             let mut segs = pkts.iter().map(|p| parse(p).unwrap());
             let jsyn = segs.find(|s| s.src.ip() == ip).expect("join SYN");

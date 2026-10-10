@@ -757,7 +757,7 @@ fn conflicting_mapping_resets_only_after_tcp_validity() {
     input(&mut ep, &seg);
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
@@ -772,7 +772,7 @@ fn unmapped_byte_bound_resets_subflow() {
     input(&mut ep, &peer_data(&syn, 5005, &[], b"e"));
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert!(packet::parse(&bytes).unwrap().flags.contains(TcpFlags::RST));
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     assert_eq!(ep.conns[&h].subflows[0].tcb.state(), TcpState::Closed);
     assert!(ep.conns[&h].hooks.retained());
 }
@@ -1980,9 +1980,20 @@ fn fastclose_valid_key_closes_once_on_ack_or_rst_after_tcp_validation() {
                 input(&mut ep, &seg);
                 assert_eq!(ep.poll_event(), None);
             } else {
-                assert_eq!(ep.poll_event(), None);
+                // A RST without a valid key is an ordinary RST: the no-subflow wait starts.
+                let down = (flags == TcpFlags::RST).then(|| (h, initial_down(CloseReason::Reset)));
+                assert_eq!(ep.poll_event(), down);
             }
         }
+    }
+}
+
+/// The initial subflow's `SubflowDown` as the last one: the no-subflow wait starts.
+fn initial_down(reason: CloseReason) -> Event {
+    Event::SubflowDown {
+        subflow: SubflowId::INITIAL,
+        reason,
+        rst: None,
     }
 }
 
@@ -1999,7 +2010,7 @@ fn ordinary_rst_keeps_data_until_no_subflow_timeout() {
             ..peer_data(&syn, 5001, &[], &[])
         },
     );
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(ep.poll_event(), Some((h, initial_down(CloseReason::Reset))));
     ep.handle_timeout(Instant::from_nanos(3));
     assert!(ep.connection(h).is_some());
     assert_eq!(
@@ -2151,7 +2162,10 @@ fn bare_tcp_fin_retires_subflow_without_data_eof_or_new_assignments() {
         ..peer_data(&syn, 5002, &[], &[])
     };
     input(&mut ep, &ack);
-    assert_eq!(ep.poll_event(), None);
+    assert_eq!(
+        ep.poll_event(),
+        Some((h, initial_down(CloseReason::Normal)))
+    );
     assert_eq!(ep.connection(h).unwrap().write(b"more"), Ok(4));
     let at = ep.poll_timeout().unwrap();
     assert_eq!(at, Instant::from_nanos(2) + Duration::from_secs(60));

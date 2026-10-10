@@ -34,7 +34,9 @@ const MAX_OOO_RANGES: usize = 64;
 const MSL: Duration = Duration::from_secs(60);
 
 /// Per-connection settings (spec §3; R2 is settable per connection, RFC 9293 MUST-21).
+/// Build it from `ConnectConfig::default()` and assign the fields to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectConfig {
     pub mtu: u16,
     /// Octets received in order and not yet read, which bounds the window offered. Memory
@@ -86,6 +88,7 @@ pub enum TcpState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
     Normal,
     Reset,
@@ -93,6 +96,8 @@ pub enum CloseReason {
     /// The peer fell back to TCP (infinite mapping) while another subflow held data not yet
     /// acknowledged at connection level: that data can no longer be delivered.
     FallbackDataLoss,
+    /// The application aborted the connection (`Connection::abort`).
+    Aborted,
 }
 
 /// What the caller must report after an input. Every `Closed(_)` is returned exactly once.

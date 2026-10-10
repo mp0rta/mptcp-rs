@@ -10,6 +10,7 @@ use crate::Instant;
 use crate::SeqNum;
 use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
+use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
 use crate::mptcp::{
     Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState,
 };
@@ -26,6 +27,7 @@ const EPHEMERAL_COUNT: u32 = 65536 - EPHEMERAL_FIRST as u32;
 pub struct ConnectionHandle(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     Connected {
         mptcp: bool,
@@ -45,12 +47,14 @@ pub enum Event {
     /// A subflow ended (`Reset`: refused or reset, also a queued join that can no longer
     /// start, or reset by us at close because it held only DATA_ACKed data; `Timeout`: R2;
     /// `Normal`: FIN exchange). The connection carries on; data the subflow had in flight is
-    /// resent on the others. For the initial subflow (`SubflowId::INITIAL`) only while
-    /// another subflow is open: as the last one, its end starts the no-subflow wait, which
-    /// ends in `Closed`. Not emitted for the subflows a fallback or MP_FASTCLOSE resets.
+    /// resent on the others; if it was the last open subflow, the no-subflow wait starts and
+    /// ends in `Closed` unless `add_subflow` starts a join first. Not emitted for the subflows
+    /// a fallback or MP_FASTCLOSE resets, nor for the initial subflow ending after both
+    /// DATA_FINs. `rst`: the MP_TCPRST of the peer's RST that ended it, if it carried one.
     SubflowDown {
         subflow: SubflowId,
         reason: CloseReason,
+        rst: Option<MpTcpRst>,
     },
     /// A subflow's retransmission timer expired R1 = 3 times in a row: it gets no new data,
     /// and data it had in flight is resent on the other subflows.
@@ -61,16 +65,44 @@ pub enum Event {
     SubflowRecovered {
         subflow: SubflowId,
     },
+    /// The peer announced an address (ADD_ADDR) as `id`; `addr` carries the port to join.
+    AddressAnnounced {
+        id: u8,
+        addr: SocketAddr,
+    },
+    /// The peer withdrew the address it announced as `id` (REMOVE_ADDR).
+    AddressRemoved {
+        id: u8,
+    },
+    /// The peer asked us to treat `subflow` as backup or not (MP_PRIO).
+    PeerPriority {
+        subflow: SubflowId,
+        backup: bool,
+    },
+}
+
+/// The MP_TCPRST option of a peer's RST (RFC 8684 §3.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MpTcpRst {
+    pub reason: u8,
+    /// The T flag: the condition is temporary, a new join may succeed.
+    pub transient: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AddSubflowError {
     NoConnection,
     /// Plain TCP, or the connection fell back to it.
     NotMptcp,
-    /// The peer's MP_CAPABLE set C=1: no MP_JOIN to its address (ADD_ADDR is M3).
+    /// The peer's MP_CAPABLE set C=1, and `remote` is the connection's initial remote address
+    /// and port.
     PeerForbidsJoin,
-    /// `local` and the connection's remote address are of different IP families.
+    /// `remote` is an address the peer announced, and a join to it failed; joins to it are
+    /// refused until the peer announces it again.
+    AddressFailed,
+    /// `local` and `remote` are of different IP families.
     FamilyMismatch,
     /// IPv4 needs an MTU of at least 68, IPv6 at least 1280.
     InvalidMtu,
@@ -80,9 +112,43 @@ pub enum AddSubflowError {
     NoPort,
     /// The connection has 8 subflows, queued joins included.
     TooManySubflows,
+    /// The connection has bound 256 local IPs, each to its own address ID, and `local` is
+    /// another one.
+    TooManyAddresses,
+    /// The connection has used up its subflow IDs.
+    SubflowIdsExhausted,
+}
+
+/// Why a call on one subflow failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubflowError {
+    NoConnection,
+    /// The connection never issued this ID, or its subflow has ended.
+    NoSubflow,
+    /// Plain TCP, or the connection fell back to it.
+    NotMptcp,
+    /// The application closed the connection, or it is closed.
+    Closed,
+    /// `close_subflow`: no other Active subflow can take over its data.
+    LastSubflow,
+}
+
+/// Why `remove_address` failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AddressError {
+    NoConnection,
+    /// Plain TCP, or the connection fell back to it.
+    NotMptcp,
+    /// The connection never bound this local IP to an address ID.
+    UnknownAddress,
+    /// The application closed the connection, or it is closed.
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectError {
     /// All ephemeral ports to this remote are in use.
     NoPort,
@@ -189,7 +255,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 nodelay: false,
                 queued_joins: Vec::new(),
                 next_subflow: 1,
-                addr_ids: vec![initial_ip],
+                local_addrs: LocalAddrs::new(initial_ip),
+                peer_addrs: PeerAddrs::default(),
                 opp: None,
                 repair: Default::default(),
             },
@@ -221,8 +288,10 @@ impl<R: CryptoRng> Endpoint<R> {
         Tcb::new_active(cfg, local, remote, isn, now)
     }
 
-    /// Opens an MP_JOIN subflow from `local`, whose path MTU is `mtu`, to the connection's
-    /// remote address; its `Tcb` uses the connection's `ConnectConfig` with this MTU.
+    /// Opens an MP_JOIN subflow from `local`, whose path MTU is `mtu`, to `remote`: the
+    /// connection's remote address, or another endpoint of the peer such as one it announced
+    /// (`Event::AddressAnnounced`). Its `Tcb` uses the connection's `ConnectConfig` with this
+    /// MTU. `backup` is the preference the join advertises (the MP_JOIN B bit; not sent yet).
     /// Before the connection is Confirmed (the peer's first DSS) the join is queued and starts
     /// at the first `poll_transmit` after that (RFC 8684 L884–887); a queued join that can no
     /// longer start (fallback, C=1) ends with `SubflowDown { Reset }`. `SubflowUp` follows the
@@ -232,20 +301,23 @@ impl<R: CryptoRng> Endpoint<R> {
         now: Instant,
         h: ConnectionHandle,
         local: IpAddr,
+        remote: SocketAddr,
         mtu: u16,
+        backup: bool,
     ) -> Result<SubflowId, AddSubflowError> {
         use AddSubflowError as E;
-        let c = self.conns.get_mut(&h).ok_or(E::NoConnection)?;
-        let m = (c.hooks.negotiation.as_ref())
-            .filter(|m| m.state != State::FellBack)
-            .ok_or(E::NotMptcp)?;
-        if c.closed_by_app || c.reset || c.detached || closed(c) {
-            return Err(E::Closed);
-        }
-        if m.peer_c {
+        let _ = backup; // the join SYN B bit (M3 Task 7)
+        // Only IP and port reach the wire (`connect`).
+        let remote = SocketAddr::new(remote.ip(), remote.port());
+        let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
+        let m = c.hooks.negotiation.as_ref().unwrap();
+        if m.peer_c && remote == c.subflows[0].remote {
             return Err(E::PeerForbidsJoin);
         }
-        let min = min_mtu(local, c.subflows[0].remote.ip()).ok_or(E::FamilyMismatch)?;
+        if c.peer_addrs.failed(remote) {
+            return Err(E::AddressFailed);
+        }
+        let min = min_mtu(local, remote.ip()).ok_or(E::FamilyMismatch)?;
         if mtu < min {
             return Err(E::InvalidMtu);
         }
@@ -253,8 +325,18 @@ impl<R: CryptoRng> Endpoint<R> {
             return Err(E::TooManySubflows);
         }
         let id = SubflowId(c.next_subflow);
-        let next = c.next_subflow.checked_add(1).ok_or(E::TooManySubflows)?;
-        let join = QueuedJoin { id, local, mtu };
+        let next = c
+            .next_subflow
+            .checked_add(1)
+            .ok_or(E::SubflowIdsExhausted)?;
+        let addr_id = c.local_addrs.bind(local).ok_or(E::TooManyAddresses)?;
+        let join = QueuedJoin {
+            id,
+            local,
+            remote,
+            mtu,
+            addr_id,
+        };
         if m.state == State::Confirmed {
             self.start_join(now, h, join)?;
         } else {
@@ -263,6 +345,89 @@ impl<R: CryptoRng> Endpoint<R> {
         }
         self.conns.get_mut(&h).unwrap().next_subflow = next;
         Ok(id)
+    }
+
+    /// `h` as an open MPTCP connection, else the caller's error for: no such connection, not
+    /// MPTCP (plain TCP or fallen back), closed.
+    fn open_mptcp<E>(
+        &mut self,
+        h: ConnectionHandle,
+        [none, not_mptcp, closed_err]: [E; 3],
+    ) -> Result<&mut Connection, E> {
+        let c = self.conns.get_mut(&h).ok_or(none)?;
+        if !(c.hooks.negotiation.as_ref()).is_some_and(|m| m.state != State::FellBack) {
+            return Err(not_mptcp);
+        }
+        if c.closed_by_app || c.reset || c.detached || closed(c) {
+            return Err(closed_err);
+        }
+        Ok(c)
+    }
+
+    /// The connection of a call on subflow `s`, which must be issued and not ended (a queued
+    /// join counts).
+    fn subflow_conn(
+        &mut self,
+        h: ConnectionHandle,
+        s: SubflowId,
+    ) -> Result<&mut Connection, SubflowError> {
+        use SubflowError as E;
+        let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
+        let open = |sf: &Subflow| sf.id == s && sf.tcb.state() != TcpState::Closed;
+        if !(c.subflows.iter().any(open) || c.queued_joins.iter().any(|q| q.id == s)) {
+            return Err(E::NoSubflow);
+        }
+        Ok(c)
+    }
+
+    /// Advertises whether the peer should treat subflow `s` as backup (MP_PRIO). Not
+    /// implemented yet: checks its arguments only.
+    #[doc(hidden)]
+    pub fn set_backup(
+        &mut self,
+        _now: Instant,
+        h: ConnectionHandle,
+        s: SubflowId,
+        _backup: bool,
+    ) -> Result<(), SubflowError> {
+        self.subflow_conn(h, s).map(drop)
+    }
+
+    /// Sends on subflow `s` only as a backup, or not; no wire effect. Not implemented yet:
+    /// checks its arguments only.
+    #[doc(hidden)]
+    pub fn set_local_backup(
+        &mut self,
+        h: ConnectionHandle,
+        s: SubflowId,
+        _backup: bool,
+    ) -> Result<(), SubflowError> {
+        self.subflow_conn(h, s).map(drop)
+    }
+
+    /// Retires subflow `s` by FIN exchange. Not implemented yet: checks its arguments only.
+    #[doc(hidden)]
+    pub fn close_subflow(
+        &mut self,
+        _now: Instant,
+        h: ConnectionHandle,
+        s: SubflowId,
+    ) -> Result<(), SubflowError> {
+        self.subflow_conn(h, s).map(drop)
+    }
+
+    /// Withdraws the local IP `local` (REMOVE_ADDR) and resets the subflows that use it. Not
+    /// implemented yet: checks its arguments only.
+    #[doc(hidden)]
+    pub fn remove_address(
+        &mut self,
+        _now: Instant,
+        h: ConnectionHandle,
+        local: IpAddr,
+    ) -> Result<(), AddressError> {
+        use AddressError as E;
+        let c = self.open_mptcp(h, [E::NoConnection, E::NotMptcp, E::Closed])?;
+        c.local_addrs.id(local).ok_or(E::UnknownAddress).map(drop)
     }
 
     /// Materializes a join: port, ISN, nonce, demux entry and a Joining subflow whose `Tcb`
@@ -274,12 +439,7 @@ impl<R: CryptoRng> Endpoint<R> {
         q: QueuedJoin,
     ) -> Result<(), AddSubflowError> {
         let c = &self.conns[&h];
-        let remote = c.subflows[0].remote;
-        let known = c.addr_ids.iter().position(|&ip| ip == q.local);
-        // ponytail: address IDs are never freed; 256 distinct local IPs per connection.
-        if known.is_none() && c.addr_ids.len() > usize::from(u8::MAX) {
-            return Err(AddSubflowError::TooManySubflows);
-        }
+        let remote = q.remote;
         let cfg = ConnectConfig {
             mtu: q.mtu,
             ..c.cfg.clone()
@@ -290,16 +450,12 @@ impl<R: CryptoRng> Endpoint<R> {
         let nonce = self.rng.next_u32();
         let c = self.conns.get_mut(&h).unwrap();
         tcb.set_nodelay(c.nodelay);
-        let addr_id = known.unwrap_or_else(|| {
-            c.addr_ids.push(q.local);
-            c.addr_ids.len() - 1
-        }) as u8;
         // SubflowMp fields the MP_CAPABLE path would set: this subflow's own ISN, and nothing
         // TCP-acknowledged on it yet. `peer_scale` comes with its SYN/ACK (`join_segment`).
         let mut mp = SubflowMp::new();
         mp.local_isn = isn;
         mp.tcp_acked_dsn = c.hooks.data.as_ref().map_or(0, |d| d.send.una);
-        mp.join = Some(Join::new(nonce, addr_id));
+        mp.join = Some(Join::new(nonce, q.addr_id));
         c.hooks.cancel_no_subflow_wait();
         self.demux.insert((local, remote), (h, q.id));
         c.subflows.push(Subflow {
@@ -314,25 +470,32 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// Starts the queued joins of connections that became Confirmed; drops those that can no
-    /// longer start (fallback, C=1, connection closed).
+    /// longer start (fallback, C=1 for the initial remote, connection closed).
     fn start_queued_joins(&mut self, now: Instant) {
         for h in std::mem::take(&mut self.pending_joins) {
             let Some(c) = self.conns.get_mut(&h) else {
                 continue;
             };
             let m = c.hooks.negotiation.as_ref().unwrap();
-            let open = !c.reset && !c.detached && !closed(c) && !m.peer_c;
-            let state = m.state;
-            if open && matches!(state, State::SynSent | State::PreConfirmed) {
-                self.pending_joins.insert(h);
-                continue;
-            }
+            let open = !c.reset && !c.detached && !closed(c);
+            let (state, peer_c, initial) = (m.state, m.peer_c, c.subflows[0].remote);
+            let waiting = open && matches!(state, State::SynSent | State::PreConfirmed);
+            let mut kept = Vec::new();
             for q in std::mem::take(&mut c.queued_joins) {
                 let subflow = q.id;
-                if !(open && state == State::Confirmed && self.start_join(now, h, q).is_ok()) {
-                    let reason = CloseReason::Reset;
-                    (self.events).push_back((h, Event::SubflowDown { subflow, reason }));
+                let allowed = open && !(peer_c && q.remote == initial);
+                if allowed && waiting {
+                    kept.push(q);
+                } else if !(allowed
+                    && state == State::Confirmed
+                    && self.start_join(now, h, q).is_ok())
+                {
+                    (self.events).push_back((h, down(subflow, CloseReason::Reset)));
                 }
+            }
+            if !kept.is_empty() {
+                self.conns.get_mut(&h).unwrap().queued_joins = kept;
+                self.pending_joins.insert(h);
             }
         }
     }
@@ -514,7 +677,7 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         if let Some(reason) = reason {
             if !hooks.fast_closed {
-                events.push_back((h, Event::SubflowDown { subflow, reason }));
+                events.push_back((h, down(subflow, reason)));
             }
         } else if *state == SubflowState::Joining && !joining {
             *state = SubflowState::Active;
@@ -522,9 +685,9 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
-    /// The events of `subflows[0]`. With MPTCP active its end is `SubflowDown` while another
-    /// subflow is open (`others_open`) and the connection carries on (not on MP_FASTCLOSE);
-    /// as the last subflow it leads to the no-subflow wait, whose end is `Closed`.
+    /// The events of `subflows[0]`. With MPTCP active its end is `SubflowDown` while the
+    /// connection carries on (not on MP_FASTCLOSE): another subflow is open (`others_open`),
+    /// or, as the last one, its end starts the no-subflow wait, whose end is `Closed`.
     fn push_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         hooks: &ConnectionHooks,
@@ -543,9 +706,9 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             Reaction::Closed(reason) => {
                 if hooks.active() {
-                    if others_open && hooks.retained() && !hooks.fast_closed {
-                        let subflow = SubflowId::INITIAL;
-                        events.push_back((h, Event::SubflowDown { subflow, reason }));
+                    let carries_on = others_open || !hooks.data_closed();
+                    if carries_on && hooks.retained() && !hooks.fast_closed {
+                        events.push_back((h, down(SubflowId::INITIAL, reason)));
                     }
                     return;
                 }
@@ -800,19 +963,22 @@ impl<R: CryptoRng> Endpoint<R> {
                 }
             }
             for q in c.queued_joins.drain(..) {
-                let reason = CloseReason::Reset;
-                events.push_back((
-                    h,
-                    Event::SubflowDown {
-                        subflow: q.id,
-                        reason,
-                    },
-                ));
+                events.push_back((h, down(q.id, CloseReason::Reset)));
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && c.hooks.has_unread();
             c.detached
         });
+    }
+}
+
+/// `SubflowDown` for an end without a peer MP_TCPRST.
+fn down(subflow: SubflowId, reason: CloseReason) -> Event {
+    let rst = None;
+    Event::SubflowDown {
+        subflow,
+        reason,
+        rst,
     }
 }
 
