@@ -751,6 +751,16 @@ mod tests {
                 "{bad}"
             );
         }
+        // IPv6 local, remote and join addresses (M3 spec §5.3).
+        let v6 =
+            "--mode mptcp --tun t0 --local fd00:91::2 --remote [dead:beef:1::2]:5201 --expect 0";
+        let a = parse_args(v(&format!("{v6} --send 5 --join fd00:92::2"))).unwrap();
+        let text = a.scenario().unwrap();
+        assert_eq!(
+            text,
+            "\nat Connected +0 join fd00:92::2 [dead:beef:1::2]:5201 mtu 1500"
+        );
+        assert!(Script::parse(&text).is_ok());
         let a = parse_args(v(&format!("{timed} --send 5 --script /nonexistent"))).unwrap();
         assert!(a.scenario().is_err());
         assert!(parse_args(v(&format!("{timed} --send 5 --abort-after-ms x"))).is_none());

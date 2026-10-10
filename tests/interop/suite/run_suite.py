@@ -42,6 +42,9 @@ def topology(case):
         sh("ip", "netns", "add", n)
         sh("ip", "-n", n, "link", "set", "lo", "up")
         ns(n, "sysctl", "-qw", "net.ipv4.conf.all.rp_filter=0", "net.mptcp.enabled=1")
+        # No DAD on the links made below: a tentative link-local address holds back neighbour
+        # discovery, so a fresh link's first IPv6 packets would wait about 2 s.
+        ns(n, "sysctl", "-qw", "net.ipv6.conf.all.accept_dad=0", "net.ipv6.conf.default.accept_dad=0")
     ns("cli", "sysctl", "-qw", "net.ipv4.ip_forward=1", "net.ipv6.conf.all.forwarding=1")
     ns("cli", "ip", "tuntap", "add", "dev", "mtun0", "mode", "tun")
     sh("ip", "-n", "cli", "link", "set", "mtun0", "up")
@@ -156,7 +159,7 @@ def run_case(case, out):
     while "listening" not in (out / "server.log").read_text() and srv.poll() is None and time.time() < until:
         time.sleep(0.05)
     cli = subprocess.Popen(["ip", "netns", "exec", "cli", "target/release/mptcp-rs-tun", "--mode", "mptcp", "--tun",
-                            "mtun0", "--local", CLIENT, "--remote", SERVER, *map(str, cargs)],
+                            "mtun0", "--local", c.get("local", CLIENT), "--remote", c.get("remote", SERVER), *map(str, cargs)],
                            stdout=open(out / "client.log", "w"), stderr=subprocess.STDOUT)
 
     def at(barrier, ms, label, act):

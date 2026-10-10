@@ -6,7 +6,8 @@
   setup [shell command] run in srv before the server starts
 - client: script (scenario text for `mptcp-rs-tun --script`, crates/mptcp-rs-tun/src/script.rs),
   send_secs, send_rate (Mbit/s as a string; None: unlimited), optional args (extra mptcp-rs-tun
-  flags, e.g. --join)
+  flags, e.g. --join), optional local and remote (the initial subflow's addresses; default
+  10.0.91.2 to 10.0.1.2:5201)
 - links {i: {"rate", "delay"}} overriding 20mbit/10ms; fail [(link, barrier, ms, secs)]; optional
   drop_once (an iptables match): a cli FORWARD DROP rule, deleted once it has dropped one packet
 - expect: bytes c2s|s2c|bidi, nstat {counter: int or (op, int)} on the srv delta, pcap [check(r)]
@@ -321,7 +322,8 @@ def echoed(rid, ip, port=None):
     """At mtun0: every echo the client sent is ADD_ADDR rid with E=1, no HMAC, and the announced
     address and port (M3 spec §3.2)."""
     def check(r):
-        got = {(o.get("tcp.options.mptcp.addrid"), o.get("tcp.options.mptcp.ipv4"), o.get("tcp.options.mptcp.port"),
+        family = "ipv6" if ":" in ip else "ipv4"
+        got = {(o.get("tcp.options.mptcp.addrid"), o.get(f"tcp.options.mptcp.{family}"), o.get("tcp.options.mptcp.port"),
                 "tcp.options.mptcp.addaddrtrunchmac" in o) for _, o in add_addrs(r, "cli", "c2s", "1")}
         assert got == {(str(rid), ip, port and str(port), False)}, f"echoes {got}"
     return check
@@ -332,27 +334,33 @@ def join_syns(r):
     return [g for g, _ in mptcp_with(r, "cli", "c2s", "1") if g.flags & 0x12 == 0x02]
 
 
-def joined_only(*dsts):
-    """At mtun0: the MP_JOIN SYNs went from 10.0.92.2 to dsts ("IP:port") and nowhere else."""
+def hostport(ip, port):
+    """ "IP:port", IPv6 in brackets: as the client prints a socket address."""
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def joined_only(*dsts, src=BACKUP):
+    """At mtun0: the MP_JOIN SYNs went from src to dsts ("IP:port") and nowhere else."""
     def check(r):
-        got = {(g.src, f"{g.dst}:{g.dport}") for g in join_syns(r)}
-        assert got == {(BACKUP, d) for d in dsts}, f"join SYNs {got}"
+        got = {(g.src, hostport(g.dst, g.dport)) for g in join_syns(r)}
+        assert got == {(src, d) for d in dsts}, f"join SYNs {got}"
     return check
 
 
 def signal(name, script=REACT, endpoint=f"{SIGNALLED} dev s2 id 2 signal", announced=f"{SIGNALLED}:5201",
-           direction="s2c", joins=1):
+           direction="s2c", joins=1, src=BACKUP):
     """The server announces `endpoint` (ADD_ADDR, as `announced`) once the connection is up; the
-    client echoes it and, by `script`, joins it from 10.0.92.2 on link 2. Linux's first ADD_ADDR
+    client echoes it and, by `script`, joins it from src (link 2). Linux's first ADD_ADDR
     may arrive before its first DSS: the client stages it and echoes it once Confirmed (M3 spec
     §3.3 rev3)."""
     case = scripted(name, "signal", direction, script)
     case["server"]["pm"] = ["limits set subflows 1 add_addr_accepted 0", f"endpoint add {endpoint}"]
     ip, _, port = announced.rpartition(":")
+    ip = ip.strip("[]")
     e = case["expect"]
     e["nstat"].update(MPTcpExtAddAddrTx=(">=", 1), MPTcpExtEchoAdd=(">=", 1),
                       MPTcpExtMPJoinSynRx=joins, MPTcpExtMPJoinAckRx=joins)
-    e["pcap"] += [echoed(2, ip, None if " port " not in endpoint else port), joined_only(*[announced] * bool(joins))]
+    e["pcap"] += [echoed(2, ip, None if " port " not in endpoint else port), joined_only(*[announced] * bool(joins), src=src)]
     e["events"] = ["Connected mptcp=true", f"AddressAnnounced {{ id: 2, addr: {announced} }}"] + ["SubflowUp"] * joins
     return case
 
@@ -503,6 +511,44 @@ def signal_backup_failover():
     return case
 
 
+V6_SERVER = "[dead:beef:1::2]:5201"
+
+
+def v6_two_paths():
+    """IPv6 only (amendment §5.4): a v6 server; the initial subflow from fd00:91::2 on link 1 and a
+    join from fd00:92::2 on link 2, both carrying new data in both directions."""
+    cips = ["fd00:91::2", "fd00:92::2"]
+    case = joins("v6-two-paths", 1, "bidi")
+    case["group"] = "ipv6"
+    case["server"]["family"] = "v6"
+    case["client"].update(local=cips[0], remote=V6_SERVER, args=["--join", cips[1]])
+    case["expect"]["pcap"] = [subflows(*cips), fin_fin_no_rst]
+    return case
+
+
+def v4_initial_v6_join():
+    """Mixed families through the dual-stack server (amendment §5.4): the initial subflow is IPv4,
+    the server announces its IPv6 address on link 2 and the client joins it from fd00:92::2; both
+    subflows carry new data in both directions."""
+    v6 = "fd00:92::2"
+    case = signal("v4-initial-v6-join", script=f"on announced join {v6}", endpoint="dead:beef:2::2 dev s2 id 2 signal",
+                  announced="[dead:beef:2::2]:5201", direction="bidi", src=v6)
+    case["group"] = "ipv6"
+    case["server"]["family"] = "dual"
+    case["expect"]["pcap"] += [subflows(PRIMARY, v6)]
+    return case
+
+
+def v6_initial_v4_join():
+    """The mirror (amendment §5.4): the initial subflow is IPv6 from fd00:91::2, the join IPv4 from
+    10.0.92.2 to the server's IPv4 address; both carry new data in both directions."""
+    case = scripted("v6-initial-v4-join", "ipv6", "bidi", JOIN)
+    case["server"]["family"] = "dual"
+    case["client"].update(local="fd00:91::2", remote=V6_SERVER)
+    case["expect"]["pcap"] += [subflows("fd00:91::2", BACKUP)]
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
@@ -533,4 +579,7 @@ CASES = [
     c1_alternate_port(),
     server_remove_signal(),
     signal_backup_failover(),
+    v6_two_paths(),
+    v4_initial_v6_join(),
+    v6_initial_v4_join(),
 ]

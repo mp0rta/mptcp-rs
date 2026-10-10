@@ -135,3 +135,16 @@ fn single_segment_keeps_the_200ms_delayed_ack() {
         );
     }
 }
+
+/// The adapter hands a frame to the endpoint as read and writes back what it returns: an IPv6
+/// data frame in, an IPv6 ACK out (version nibble 6, payload length = the frame's rest).
+#[test]
+fn tun_passes_ipv6_frames() {
+    let mut f = Fixture::new(true);
+    assert_eq!(f.data(0), None);
+    assert_eq!(f.data(1), Some(PEER_ISN + 1 + 2 * f.mss as u32));
+    let n = 40 + usize::from(u16::from_be_bytes([f.pkt[4], f.pkt[5]]));
+    assert_eq!(f.pkt[0] >> 4, 6, "an IPv6 frame");
+    let ack = parse(&f.pkt[..n]).unwrap();
+    assert_eq!((ack.src, ack.dst), (f.local, f.peer));
+}

@@ -2515,13 +2515,23 @@ fn connected_with(
     cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
     sack: bool,
 ) -> Connected {
+    connected_between("10.0.0.1", "10.0.0.2:80", cap, cc, sack)
+}
+/// `connected_with`, from `local` to `remote`.
+fn connected_between(
+    local: &str,
+    remote: &str,
+    cap: u32,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+    sack: bool,
+) -> Connected {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
     ep.cc = cc;
     let h = ep
         .connect_mptcp(
             Instant::from_nanos(0),
-            "10.0.0.1".parse().unwrap(),
-            "10.0.0.2:80".parse().unwrap(),
+            local.parse().unwrap(),
+            remote.parse().unwrap(),
             ConnectConfig {
                 recv_buffer: cap,
                 ..ConnectConfig::default()

@@ -2750,3 +2750,115 @@ fn add_addr_preconfirmed_then_fallback_discards() {
         Err(AddSubflowError::NotMptcp)
     );
 }
+
+// M3 Task 10: IPv6 and mixed families (M3 spec §5.4).
+
+/// A Confirmed connection (Reno) from `local` to `remote`, joined from `jlocal` to `jremote`;
+/// `n` octets written go to the peer over both subflows, which must each carry data, and arrive
+/// byte-exact.
+fn two_families(local: &str, remote: &str, jlocal: &str, jremote: &str) {
+    let n = 200_000;
+    let (mut ep, h, syn, _) = connected_between(local, remote, 1 << 20, Some(reno), false);
+    open_window(&mut ep, &syn, h);
+    let id = (ep.add_subflow(ms(10), h, ip(jlocal), jremote.parse().unwrap(), 1500, false))
+        .expect("same-family join");
+    let jsyn = from(&drain(&mut ep, ms(10)), jlocal)
+        .pop()
+        .expect("join SYN");
+    assert_eq!(jsyn.dst, jremote.parse().unwrap());
+    let opts = synack_opts(&ep, h, &jsyn, 7, None);
+    synack(&mut ep, &jsyn, &opts, ms(10));
+    let ack = from(&drain(&mut ep, ms(10)), jlocal)
+        .pop()
+        .expect("third ACK");
+    assert_third_ack(&ep, h, &jsyn, &ack);
+    let head = una(&ep, h);
+    peer_ack(&mut ep, &jsyn, ms(10), jsyn.seq.wrapping_add(1), head, 1000);
+    assert_eq!(events(&mut ep), vec![Event::SubflowUp { subflow: id }]);
+    let (t, _) = prime(&mut ep, h, &syn, SubflowId::INITIAL, ms(20), 30);
+    let (t, _) = prime(&mut ep, h, &jsyn, id, t, 10);
+    let head = una(&ep, h);
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let mut peer = Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]);
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64, "all DATA_ACKed");
+    assert_eq!(peer.received(), data, "byte-exact");
+    for path in [0, 1] {
+        assert!(
+            peer.log.iter().any(|l| l.1 == path),
+            "data on subflow {path}"
+        );
+    }
+    assert!(events(&mut ep).is_empty());
+}
+
+#[test]
+fn v6_connect_and_join_same_family() {
+    two_families(
+        "fd00:91::2",
+        "[dead:beef:1::2]:80",
+        "fd00:92::2",
+        "[dead:beef:1::2]:80",
+    );
+}
+
+#[test]
+fn v4_initial_v6_join() {
+    two_families(
+        "10.0.91.2",
+        "10.0.1.2:80",
+        "fd00:92::2",
+        "[dead:beef:2::2]:80",
+    );
+}
+
+#[test]
+fn v6_initial_v4_join() {
+    two_families(
+        "fd00:91::2",
+        "[dead:beef:1::2]:80",
+        "10.0.92.2",
+        "10.0.1.2:80",
+    );
+}
+
+#[test]
+fn join_family_mismatch_refused() {
+    for (local, remote) in [("10.0.0.1", "10.0.0.2:80"), ("fd00::1", "[fd00::2]:80")] {
+        let (mut ep, h, syn, _) = connected_between(local, remote, 1 << 20, None, false);
+        open_window(&mut ep, &syn, h);
+        for (jlocal, jremote) in [("10.0.1.1", "[fd00::3]:80"), ("fd00::4", "10.0.0.3:80")] {
+            assert_eq!(
+                ep.add_subflow(ms(5), h, ip(jlocal), jremote.parse().unwrap(), 1500, false),
+                Err(AddSubflowError::FamilyMismatch),
+                "{jlocal} to {jremote} on {local}"
+            );
+        }
+        assert!(drain(&mut ep, ms(5)).is_empty(), "nothing sent");
+        assert_eq!(ep.conns[&h].subflows.len(), 1, "no subflow made");
+    }
+}
+
+#[test]
+fn add_addr_v6_on_v4_connection_announced() {
+    let (mut ep, h, syn, _) = confirmed();
+    announce(&mut ep, h, &syn, (2, "dead:beef:2::2", Some(5201)), ms(10));
+    assert_eq!(events(&mut ep), vec![announced(2, "[dead:beef:2::2]:5201")]);
+    let want = (syn.src, echo(2, "dead:beef:2::2", Some(5201)));
+    assert_eq!(echoes(&drain(&mut ep, ms(10))), vec![want]);
+    assert_eq!(
+        table(&ep, h),
+        vec![(2, Some((ip("dead:beef:2::2"), 5201)), false)]
+    );
+    // Joinable from a v6 local only.
+    let remote = "[dead:beef:2::2]:5201".parse().unwrap();
+    assert_eq!(
+        ep.add_subflow(ms(20), h, ip(JOIN_IP), remote, 1500, false),
+        Err(AddSubflowError::FamilyMismatch)
+    );
+    ep.add_subflow(ms(20), h, ip("fd00:92::2"), remote, 1500, false)
+        .unwrap();
+    let jsyn = from(&drain(&mut ep, ms(20)), "fd00:92::2").pop();
+    assert_eq!(jsyn.expect("join SYN").dst, remote);
+}
