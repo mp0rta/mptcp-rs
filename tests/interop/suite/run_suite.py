@@ -96,9 +96,22 @@ def drop_once(rule, r, alive):
 
 
 def lost(log):
-    """Packets tcpdump dropped, or received but never wrote (still queued when it stopped)."""
-    n = lambda what: sum(map(int, re.findall(rf"(\d+) packets? {what}", log)))
+    """Packets tcpdump dropped, or received but never wrote (still queued when it stopped); None
+    if it printed no statistics, which is no evidence of a clean capture."""
+    found = lambda what: re.findall(rf"(\d+) packets? {what}", log)
+    if not (found("captured") and found("dropped by kernel")):
+        return None
+    n = lambda what: sum(map(int, found(what)))
     return n("dropped by") + n("received by filter") - n("captured")
+
+
+def active_closer(segs):
+    """At mtun0, the client sent the first FIN of the subflow whose close began last: it is the
+    active closer there, so it holds TIME-WAIT (2 MSL) before reporting `Closed`."""
+    first = {}
+    for g in sorted((g for g in segs if g.point == "cli" and g.flags & 0x01), key=lambda g: g.t):
+        first.setdefault(g.flow, g)
+    return bool(first) and max(first.values(), key=lambda g: g.t).direction == "c2s"
 
 
 def barrier_time(log, barrier, until):
@@ -192,7 +205,7 @@ def run_case(case, out):
         acts.append(threading.Thread(target=drop_once, args=(case["drop_once"], r, lambda: cli.poll() is None)))
     for t in acts:
         t.start()
-    r.watchdog = r.time_wait = False
+    r.watchdog = r.stopped = False
     while cli.poll() is None or srv.poll() is None:
         if time.time() > until:
             r.watchdog = True
@@ -200,10 +213,10 @@ def run_case(case, out):
                 q.kill()
         elif srv.poll() == 0:
             # The server verified every byte and closed; 2 s covers the subflow FIN exchange and a
-            # passive closer's own exit. A client still running sits in TIME-WAIT (the core holds
-            # Closed for 2 MSL); its FIN exchange is judged from the pcap (cases.fin_fin_no_rst).
+            # passive closer's own exit. A client still running may sit in TIME-WAIT (the core
+            # holds Closed for 2 MSL): judged from the pcap once decoded (`active_closer`).
             time.sleep(2)
-            r.time_wait = cli.poll() is None
+            r.stopped = cli.poll() is None
             cli.terminate()
         time.sleep(0.05)
     r.rc = cli.returncode, srv.returncode
@@ -219,6 +232,9 @@ def run_case(case, out):
     r.client, r.server = (out / "client.log").read_text(), (out / "server.log").read_text()
     r.events = [ln.removeprefix("event: ") for ln in r.client.splitlines() if ln.startswith("event: ")]
     r.segs = decode.load({out / f"{c}.pcap": "cli" if c == "tun" else "srv" for c in caps})
+    # Stopped in TIME-WAIT only as the active closer; its FIN exchange is judged from the pcap
+    # (cases.fin_fin_no_rst). Otherwise the client must exit on its own with `Closed Normal`.
+    r.time_wait = r.stopped and active_closer(r.segs)
     # Packets within GUARD of a phase boundary are excluded from phase assertions only.
     r.phase = lambda t0, t1: [g for g in r.segs if t0 + GUARD <= g.t <= t1 - GUARD]
     return r
@@ -233,7 +249,9 @@ def judge(r):
         why.append(f"watchdog {case['watchdog_s']} s")
     # A case that ends in an abort by design: the exits that abort gives, and no byte counts.
     aborted = e.get("aborted")
-    want_rc = {"client": (0, SERVER_RESET), "server": (1, SERVER_ABORTED)}.get(aborted, (-15 if r.time_wait else 0, 0))
+    want_rc = {"client": (0, SERVER_RESET), "server": (1, SERVER_ABORTED)}.get(aborted, (-15 if r.stopped else 0, 0))
+    if r.stopped and not r.time_wait:
+        why.append("client still running 2 s after the server exited, not as the active closer")
     if r.rc != want_rc:
         why.append(f"exit client={r.rc[0]} server={r.rc[1]}")
     cm = re.search(r"^closing: sent (\d+) bytes, verified (\d+) bytes$", r.client, re.M)
@@ -268,7 +286,8 @@ def judge(r):
         if not OPS[op](delta, v):
             why.append(f"nstat {k} delta {delta}, want {op} {v}")
     # (c) capture hygiene, clock drift, pcap assertions
-    why += [f"tcpdump {c} lost {n} packets" for c, n in r.drops.items() if n]
+    why += [f"tcpdump {c}: no statistics" if n is None else f"tcpdump {c} lost {n} packets"
+            for c, n in r.drops.items() if n != 0]
     if r.drift_ms > 10:
         why.append(f"realtime - monotonic drifted {r.drift_ms:.1f} ms")
     for check in e["pcap"]:

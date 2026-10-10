@@ -99,5 +99,32 @@ class Decode(unittest.TestCase):
                                      ("srv", "s2c", 700, 0), ("cli", "s2c", 0, 0)])
 
 
+class Judge(unittest.TestCase):
+    """run_suite.py judgement helpers."""
+
+    def test_lost_requires_statistics(self):
+        import run_suite
+        stats = "10 packets captured\n10 packets received by filter\n0 packets dropped by kernel\n"
+        self.assertEqual(run_suite.lost(stats), 0)
+        self.assertEqual(run_suite.lost(stats.replace("10 packets captured", "9 packets captured")), 1)
+        self.assertIsNone(run_suite.lost("listening on mtun0\n"))
+        self.assertIsNone(run_suite.lost("10 packets captured\n"))
+
+    def test_active_closer_is_first_fin_of_last_closing_subflow(self):
+        import run_suite
+        FIN = 0x01
+
+        def seg(t, sport, direction, flags=FIN | ACK):
+            g = decode.Seg(t, "cli", "a", "b", sport, 5201, flags, 0, 0, 0, 0, [], [])
+            g.direction = direction
+            return g
+        # A retired subflow closed by the client, then the server closes the last one first.
+        segs = [seg(1, 1, "c2s"), seg(1.1, 1, "s2c"), seg(5, 2, "s2c"), seg(5.1, 2, "c2s")]
+        self.assertFalse(run_suite.active_closer(segs))
+        self.assertTrue(run_suite.active_closer(segs[:2] + [seg(5, 2, "c2s"), seg(5.1, 2, "s2c")]))
+        self.assertFalse(run_suite.active_closer([seg(1, 1, "c2s", ACK)]))
+        self.assertFalse(run_suite.active_closer([]))
+
+
 if __name__ == "__main__":
     unittest.main()
