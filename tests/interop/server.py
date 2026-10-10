@@ -2,7 +2,8 @@
 """Linux TCP/MPTCP peer for the interop tests, listening on 10.0.1.2 (or the --family wildcard):
 receive the pattern (--expect bytes, or until EOF), then send it (--send-bytes, or for --send-secs;
 --bidi: while receiving), then read until EOF. --bytes sets both counts. --abort-after: close
-with SO_LINGER 0 once that many bytes were received and sent in total."""
+with SO_LINGER 0 once that many bytes were received and sent in total, and exit 3. A connection
+reset by the client exits 4. Exit 0 means every byte was verified."""
 import argparse, os, socket, struct, sys, threading, time
 
 ap = argparse.ArgumentParser()
@@ -39,13 +40,24 @@ ls.listen(1)
 print("listening", flush=True)
 c, peer = ls.accept()
 
+ABORTED, RESET = 3, 4  # exit statuses (run_suite.py)
 got = sent = 0
+abort_lock = threading.Lock()  # --bidi: both threads may get here
 def maybe_abort():
     if a.abort_after is not None and got + sent >= a.abort_after:
-        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        c.close()
-        print(f"server aborted: received {got} sent {sent}", flush=True)
-        os._exit(0)
+        with abort_lock:
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            print(f"server aborted: received {got} sent {sent}", flush=True)
+            # The exit is the close: no other thread can see the socket closed and fail first.
+            os._exit(ABORTED)
+
+def on_error(t, v, tb):
+    if issubclass(t, ConnectionResetError):
+        print(f"server reset: received {got} sent {sent}", flush=True)
+        os._exit(RESET)
+    sys.__excepthook__(t, v, tb)
+    os._exit(1)
+sys.excepthook = on_error
 
 def send():
     global sent
@@ -59,7 +71,7 @@ def send():
         c.shutdown(socket.SHUT_WR)
 
 if a.bidi:
-    threading.excepthook = lambda e: (sys.__excepthook__(e.exc_type, e.exc_value, e.exc_traceback), os._exit(1))
+    threading.excepthook = lambda e: on_error(e.exc_type, e.exc_value, e.exc_traceback)
     sender = threading.Thread(target=send)
     sender.start()
 ok = True

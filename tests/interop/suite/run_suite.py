@@ -22,6 +22,7 @@ import decode
 LINKS = range(1, 5)
 CLIENT, SERVER = "10.0.91.2", "10.0.1.2:5201"
 GUARD = 0.1  # phase assertions skip packets this close (s) to a boundary; the decoder keeps them
+SERVER_ABORTED, SERVER_RESET = 3, 4  # server.py exit statuses; 0: every byte verified
 OPS = {"==": operator.eq, ">=": operator.ge, "<=": operator.le, ">": operator.gt, "<": operator.lt}
 
 
@@ -203,15 +204,20 @@ def judge(r):
     # counts are from its `closing:` line (printed when it closes, so also before a TIME-WAIT stop).
     if r.watchdog:
         why.append(f"watchdog {case['watchdog_s']} s")
-    if r.rc != (-15 if r.time_wait else 0, 0):
+    # A case that ends in an abort by design: the exits that abort gives, and no byte counts.
+    aborted = e.get("aborted")
+    want_rc = {"client": (0, SERVER_RESET), "server": (1, SERVER_ABORTED)}.get(aborted, (-15 if r.time_wait else 0, 0))
+    if r.rc != want_rc:
         why.append(f"exit client={r.rc[0]} server={r.rc[1]}")
     cm = re.search(r"^closing: sent (\d+) bytes, verified (\d+) bytes$", r.client, re.M)
     sm = re.search(r"^server ok: received (\d+) sent (\d+) ", r.server, re.M)
     if r.time_wait and fin_fin_no_rst not in e["pcap"]:
         e = {**e, "pcap": e["pcap"] + [fin_fin_no_rst]}  # the proof of the FIN exchange
-    elif r.rc[0] == 0 and "Closed Normal" not in r.events:
+    elif r.rc[0] == 0 and not aborted and "Closed Normal" not in r.events:
         why.append("passive close without Closed Normal")
-    if cm and sm:
+    if aborted:
+        pass
+    elif cm and sm:
         c2s, s2c = int(cm[1]), int(cm[2])
         if (int(sm[1]), int(sm[2])) != (c2s, s2c):
             why.append(f"byte counts: client sent {c2s} got {s2c}, server got {sm[1]} sent {sm[2]}")

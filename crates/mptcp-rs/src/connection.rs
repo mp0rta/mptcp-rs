@@ -8,7 +8,7 @@ use crate::tcp::{ConnectConfig, TcpState};
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
 
-/// `write` failed because the connection is closed (by `close`, a reset or a timeout).
+/// `write` failed because the connection is closed (by `close`, `abort`, a reset or a timeout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteError {
@@ -20,7 +20,7 @@ pub enum WriteError {
 pub enum ReadError {
     /// No data yet and no FIN from the peer.
     WouldBlock,
-    /// The peer reset the connection.
+    /// The connection was reset: by the peer, a timeout or `abort`.
     Reset,
 }
 
@@ -30,6 +30,8 @@ pub struct Connection {
     pub(crate) subflows: Vec<Subflow>,
     pub(crate) hooks: ConnectionHooks,
     pub(crate) closed_by_app: bool,
+    /// `abort` was called; the endpoint carries it out at its next call.
+    pub(crate) aborting: bool,
     pub(crate) reset: bool,
     /// Closed and out of the demux table, kept only until the application has read the
     /// remaining data (no timers, no packets).
@@ -107,6 +109,9 @@ impl Connection {
     /// `Closed { Normal }` is reported. Wait for `Event::Connected` before `close` if the
     /// queued data must be delivered.
     pub fn close(&mut self) {
+        if self.aborting {
+            return;
+        }
         self.closed_by_app = true;
         if self.hooks.close() {
             return;
@@ -114,9 +119,17 @@ impl Connection {
         self.subflows[0].tcb.close();
     }
 
-    /// Tears the connection down at once (MP_FASTCLOSE). Not implemented yet: does nothing.
-    #[doc(hidden)]
-    pub fn abort(&mut self) {}
+    /// Tears the connection down at once (RFC 8684 §3.5, without waiting for the peer). Each
+    /// subflow past its SYN/ACK, except one in TIME-WAIT, gets a RST at SND.MAX carrying
+    /// MP_FASTCLOSE with the peer's key, or a plain RST for plain TCP and after a fallback; a
+    /// subflow in SYN-SENT gets nothing. The connection ends with `Closed { Aborted }`, without
+    /// `SubflowDown`; queued and unread data are discarded. The endpoint does this at its next
+    /// `poll_transmit`, `handle_packet` or `handle_timeout`: call `poll_transmit` after `abort`.
+    /// Does nothing once `Closed` was reported, or on a second call.
+    pub fn abort(&mut self) {
+        self.closed_by_app = true;
+        self.aborting = true;
+    }
 
     /// Opportunistic retransmission counters, for test drivers; not a stable API.
     #[doc(hidden)]

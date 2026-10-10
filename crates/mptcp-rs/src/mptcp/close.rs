@@ -66,6 +66,13 @@ impl ConnectionHooks {
             d.close.no_subflow_at = None;
         }
     }
+    /// `Connection::abort`: the data level ends with no `Closed` of its own. Returns the peer's
+    /// key when the RSTs carry MP_FASTCLOSE (MPTCP, not fallen back).
+    pub fn abort(&mut self) -> Option<u64> {
+        let d = self.data.as_mut().filter(|d| !d.fallback)?;
+        d.close.closed = true;
+        self.negotiation.as_ref()?.peer_key
+    }
     pub fn close(&mut self) -> bool {
         if let Some(d) = self.data.as_mut().filter(|d| !d.fallback) {
             d.close.local.get_or_insert(d.send.end);

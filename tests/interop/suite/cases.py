@@ -10,7 +10,8 @@
 - expect: bytes c2s|s2c|bidi, nstat {counter: int or (op, int)} on the srv delta, pcap [check(r)]
   raising AssertionError, events (ordered prefixes of client `event:` lines; the runner requires
   "Closed Normal" itself when the client closes passively, and stops an active closer in
-  TIME-WAIT), kernel ("X.Y" minimum, else SKIP)
+  TIME-WAIT), kernel ("X.Y" minimum, else SKIP), optional aborted ("client" | "server": the case
+  ends in that side's abort, so no transfer completes and the runner expects that side's exit)
 - watchdog_s; ci (part of the CI subset)
 
 A barrier is a client event name with an optional subflow number: "Connected", "SubflowUp:1".
@@ -72,9 +73,52 @@ def refused_join():
     return case
 
 
+def fastclose_rsts(r):
+    """At mtun0: every subflow carried a client RST whose only MPTCP option is MP_FASTCLOSE with
+    the server's key, from its MP_CAPABLE SYN/ACK (M3 spec §3.4 note, §3.5)."""
+    tun = [g for g in r.segs if g.point == "cli"]
+    keys = {o.get("tcp.options.mptcp.sendkey") for g in tun if g.flags & 0x12 == 0x12 for o in g.mptcp} - {None}
+    assert len(keys) == 1, f"server keys {keys}"
+    for f in {g.flow for g in tun}:
+        rsts = [g for g in tun if g.flow == f and g.direction == "c2s" and g.flags & 0x04]
+        opts = [[(o["tcp.options.mptcp.subtype"], o.get("tcp.options.mptcp.recvkey")) for o in g.mptcp] for g in rsts]
+        assert [("7", *keys)] in opts, f"{f}: client RSTs {opts}, server key {keys}"
+
+
+def linux_fastclose(r):
+    """At mtun0: Linux's abort RST carries MP_FASTCLOSE (probe `fastclose_on_linger0`)."""
+    rsts = [g for g in r.segs if g.point == "cli" and g.direction == "s2c" and g.flags & 0x04]
+    subtypes = [[o["tcp.options.mptcp.subtype"] for o in g.mptcp] for g in rsts]
+    assert any("7" in s for s in subtypes), f"server RSTs {subtypes}"
+
+
+def client_abort():
+    """The client aborts 2 s after Connected, its join up (`--abort-after-ms`): RST and
+    MP_FASTCLOSE on every subflow; Linux counts the MP_FASTCLOSE and resets the server socket."""
+    case = joins("client-abort", 1, "c2s")
+    case["client"]["args"] += ["--abort-after-ms", "2000"]
+    e = case["expect"]
+    e.update(aborted="client", pcap=[e["pcap"][0], fastclose_rsts],
+             events=["Connected mptcp=true", "SubflowUp", "Closed Aborted"])
+    e["nstat"]["MPTcpExtMPFastcloseRx"] = (">=", 1)
+    return case
+
+
+def server_abort():
+    """`server.py --abort-after` (SO_LINGER 0): Linux's RST with MP_FASTCLOSE, which the client
+    reports as `Closed { Reset }`."""
+    case = joins("server-abort", 0, "s2c")
+    case["server"]["abort_after"] = 1000000
+    case["expect"].update(aborted="server", pcap=[linux_fastclose],
+                          events=["Connected mptcp=true", "Closed Reset"])
+    return case
+
+
 CASES = [
     joins("no-join", 0, "c2s"),
     joins("one-join", 1, "s2c"),
     joins("two-joins", 2, "bidi"),
     refused_join(),
+    client_abort(),
+    server_abort(),
 ]

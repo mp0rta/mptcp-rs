@@ -495,3 +495,350 @@ fn no_tcb_rst_has_no_mptcp_option() {
         "freed join 4-tuple"
     );
 }
+
+/// MP_FASTCLOSE wire bytes carrying `key`.
+fn fastclose(key: u64) -> Vec<u8> {
+    let mut out = [0; 12];
+    let option = MptcpOption::FastClose { receiver_key: key };
+    let n = mptcp::encode(&option, &mut out).unwrap();
+    out[..n].to_vec()
+}
+/// SND.MAX of `syn`'s subflow: `sent` holds everything it sent after its SYN.
+fn snd_max(sent: &[Vec<u8>], syn: &Segment) -> SeqNum {
+    let ends = on(sent, syn).iter().map(end).collect::<Vec<_>>();
+    (ends.into_iter()).fold(syn.seq.wrapping_add(1), |m, e| if e.gt(m) { e } else { m })
+}
+const ABORTED: Event = Event::Closed {
+    reason: CloseReason::Aborted,
+};
+/// `confirmed`, 3000 octets sent (none acknowledged), then aborted and freed at `ms(10)`.
+/// Returns the endpoint, the SYN and SND.MAX.
+fn aborted_with_data() -> (Endpoint<ChaCha20Rng>, Segment<'static>, SeqNum) {
+    let (mut ep, h, syn, _) = confirmed();
+    ep.connection(h).unwrap().write(&[7; 3000]).unwrap();
+    let sent = drain(&mut ep, ms(5));
+    let max = snd_max(&sent, &syn);
+    assert!(max.gt(syn.seq.wrapping_add(1)), "data in flight");
+    ep.connection(h).unwrap().abort();
+    ep.handle_timeout(ms(10));
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    assert!(ep.connection(h).is_none());
+    let out: Vec<_> = drain(&mut ep, ms(10)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1);
+    let fc = fastclose(PEER_KEY);
+    assert_eq!(
+        (out[0].seq, out[0].flags, out[0].options),
+        (max, TcpFlags::RST, &fc[..])
+    );
+    (ep, syn, max)
+}
+
+/// M3 spec §3.5: every synchronized subflow (Active, Stale, Joining after its SYN/ACK) gets
+/// one RST at SND.MAX carrying only MP_FASTCLOSE with the peer's key, sent after the teardown;
+/// a join in SYN-SENT gets none. No `SubflowDown`.
+#[test]
+fn abort_sends_fastclose_rst_on_every_subflow() {
+    let (mut ep, h, syn, jsyn) = two_paths(reno, reno);
+    ep.connection(h).unwrap().write(&[7; 20_000]).unwrap();
+    let mut sent = drain(&mut ep, ms(20));
+    let (_, jsyn2) = join_syn(&mut ep, h, ms(30), "10.0.2.1", 1500);
+    let opts = synack_opts(&ep, h, &jsyn2, 7, None);
+    synack(&mut ep, &jsyn2, &opts, ms(30));
+    sent.extend(drain(&mut ep, ms(30)));
+    let (_, jsyn3) = join_syn(&mut ep, h, ms(30), "10.0.3.1", 1500);
+    let c = ep.conns.get_mut(&h).unwrap();
+    // Health is not under test: subflow 1 is made Stale directly.
+    c.subflows[1].state = SubflowState::Stale;
+    assert_eq!(c.subflows[2].state, SubflowState::Joining);
+    assert_eq!(c.subflows[2].tcb.state(), TcpState::Established);
+    assert_eq!(c.subflows[3].tcb.state(), TcpState::SynSent);
+    ep.connection(h).unwrap().abort();
+    ep.handle_timeout(ms(40));
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    assert!(
+        ep.connection(h).is_none(),
+        "torn down before the RSTs leave"
+    );
+    let out: Vec<_> = drain(&mut ep, ms(40)).into_iter().map(leak).collect();
+    let fc = fastclose(PEER_KEY);
+    for s in [&syn, &jsyn, &jsyn2] {
+        let rst: Vec<_> = out.iter().filter(|g| g.src == s.src).collect();
+        assert_eq!(rst.len(), 1, "one RST from {}", s.src);
+        assert_eq!(rst[0].dst, s.dst);
+        let max = snd_max(&sent, s);
+        assert_eq!(
+            (rst[0].seq, rst[0].flags, rst[0].options),
+            (max, TcpFlags::RST, &fc[..])
+        );
+    }
+    assert!(out.iter().all(|g| g.src != jsyn3.src), "SYN-SENT: no RST");
+    assert_eq!(out.len(), 3);
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+/// Before the SYN/ACK nothing is synchronized and no key is known: the TCB is deleted without
+/// a RST (RFC 9293 §3.10.5), and a late SYN/ACK gets a plain RST.
+#[test]
+fn abort_before_synack_plain_rst() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let h = open(&mut ep);
+    let syn = leak(transmit(&mut ep, ms(0)));
+    ep.connection(h).unwrap().abort();
+    assert!(drain(&mut ep, ms(1)).is_empty(), "no RST in SYN-SENT");
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    ep.handle_timeout(ms(1));
+    assert!(ep.connection(h).is_none());
+    let opts = capable(1, CAP_H);
+    let synack = Segment {
+        flags: TcpFlags::SYN | TcpFlags::ACK,
+        seq: SeqNum(5000),
+        ..peer_data(&syn, 5000, &opts, &[])
+    };
+    let rst = answer(&mut ep, &synack, ms(2)).expect("RST for the late SYN/ACK");
+    assert_eq!((rst.seq, rst.flags), (synack.ack, TcpFlags::RST));
+    assert!(rst.options.is_empty());
+    assert_eq!(events(&mut ep), vec![]);
+}
+
+/// After a fallback to TCP: a plain RST at SND.MAX, and the 4-tuple is not retained.
+#[test]
+fn abort_after_fallback_plain_rst() {
+    let (mut ep, h, syn, _) = confirmed();
+    peer_infinite_mapping(&mut ep, &syn, ms(10));
+    let mut sent = drain(&mut ep, ms(10));
+    assert_eq!(events(&mut ep), vec![Event::FellBack]);
+    ep.connection(h).unwrap().write(&[7; 100]).unwrap();
+    sent.extend(drain(&mut ep, ms(20)));
+    ep.connection(h).unwrap().abort();
+    let out: Vec<_> = drain(&mut ep, ms(30)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1);
+    let max = snd_max(&sent, &syn);
+    assert_eq!(
+        (out[0].src, out[0].seq, out[0].flags),
+        (syn.src, max, TcpFlags::RST)
+    );
+    assert!(out[0].options.is_empty());
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    ep.handle_timeout(ms(30));
+    assert!(ep.connection(h).is_none());
+    let chal = peer_data(&syn, 5006, &[], &[]);
+    let rst = answer(&mut ep, &chal, ms(40)).expect("RST");
+    assert!(rst.options.is_empty(), "not retained");
+}
+
+#[test]
+fn abort_plain_tcp_plain_rst() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let cfg = ConnectConfig::default();
+    let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
+    let mut sent = drain(&mut ep, ms(1));
+    assert_eq!(events(&mut ep), vec![Event::Connected { mptcp: false }]);
+    ep.connection(h).unwrap().write(&[7; 100]).unwrap();
+    sent.extend(drain(&mut ep, ms(2)));
+    ep.connection(h).unwrap().abort();
+    let out: Vec<_> = drain(&mut ep, ms(3)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1);
+    let max = snd_max(&sent, &syn);
+    assert!(max.gt(syn.seq.wrapping_add(1)));
+    assert_eq!((out[0].seq, out[0].flags), (max, TcpFlags::RST));
+    assert!(out[0].options.is_empty());
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+}
+
+/// The peer missed our data, so our RST at SND.MAX is beyond its RCV.NXT: it answers with a
+/// challenge ACK (RFC 9293 L3567–3575), and our RST to that is at its ACK, with MP_FASTCLOSE,
+/// whether the aborted connection is still held or already freed.
+#[test]
+fn fastclose_challenge_ack_answered_exactly() {
+    for freed in [false, true] {
+        let (mut ep, h, syn, _) = confirmed();
+        ep.connection(h).unwrap().write(&[7; 3000]).unwrap();
+        let sent = drain(&mut ep, ms(5));
+        ep.connection(h).unwrap().abort();
+        let out: Vec<_> = drain(&mut ep, ms(10)).into_iter().map(leak).collect();
+        assert_eq!(out[0].seq, snd_max(&sent, &syn));
+        if freed {
+            ep.handle_timeout(ms(10));
+        }
+        assert_eq!(ep.connection(h).is_none(), freed);
+        let rcv_nxt = syn.seq.wrapping_add(1);
+        let chal = Segment {
+            ack: rcv_nxt,
+            ..peer_data(&syn, 5001, &[], &[])
+        };
+        let rst = answer(&mut ep, &chal, ms(30)).expect("RST for the challenge ACK");
+        assert_eq!((rst.src, rst.dst), (syn.src, syn.dst));
+        assert_eq!(
+            (rst.seq, rst.ack, rst.flags),
+            (rcv_nxt, SeqNum(0), TcpFlags::RST)
+        );
+        assert_eq!(rst.options, &fastclose(PEER_KEY)[..], "freed={freed}");
+    }
+}
+
+/// RSTs are never answered (RFC 9293 §3.10.7.1), so simultaneous aborts cannot loop.
+#[test]
+fn retained_tuple_incoming_rst_not_answered() {
+    let (mut ep, syn, _) = aborted_with_data();
+    assert!(answer(&mut ep, &rst_on(&syn), ms(20)).is_none());
+    let fc = fastclose(0x55);
+    let theirs = Segment {
+        flags: TcpFlags::RST,
+        options: &fc,
+        ..rst_on(&syn)
+    };
+    assert!(
+        answer(&mut ep, &theirs, ms(20)).is_none(),
+        "the peer's own abort"
+    );
+}
+
+/// No ACK bit: `<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`, with MP_FASTCLOSE.
+#[test]
+fn retained_tuple_no_ack_segment_format() {
+    let (mut ep, syn, _) = aborted_with_data();
+    let bare = Segment {
+        flags: TcpFlags::FIN,
+        ack: SeqNum(0),
+        ..peer_data(&syn, 5001, &[], b"xy")
+    };
+    let rst = answer(&mut ep, &bare, ms(20)).expect("RST for the bare FIN");
+    assert_eq!(
+        (rst.seq, rst.ack, rst.flags),
+        (SeqNum(0), SeqNum(5004), TcpFlags::RST | TcpFlags::ACK)
+    );
+    assert_eq!(rst.options, &fastclose(PEER_KEY)[..]);
+}
+
+/// The entry lasts 3 × the subflow's RTO (1 s here), which `poll_timeout` reports; until then
+/// its 4-tuple is not given to a new connection, afterwards it is, and answers are plain.
+#[test]
+fn retained_tuple_not_reallocated_until_expiry() {
+    let (mut ep, syn, _) = aborted_with_data();
+    let expiry = ms(10) + Duration::from_secs(3);
+    assert_eq!(ep.poll_timeout(), Some(expiry));
+    // Every other ephemeral port to the remote is taken: only the retained one is left.
+    let taken = (ConnectionHandle(99), SubflowId::INITIAL);
+    for port in EPHEMERAL_FIRST..=u16::MAX {
+        if port != syn.src.port() {
+            ep.demux
+                .insert((SocketAddr::new(syn.src.ip(), port), syn.dst), taken);
+        }
+    }
+    let chal = peer_data(&syn, 5001, &[], &[]);
+    let before = Instant::from_nanos(expiry.as_nanos() - 1);
+    let rst = answer(&mut ep, &chal, before).expect("RST");
+    assert_eq!(rst.options, &fastclose(PEER_KEY)[..]);
+    let cfg = ConnectConfig::default;
+    let ip = syn.src.ip();
+    assert_eq!(
+        ep.connect(before, ip, syn.dst, cfg()).err(),
+        Some(ConnectError::NoPort)
+    );
+    ep.handle_timeout(expiry);
+    assert_eq!(ep.poll_timeout(), None);
+    let rst = answer(&mut ep, &chal, expiry).expect("RST");
+    assert!(rst.options.is_empty(), "expired");
+    let h = ep.connect(expiry, ip, syn.dst, cfg()).unwrap();
+    assert_eq!(ep.connection(h).unwrap().local(), syn.src);
+}
+
+/// The 65th aborted 4-tuple evicts the oldest; the others keep answering with MP_FASTCLOSE.
+#[test]
+fn retained_table_evicts_oldest_at_64() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let syns: Vec<_> = (0..65)
+        .map(|_| {
+            let h = open(&mut ep);
+            let syn = from(&drain(&mut ep, ms(0)), "10.0.0.1").pop().unwrap();
+            reply(&mut ep, &syn, &capable(1, CAP_H), syn.seq.wrapping_add(1));
+            ep.connection(h).unwrap().abort();
+            drain(&mut ep, ms(0));
+            syn
+        })
+        .collect();
+    ep.handle_timeout(ms(1));
+    // Aborted before the third ACK left: no `Connected`.
+    assert_eq!(events(&mut ep), vec![ABORTED; 65]);
+    for (i, syn) in syns.iter().enumerate() {
+        let rst = answer(&mut ep, &peer_data(syn, 5001, &[], &[]), ms(2)).expect("RST");
+        let want = if i == 0 { vec![] } else { fastclose(PEER_KEY) };
+        assert_eq!(rst.options, &want[..], "tuple {i}");
+    }
+}
+
+/// Review Focus 4: `abort` twice, after `Closed`, in the no-subflow wait and in SYN-SENT: no
+/// panic, exactly one `Closed`, and only the RSTs §3.5 prescribes.
+#[test]
+fn abort_is_idempotent_in_every_state() {
+    // Twice, then once more after the RST left.
+    let (mut ep, h, syn, _) = confirmed();
+    ep.connection(h).unwrap().abort();
+    ep.connection(h).unwrap().abort();
+    let out: Vec<_> = drain(&mut ep, ms(10)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1);
+    let fc = fastclose(PEER_KEY);
+    assert_eq!(
+        (out[0].src, out[0].flags, out[0].options),
+        (syn.src, TcpFlags::RST, &fc[..])
+    );
+    // `close` after `abort` changes nothing.
+    ep.connection(h).unwrap().close();
+    ep.connection(h).unwrap().abort();
+    assert!(drain(&mut ep, ms(10)).is_empty());
+    ep.handle_timeout(ms(10));
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    assert!(ep.connection(h).is_none());
+
+    // After `Closed { Reset }` from the peer's MP_FASTCLOSE: only its own RST.
+    let (mut ep, h, syn, _) = confirmed();
+    let fc = fastclose(local_key(&ep, h));
+    input_at(&mut ep, &peer_data(&syn, 5001, &fc, &[]), ms(10));
+    ep.connection(h).unwrap().abort();
+    let out: Vec<_> = drain(&mut ep, ms(10)).into_iter().map(leak).collect();
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].options.is_empty(),
+        "the reset of a received MP_FASTCLOSE"
+    );
+    let reason = CloseReason::Reset;
+    assert_eq!(events(&mut ep), vec![Event::Closed { reason }]);
+
+    // After `Closed { Reset }` of a plain TCP connection.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let cfg = ConnectConfig::default();
+    let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
+    let syn = leak(transmit(&mut ep, ms(0)));
+    reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
+    drain(&mut ep, ms(1));
+    input_at(&mut ep, &rst_on(&syn), ms(2));
+    ep.connection(h).unwrap().abort();
+    assert!(drain(&mut ep, ms(2)).is_empty());
+    let connected = Event::Connected { mptcp: false };
+    assert_eq!(events(&mut ep), vec![connected, Event::Closed { reason }]);
+
+    // In the no-subflow wait: no TCB is synchronized, so no RST.
+    let (mut ep, h, syn, _) = confirmed();
+    input_at(&mut ep, &rst_on(&syn), ms(10));
+    assert_eq!(events(&mut ep), vec![initial_down(CloseReason::Reset)]);
+    ep.connection(h).unwrap().abort();
+    assert!(drain(&mut ep, ms(10)).is_empty());
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    ep.handle_timeout(ms(10) + Duration::from_secs(60));
+    assert_eq!(events(&mut ep), vec![]);
+
+    // SYN-SENT, twice.
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
+    let h = open(&mut ep);
+    transmit(&mut ep, ms(0));
+    ep.connection(h).unwrap().abort();
+    ep.connection(h).unwrap().close();
+    ep.connection(h).unwrap().abort();
+    assert!(drain(&mut ep, ms(1)).is_empty());
+    ep.handle_timeout(ms(1));
+    assert_eq!(events(&mut ep), vec![ABORTED]);
+    assert!(ep.connection(h).is_none());
+    assert_eq!(ep.poll_timeout(), None);
+}

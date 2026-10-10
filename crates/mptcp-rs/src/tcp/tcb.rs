@@ -768,6 +768,12 @@ impl Tcb {
         self.rst_due = Some((self.snd_max, rst_option));
         self.terminate(reason, now)
     }
+    /// RFC 9293 §3.10.5 ABORT whose RST, if any, the caller sends: the TCB is Closed with
+    /// `Aborted`. Returns SND.MAX, that RST's sequence number.
+    pub(crate) fn delete(&mut self, now: Instant) -> SeqNum {
+        self.terminate(CloseReason::Aborted, now);
+        self.snd_max
+    }
     pub(crate) fn request_ack(&mut self) {
         self.ack_due = true;
     }

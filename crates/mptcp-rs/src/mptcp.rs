@@ -72,6 +72,14 @@ pub(crate) fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
     out
 }
 
+/// MP_FASTCLOSE option bytes carrying the peer's `key` (M3 spec §3.5).
+pub(crate) fn fastclose(key: u64) -> [u8; 12] {
+    let mut out = [0; 12];
+    let option = MptcpOption::FastClose { receiver_key: key };
+    mptcp::encode(&option, &mut out).expect("MP_FASTCLOSE is 12 octets");
+    out
+}
+
 /// Subflows per connection (M2: snapshot buffer capacity).
 pub(crate) const SUBFLOW_CAP: usize = 8;
 

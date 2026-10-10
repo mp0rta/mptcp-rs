@@ -17,7 +17,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--join IP [--join-mtu N]]...";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--join IP [--join-mtu N]]... [--abort-after-ms MS]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -44,6 +44,8 @@ struct Args {
     expect: Option<u64>,
     /// `--join IP [--join-mtu N]`: extra subflows from these local addresses, with that MTU.
     joins: Vec<(IpAddr, u16)>,
+    /// `--abort-after-ms`: `Connection::abort` this long after `Connected`, instead of a close.
+    abort_after: Option<Duration>,
 }
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
@@ -52,6 +54,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let mut mode = None;
     let mut pause_read = Duration::ZERO;
     let mut joins = Vec::new();
+    let mut abort_after = None;
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -70,6 +73,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             // The TUN device's MTU, which the initial subflow also uses.
             "--join" => joins.push((v.parse().ok()?, ConnectConfig::default().mtu)),
             "--join-mtu" => joins.last_mut()?.1 = v.parse().ok()?,
+            "--abort-after-ms" => abort_after = Some(Duration::from_millis(v.parse().ok()?)),
             "--send-secs" => {
                 send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
             }
@@ -97,6 +101,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         send_secs,
         expect: expect?,
         joins,
+        abort_after,
     })
 }
 
@@ -168,6 +173,13 @@ fn run(a: Args) -> Result<String, String> {
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
         st.events(&mut ep, &a, start.elapsed())?;
 
+        // An abort replaces the close; a close already begun wins.
+        let elapsed = start.elapsed();
+        let due = (a.abort_after.zip(st.connected_at)).is_some_and(|(d, c)| elapsed >= c + d);
+        if due && !st.aborted && !st.closing {
+            ep.connection(h).ok_or("connection gone")?.abort();
+            st.aborted = true;
+        }
         // After a normal close the connection is gone unless data is still unread.
         if st.drives(ep.connection(h).is_some()) {
             let conn = ep.connection(h).ok_or("connection gone")?;
@@ -238,6 +250,12 @@ fn run(a: Args) -> Result<String, String> {
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
             write_packet(&tun, &pkt[..n])?;
         }
+        if st.done && st.aborted {
+            return Ok(format!(
+                "aborted: sent {} bytes, verified {} bytes",
+                st.sent, st.verified
+            ));
+        }
         if st.done {
             if !st.eof {
                 return Err("closed before EOF".into());
@@ -305,6 +323,8 @@ struct State {
     first_rx: Option<Duration>,
     last_rx: Duration,
     closing: bool,
+    /// `Connection::abort` was called.
+    aborted: bool,
     eof: bool,
     done: bool,
     /// The connection's counters, as last seen while it existed.
@@ -326,7 +346,7 @@ impl State {
     /// Whether this iteration writes, reads and closes. After a normal close the connection is
     /// gone unless data is still unread. EOF only stops the read loop, never the writes.
     fn drives(&self, conn_present: bool) -> bool {
-        self.connected && (!self.done || conn_present)
+        self.connected && !self.aborted && (!self.done || conn_present)
     }
 
     /// All bytes are written: the fixed count, or the `--send-secs` deadline has passed.
@@ -389,7 +409,14 @@ impl State {
                     eprintln!("event: Closed Normal");
                     self.done = true;
                 }
+                Event::Closed {
+                    reason: CloseReason::Aborted,
+                } if self.aborted => {
+                    eprintln!("event: Closed Aborted");
+                    self.done = true;
+                }
                 Event::Closed { reason } => {
+                    eprintln!("event: Closed {reason:?}");
                     return Err(format!(
                         "connection closed: {reason:?} (sent {}, verified {})",
                         self.sent, self.verified
@@ -467,6 +494,9 @@ mod tests {
         assert_eq!(a.joins, [(ip("10.0.8.2"), 1280), (ip("10.0.7.2"), 1500)]);
         assert!(parse_args(v(&format!("{timed} --send 5 --join-mtu 1280"))).is_none());
         assert!(parse_args(v(&format!("{timed} --send 5 --join x"))).is_none());
+        let a = parse_args(v(&format!("{timed} --send 5 --abort-after-ms 2000"))).unwrap();
+        assert_eq!(a.abort_after, Some(Duration::from_millis(2000)));
+        assert!(parse_args(v(&format!("{timed} --send 5 --abort-after-ms x"))).is_none());
         assert!(
             parse_args(v(
                 "--mode tcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 1"

@@ -12,10 +12,13 @@ use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
 use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
 use crate::mptcp::{
-    Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState, tcprst,
+    Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState, fastclose,
+    tcprst,
 };
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::packet::{self, Segment, TcpFlags};
+
+mod aborted;
 
 /// Queued RSTs for segments without a TCB; beyond this they are dropped.
 const MAX_PENDING_RST: usize = 64;
@@ -166,6 +169,8 @@ struct PendingRst {
     seq: SeqNum,
     ack: SeqNum,
     flags: TcpFlags,
+    /// MP_FASTCLOSE, on the RSTs of an aborted subflow (M3 spec §3.5).
+    option: Option<[u8; 12]>,
 }
 
 pub struct Endpoint<R: CryptoRng> {
@@ -180,6 +185,8 @@ pub struct Endpoint<R: CryptoRng> {
     ip_id: u16,
     events: VecDeque<(ConnectionHandle, Event)>,
     pending_rst: VecDeque<PendingRst>,
+    /// The 4-tuples `Connection::abort` reset with MP_FASTCLOSE.
+    aborted: aborted::Aborted,
     scratch: SegmentWriter,
     /// Connections with queued joins (`Connection::queued_joins`).
     pending_joins: BTreeSet<ConnectionHandle>,
@@ -202,6 +209,7 @@ impl<R: CryptoRng> Endpoint<R> {
             ip_id: 0,
             events: VecDeque::new(),
             pending_rst: VecDeque::new(),
+            aborted: Default::default(),
             scratch: SegmentWriter::default(),
             pending_joins: BTreeSet::new(),
             #[cfg(test)]
@@ -230,7 +238,7 @@ impl<R: CryptoRng> Endpoint<R> {
             return Err(ConnectError::InvalidBuffer);
         }
         let initial_ip = local;
-        let local = self.free_port(local, remote).ok_or(ConnectError::NoPort)?;
+        let local = (self.free_port(now, local, remote)).ok_or(ConnectError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
         let tcb = self.new_tcb(&cfg, local, remote, isn, now);
         let h = ConnectionHandle(self.next_handle);
@@ -249,6 +257,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 }],
                 hooks: ConnectionHooks::new(&cfg),
                 closed_by_app: false,
+                aborting: false,
                 reset: false,
                 detached: false,
                 cfg,
@@ -264,13 +273,17 @@ impl<R: CryptoRng> Endpoint<R> {
         Ok(h)
     }
 
-    /// A free ephemeral port from `local` to `remote`, searched from a random start.
-    fn free_port(&mut self, local: IpAddr, remote: SocketAddr) -> Option<SocketAddr> {
+    /// A free ephemeral port from `local` to `remote`, searched from a random start. A retained
+    /// aborted 4-tuple is in use.
+    fn free_port(&mut self, now: Instant, local: IpAddr, remote: SocketAddr) -> Option<SocketAddr> {
         let start = self.rng.next_u32() % EPHEMERAL_COUNT;
         (0..EPHEMERAL_COUNT)
             .map(|i| EPHEMERAL_FIRST + ((start + i) % EPHEMERAL_COUNT) as u16)
             .map(|port| SocketAddr::new(local, port))
-            .find(|l| !self.demux.contains_key(&(*l, remote)))
+            .find(|&l| {
+                !self.demux.contains_key(&(l, remote))
+                    && self.aborted.key((l, remote), now).is_none()
+            })
     }
 
     fn new_tcb(
@@ -445,7 +458,7 @@ impl<R: CryptoRng> Endpoint<R> {
             mtu: q.mtu,
             ..c.cfg.clone()
         };
-        let local = (self.free_port(q.local, remote)).ok_or(AddSubflowError::NoPort)?;
+        let local = (self.free_port(now, q.local, remote)).ok_or(AddSubflowError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
         let mut tcb = self.new_tcb(&cfg, local, remote, isn, now);
         let nonce = self.rng.next_u32();
@@ -543,8 +556,9 @@ impl<R: CryptoRng> Endpoint<R> {
         let Ok(seg) = packet::parse(ip_packet) else {
             return;
         };
+        self.apply_aborts(now);
         let Some(&(h, id)) = self.demux.get(&(seg.dst, seg.src)) else {
-            self.queue_rst(&seg);
+            self.queue_rst(&seg, now);
             return;
         };
         let Some(c) = self.conns.get_mut(&h) else {
@@ -558,7 +572,7 @@ impl<R: CryptoRng> Endpoint<R> {
         let tcb = &c.subflows[i].tcb;
         if tcb.state() == TcpState::Closed {
             if !tcb.reset_pending() {
-                self.queue_rst(&seg);
+                self.queue_rst(&seg, now);
             }
             return;
         }
@@ -721,8 +735,49 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
-    /// RFC 9293 §3.10.7.1: segment arrives in CLOSED. Never in reply to a RST.
-    fn queue_rst(&mut self, seg: &Segment) {
+    /// Carries out `Connection::abort` (M3 spec §3.5) where it was called: every TCB is
+    /// deleted, each synchronized one but TIME-WAIT with a RST at SND.MAX, with MP_FASTCLOSE
+    /// and a retained 4-tuple when MPTCP is in use.
+    fn apply_aborts(&mut self, now: Instant) {
+        for (&h, c) in &mut self.conns {
+            if !std::mem::take(&mut c.aborting) || ended(c) {
+                continue;
+            }
+            let key = c.hooks.abort();
+            for sf in &mut c.subflows {
+                let state = sf.tcb.state();
+                if state == TcpState::Closed {
+                    continue;
+                }
+                let rto = sf.tcb.retransmission_timeout();
+                let seq = sf.tcb.delete(now);
+                if matches!(state, TcpState::SynSent | TcpState::TimeWait) {
+                    continue;
+                }
+                let (src, dst) = (sf.local, sf.remote);
+                let (ack, flags, option) = (SeqNum(0), TcpFlags::RST, key.map(fastclose));
+                // Not bounded by MAX_PENDING_RST: at most SUBFLOW_CAP, once per connection.
+                (self.pending_rst).push_back(PendingRst {
+                    src,
+                    dst,
+                    seq,
+                    ack,
+                    flags,
+                    option,
+                });
+                if let Some(key) = key {
+                    self.aborted.insert((src, dst), key, now + 3 * rto);
+                }
+            }
+            c.reset = true;
+            let reason = CloseReason::Aborted;
+            self.events.push_back((h, Event::Closed { reason }));
+        }
+    }
+
+    /// RFC 9293 §3.10.7.1: segment arrives in CLOSED. Never in reply to a RST. On a retained
+    /// aborted 4-tuple the RST carries MP_FASTCLOSE (M3 spec §3.5).
+    fn queue_rst(&mut self, seg: &Segment, now: Instant) {
         if seg.flags.contains(TcpFlags::RST) || self.pending_rst.len() >= MAX_PENDING_RST {
             return;
         }
@@ -738,12 +793,14 @@ impl<R: CryptoRng> Endpoint<R> {
                 TcpFlags::RST | TcpFlags::ACK,
             )
         };
+        let option = self.aborted.key((seg.dst, seg.src), now).map(fastclose);
         self.pending_rst.push_back(PendingRst {
             src: seg.dst,
             dst: seg.src,
             seq,
             ack,
             flags,
+            option,
         });
     }
 
@@ -751,10 +808,11 @@ impl<R: CryptoRng> Endpoint<R> {
     /// to be sent. `buf` must hold the largest MTU of any subflow of any connection: a subflow
     /// whose MTU exceeds `buf.len()` is skipped (nothing is built for it, so no sequence,
     /// mapping, pacing or timer state is consumed) until a large enough `buf` is passed.
-    /// Driver contract: call this after every `read`, `write`, `close`, `add_subflow` and
-    /// `handle_packet` until it returns `None`: those calls can make a packet (window update,
+    /// Driver contract: call this after every `read`, `write`, `close`, `abort`, `add_subflow`
+    /// and `handle_packet` until it returns `None`: those calls can make a packet (window update,
     /// data, FIN, MP_JOIN SYN) due without any timer being armed.
     pub fn poll_transmit(&mut self, now: Instant, buf: &mut [u8]) -> Option<usize> {
+        self.apply_aborts(now);
         while let Some(r) = self.pending_rst.pop_front() {
             let seg = Segment {
                 src: r.src,
@@ -763,7 +821,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 ack: r.ack,
                 flags: r.flags,
                 wnd: 0,
-                options: &[],
+                options: r.option.as_ref().map_or(&[], |o| o),
                 payload: &[],
             };
             if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
@@ -882,8 +940,10 @@ impl<R: CryptoRng> Endpoint<R> {
                     })
                     .chain(c.hooks.recovery_deadline())
                     .chain(c.opp_deadline())
+                    .chain(c.aborting.then_some(Instant::from_nanos(0)))
                     .min()
             })
+            .chain(self.aborted.next_expiry())
             .min()
     }
 
@@ -891,6 +951,8 @@ impl<R: CryptoRng> Endpoint<R> {
     /// its `Closed(Normal)` there) and the MP_JOIN third-ACK items, then frees the TCBs that
     /// are `Closed`: ended joined subflows with their ports, and connections.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.apply_aborts(now);
+        self.aborted.expire(now);
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
             c.update_recovery(now);
             for i in 0..c.subflows.len() {
@@ -1000,6 +1062,17 @@ fn min_mtu(local: IpAddr, remote: IpAddr) -> Option<u16> {
 /// Some subflow other than `subflows[i]` is open.
 fn others_open(subflows: &[Subflow], i: usize) -> bool {
     (subflows.iter().enumerate()).any(|(j, s)| j != i && s.tcb.state() != TcpState::Closed)
+}
+
+/// `Closed` was reported, or (a `close` in SYN-SENT) is due without further input.
+fn ended(c: &Connection) -> bool {
+    let initial = c.subflows[0].tcb.state();
+    c.detached
+        || if c.hooks.active() {
+            !c.hooks.retained()
+        } else {
+            matches!(initial, TcpState::Closed | TcpState::TimeWait)
+        }
 }
 
 /// The connection's data level has closed (MPTCP; no data state yet counts as open).
