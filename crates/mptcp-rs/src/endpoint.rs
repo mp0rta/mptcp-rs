@@ -303,18 +303,19 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     fn new_tcb(
-        &self,
+        &mut self,
         cfg: &ConnectConfig,
         local: SocketAddr,
         remote: SocketAddr,
         isn: SeqNum,
         now: Instant,
     ) -> Tcb {
+        let seed = self.rng.next_u64();
         #[cfg(test)]
         if let Some(cc) = self.cc {
             return Tcb::with_cc(cfg, local, remote, isn, now, cc());
         }
-        Tcb::new_active(cfg, local, remote, isn, now)
+        Tcb::new_active(cfg, local, remote, isn, now, seed)
     }
 
     /// Opens an MP_JOIN subflow from `local`, whose path MTU is `mtu`, to `remote`: the

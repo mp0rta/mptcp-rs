@@ -64,6 +64,23 @@ sudo target/release/mptcp-rs-tun --mode mptcp --tun mtun0 \
 
 Rust 1.85 or later is required.
 
+## Congestion control
+
+Two congestion controllers are available, chosen per connection with
+`ConnectConfig::congestion_control`:
+
+- `CongestionControlKind::Cubic` (the default): CUBIC with HyStart++ and pacing.
+- `CongestionControlKind::BbrV3`: BBRv3 (draft-ietf-ccwg-bbr-06, experimental).
+
+```rust
+let mut cfg = ConnectConfig::default();
+cfg.congestion_control = CongestionControlKind::BbrV3;
+```
+
+`mptcp-rs-tun` takes `--cc cubic|bbr3`. Every subflow of a connection runs the same
+controller, and the subflows are not coupled: two subflows that share one bottleneck take about
+the share of two TCP flows, with either controller.
+
 ## Testing
 
 Run `cargo test --workspace` for the unit and integration tests.

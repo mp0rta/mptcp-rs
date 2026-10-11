@@ -4678,6 +4678,85 @@ fn opp_episode_deadline_from_install_and_data_ack_advance() {
     assert_eq!(peer.received(), data);
 }
 
+// BBRv3 Task 8: the controller chosen by `ConnectConfig::congestion_control`.
+
+fn bbr_connected() -> Connected {
+    let cfg = ConnectConfig {
+        recv_buffer: 1 << 20,
+        congestion_control: crate::tcp::CongestionControlKind::BbrV3,
+        ..ConnectConfig::default()
+    };
+    let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
+    open_window(&mut ep, &syn, h);
+    (ep, h, syn, dsn)
+}
+/// Per subflow: whether it runs BBR, which alone has a send quantum.
+fn runs_bbr(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<bool> {
+    let subflows = ep.conns[&h].subflows.iter();
+    subflows
+        .map(|s| s.tcb.cc().send_quantum().is_some())
+        .collect()
+}
+
+/// A join inherits the connection's `BbrV3` (spec §4.1), and data over both subflows arrives
+/// byte-exact.
+#[test]
+fn mptcp_two_subflows_bbr() {
+    let (mut ep, h, syn, _) = bbr_connected();
+    let (_, jsyn) = joined(&mut ep, h, ms(10), JOIN_IP, 1500, 7);
+    assert_eq!(runs_bbr(&ep, h), [true, true]);
+    let n = 400_000;
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]);
+    let t = ms(10);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+    for path in [0, 1] {
+        assert!(peer.log.iter().any(|l| l.1 == path), "data on {path}");
+    }
+}
+
+/// Review Focus 4: after an infinite-mapping fallback the subflow keeps its BBR as it was, with
+/// no reset (spec §4.2), and plain TCP carries on under it.
+#[test]
+fn fallback_keeps_bbr() {
+    let (mut ep, h, syn, peer_dsn) = bbr_connected();
+    let n = 200_000;
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&vec![3; n]), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 20)]);
+    let now = peer.run(&mut ep, h, ms(10), ms(10_000));
+    assert_eq!(una(&ep, h), head + n as u64);
+    let cc = |ep: &Endpoint<ChaCha20Rng>| {
+        let c = ep.conns[&h].subflows[0].tcb.cc();
+        (c.cwnd(), c.pacing_rate(), c.send_quantum())
+    };
+    let before = cc(&ep);
+    assert!(
+        before.0 > 10 * 1432,
+        "grown past the initial window: {before:?}"
+    );
+    let inf = mapping(1, peer_dsn, 0);
+    let seg = Segment {
+        ack: peer.next[0],
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &inf, &[])
+    };
+    input_at(&mut ep, &seg, now);
+    assert!(events(&mut ep).contains(&Event::FellBack));
+    assert_eq!(cc(&ep), before, "unchanged by the fallback");
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&vec![4; n]), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 20)]);
+    peer.strip[0] = true;
+    peer.run(&mut ep, h, now, now + Duration::from_secs(10));
+    assert_eq!(una(&ep, h), head + n as u64, "plain TCP delivered it");
+    assert_eq!(runs_bbr(&ep, h), [true]);
+}
+
 // M3 Task 4: path-management API groundwork, reusing the helpers above.
 #[path = "pm_tests.rs"]
 mod pm_tests;

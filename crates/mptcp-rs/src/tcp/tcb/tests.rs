@@ -49,7 +49,7 @@ struct Fixture<H = PlainHooks> {
 impl Fixture {
     fn new(cfg: ConnectConfig, addrs: (SocketAddr, SocketAddr)) -> Self {
         Self {
-            tcb: Tcb::new_active(&cfg, addrs.0, addrs.1, ISN, t(0)),
+            tcb: Tcb::new_active(&cfg, addrs.0, addrs.1, ISN, t(0), 1),
             h: PlainHooks::new(&cfg),
             out: SegmentWriter::default(),
             addrs,
@@ -4733,4 +4733,144 @@ fn app_limited_request_forced() {
         "taken after on_rate_sample"
     );
     assert!(f.tcb.sampler().is_app_limited());
+}
+
+// ---- Selecting the controller (BBRv3 Task 8) ----
+
+/// `ConnectConfig::default()` runs CUBIC, which has no send quantum of its own (BBR has one).
+#[test]
+fn default_is_cubic() {
+    assert_eq!(
+        ConnectConfig::default().congestion_control,
+        CongestionControlKind::Cubic
+    );
+    let mut f = Fixture::new(ConnectConfig::default(), v4());
+    assert_eq!(f.tcb.cc.send_quantum(), None);
+    assert_eq!(f.synack(BIG, &sack_opts()), Reaction::Established);
+    assert_eq!(f.tcb.cc.send_quantum(), None);
+}
+
+fn bbr_cfg() -> ConnectConfig {
+    ConnectConfig {
+        congestion_control: CongestionControlKind::BbrV3,
+        ..ConnectConfig::default()
+    }
+}
+
+#[test]
+fn bbr_selected_by_config() {
+    let mut f = Fixture::new(bbr_cfg(), v4());
+    assert_eq!(f.synack(BIG, &sack_opts()), Reaction::Established);
+    // BBR's send quantum at its initial pacing rate, between 2·SMSS and 64 KiB (§5.6.3).
+    let q = f.tcb.cc.send_quantum().expect("BBR");
+    assert!((2 * u32::from(MSS)..=64 << 10).contains(&q), "{q}");
+    assert!(f.tcb.cc.pacing_rate().is_some_and(|r| r > 0));
+}
+
+/// BBRv3 end to end: 4 MiB through a scripted path, 10 ms each way behind an 80 Mbit/s
+/// bottleneck with an unbounded queue; SACK and window scale 7 negotiated, ACKs never lost.
+/// Three segments near 1 MiB are lost once each (SACK recovery), and every data segment sent
+/// in the 100 ms after the 2 MiB mark is lost, which only an RTO repairs. The peer gets every
+/// octet.
+#[test]
+fn bbr_bulk_transfer_scripted() {
+    const N: u32 = 4 << 20;
+    const DELAY: Duration = Duration::from_millis(10);
+    const NS_PER_OCTET: u64 = 100;
+    let mut f = Fixture::new(bbr_cfg(), v4());
+    f.send(t(0)).unwrap();
+    let mut o = opts(Some(MSS), Some(7));
+    let mut b = [0; 4];
+    let n = tcp_options::write_sack_permitted(&mut b);
+    o.extend_from_slice(&b[..n]);
+    let synack = Segment {
+        src: f.addrs.1,
+        dst: f.addrs.0,
+        seq: PEER_ISN,
+        ack: ISN.wrapping_add(1),
+        flags: TcpFlags::SYN | TcpFlags::ACK,
+        wnd: BIG,
+        options: &o,
+        payload: &[],
+    };
+    let mut now = tm(20);
+    assert_eq!(
+        f.tcb.on_segment(&synack, now, &mut f.h),
+        Reaction::Established
+    );
+    let bytes = pattern(N as usize);
+    f.write(&bytes);
+
+    let mut link_free = now;
+    // (arrival, offset, payload) to the peer; (arrival, cumulative ACK, SACK blocks) back.
+    let mut to_peer = std::collections::VecDeque::new();
+    let mut to_us = std::collections::VecDeque::<(Instant, u32, Vec<_>)>::new();
+    let mut lose = vec![1 << 20, (1 << 20) + 10_000, (1 << 20) + 20_000];
+    let mut blackout = None;
+    let mut got = RangeSet::new();
+    let mut rcvd = vec![0u8; N as usize];
+    let mut cum = 0u32;
+    let (mut rtos, mut recoveries) = (0, 0);
+    for _ in 0..1_000_000 {
+        while let Some(m) = f.send(now) {
+            if m.len == 0 {
+                continue;
+            }
+            let off = m.seq.0.wrapping_sub(data(0).0);
+            let p = f.out.payload.clone();
+            let end = off + p.len() as u32;
+            if off >= 2 << 20 && blackout.is_none() {
+                blackout = Some(now + Duration::from_millis(100));
+            }
+            if blackout.is_some_and(|until| now < until) {
+                continue;
+            }
+            if let Some(k) = lose.iter().position(|x| (off..end).contains(x)) {
+                lose.remove(k);
+                continue;
+            }
+            link_free = link_free.max(now) + Duration::from_nanos(NS_PER_OCTET * p.len() as u64);
+            to_peer.push_back((link_free + DELAY, off, p));
+        }
+        if f.tcb.snd_una == data(N) {
+            break;
+        }
+        let next = [
+            to_peer.front().map(|p| p.0),
+            to_us.front().map(|a| a.0),
+            f.tcb.poll_send_at(),
+        ];
+        now = next.into_iter().flatten().min().expect("stalled").max(now);
+        while to_peer.front().is_some_and(|p| p.0 <= now) {
+            let (_, off, p) = to_peer.pop_front().unwrap();
+            let end = off + p.len() as u32;
+            rcvd[off as usize..end as usize].copy_from_slice(&p);
+            got.insert(off..end);
+            cum = got.get(&cum).map_or(cum, |r| r.end);
+            let mut above = got.clone();
+            above.remove(0..cum);
+            to_us.push_back((now + DELAY, cum, blocks_after(&above, off)));
+        }
+        while to_us.front().is_some_and(|a| a.0 <= now) {
+            let (_, ack, blocks) = to_us.pop_front().unwrap();
+            let was = f.tcb.sack.in_recovery();
+            assert_eq!(f.sack_ack(now, data(ack), &blocks), Reaction::None);
+            recoveries += usize::from(!was && f.tcb.sack.in_recovery());
+        }
+        if f.tcb.poll_send_at().is_some_and(|at| at <= now) {
+            let before = f.tcb.rto_streak();
+            assert_eq!(f.timeout(now), Reaction::None);
+            rtos += usize::from(f.tcb.rto_streak() > before);
+        }
+    }
+    assert_eq!(f.tcb.snd_una, data(N), "complete");
+    assert!(rcvd == bytes, "byte-exact");
+    assert!(lose.is_empty() && blackout.is_some());
+    assert_eq!(rtos, 1);
+    assert!(recoveries >= 1, "SACK recovery");
+    // 0.42 s at line rate, plus the 1 s minimum RTO, from the SYN/ACK at 20 ms.
+    assert!(now < t(3), "took until {now:?}");
+    // Paced near the 10 MB/s bottleneck (Cruise: the bandwidth less the 1% margin).
+    let rate = f.tcb.cc.pacing_rate().unwrap();
+    assert!((9_000_000..=12_500_000).contains(&rate), "{rate}");
 }

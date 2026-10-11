@@ -223,10 +223,6 @@ pub(crate) struct Bbr {
     prior_cwnd: u64,
     /// InLossRecovery(): from `on_recovery_start` to the ACK that carries `recovery_exit`.
     in_loss_recovery: bool,
-    // SaveStateUponLoss (§5.5.11.1); kept for a spurious-loss undo not yet implemented.
-    undo_bw_shortterm: u64,
-    undo_inflight_shortterm: u64,
-    undo_inflight_longterm: u64,
 }
 
 impl Bbr {
@@ -299,9 +295,6 @@ impl Bbr {
             delivered: 0,
             prior_cwnd: 0,
             in_loss_recovery: false,
-            undo_bw_shortterm: INFINITE,
-            undo_inflight_shortterm: INFINITE,
-            undo_inflight_longterm: INFINITE,
         }
     }
 
@@ -1004,14 +997,6 @@ impl Bbr {
         self.cwnd = self.cwnd.max(self.prior_cwnd);
     }
 
-    /// §5.5.11.1.
-    fn save_state_upon_loss(&mut self) {
-        self.save_cwnd();
-        self.undo_bw_shortterm = self.bw_shortterm;
-        self.undo_inflight_shortterm = self.inflight_shortterm;
-        self.undo_inflight_longterm = self.inflight_longterm;
-    }
-
     fn init_pacing_rate(&mut self, srtt: Option<Duration>) {
         let (num, den) = STARTUP_PACING_GAIN;
         let srtt = srtt.unwrap_or(Duration::from_millis(1)).as_nanos();
@@ -1186,9 +1171,8 @@ impl CongestionControl for Bbr {
     /// Startup's loss exit (§5.3.1.3).
     fn on_recovery_start(&mut self, r: &RecoveryStart) {
         self.fast_recovery_round = (r.kind == RecoveryKind::Fast).then_some(self.round_count);
-        // The draft calls SaveCwnd and then SaveStateUponLoss, which calls it again to the
-        // same effect.
-        self.save_state_upon_loss();
+        // SaveStateUponLoss (§5.5.11.1) goes here once spurious-loss undo exists (spec §3.2a).
+        self.save_cwnd();
         self.in_loss_recovery = true;
         if r.kind == RecoveryKind::Rto {
             // C.inflight + 1 packet.
@@ -2368,15 +2352,6 @@ mod tests {
         assert!(bbr.in_loss_recovery);
         assert_eq!(bbr.prior_cwnd, c0, "SaveCwnd");
         assert_eq!(bbr.cwnd, c0, "fast recovery leaves cwnd to the model");
-        assert_eq!(
-            (
-                bbr.undo_bw_shortterm,
-                bbr.undo_inflight_shortterm,
-                bbr.undo_inflight_longterm
-            ),
-            (v.bw_shortterm, v.inflight_shortterm, INFINITE),
-            "SaveStateUponLoss"
-        );
         // As a cut during recovery would leave it.
         bbr.cwnd = 20_000;
         recovery_ack(&mut bbr, 1_000, 300_000, at(100), false);

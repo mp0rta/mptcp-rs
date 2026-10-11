@@ -2525,6 +2525,20 @@ fn connected_between(
     cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
     sack: bool,
 ) -> Connected {
+    let cfg = ConnectConfig {
+        recv_buffer: cap,
+        ..ConnectConfig::default()
+    };
+    connected_cfg(local, remote, cfg, cc, sack)
+}
+/// `connected_between` with the whole `ConnectConfig`.
+fn connected_cfg(
+    local: &str,
+    remote: &str,
+    cfg: ConnectConfig,
+    cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+    sack: bool,
+) -> Connected {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
     ep.cc = cc;
     let h = ep
@@ -2532,10 +2546,7 @@ fn connected_between(
             Instant::from_nanos(0),
             local.parse().unwrap(),
             remote.parse().unwrap(),
-            ConnectConfig {
-                recv_buffer: cap,
-                ..ConnectConfig::default()
-            },
+            cfg,
         )
         .unwrap();
     let syn_bytes = transmit(&mut ep, Instant::from_nanos(0)).leak();

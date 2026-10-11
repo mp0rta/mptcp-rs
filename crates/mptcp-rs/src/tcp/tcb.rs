@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use rangemap::RangeSet;
 
+use super::bbr::Bbr;
 use super::cc::{
     AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck, RecoveryKind,
     RecoveryStart, Start, Transmit,
@@ -57,6 +58,21 @@ pub struct ConnectConfig {
     pub r2_data: Duration,
     /// Used as at least 180 s (RFC 9293 MUST-23).
     pub r2_syn: Duration,
+    /// The congestion controller of every subflow of the connection.
+    pub congestion_control: CongestionControlKind,
+}
+
+/// A congestion controller to run (`ConnectConfig::congestion_control`). MPTCP subflows are
+/// uncoupled: each runs its own, so two subflows through one bottleneck take about two flows'
+/// share.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CongestionControlKind {
+    /// CUBIC (RFC 9438) with HyStart++ and pacing.
+    #[default]
+    Cubic,
+    /// BBRv3 (draft-ietf-ccwg-bbr-06, experimental).
+    BbrV3,
 }
 
 impl Default for ConnectConfig {
@@ -73,6 +89,7 @@ impl Default for ConnectConfig {
             send_buffer: 16 << 20,
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),
+            congestion_control: CongestionControlKind::Cubic,
         }
     }
 }
@@ -362,14 +379,20 @@ pub struct Tcb {
 }
 
 impl Tcb {
+    /// `seed` seeds BBR's PRNG (BBRv3 spec §3.4); CUBIC does not use it.
     pub fn new_active(
         cfg: &ConnectConfig,
         local: SocketAddr,
         remote: SocketAddr,
         isn: SeqNum,
         now: Instant,
+        seed: u64,
     ) -> Tcb {
-        Self::with_cc(cfg, local, remote, isn, now, Box::new(Cubic::new()))
+        let cc: Box<dyn CongestionControl> = match cfg.congestion_control {
+            CongestionControlKind::Cubic => Box::new(Cubic::new()),
+            CongestionControlKind::BbrV3 => Box::new(Bbr::new(seed)),
+        };
+        Self::with_cc(cfg, local, remote, isn, now, cc)
     }
 
     pub(crate) fn with_cc(
@@ -966,6 +989,10 @@ impl Tcb {
     #[cfg(test)]
     pub(crate) fn cwnd(&self) -> u32 {
         self.cc.cwnd()
+    }
+    #[cfg(test)]
+    pub(crate) fn cc(&self) -> &dyn CongestionControl {
+        &*self.cc
     }
     #[cfg(test)]
     pub(crate) fn sampler(&self) -> &RateSampler {

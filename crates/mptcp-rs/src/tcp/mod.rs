@@ -1,6 +1,5 @@
 //! Plain TCP engine: the pure `Tcb` state machine and the hooks it drives (spec §3).
 
-#[cfg_attr(not(test), allow(dead_code))]
 mod bbr;
 pub mod cc;
 mod cubic;
@@ -16,5 +15,6 @@ pub use cc::{
 };
 pub use hooks::{AckPurpose, Hooks, PlainHooks, SegmentHooks, SendBuf};
 pub use tcb::{
-    CloseReason, ConnectConfig, Reaction, SegmentWriter, SendBudget, SentMeta, Tcb, TcpState,
+    CloseReason, CongestionControlKind, ConnectConfig, Reaction, SegmentWriter, SendBudget,
+    SentMeta, Tcb, TcpState,
 };
