@@ -211,7 +211,7 @@ class Driver(unittest.TestCase):
 
 def unshaped_rec(rep, server_share, client="kernel", direction="c2s", client_cpu=(2, 8)):
     cpu = {"window_s": 20, "host_busy_cpus": 3, "client": {"user_s": client_cpu[0], "sys_s": client_cpu[1]},
-           "server": {"user_s": 0, "sys_s": 20 * server_share},
+           "server": {"user_s": 10 * server_share, "sys_s": 10 * server_share},  # half Python
            "payload": {"a": {"received": 15e9, "acked": 0}, "b": {"received": 5e9, "acked": 0}}, "valid": True}
     return {"scenario": "m2-unshaped", "dir": direction, "client": client, "rep": rep, "goodput_mbps": 8000.0,
             "ceiling_mbps": None, "leg_payload": None, "cpu": cpu, "artifacts": f"run{rep}", "error": None}
@@ -242,6 +242,14 @@ class Summary(unittest.TestCase):
         self.assertTrue(r["bottleneck"])
         # A saturated mptcp-rs client is its own stack at work, not a harness bottleneck.
         self.assertFalse(bench_plot.record_cpu(unshaped_rec(0, 0.5, client="mptcp-rs", client_cpu=(4, 16)))["bottleneck"])
+
+    def test_saturated_kernel_sender_not_flagged(self):
+        import bench_plot
+        # The smoke run: the kernel client's send path saturates one core, 97 % of it sys time.
+        rec = unshaped_rec(0, 0.5, client_cpu=(0.53, 19.07))
+        r = bench_plot.record_cpu(rec)
+        self.assertAlmostEqual(r["client_core_share"], 0.98)
+        self.assertFalse(r["bottleneck"])
 
     def test_bottleneck_any_run(self):
         import bench_plot

@@ -22,9 +22,14 @@ def record_cpu(rec):
     b = c["payload"]["b"]["received" if rec["dir"] == "c2s" else "acked"]
     r = {"host_cpu_s_per_gb": c["host_busy_cpus"] * c["window_s"] / gb, "client_cpu_s_per_gb": cli / gb,
          "client_core_share": cli / c["window_s"], "client_user_frac": c["client"]["user_s"] / cli if cli else 0.0,
-         "server_core_share": srv / c["window_s"], "leg_b_share": b / (gb * 1e9)}
-    # Only the Python programs can be a harness bottleneck: a saturated mptcp-rs is the stack itself.
-    r["bottleneck"] = r["server_core_share"] >= 0.9 or (rec["client"] == "kernel" and r["client_core_share"] >= 0.9)
+         "server_core_share": srv / c["window_s"], "server_user_frac": c["server"]["user_s"] / srv if srv else 0.0,
+         "leg_b_share": b / (gb * 1e9)}
+    # Only the Python programs can be a harness bottleneck (a saturated mptcp-rs is the stack itself),
+    # and only through their user time: sys time is the kernel stack, which a native program pays too.
+    py = [(r["server_core_share"], r["server_user_frac"])]
+    if rec["client"] == "kernel":
+        py.append((r["client_core_share"], r["client_user_frac"]))
+    r["bottleneck"] = any(share >= 0.9 and user >= 0.2 for share, user in py)
     return r
 
 
@@ -52,7 +57,7 @@ def summarize(records):
                 s[f] = med([c[f] for _, c in cpus])
             s["server_core_share_max"] = max(c["server_core_share"] for _, c in cpus)
             s["leg_b_share_median"] = med([c["leg_b_share"] for _, c in cpus])
-            s["bottleneck_runs"] = [{"rep": r["rep"], "artifacts": r["artifacts"], **{f: c[f] for f in ("client_core_share", "client_user_frac", "server_core_share")}}
+            s["bottleneck_runs"] = [{"rep": r["rep"], "artifacts": r["artifacts"], **{f: c[f] for f in ("client_core_share", "client_user_frac", "server_core_share", "server_user_frac")}}
                                     for r, c in cpus if c["bottleneck"]]
             s["bottleneck"] = bool(s["bottleneck_runs"])
         else:
@@ -147,7 +152,9 @@ def plot(summary, outdir):
                        mpatches.Patch(facecolor=SURFACE, edgecolor=MUTED, hatch="////", label="client process CPU")],
               frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
     style(ac, "CPU seconds per GB of TCP payload")
-    fig.suptitle("No netem (CPU-bound), paths A+B; veth, offloads default; CUBIC; median of runs", fontsize=9, color=INK, x=0.01, ha="left")
+    fig.suptitle("No netem (CPU-bound), paths A+B; veth, offloads default; CUBIC; median of runs\n"
+                 "one connection, one sending thread (the kernel's sender saturates one core, mostly in the kernel)",
+                 fontsize=9, color=INK, x=0.01, ha="left")
     fig.tight_layout()
     fig.savefig(outdir / "unshaped.svg")
     plt.close(fig)
