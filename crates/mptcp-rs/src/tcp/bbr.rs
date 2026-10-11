@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use super::cc::{
-    AckSample, CongestionControl, CongestionEvent, RateSample, RecoveryAck, Start, initial_window,
+    AckSample, CongestionControl, CongestionEvent, LossEvent, RateSample, RecoveryAck,
+    RecoveryKind, RecoveryStart, Start, initial_window,
 };
 use crate::time::Instant;
 
@@ -25,10 +26,19 @@ const STARTUP_PACING_GAIN: Gain = (277, 100);
 const DRAIN_PACING_GAIN: Gain = (1, 2);
 /// §5.3.3.1 and §5.6.1: ProbeBW_DOWN paces at 0.90 (Appendix: BBR.ProbeDownPacingGain).
 const PROBE_DOWN_PACING_GAIN: Gain = (90, 100);
+/// §5.3.3.5 and §5.6.1: ProbeBW_UP paces at 1.25 with a cwnd gain of 2.25.
+const PROBE_UP_PACING_GAIN: Gain = (5, 4);
+const PROBE_UP_CWND_GAIN: Gain = (9, 4);
 const PACING_MARGIN_PERCENT: u64 = 1;
 const DEFAULT_CWND_GAIN: Gain = (2, 1);
 /// §2.8: 0.15.
 const HEADROOM: Gain = (15, 100);
+/// §2.8: 2%.
+const LOSS_THRESH: Gain = (2, 100);
+/// §2.8: 0.7.
+const BETA: Gain = (7, 10);
+/// §5.3.1.3: BBRStartupFullLossCnt.
+const STARTUP_FULL_LOSS_CNT: u64 = 6;
 /// §2.11, in ProbeBW cycles.
 const MAX_BW_FILTER_LEN: u64 = 2;
 /// §2.12, in packet-timed rounds.
@@ -54,6 +64,9 @@ pub(crate) enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckPhase {
     Init,
+    Refilling,
+    ProbeStarting,
+    ProbeFeedback,
     ProbeStopping,
 }
 
@@ -159,17 +172,38 @@ pub(crate) struct Bbr {
     max_inflight: u64,
     inflight_longterm: u64,
     inflight_shortterm: u64,
-    // Startup (§2.13).
+    // Responding to congestion (§2.10, §5.5.10.3).
+    bw_latest: u64,
+    inflight_latest: u64,
+    loss_round_delivered: u64,
+    loss_round_start: bool,
+    // Startup (§2.13), and its loss exit (§5.3.1.3).
     full_bw_reached: bool,
     full_bw_now: bool,
     full_bw: u64,
     full_bw_count: u64,
+    /// Discontiguous ranges lost in the current loss round.
+    loss_events_in_round: u64,
+    /// The end of the last range reported lost.
+    last_loss_end: u64,
+    /// round_count when the current fast recovery began; `None` after an RTO.
+    fast_recovery_round: Option<u64>,
     // ProbeBW (§2.14).
     ack_phase: AckPhase,
+    is_bw_probe_sample: bool,
+    is_loss_in_round: bool,
+    bw_probe_up_acked: u64,
     probe_up_acked_per_inc: u64,
+    bw_probe_up_rounds: u32,
     rounds_since_probe_up: u64,
     bw_probe_wait: Duration,
     cycle_stamp: Instant,
+    prev_probe_too_high: bool,
+    prev_probe_precautionary: bool,
+    /// C.is_cwnd_limited (spec §1.8): `cwnd_filled` OR-ed over the current round and the
+    /// round before it.
+    cwnd_limited_in_round: bool,
+    cwnd_limited_last_round: bool,
     // min_rtt estimation inside the ProbeRTT machinery (§2.16, §5.3.4.3).
     probe_rtt_min_delay: Duration,
     probe_rtt_min_stamp: Instant,
@@ -209,16 +243,32 @@ impl Bbr {
             max_inflight: 0,
             inflight_longterm: INFINITE,
             inflight_shortterm: INFINITE,
+            // ResetCongestionSignals.
+            bw_latest: 0,
+            inflight_latest: 0,
+            loss_round_delivered: 0,
+            loss_round_start: false,
             // ResetFullBW.
             full_bw_reached: false,
             full_bw_now: false,
             full_bw: 0,
             full_bw_count: 0,
+            loss_events_in_round: 0,
+            last_loss_end: 0,
+            fast_recovery_round: None,
             ack_phase: AckPhase::Init,
+            is_bw_probe_sample: false,
+            is_loss_in_round: false,
+            bw_probe_up_acked: 0,
             probe_up_acked_per_inc: INFINITE,
+            bw_probe_up_rounds: 0,
             rounds_since_probe_up: 0,
             bw_probe_wait: Duration::ZERO,
             cycle_stamp: Instant::from_nanos(0),
+            prev_probe_too_high: false,
+            prev_probe_precautionary: false,
+            cwnd_limited_in_round: false,
+            cwnd_limited_last_round: false,
             probe_rtt_min_delay: INFINITE_RTT,
             probe_rtt_min_stamp: Instant::from_nanos(0),
         }
@@ -248,13 +298,16 @@ impl Bbr {
     // §5.2.3, per ACK.
 
     fn update_model_and_state(&mut self, rs: &RateSample) {
-        // UpdateMaxBw, the first step of UpdateCongestionSignals.
-        self.update_max_bw(rs);
+        self.update_latest_delivery_signals(rs);
+        self.update_congestion_signals(rs);
+        self.update_cwnd_limited(rs);
         self.update_ack_aggregation(rs);
         self.check_full_bw_reached(rs);
-        self.check_startup_done();
+        self.check_startup_done(rs);
         self.check_drain_done(rs);
+        self.update_probe_bw_cycle_phase(rs);
         self.update_min_rtt(rs);
+        self.advance_latest_delivery_signals(rs);
         self.bound_bw_for_model();
     }
 
@@ -272,9 +325,41 @@ impl Bbr {
         self.cwnd_gain = DEFAULT_CWND_GAIN;
     }
 
-    fn check_startup_done(&mut self) {
+    fn check_startup_done(&mut self, rs: &RateSample) {
+        self.check_startup_high_loss(rs);
         if self.state == State::Startup && self.full_bw_reached {
             self.enter_drain();
+        }
+    }
+
+    /// §5.3.1.3. With SACK: a loss round that ends after a full packet-timed round of fast
+    /// recovery, with at least six discontiguous ranges lost in it and a loss rate above
+    /// LossThresh. Without SACK: any loss detected during fast recovery.
+    fn check_startup_high_loss(&mut self, rs: &RateSample) {
+        let in_fast_recovery = rs.in_recovery && self.fast_recovery_round.is_some();
+        // The round in progress when fast recovery began ends at round r + 1; the next one,
+        // wholly in fast recovery, at r + 2.
+        let high_loss = if rs.sack {
+            self.loss_round_start
+                && in_fast_recovery
+                && self
+                    .fast_recovery_round
+                    .is_some_and(|r| self.round_count >= r + 2)
+                && self.loss_events_in_round >= STARTUP_FULL_LOSS_CNT
+                && rs
+                    .delivery
+                    .is_some_and(|d| is_inflight_too_high(d.lost, d.tx_in_flight, true))
+        } else {
+            in_fast_recovery && self.loss_events_in_round > 0
+        };
+        if self.state == State::Startup && !self.full_bw_reached && high_loss {
+            self.full_bw_reached = true;
+            // Appendix A.2 expects full_bw_now as well.
+            self.full_bw_now = true;
+            self.inflight_longterm = self.bdp_multiple(UNITY_GAIN).max(self.inflight_latest);
+        }
+        if self.loss_round_start {
+            self.loss_events_in_round = 0;
         }
     }
 
@@ -324,20 +409,210 @@ impl Bbr {
 
     fn enter_probe_bw(&mut self, rs: &RateSample) {
         self.cwnd_gain = DEFAULT_CWND_GAIN;
-        self.start_probe_bw_down(rs);
+        self.start_probe_bw_down(rs.now, rs.delivered);
     }
 
-    fn start_probe_bw_down(&mut self, rs: &RateSample) {
+    // The draft gives each ProbeBW phase's gains in prose and in the table of §5.6.1.
+
+    /// `delivered` is C.delivered.
+    fn start_probe_bw_down(&mut self, now: Instant, delivered: u64) {
+        self.reset_congestion_signals();
         // Not growing BBR.inflight_longterm.
         self.probe_up_acked_per_inc = INFINITE;
         self.pick_probe_wait();
-        self.cycle_stamp = rs.now;
+        self.cycle_stamp = now;
         self.ack_phase = AckPhase::ProbeStopping;
-        self.start_round(rs.delivered);
+        self.start_round(delivered);
         self.state = State::ProbeBwDown;
-        // The draft gives ProbeBW_DOWN's gains in prose and in the table of §5.6.1.
         self.pacing_gain = PROBE_DOWN_PACING_GAIN;
         self.cwnd_gain = DEFAULT_CWND_GAIN;
+    }
+
+    fn start_probe_bw_cruise(&mut self) {
+        self.state = State::ProbeBwCruise;
+        self.pacing_gain = UNITY_GAIN;
+        self.cwnd_gain = DEFAULT_CWND_GAIN;
+    }
+
+    fn start_probe_bw_refill(&mut self, rs: &RateSample) {
+        self.reset_short_term_model();
+        self.bw_probe_up_rounds = 0;
+        self.bw_probe_up_acked = 0;
+        self.prev_probe_precautionary = false;
+        self.ack_phase = AckPhase::Refilling;
+        self.start_round(rs.delivered);
+        self.state = State::ProbeBwRefill;
+        self.pacing_gain = UNITY_GAIN;
+        self.cwnd_gain = DEFAULT_CWND_GAIN;
+    }
+
+    fn start_probe_bw_up(&mut self, rs: &RateSample) {
+        self.ack_phase = AckPhase::ProbeStarting;
+        self.start_round(rs.delivered);
+        self.reset_full_bw();
+        self.full_bw = delivery_rate(rs);
+        self.state = State::ProbeBwUp;
+        self.pacing_gain = PROBE_UP_PACING_GAIN;
+        self.cwnd_gain = PROBE_UP_CWND_GAIN;
+        self.raise_inflight_longterm_slope();
+    }
+
+    /// §5.3.3.9, on each ACK that delivered data.
+    fn update_probe_bw_cycle_phase(&mut self, rs: &RateSample) {
+        if !self.full_bw_reached || rs.delivery.is_none() {
+            return;
+        }
+        if self.adapt_long_term_model(rs) || !self.is_in_a_probe_bw_state() {
+            return;
+        }
+        match self.state {
+            State::ProbeBwDown => {
+                if !self.is_time_to_probe_bw(rs) && self.is_time_to_cruise(rs) {
+                    self.start_probe_bw_cruise();
+                }
+            }
+            State::ProbeBwCruise => {
+                self.is_time_to_probe_bw(rs);
+            }
+            State::ProbeBwRefill => {
+                // After one round of REFILL, start UP.
+                if self.round_start {
+                    self.is_bw_probe_sample = true;
+                    self.start_probe_bw_up(rs);
+                }
+            }
+            State::ProbeBwUp => {
+                if self.is_time_to_go_down(rs) {
+                    // No high loss (yet).
+                    self.prev_probe_too_high = false;
+                    self.start_probe_bw_down(rs.now, rs.delivered);
+                }
+            }
+            State::Startup | State::Drain | State::ProbeRtt => {}
+        }
+    }
+
+    /// Time to go from DOWN to CRUISE? C.inflight leaves the headroom free and is within
+    /// BBR.bdp (§5.3.3.1). The draft's pseudocode writes `Inflight(BBR.max_bw, 1.0)`, a
+    /// signature it defines nowhere; this is its Inflight(1.0), on BBR.bw.
+    fn is_time_to_cruise(&self, rs: &RateSample) -> bool {
+        rs.inflight <= self.inflight_with_headroom() && rs.inflight <= self.inflight(UNITY_GAIN)
+    }
+
+    /// Time to go from UP to DOWN?
+    fn is_time_to_go_down(&mut self, rs: &RateSample) -> bool {
+        // Precautionary bandwidth probing: deceleration.
+        if self.prev_probe_too_high && rs.inflight >= self.inflight_longterm {
+            self.prev_probe_precautionary = true;
+            return true;
+        }
+        if self.is_cwnd_limited() && self.cwnd >= self.inflight_longterm {
+            // bw is limited by inflight_longterm.
+            self.reset_full_bw();
+            self.full_bw = delivery_rate(rs);
+            false
+        } else {
+            // Have we fully used the path's bw?
+            self.full_bw_now
+        }
+    }
+
+    fn is_probing_bw(&self) -> bool {
+        matches!(
+            self.state,
+            State::Startup | State::ProbeBwRefill | State::ProbeBwUp
+        )
+    }
+
+    fn has_elapsed_in_phase(&self, interval: Duration, now: Instant) -> bool {
+        now > self.cycle_stamp + interval
+    }
+
+    fn raise_inflight_longterm_slope(&mut self) {
+        let growth_this_round = 1u64 << self.bw_probe_up_rounds;
+        self.bw_probe_up_rounds = (self.bw_probe_up_rounds + 1).min(30);
+        // Rounded up: inflight_longterm grows no faster than the slope.
+        self.probe_up_acked_per_inc = self.cwnd.div_ceil(growth_this_round).max(self.smss);
+    }
+
+    fn probe_inflight_longterm_upward(&mut self, rs: &RateSample) {
+        if !self.is_cwnd_limited() || self.cwnd < self.inflight_longterm {
+            // Not fully using inflight_longterm, so not growing it.
+            return;
+        }
+        self.bw_probe_up_acked += rs.delivery.map_or(0, |d| d.newly_acked);
+        if self.bw_probe_up_acked >= self.probe_up_acked_per_inc {
+            let delta = self.bw_probe_up_acked / self.probe_up_acked_per_inc;
+            self.bw_probe_up_acked -= delta * self.probe_up_acked_per_inc;
+            self.inflight_longterm = self
+                .inflight_longterm
+                .saturating_add(delta.saturating_mul(self.smss));
+        }
+        if self.round_start {
+            self.raise_inflight_longterm_slope();
+        }
+    }
+
+    /// Tracks the ACK phase, advances the max_bw filter and raises inflight_longterm. True if
+    /// it decided a state transition.
+    fn adapt_long_term_model(&mut self, rs: &RateSample) -> bool {
+        let Some(d) = rs.delivery else {
+            return false;
+        };
+        if self.ack_phase == AckPhase::ProbeStarting && self.round_start {
+            // Starting to get bw probing samples.
+            self.ack_phase = AckPhase::ProbeFeedback;
+        }
+        if self.ack_phase == AckPhase::ProbeStopping && self.round_start {
+            // End of samples from the bw probing phase.
+            self.is_bw_probe_sample = false;
+            self.ack_phase = AckPhase::Init;
+            if self.is_in_a_probe_bw_state() && !d.is_app_limited {
+                self.advance_max_bw_filter();
+            }
+            // Precautionary bandwidth probing: acceleration.
+            if self.is_in_a_probe_bw_state()
+                && self.prev_probe_precautionary
+                && !self.prev_probe_too_high
+            {
+                self.start_probe_bw_refill(rs);
+                return true;
+            }
+        }
+        if !is_inflight_too_high(d.lost, d.tx_in_flight, rs.sack) {
+            // The loss rate is safe: adjust the upper bounds upward.
+            if self.inflight_longterm == INFINITE {
+                return false;
+            }
+            self.inflight_longterm = self.inflight_longterm.max(d.tx_in_flight);
+            if self.state == State::ProbeBwUp {
+                self.probe_inflight_longterm_upward(rs);
+            }
+        }
+        false
+    }
+
+    /// Time to go from DOWN or CRUISE to REFILL? Starts REFILL if so (§5.3.3.8.2).
+    fn is_time_to_probe_bw(&mut self, rs: &RateSample) -> bool {
+        if self.has_elapsed_in_phase(self.bw_probe_wait, rs.now)
+            || self.is_reno_coexistence_probe_time()
+        {
+            self.start_probe_bw_refill(rs);
+            return true;
+        }
+        false
+    }
+
+    /// T_reno: TargetInflight in packets, at most 63 rounds.
+    fn is_reno_coexistence_probe_time(&self) -> bool {
+        // Rounded up: never probes sooner than Reno's sawtooth would.
+        let reno_rounds = self.target_inflight().div_ceil(self.smss);
+        self.rounds_since_probe_up >= reno_rounds.min(63)
+    }
+
+    /// Our estimated BDP, unless congestion cut C.cwnd.
+    fn target_inflight(&self) -> u64 {
+        self.bdp_multiple(UNITY_GAIN).min(self.cwnd)
     }
 
     /// §5.3.3.8.2: 0 or 1 rounds, and 2 s plus a uniform 0..1 s.
@@ -449,6 +724,139 @@ impl Bbr {
             .update(extra, self.round_count, filter_len);
     }
 
+    // Responding to congestion (§5.5.10).
+
+    /// Near the start of ACK processing.
+    fn update_latest_delivery_signals(&mut self, rs: &RateSample) {
+        self.loss_round_start = false;
+        let Some(d) = rs.delivery else {
+            return;
+        };
+        self.bw_latest = self.bw_latest.max(delivery_rate(rs));
+        self.inflight_latest = self.inflight_latest.max(d.delivered);
+        if d.prior_delivered >= self.loss_round_delivered {
+            self.loss_round_delivered = rs.delivered;
+            self.loss_round_start = true;
+        }
+    }
+
+    /// Near the end of ACK processing.
+    fn advance_latest_delivery_signals(&mut self, rs: &RateSample) {
+        if let Some(d) = rs.delivery.filter(|_| self.loss_round_start) {
+            self.bw_latest = delivery_rate(rs);
+            self.inflight_latest = d.delivered;
+        }
+    }
+
+    fn reset_congestion_signals(&mut self) {
+        self.is_loss_in_round = false;
+        self.bw_latest = 0;
+        self.inflight_latest = 0;
+    }
+
+    fn update_congestion_signals(&mut self, rs: &RateSample) {
+        self.update_max_bw(rs);
+        if !self.loss_round_start {
+            // Wait until the end of the round trip.
+            return;
+        }
+        self.adapt_lower_bounds_from_congestion();
+        self.is_loss_in_round = false;
+    }
+
+    /// Once per round trip, respond to congestion.
+    fn adapt_lower_bounds_from_congestion(&mut self) {
+        if self.is_probing_bw() {
+            return;
+        }
+        if self.is_loss_in_round {
+            self.init_lower_bounds();
+            self.loss_lower_bounds();
+        }
+    }
+
+    /// The first congestion episode in this cycle.
+    fn init_lower_bounds(&mut self) {
+        if self.bw_shortterm == INFINITE {
+            self.bw_shortterm = self.max_bw;
+        }
+        if self.inflight_shortterm == INFINITE {
+            self.inflight_shortterm = self.cwnd;
+        }
+    }
+
+    fn loss_lower_bounds(&mut self) {
+        self.bw_shortterm = self.bw_latest.max(times_beta(self.bw_shortterm));
+        self.inflight_shortterm = self
+            .inflight_latest
+            .max(times_beta(self.inflight_shortterm));
+    }
+
+    fn reset_short_term_model(&mut self) {
+        self.bw_shortterm = INFINITE;
+        self.inflight_shortterm = INFINITE;
+    }
+
+    /// C.is_cwnd_limited (spec §1.8), after this ACK's round_start is known.
+    fn update_cwnd_limited(&mut self, rs: &RateSample) {
+        self.cwnd_limited_in_round |= rs.cwnd_filled;
+        if self.round_start {
+            self.cwnd_limited_last_round = self.cwnd_limited_in_round;
+            self.cwnd_limited_in_round = false;
+        }
+    }
+
+    fn is_cwnd_limited(&self) -> bool {
+        self.cwnd_limited_last_round || self.cwnd_limited_in_round
+    }
+
+    /// `delivered` is C.delivered.
+    fn note_loss(&mut self, delivered: u64) {
+        // First loss in this round trip?
+        if !self.is_loss_in_round {
+            self.loss_round_delivered = delivered;
+        }
+        self.is_loss_in_round = true;
+    }
+
+    /// HandleLostPacket (§5.2.4, §5.5.10.2) for one lost range. Losses from fast-retransmit
+    /// sends arrive here outside any ACK; the per-round accounting takes them at the next
+    /// delivery sample (spec §1.4).
+    fn handle_lost_packet(&mut self, e: &LossEvent) {
+        self.note_loss(e.delivered);
+        // Startup's loss exit counts discontiguous ranges (§5.3.1.3).
+        if self.loss_events_in_round == 0 || e.start != self.last_loss_end {
+            self.loss_events_in_round += 1;
+        }
+        self.last_loss_end = e.end;
+        if !self.is_bw_probe_sample {
+            // Not sent while probing bandwidth.
+            return;
+        }
+        if is_inflight_too_high(e.lost_since_tx, e.tx_in_flight, e.sack) {
+            let tx_in_flight = inflight_at_loss(e);
+            self.handle_inflight_too_high(tx_in_flight, e.is_app_limited, e.now, e.delivered);
+        }
+    }
+
+    fn handle_inflight_too_high(
+        &mut self,
+        tx_in_flight: u64,
+        is_app_limited: bool,
+        now: Instant,
+        delivered: u64,
+    ) {
+        self.prev_probe_too_high = true;
+        // Only react once per bw probe.
+        self.is_bw_probe_sample = false;
+        if !is_app_limited {
+            self.inflight_longterm = tx_in_flight.max(times_beta(self.target_inflight()));
+        }
+        if self.state == State::ProbeBwUp {
+            self.start_probe_bw_down(now, delivered);
+        }
+    }
+
     fn bound_bw_for_model(&mut self) {
         self.bw = self.max_bw.min(self.bw_shortterm);
     }
@@ -550,6 +958,32 @@ impl Bbr {
     }
 }
 
+/// IsInflightTooHigh (§5.5.10.2): `lost` > LossThresh × `tx_in_flight`, compared exactly, or
+/// any loss without SACK.
+fn is_inflight_too_high(lost: u64, tx_in_flight: u64, sack: bool) -> bool {
+    let (num, den) = LOSS_THRESH;
+    u128::from(lost) * u128::from(den) > u128::from(tx_in_flight) * u128::from(num)
+        || (lost > 0 && !sack)
+}
+
+/// InflightAtLoss (§5.5.10.2): the C.inflight at which losses crossed LossThresh within the
+/// lost range, solving (lost_prev + lost_prefix) / (inflight_prev + lost_prefix) = LossThresh.
+fn inflight_at_loss(e: &LossEvent) -> u64 {
+    let (num, den) = (i128::from(LOSS_THRESH.0), i128::from(LOSS_THRESH.1));
+    let inflight_prev = i128::from(e.tx_in_flight.saturating_sub(e.len));
+    let lost_prev = i128::from(e.lost_since_tx.saturating_sub(e.len));
+    // Rounded toward −∞: inflight_longterm is never set above the crossing point.
+    let lost_prefix = (num * inflight_prev - den * lost_prev).div_euclid(den - num);
+    u64::try_from((inflight_prev + lost_prefix).max(0)).unwrap_or(0)
+}
+
+/// BBR.Beta × `x`.
+fn times_beta(x: u64) -> u64 {
+    let (num, den) = BETA;
+    // Rounded down: the bound is never above Beta × x.
+    mul_div(u128::from(x), u128::from(num), u128::from(den))
+}
+
 /// RS.delivery_rate: 0 when the sample has no valid rate (§4.1.2.3).
 fn delivery_rate(rs: &RateSample) -> u64 {
     rs.delivery
@@ -590,6 +1024,15 @@ impl CongestionControl for Bbr {
     fn on_rate_sample(&mut self, rs: &RateSample) {
         self.update_model_and_state(rs);
         self.update_control_parameters(rs);
+    }
+
+    /// Records when fast recovery began, for Startup's loss exit (§5.3.1.3).
+    fn on_recovery_start(&mut self, r: &RecoveryStart) {
+        self.fast_recovery_round = (r.kind == RecoveryKind::Fast).then_some(self.round_count);
+    }
+
+    fn on_loss(&mut self, e: &LossEvent) {
+        self.handle_lost_packet(e);
     }
 
     fn on_ack(&mut self, _: &AckSample) {}
@@ -696,6 +1139,430 @@ mod tests {
         assert_eq!(bbr.view().state, State::Drain);
     }
 
+    /// ProbeBW_DOWN after Drain's three-round limit, with C.inflight held above BBR.bdp
+    /// (100 000) so DOWN does not move on to CRUISE.
+    fn to_probe_bw_down(bbr: &mut Bbr) {
+        to_drain(bbr);
+        for i in 5..=8 {
+            ack_with(bbr, 100_000, 300_000, at(10 * i));
+        }
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+    }
+
+    /// DOWN, CRUISE, then REFILL once bw_probe_wait has elapsed. Returns REFILL's start.
+    fn to_probe_bw_refill(bbr: &mut Bbr) -> Instant {
+        to_probe_bw_down(bbr);
+        ack_with(bbr, 100_000, 100_000, at(90));
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+        let t = bbr.cycle_stamp + bbr.bw_probe_wait + ms(1);
+        ack_with(bbr, 100_000, 100_000, t);
+        assert_eq!(bbr.view().state, State::ProbeBwRefill);
+        t
+    }
+
+    /// REFILL, then UP after one round. Returns UP's start.
+    fn to_probe_bw_up(bbr: &mut Bbr) -> Instant {
+        let t = to_probe_bw_refill(bbr) + ms(10);
+        ack_with(bbr, 100_000, 100_000, t);
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        t
+    }
+
+    /// A lost range (SACK), noted at the current C.delivered.
+    fn loss(bbr: &Bbr, start: u64, len: u64, tx_in_flight: u64, lost_since_tx: u64) -> LossEvent {
+        LossEvent {
+            start,
+            end: start + len,
+            len,
+            tx_in_flight,
+            lost_since_tx,
+            is_app_limited: false,
+            delivered: bbr.next_round_delivered,
+            sack: true,
+            now: T0,
+        }
+    }
+
+    fn recovery_start(bbr: &mut Bbr, kind: RecoveryKind) {
+        bbr.on_recovery_start(&RecoveryStart {
+            kind,
+            inflight: 0,
+            now: T0,
+        });
+    }
+
+    /// An ACK that delivers nothing (a duplicate ACK) during recovery, without SACK.
+    fn dup_ack_no_sack(bbr: &mut Bbr, now: Instant) {
+        let mut rs = sample(bbr, 0, ms(10), ms(10), now);
+        rs.delivery = None;
+        rs.delivered = bbr.next_round_delivered;
+        rs.inflight = 1_000_000;
+        rs.in_recovery = true;
+        rs.sack = false;
+        bbr.on_rate_sample(&rs);
+    }
+
+    /// Six discontiguous 1000-octet ranges from `base`.
+    fn six_ranges(base: u64) -> [(u64, u64); 6] {
+        std::array::from_fn(|i| (base + 2_000 * i as u64, 1_000))
+    }
+
+    /// One Startup round in fast recovery: `ranges` are lost, then a round-ending ACK
+    /// delivers `delivered` over 10 ms; its packet saw `lost` of 400 000 in flight lost. A
+    /// million octets stay in flight, so a Drain entered here does not end at once.
+    fn recovery_round(
+        bbr: &mut Bbr,
+        ranges: &[(u64, u64)],
+        delivered: u64,
+        lost: u64,
+        now: Instant,
+    ) {
+        for &(start, len) in ranges {
+            let e = loss(bbr, start, len, 400_000, lost);
+            bbr.on_loss(&e);
+        }
+        let mut rs = sample(bbr, delivered, ms(10), ms(10), now);
+        rs.inflight = 1_000_000;
+        rs.in_recovery = true;
+        let d = rs.delivery.as_mut().expect("delivery");
+        d.lost = lost;
+        d.tx_in_flight = 400_000;
+        bbr.on_rate_sample(&rs);
+    }
+
+    #[test]
+    fn probe_bw_cycle_down_cruise_refill_up() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        // The round-ending ACK that entered DOWN also ended ACKS_PROBE_STOPPING.
+        assert_eq!(bbr.view().phase, AckPhase::Init);
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(bbr.view().pacing_rate, 8_910_000);
+
+        // DOWN until C.inflight is within BBR.bdp; then CRUISE at 1.0.
+        ack_with(&mut bbr, 100_000, 100_001, at(90));
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+        ack_with(&mut bbr, 100_000, 100_000, at(100));
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+        assert_eq!(bbr.view().pacing_rate, 9_900_000);
+
+        // CRUISE until bw_probe_wait has elapsed (strictly), then REFILL at 1.0.
+        let probe_at = bbr.cycle_stamp + bbr.bw_probe_wait;
+        ack_with(&mut bbr, 100_000, 100_000, probe_at);
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+        ack_with(&mut bbr, 100_000, 100_000, probe_at + ms(1));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwRefill);
+        assert_eq!(v.phase, AckPhase::Refilling);
+        assert_eq!(v.pacing_rate, 9_900_000);
+        assert_eq!(bbr.cwnd_gain, DEFAULT_CWND_GAIN);
+        assert_eq!(bbr.next_round_delivered, 1_200_000, "StartRound");
+
+        // An ACK that ends no round stays in REFILL.
+        let mut rs = sample(&bbr, 100_000, ms(10), ms(10), probe_at + ms(5));
+        rs.delivery.as_mut().expect("delivery").prior_delivered = 0;
+        bbr.on_rate_sample(&rs);
+        assert_eq!(bbr.view().state, State::ProbeBwRefill);
+
+        // After one round, UP: 1.25 × 10 MB/s × 99%, cwnd gain 2.25.
+        ack_with(&mut bbr, 100_000, 100_000, probe_at + ms(10));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwUp);
+        assert_eq!(v.phase, AckPhase::ProbeStarting);
+        assert!(bbr.is_bw_probe_sample);
+        assert_eq!(v.pacing_rate, 12_375_000);
+        assert_eq!(bbr.cwnd_gain, PROBE_UP_CWND_GAIN);
+        assert_eq!(bbr.full_bw, 10_000_000);
+        assert_eq!(bbr.bw_probe_up_rounds, 1);
+
+        // UP until three rounds without 25% growth fill the pipe.
+        ack_with(&mut bbr, 100_000, 100_000, probe_at + ms(20));
+        assert_eq!(bbr.view().phase, AckPhase::ProbeFeedback);
+        ack_with(&mut bbr, 100_000, 100_000, probe_at + ms(30));
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        let down_at = probe_at + ms(40);
+        ack_with(&mut bbr, 100_000, 100_000, down_at);
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwDown);
+        assert_eq!(v.phase, AckPhase::ProbeStopping);
+        assert_eq!(v.pacing_rate, 8_910_000);
+        assert_eq!(bbr.cycle_stamp, down_at);
+        assert!(!bbr.prev_probe_too_high);
+
+        // The next round ends the probe's feedback and advances the max_bw filter.
+        ack_with(&mut bbr, 100_000, 300_000, down_at + ms(10));
+        assert_eq!(bbr.view().phase, AckPhase::Init);
+        assert!(!bbr.is_bw_probe_sample);
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+    }
+
+    #[test]
+    fn probe_wait_randomized_by_seed() {
+        let wait = |seed| {
+            let mut bbr = Bbr::new(seed);
+            bbr.pick_probe_wait();
+            (bbr.rounds_since_probe_up, bbr.bw_probe_wait)
+        };
+        let waits: Vec<_> = (0..64).map(wait).collect();
+        for &(rounds, wait) in &waits {
+            assert!(rounds <= 1);
+            assert!(wait >= Duration::from_secs(2) && wait < Duration::from_secs(3));
+        }
+        assert!(waits.iter().any(|w| w.0 == 0) && waits.iter().any(|w| w.0 == 1));
+        assert_ne!(waits[1].1, waits[2].1, "two seeds, two waits");
+        assert_eq!(wait(1), waits[1], "one seed, one wait");
+    }
+
+    #[test]
+    fn inflight_too_high_cuts_longterm() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_up(&mut bbr);
+        assert!(bbr.cwnd >= 100_000);
+        // Exactly 2% lost since transmit is not too high.
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 100_000, 2_000));
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        assert_eq!(bbr.view().inflight_longterm, INFINITE);
+
+        // Above 2%: inflight_longterm is where the loss rate crossed 2% within the range.
+        // inflight_prev 99 000, lost_prev 1 100: lost_prefix = (0.02 × 99 000 − 1 100) / 0.98
+        // = 897.9…, so 99 897.
+        let down_at = at(5_000);
+        let mut e = loss(&bbr, 2_010_000, 1_000, 100_000, 2_100);
+        e.now = down_at;
+        bbr.on_loss(&e);
+        let v = bbr.view();
+        assert_eq!(v.inflight_longterm, 99_897);
+        assert_eq!(v.state, State::ProbeBwDown);
+        assert_eq!(bbr.cycle_stamp, down_at);
+        assert!(bbr.prev_probe_too_high && !bbr.is_bw_probe_sample);
+        // Once per probe.
+        bbr.on_loss(&loss(&bbr, 2_020_000, 1_000, 50_000, 10_000));
+        assert_eq!(bbr.view().inflight_longterm, 99_897);
+
+        // Heavy loss: the crossing point (9 000 − 3 897.9…) is below Beta × TargetInflight,
+        // 0.7 × min(BBR.bdp 100 000, cwnd), which is the floor.
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_up(&mut bbr);
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 10_000, 5_000));
+        assert_eq!(bbr.view().inflight_longterm, 70_000);
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+
+        // Without SACK any loss is too high, even 1%. InflightAtLoss still solves for the 2%
+        // crossing, which here lies above tx_in_flight: 99 000 + 0.02 × 99 000 / 0.98.
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_up(&mut bbr);
+        let mut e = loss(&bbr, 2_000_000, 1_000, 100_000, 1_000);
+        e.sack = false;
+        bbr.on_loss(&e);
+        assert_eq!(bbr.view().inflight_longterm, 101_020);
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+
+        // An app-limited range leaves inflight_longterm but still ends the probe.
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_up(&mut bbr);
+        let mut e = loss(&bbr, 2_000_000, 1_000, 100_000, 3_000);
+        e.is_app_limited = true;
+        bbr.on_loss(&e);
+        assert_eq!(bbr.view().inflight_longterm, INFINITE);
+        assert_eq!(bbr.view().state, State::ProbeBwDown);
+    }
+
+    #[test]
+    fn startup_exits_on_loss_after_full_recovery_round() {
+        // Six discontiguous ranges and 10 000 of 400 000 (2.5%) lost exit Startup; five
+        // discontiguous ranges, or exactly 2%, do not.
+        let mut five = six_ranges(100_000);
+        five[1].0 = five[0].0 + five[0].1;
+        for (ranges, lost, exits) in [
+            (six_ranges(100_000), 10_000, true),
+            (five, 10_000, false),
+            (six_ranges(100_000), 8_000, false),
+        ] {
+            let mut bbr = started(SMSS, None);
+            ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+            recovery_start(&mut bbr, RecoveryKind::Fast);
+            // The round in progress when fast recovery began is not a full one.
+            recovery_round(&mut bbr, &six_ranges(0), 200_000, 10_000, at(20));
+            assert_eq!(bbr.view().state, State::Startup);
+            recovery_round(&mut bbr, &ranges, 400_000, lost, at(30));
+            let v = bbr.view();
+            assert_eq!(v.round_count, 3);
+            if !exits {
+                assert_eq!(v.state, State::Startup, "{ranges:?} {lost}");
+                assert_eq!(v.inflight_longterm, INFINITE);
+                continue;
+            }
+            assert_eq!(v.state, State::Drain);
+            assert!(bbr.full_bw_reached && bbr.full_bw_now);
+            // max(BBR.bdp = 20 MB/s × 10 ms, inflight_latest = this round's 400 000).
+            assert_eq!(v.inflight_longterm, 400_000);
+        }
+    }
+
+    #[test]
+    fn startup_stays_when_threshold_before_recovery_round() {
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        // Six ranges and 2.5% in the round fast recovery began in: too early.
+        recovery_round(&mut bbr, &six_ranges(0), 200_000, 10_000, at(20));
+        let v = bbr.view();
+        assert_eq!(v.state, State::Startup);
+        assert!(!bbr.full_bw_reached);
+        assert_eq!(v.inflight_longterm, INFINITE);
+        // Each loss round counts its own ranges: a full recovery round that loses none does
+        // not exit on the earlier round's.
+        recovery_round(&mut bbr, &[], 400_000, 10_000, at(30));
+        assert_eq!(bbr.view().state, State::Startup);
+    }
+
+    #[test]
+    fn startup_no_sack_rule() {
+        let mut bbr = started(SMSS, None);
+        let mut rs = sample(&bbr, 100_000, ms(10), ms(10), at(10));
+        rs.sack = false;
+        bbr.on_rate_sample(&rs);
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        // The ACK that enters fast recovery: the fast retransmit reports its range later.
+        dup_ack_no_sack(&mut bbr, at(15));
+        assert_eq!(bbr.view().state, State::Startup);
+        let mut e = loss(&bbr, 100_000, 1_000, 100_000, 1_000);
+        e.sack = false;
+        bbr.on_loss(&e);
+        // One loss during fast recovery is enough without SACK.
+        dup_ack_no_sack(&mut bbr, at(16));
+        let v = bbr.view();
+        assert_eq!(v.state, State::Drain);
+        assert!(bbr.full_bw_reached);
+        // max(BBR.bdp = 10 MB/s × 10 ms, inflight_latest 100 000).
+        assert_eq!(v.inflight_longterm, 100_000);
+
+        // A loss in RTO recovery does not exit Startup.
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        recovery_start(&mut bbr, RecoveryKind::Rto);
+        bbr.on_loss(&e);
+        dup_ack_no_sack(&mut bbr, at(16));
+        assert_eq!(bbr.view().state, State::Startup);
+
+        // With SACK one lost range in fast recovery does not either.
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        recovery_round(&mut bbr, &[(100_000, 1_000)], 100_000, 10_000, at(20));
+        recovery_round(&mut bbr, &[(200_000, 1_000)], 100_000, 10_000, at(30));
+        assert_eq!(bbr.view().state, State::Startup);
+    }
+
+    #[test]
+    fn shortterm_adapts_when_not_probing() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        assert_eq!(bbr.inflight_latest, 100_000);
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 1_000_000, 1_000));
+        let cwnd = bbr.cwnd;
+        // At the end of the loss round, at 5 MB/s: InitLowerBounds (max_bw, cwnd), then
+        // max(latest, Beta × bound). bw_latest is still last round's 10 MB/s.
+        ack_with(&mut bbr, 50_000, 300_000, at(90));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwDown);
+        assert_eq!(v.bw_shortterm, 10_000_000);
+        let inflight_shortterm = (cwnd * 7 / 10).max(100_000);
+        assert_eq!(v.inflight_shortterm, inflight_shortterm);
+
+        // Another loss round: the latest round's 5 MB/s and 50 000 are below Beta × bound.
+        bbr.on_loss(&loss(&bbr, 2_100_000, 1_000, 1_000_000, 1_000));
+        ack_with(&mut bbr, 50_000, 300_000, at(100));
+        let v = bbr.view();
+        assert_eq!(v.bw_shortterm, 7_000_000);
+        assert_eq!(
+            v.inflight_shortterm,
+            (inflight_shortterm * 7 / 10).max(50_000)
+        );
+        assert_eq!(bbr.bw, 7_000_000, "BoundBWForModel");
+
+        // A round without loss leaves them.
+        ack_with(&mut bbr, 50_000, 300_000, at(110));
+        assert_eq!(bbr.view().bw_shortterm, 7_000_000);
+    }
+
+    #[test]
+    fn shortterm_not_adapted_while_probing() {
+        // Startup.
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        bbr.on_loss(&loss(&bbr, 0, 1_000, 1_000_000, 1_000));
+        ack(&mut bbr, 200_000, ms(10), ms(10), at(20));
+        let v = bbr.view();
+        assert_eq!(v.state, State::Startup);
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
+
+        // REFILL, whose round-ending ACK starts UP, then UP.
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_bw_refill(&mut bbr);
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 1_000_000, 1_000));
+        ack_with(&mut bbr, 100_000, 100_000, t + ms(10));
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        bbr.on_loss(&loss(&bbr, 2_100_000, 1_000, 1_000_000, 1_000));
+        ack_with(&mut bbr, 100_000, 100_000, t + ms(20));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwUp);
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
+        assert!(
+            !bbr.is_loss_in_round,
+            "taken at the round's end all the same"
+        );
+    }
+
+    #[test]
+    fn refill_resets_shortterm() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 1_000_000, 1_000));
+        ack_with(&mut bbr, 50_000, 300_000, at(90));
+        ack_with(&mut bbr, 100_000, 50_000, at(100));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwCruise);
+        assert_eq!(v.bw_shortterm, 10_000_000);
+        assert_ne!(v.inflight_shortterm, INFINITE);
+
+        let t = bbr.cycle_stamp + bbr.bw_probe_wait + ms(1);
+        ack_with(&mut bbr, 100_000, 50_000, t);
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwRefill);
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
+        assert_eq!(bbr.bw, v.max_bw);
+    }
+
+    #[test]
+    fn longterm_grows_only_when_cwnd_limited() {
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_bw_up(&mut bbr);
+        // As a loss in an earlier probe would have left it.
+        bbr.inflight_longterm = 80_000;
+        bbr.probe_up_acked_per_inc = 10_000;
+        assert!(bbr.cwnd >= 80_000);
+
+        // A round in which no send filled cwnd: no growth.
+        let mut rs = sample(&bbr, 100_000, ms(10), ms(10), t + ms(10));
+        rs.cwnd_filled = false;
+        bbr.on_rate_sample(&rs);
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        assert_eq!(bbr.view().inflight_longterm, 80_000);
+        assert_eq!(bbr.cwnd, 80_000, "bounded by inflight_longterm");
+        assert_eq!(bbr.bw_probe_up_acked, 0);
+
+        // cwnd filled: 100 000 acked at 10 000 per increment grows it by 10 SMSS.
+        ack_with(&mut bbr, 100_000, 80_000, t + ms(20));
+        assert_eq!(bbr.view().state, State::ProbeBwUp);
+        assert_eq!(bbr.view().inflight_longterm, 90_000);
+        assert_eq!(
+            bbr.bw_probe_up_rounds, 2,
+            "the round's end raised the slope"
+        );
+    }
+
     #[test]
     fn splitmix64_known_vector() {
         let mut rng = SplitMix64(0);
@@ -785,9 +1652,12 @@ mod tests {
         };
         bbr.on_rate_sample(&rs);
         let v = bbr.view();
-        assert_eq!(v.state, State::ProbeBwDown);
-        assert_eq!(v.phase, AckPhase::ProbeStopping);
-        assert_eq!(bbr.pacing_gain, PROBE_DOWN_PACING_GAIN);
+        // ProbeBW_DOWN, and on the same ACK CRUISE: C.inflight is within BBR.bdp and there is
+        // no inflight_longterm. That ACK also ends a round, which ends ACKS_PROBE_STOPPING.
+        assert_eq!(v.state, State::ProbeBwCruise);
+        assert_eq!(v.phase, AckPhase::Init);
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(bbr.pacing_gain, UNITY_GAIN);
         assert_eq!(bbr.cwnd_gain, DEFAULT_CWND_GAIN);
         assert_eq!(bbr.cycle_stamp, at(60));
         assert_eq!(bbr.probe_up_acked_per_inc, INFINITE);
@@ -800,8 +1670,8 @@ mod tests {
         assert_eq!(bbr.bw_probe_wait, wait);
         assert!(bbr.bw_probe_wait >= Duration::from_secs(2));
         assert!(bbr.bw_probe_wait < Duration::from_secs(3));
-        // 0.9 × 10 MB/s × 99%.
-        assert_eq!(v.pacing_rate, 8_910_000);
+        // 1.0 × 10 MB/s × 99%.
+        assert_eq!(v.pacing_rate, 9_900_000);
     }
 
     #[test]
@@ -933,9 +1803,10 @@ mod tests {
         for i in 1..=4 {
             ack(&mut bbr, 1_000, ms(10), ms(10), at(10 * i));
         }
-        let v = bbr.view();
-        assert_eq!(v.state, State::ProbeBwDown);
-        assert_eq!(v.pacing_rate, 89_100);
+        // BBR.bdp is below one SMSS, so ProbeBW goes straight on to CRUISE or REFILL; both
+        // pace at 1.0.
+        assert!(bbr.is_in_a_probe_bw_state());
+        assert_eq!(bbr.view().pacing_rate, 99_000);
         assert_eq!(bbr.send_quantum(), Some(2 * V6_SMSS));
         assert!(bbr.cwnd() >= 4 * V6_SMSS);
         assert!(bbr.inflight(UNITY_GAIN) >= u64::from(4 * V6_SMSS));
