@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use super::cc::{
+use super::{
     AckSample, CongestionControl, CongestionEvent, RecoveryAck, initial_window, recovery_window,
 };
 use crate::time::Instant;

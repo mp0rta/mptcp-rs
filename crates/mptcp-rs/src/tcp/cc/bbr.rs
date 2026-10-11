@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::cc::{
+use super::{
     AckSample, CongestionControl, CongestionEvent, LossEvent, RateSample, RecoveryAck,
     RecoveryKind, RecoveryStart, Start, Transmit, initial_window,
 };

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rangemap::RangeMap;
 
-use super::cc::{Delivery, LossEvent, RateSample};
+use super::{Delivery, LossEvent, RateSample};
 use crate::time::Instant;
 
 /// The draft's per-packet (P) state of one transmission (spec §1.2).

@@ -3997,7 +3997,7 @@ fn hostile_alternating_sack_bounded() {
 /// Delegates every legacy `CongestionControl` method to a real `Cubic` and logs one line
 /// per callback: method, event, arguments, `now` in nanos since `t(0)`, and cwnd after.
 struct RecordingCubic {
-    inner: crate::tcp::cubic::Cubic,
+    inner: crate::tcp::cc::cubic::Cubic,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -4062,7 +4062,7 @@ impl Fixture {
     fn cubic_ramp(sack: bool, bytes: &[u8]) -> (Self, Arc<Mutex<Vec<String>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let cc = RecordingCubic {
-            inner: crate::tcp::cubic::Cubic::new(),
+            inner: crate::tcp::cc::cubic::Cubic::new(),
             log: log.clone(),
         };
         let cfg = ConnectConfig::default();

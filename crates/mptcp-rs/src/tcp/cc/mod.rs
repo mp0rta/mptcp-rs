@@ -1,5 +1,10 @@
-//! Congestion control: the one swappable trait in M0–M2 (spec §3). CUBIC (`super::cubic`) is
-//! the default; Reno stays for tests that pin its arithmetic.
+//! Congestion control (spec §3): the `CongestionControl` trait and its hook types. CUBIC
+//! (`cubic`) is the default and BBRv3 (`bbr`) is opt-in; `rate` is the delivery-rate sampler
+//! the `Tcb` feeds for BBR. Reno stays for tests that pin its arithmetic.
+
+pub(super) mod bbr;
+pub(super) mod cubic;
+pub(super) mod rate;
 
 use std::fmt;
 use std::time::Duration;
