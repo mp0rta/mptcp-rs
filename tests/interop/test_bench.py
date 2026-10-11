@@ -143,5 +143,113 @@ class CpuSampler(unittest.TestCase):
         self.assertIn("pid", r["reason"])
 
 
+def eth_pcap(path, frames):
+    """LINKTYPE_ETHERNET pcap of IPv4/TCP frames: (src, dst, payload_len, flags)."""
+    import struct
+    out = [struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)]
+    for i, (src, dst, n, flags) in enumerate(frames):
+        tcp = struct.pack("!HHIIBBHHH", 5201 if src == "10.0.1.2" else 40000, 40000 if src == "10.0.1.2" else 5201, 1 + i, 1, 5 << 4, flags, 65535, 0, 0)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp) + n, 0, 0, 64, 6, 0, socket.inet_aton(src), socket.inet_aton(dst))
+        frame = b"\x02" * 6 + b"\x04" * 6 + b"\x08\x00" + ip + tcp + b"\x00" * n
+        out.append(struct.pack("<IIII", i, 0, len(frame), len(frame)) + frame)
+    Path(path).write_bytes(b"".join(out))
+
+
+@unittest.skipUnless(__import__("shutil").which("tshark"), "tshark not on PATH")
+class Ceiling(unittest.TestCase):
+    def test_ceiling_math(self):
+        import ceiling
+        self.assertAlmostEqual(ceiling.ceiling_mbps({"a": 1448 / 1514, "b": 1448 / 1514}), 380 * 1448 / 1514, delta=1e-9)
+        self.assertAlmostEqual(ceiling.ceiling_mbps({"a": 0.95}), 285, delta=1e-9)
+
+    def test_payload_ratio_direction(self):
+        import ceiling
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.pcap"
+            eth_pcap(p, [("10.0.1.1", "10.0.1.2", 1000, 0x18), ("10.0.1.2", "10.0.1.1", 500, 0x18), ("10.0.1.1", "10.0.1.2", 0, 0x10)])
+            self.assertAlmostEqual(ceiling.payload_ratio(p, "c2s"), 1000 / (14 + 40 + 1000))
+            self.assertAlmostEqual(ceiling.payload_ratio(p, "s2c"), 500 / (14 + 40 + 500))
+            self.assertEqual(ceiling.leg_payload(p, "c2s"), (1000, 1054))
+
+    def test_ceiling_unused_leg(self):
+        import ceiling
+        with tempfile.TemporaryDirectory() as d:
+            eth_pcap(Path(d) / "server.pcap", [("10.0.1.1", "10.0.1.2", 1448, 0x18)])
+            eth_pcap(Path(d) / "server-b.pcap", [("10.0.2.1", "10.0.1.2", 0, 0x10)])
+            c, legs = ceiling.run_ceiling(Path(d), "m2-goodput", "c2s")
+            self.assertEqual(legs, {"a": 1448, "b": 0})
+            self.assertAlmostEqual(c, 380 * 1448 / 1502)
+            eth_pcap(Path(d) / "server.pcap", [("10.0.1.1", "10.0.1.2", 0, 0x10)])
+            with self.assertRaises(ValueError):
+                ceiling.run_ceiling(Path(d), "m2-goodput", "c2s")
+
+
+class Driver(unittest.TestCase):
+    def test_fingerprint_ignores_cache(self):
+        import bench
+        fp = bench.fingerprint()
+        probe = HERE / "__pycache__" / "zz_probe.pyc"
+        probe.parent.mkdir(exist_ok=True)
+        try:
+            probe.write_bytes(b"x")
+            self.assertEqual(bench.fingerprint(), fp)
+        finally:
+            probe.unlink()
+        self.assertEqual(bench.fingerprint(), fp)
+
+    def test_pending_order(self):
+        import bench
+        todo = bench.pending([], 2, "base-a")
+        self.assertEqual(len(todo), 8)
+        self.assertEqual(todo[:2], [("base-a", "c2s", "mptcp-rs", 0), ("base-a", "c2s", "kernel", 0)])
+        self.assertEqual(todo[4:6], [("base-a", "c2s", "kernel", 1), ("base-a", "c2s", "mptcp-rs", 1)])
+        rec = {"scenario": "base-a", "dir": "c2s", "client": "kernel", "rep": 0}
+        self.assertEqual(len(bench.pending([{**rec, "error": None}], 2, "base-a")), 7)
+        self.assertEqual(len(bench.pending([{**rec, "error": "rc 1"}], 2, "base-a")), 8)
+        self.assertEqual(len(bench.pending([], 5, None)), 5 * 5 * 2 * 2)
+
+
+def unshaped_rec(rep, server_share, client="kernel", direction="c2s", client_cpu=(2, 8)):
+    cpu = {"window_s": 20, "host_busy_cpus": 3, "client": {"user_s": client_cpu[0], "sys_s": client_cpu[1]},
+           "server": {"user_s": 0, "sys_s": 20 * server_share},
+           "payload": {"a": {"received": 15e9, "acked": 0}, "b": {"received": 5e9, "acked": 0}}, "valid": True}
+    return {"scenario": "m2-unshaped", "dir": direction, "client": client, "rep": rep, "goodput_mbps": 8000.0,
+            "ceiling_mbps": None, "leg_payload": None, "cpu": cpu, "artifacts": f"run{rep}", "error": None}
+
+
+class Summary(unittest.TestCase):
+    def test_summarize(self):
+        import bench_plot
+        recs = [{"scenario": "base-a", "dir": "c2s", "client": "kernel", "rep": i, "goodput_mbps": g, "ceiling_mbps": 280.0,
+                 "leg_payload": {"a": 100}, "cpu": None, "artifacts": "x", "error": None} for i, g in enumerate([100.0, 200.0, 300.0])]
+        recs.append({**recs[0], "rep": 3, "goodput_mbps": 1.0, "error": "rc 1"})
+        s = bench_plot.summarize(recs)["base-a/c2s/kernel"]
+        self.assertEqual((s["n"], s["median_mbps"], s["min_mbps"], s["max_mbps"]), (3, 200.0, 100.0, 300.0))
+        self.assertEqual(s["ceiling_median_mbps"], 280.0)
+        self.assertFalse(s["bottleneck"])
+
+    def test_record_cpu(self):
+        import bench_plot
+        rec = unshaped_rec(0, 0.95, client_cpu=(4, 16))
+        rec["cpu"]["server"] = {"user_s": 2, "sys_s": 17}
+        r = bench_plot.record_cpu(rec)
+        self.assertAlmostEqual(r["host_cpu_s_per_gb"], 3)
+        self.assertAlmostEqual(r["client_cpu_s_per_gb"], 1.0)
+        self.assertAlmostEqual(r["client_core_share"], 1.0)
+        self.assertAlmostEqual(r["client_user_frac"], 0.2)
+        self.assertAlmostEqual(r["server_core_share"], 0.95)
+        self.assertAlmostEqual(r["leg_b_share"], 0.25)
+        self.assertTrue(r["bottleneck"])
+        # A saturated mptcp-rs client is its own stack at work, not a harness bottleneck.
+        self.assertFalse(bench_plot.record_cpu(unshaped_rec(0, 0.5, client="mptcp-rs", client_cpu=(4, 16)))["bottleneck"])
+
+    def test_bottleneck_any_run(self):
+        import bench_plot
+        recs = [unshaped_rec(i, sh) for i, sh in enumerate([0.6, 0.6, 0.6, 0.95, 0.95])]
+        s = bench_plot.summarize(recs)["m2-unshaped/c2s/kernel"]
+        self.assertTrue(s["bottleneck"])
+        self.assertEqual([r["rep"] for r in s["bottleneck_runs"]], [3, 4])
+
+
 if __name__ == "__main__":
     unittest.main()
