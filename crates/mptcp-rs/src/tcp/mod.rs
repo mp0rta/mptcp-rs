@@ -1,5 +1,7 @@
 //! Plain TCP engine: the pure `Tcb` state machine and the hooks it drives (spec §3).
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod bbr;
 pub mod cc;
 mod cubic;
 mod hooks;
