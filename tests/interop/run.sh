@@ -26,7 +26,7 @@ mkdir -p "artifacts/interop/$scenario${dir:+-$dir}"
 out=$(mktemp -d "artifacts/interop/$scenario${dir:+-$dir}/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")
 echo "artifacts: $out"
 chmod 755 "$out"
-sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,retrans.py,blackhole.sh,Dockerfile,kclient.py,cpu.py} >"$out/inputs.sha256"
+sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,retrans.py,blackhole.sh,Dockerfile,kclient.py,cpu.py,ceiling.py,bench.py} >"$out/inputs.sha256"
 uname -a >"$out/kernel.txt"
 mode=mptcp; [ "$scenario" != m0 ] || mode=tcp
 ip netns add cli; ip netns add srv
