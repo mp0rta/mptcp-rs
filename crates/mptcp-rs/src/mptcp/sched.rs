@@ -566,7 +566,7 @@ mod tests {
                     let k = bytes / seg;
                     assert!(
                         (bytes % seg == 0 && (1..=full).contains(&k) && k <= max_k)
-                            || (bytes > 0 && bytes <= partial),
+                            || (bytes > 0 && bytes == partial),
                         "seg {seg} fin {fin} budget {b:?}: {bytes}"
                     );
                 }
@@ -743,5 +743,20 @@ mod tests {
             MinRtt.on_health(&blocked, &subflows),
             HealthVerdict::Penalize
         );
+    }
+
+    /// The half-window case: `partial` = 500 is sendable because it is at least half the peer's
+    /// max window, but 1 octet is not and would wait for the SWS timer. A short New plan must
+    /// equal `partial`; a reinjection is sent regardless of SWS, so it may be shorter.
+    #[test]
+    fn short_new_plan_must_equal_partial() {
+        let b = budget(1400, 0, 500);
+        let subflows = [snap(0, Active, 10, b, b)];
+        let accept = |payload| {
+            crate::mptcp::accept_plan(send(0, payload), &subflows, Some((100, 500)), None).is_some()
+        };
+        assert!(!accept(Payload::New { bytes: 1 }));
+        assert!(accept(Payload::New { bytes: 500 }));
+        assert!(accept(Payload::Reinject { dsn: 100, len: 1 }));
     }
 }
