@@ -921,6 +921,8 @@ impl Bbr {
 
     /// `delivered` is C.delivered.
     fn note_loss(&mut self, delivered: u64) {
+        // The draft also calls SaveStateUponLoss (§5.5.11.1) here; omitted until spurious-loss
+        // undo exists (spec §3.2a).
         // First loss in this round trip?
         if !self.is_loss_in_round {
             self.loss_round_delivered = delivered;

@@ -362,7 +362,8 @@ impl RateSampler {
         }
     }
 
-    /// CheckIfApplicationLimited (spec §1.6). `pending_transmissions` is always 0 here.
+    /// CheckIfApplicationLimited (spec §1.6). The draft's C.pending_transmissions is the `Tcb`'s
+    /// `retransmit_due`, which it folds into `no_unsent`.
     pub(crate) fn check_app_limited(&mut self, no_unsent: bool, cwnd_room: bool) {
         if no_unsent && cwnd_room && self.lost_out == 0 {
             self.force_app_limited();

@@ -379,7 +379,8 @@ pub struct Tcb {
 }
 
 impl Tcb {
-    /// `seed` seeds BBR's PRNG (BBRv3 spec §3.4); CUBIC does not use it.
+    /// `seed` seeds BBR's PRNG (BBRv3 spec §3.4); CUBIC does not use it. The argument is new
+    /// in 0.2.0.
     pub fn new_active(
         cfg: &ConnectConfig,
         local: SocketAddr,

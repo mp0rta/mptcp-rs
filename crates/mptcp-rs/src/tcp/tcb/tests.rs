@@ -4519,6 +4519,38 @@ fn newreno_losses_reach_bbr_hooks() {
     assert!(losses(&c).iter().all(|e| !e.sack));
 }
 
+/// The NewReno Full ACK ends loss recovery (spec §1.7): its sample carries `recovery_exit`
+/// and is out of recovery. Closing also ends recovery.
+#[test]
+fn newreno_full_ack_exits_recovery() {
+    let (mut f, calls) = logged_flight(false, 10_000, 40_000);
+    for _ in 0..3 {
+        f.ack(tm(10), data(0), BIG);
+    }
+    f.drain(tm(10));
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Fast);
+    take(&calls);
+    f.ack(tm(20), data(10_000), BIG);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+    let c = take(&calls);
+    assert!(
+        c.contains(&Call::RecoveryAck(RecoveryAck::Full { in_flight: 0 })),
+        "{c:?}"
+    );
+    let s = rate_samples(&c);
+    assert!(
+        s.len() == 1 && s[0].recovery_exit && !s[0].in_recovery,
+        "{s:?}"
+    );
+    // A fresh (RTO) episode, then the close.
+    f.drain(tm(20));
+    let rto = f.tcb.rto_deadline().unwrap();
+    f.timeout(rto);
+    assert_ne!(f.tcb.loss_recovery, LossRecovery::None);
+    f.tcb.delete(rto);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+}
+
 // ---- App-limited check sites, cwnd room, send quantum and start/transmit (BBRv3 Task 4) ----
 
 /// `logged` from `ISN` with `PlainHooks` and the prepared `cc`.
@@ -4613,17 +4645,22 @@ fn cwnd_filled_set_when_room_below_smss() {
 }
 
 /// The send that leaves less than one SMSS of room latches `cwnd_filled`, on the new-data
-/// path and on the go-back path; the RTO's forced resend bypasses cwnd and does not.
+/// path and on the go-back path; the RTO's forced resend bypasses cwnd and does not, though
+/// it leaves only 500 octets of room.
 #[test]
 fn cwnd_filled_by_the_send_that_fills_cwnd() {
-    let (mut f, _) = logged_cc(false, cc_with_cwnd(2000));
-    f.write(&pattern(2000));
-    f.send(t(0)).unwrap();
+    let (mut f, _) = logged_cc(false, cc_with_cwnd(1500));
+    f.tcb.set_nodelay(true);
+    f.write(&pattern(1500));
     assert!(!f.tcb.cwnd_filled);
     f.send(t(0)).unwrap();
     assert!(f.tcb.cwnd_filled);
     // A duplicate ACK's sample clears it.
     f.ack(tm(5), data(0), BIG);
+    assert!(!f.tcb.cwnd_filled);
+    assert_eq!(f.send(tm(5)).unwrap().seq, data(1000));
+    assert!(f.tcb.cwnd_filled);
+    f.ack(tm(6), data(0), BIG);
     assert!(!f.tcb.cwnd_filled);
     let rto = f.tcb.rto_deadline().unwrap();
     f.timeout(rto);

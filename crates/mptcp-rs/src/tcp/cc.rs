@@ -57,7 +57,9 @@ pub enum AppLimited {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryKind {
+    /// Fast retransmit: NewReno fast recovery (RFC 6582) or RFC 6675 SACK loss recovery.
     Fast,
+    /// A retransmission timeout (RFC 6298).
     Rto,
 }
 
@@ -65,8 +67,11 @@ pub enum RecoveryKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RecoveryStart {
+    /// What started the episode.
     pub kind: RecoveryKind,
+    /// The sampler's C.inflight in octets when the episode begins.
     pub inflight: u64,
+    /// When the episode began.
     pub now: Instant,
 }
 
@@ -76,16 +81,21 @@ pub struct RecoveryStart {
 pub struct LossEvent {
     /// Absolute octet offsets, `end` exclusive; `len = end - start`.
     pub start: u64,
+    /// Exclusive end offset.
     pub end: u64,
+    /// Octets in the range.
     pub len: u64,
     /// The sampler's `P.tx_in_flight` for the lost range.
     pub tx_in_flight: u64,
     /// `C.lost - P.lost`.
     pub lost_since_tx: u64,
+    /// The lost range was sent app-limited (`P.is_app_limited`).
     pub is_app_limited: bool,
     /// `C.delivered` now.
     pub delivered: u64,
+    /// The connection negotiated SACK.
     pub sack: bool,
+    /// When the loss was declared.
     pub now: Instant,
 }
 
@@ -93,11 +103,15 @@ pub struct LossEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Delivery {
+    /// `RS.prior_delivered`: C.delivered when the rate-sample transmission was sent.
     pub prior_delivered: u64,
+    /// `RS.prior_time`: C.delivered_time when the rate-sample transmission was sent.
     pub prior_time: Instant,
     /// `RS.delivered = C.delivered - prior_delivered`.
     pub delivered: u64,
+    /// `RS.newly_acked`: octets this ACK newly delivered.
     pub newly_acked: u64,
+    /// `RS.is_app_limited`.
     pub is_app_limited: bool,
     /// `RS.tx_in_flight`.
     pub tx_in_flight: u64,
@@ -111,16 +125,29 @@ pub struct Delivery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RateSample {
+    /// Present when this ACK newly delivered octets.
     pub delivery: Option<Delivery>,
+    /// `RS.rtt`: the round trip of the newest newly delivered transmission whose range was
+    /// never resent (Karn); `None` if there is none.
     pub rtt: Option<Duration>,
+    /// Octets this ACK newly marked lost.
     pub newly_lost: u64,
+    /// C.delivered after this ACK.
     pub delivered: u64,
+    /// C.lost after this ACK.
     pub lost: u64,
+    /// C.inflight in octets after this ACK.
     pub inflight: u64,
+    /// Loss recovery (fast or RTO) is in progress after this ACK.
     pub in_recovery: bool,
+    /// This ACK ended a loss recovery episode.
     pub recovery_exit: bool,
+    /// A cwnd-governed transmission since the previous sample left less than one SMSS of
+    /// cwnd unused.
     pub cwnd_filled: bool,
+    /// The connection negotiated SACK.
     pub sack: bool,
+    /// When the ACK arrived.
     pub now: Instant,
 }
 
@@ -128,10 +155,16 @@ pub struct RateSample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Start {
+    /// The effective send MSS.
     pub smss: u32,
+    /// Our SYN was retransmitted.
     pub syn_lost: bool,
+    /// SRTT, or `None` before the first RTT sample; the SYN exchange is not timed, so this
+    /// is normally `None`.
     pub srtt: Option<Duration>,
+    /// The connection negotiated SACK.
     pub sack: bool,
+    /// When the connection reached ESTABLISHED.
     pub now: Instant,
 }
 
@@ -139,8 +172,12 @@ pub struct Start {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Transmit {
+    /// The sampler's C.inflight before this transmission: always 0, as the hook fires only
+    /// from nothing in flight.
     pub inflight: u64,
+    /// The flow is application-limited (C.app_limited is set).
     pub app_limited: bool,
+    /// When the transmission is made.
     pub now: Instant,
 }
 
@@ -182,7 +219,7 @@ pub trait CongestionControl: Send {
     /// Octets that may be outstanding.
     fn cwnd(&self) -> u32;
     /// Called once when the connection reaches ESTABLISHED, immediately after `init`, with the
-    /// parameters `init` took plus the SYN round trip and SACK negotiation. Default: nothing.
+    /// parameters `init` took plus SRTT and SACK negotiation. Default: nothing.
     fn on_start(&mut self, _: &Start) {}
     /// Called before a data transmission, new or retransmitted, that starts from nothing in
     /// flight (the rate sampler's inflight is 0), before the `Tcb` counts it in flight: the
@@ -193,8 +230,9 @@ pub trait CongestionControl: Send {
     /// callbacks for the same ACK or timeout. Default: nothing.
     fn on_recovery_start(&mut self, _: &RecoveryStart) {}
     /// Called once per range newly marked lost, in ascending offset order, before the
-    /// `on_rate_sample` of the ACK (or timeout) that detected it; a fast-retransmit resend
-    /// reports its own range when it is sent. Default: nothing.
+    /// `on_rate_sample` of the ACK that detected it. A timeout reports its ranges after its
+    /// `on_recovery_start` and has no rate sample; a fast-retransmit resend reports its own
+    /// range when it is sent. Default: nothing.
     fn on_loss(&mut self, _: &LossEvent) {}
     /// Called once per ACK with SND.UNA ≤ SEG.ACK ≤ SND.MAX, after its legacy callbacks, its
     /// `on_recovery_start` and its `on_loss` calls; never for a timeout. Default: nothing.
