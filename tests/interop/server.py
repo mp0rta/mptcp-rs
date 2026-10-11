@@ -17,6 +17,7 @@ ap.add_argument("--pause-read-ms", type=int, default=0)
 ap.add_argument("--family", choices=["v4", "v6", "dual"], help="listen on the wildcard (dual: one v6 socket, V6ONLY=0)")
 ap.add_argument("--bidi", action="store_true", help="send and receive concurrently")
 ap.add_argument("--abort-after", type=int, metavar="BYTES")
+ap.add_argument("--verify", choices=["on", "off"], default="on", help="off: count received bytes only (CPU benchmark)")
 a = ap.parse_args()
 if a.bytes is None and (a.expect is None or a.send_bytes is None and not a.send_secs):
     ap.error("give --bytes, or --expect and one of --send-bytes/--send-secs")
@@ -25,7 +26,7 @@ S = a.bytes if a.send_bytes is None else a.send_bytes
 
 # pattern byte i = (i*31+7) % 251; one repeating buffer, sliced at (offset % 251)
 PAT = bytes((i * 31 + 7) % 251 for i in range(251))
-BUF = PAT * (262144 // 251 + 2)
+BUF = memoryview(PAT * (262144 // 251 + 2))  # slices are views: no copy per send
 
 v6 = a.family in ("v6", "dual")
 ls = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_STREAM, 262 if a.mode == "mptcp" else 0)
@@ -76,11 +77,15 @@ if a.bidi:
     sender.start()
 ok = True
 first = last = None
+rbuf = bytearray(262144)
 while N is None or got < N:
-    d = c.recv(262144 if N is None else min(262144, N - got))
+    if a.verify == "off":
+        d = memoryview(rbuf)[: c.recv_into(rbuf, 262144 if N is None else min(262144, N - got))]
+    else:
+        d = c.recv(262144 if N is None else min(262144, N - got))
     if not d:
         break
-    if d != BUF[got % 251 : got % 251 + len(d)]:
+    if a.verify == "on" and d != BUF[got % 251 : got % 251 + len(d)]:
         ok = False
         print(f"mismatch in chunk at offset {got}", file=sys.stderr)
         break
