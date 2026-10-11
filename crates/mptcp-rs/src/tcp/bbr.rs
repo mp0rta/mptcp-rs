@@ -1217,13 +1217,10 @@ impl CongestionControl for Bbr {
         if ev != CongestionEvent::Penalized || self.in_loss_recovery {
             return;
         }
-        // As InitLowerBounds, except that with no bandwidth sample yet bw_shortterm stays
-        // Infinity: a zero bound models no measurement and would pin BBR.bw at 0 until REFILL.
-        if self.bw_shortterm == INFINITE && self.max_bw > 0 {
-            self.bw_shortterm = self.max_bw;
-        }
-        if self.inflight_shortterm == INFINITE {
-            self.inflight_shortterm = self.cwnd;
+        // InitLowerBounds only after a bandwidth sample: before one, the bounds would model no
+        // measurement and pin BBR.bw at 0 and cwnd at MinPipeCwnd until REFILL.
+        if self.max_bw > 0 {
+            self.init_lower_bounds();
         }
         self.pacing_rate = times_beta(self.pacing_rate);
         // Never raised: at or below MinPipeCwnd cwnd stays as it is.
@@ -1234,7 +1231,9 @@ impl CongestionControl for Bbr {
         if self.bw_shortterm != INFINITE {
             self.bw_shortterm = times_beta(self.bw_shortterm);
         }
-        self.inflight_shortterm = times_beta(self.inflight_shortterm).min(self.cwnd);
+        if self.inflight_shortterm != INFINITE {
+            self.inflight_shortterm = times_beta(self.inflight_shortterm).min(self.cwnd);
+        }
         // No SetCwnd on a stale sample.
         self.bound_bw_for_model();
         self.prior_cwnd = times_beta(self.prior_cwnd);
@@ -2598,12 +2597,17 @@ mod tests {
 
     #[test]
     fn penalty_at_min_pipe() {
-        // C.InitialCwnd is 4 SMSS here: MinPipeCwnd.
+        // C.InitialCwnd is 4 SMSS here: MinPipeCwnd. A 100 kB/s sample that acknowledges
+        // nothing new gives the bounds a max_bw and leaves cwnd at the floor.
         let mut bbr = started(SMSS, None);
+        let mut rs = sample(&bbr, 1_000, ms(10), ms(10), at(10));
+        rs.delivery.as_mut().expect("delivery").newly_acked = 0;
+        bbr.on_rate_sample(&rs);
         assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 11_080_000));
         penalize(&mut bbr);
         assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 7_756_000));
-        assert_eq!(bbr.view().inflight_shortterm, 2_800);
+        let v = bbr.view();
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (70_000, 2_800));
 
         // Just above it, the floor stops the cut.
         let mut bbr = started(SMSS, None);
@@ -2617,17 +2621,17 @@ mod tests {
     fn penalty_before_first_rate_sample() {
         let mut bbr = started(SMSS, None);
         penalize(&mut bbr);
-        // The immediate cut still happens; only bw_shortterm stays Infinity.
+        // Only the outputs are cut; both bounds stay Infinity.
         assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 7_756_000));
         let v = bbr.view();
-        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, 2_800));
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
         // Real rates raise BBR.bw and Startup's pacing: 2.77 × 10, then 20 MB/s × 99%.
         ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
         assert_eq!((bbr.bw, bbr.pacing_rate), (10_000_000, 27_423_000));
         ack(&mut bbr, 200_000, ms(10), ms(10), at(20));
         assert_eq!((bbr.bw, bbr.pacing_rate), (20_000_000, 54_846_000));
-        // inflight_shortterm (2 800) still holds cwnd at MinPipeCwnd until it is reset.
-        assert_eq!(bbr.cwnd, 4_000);
+        // cwnd grows past MinPipeCwnd: + newly_acked each ACK.
+        assert_eq!(bbr.cwnd, 304_000);
     }
 
     #[test]
@@ -2645,9 +2649,12 @@ mod tests {
             let pacing = bbr.pacing_rate;
             assert_eq!(bbr.cwnd, iw);
             penalize(&mut bbr);
-            // Never raised to the floor.
+            // Never raised to the floor. Before the first data ACK there is no bandwidth
+            // sample, so the bounds stay Infinity.
             assert_eq!(bbr.cwnd, iw, "{smss} {syn_lost}");
             assert_eq!(bbr.pacing_rate, pacing * 7 / 10);
+            let v = bbr.view();
+            assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
         }
     }
 
