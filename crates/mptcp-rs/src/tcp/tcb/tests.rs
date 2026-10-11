@@ -5,6 +5,7 @@ use crate::tcp::cc::{
 };
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
 use rangemap::RangeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const ISN: SeqNum = SeqNum(0x1000);
@@ -2992,11 +2993,16 @@ fn assignment_budget_obeys_nagle_windows_and_reinjection() {
 // ---- Pacing gate, release timer and app-limited marking (M2 Task 3b) ----
 
 /// Fixed cwnd and, if `rate` is set, a fixed pacing rate; records every ACK sample.
+#[derive(Default)]
 struct TestCc {
     rate: Option<u64>,
     cwnd: u32,
     samples: Samples,
     calls: Calls,
+    /// `send_quantum`.
+    quantum: Option<u32>,
+    /// Taken by `take_app_limited_request`.
+    request: Arc<AtomicBool>,
 }
 type Samples = Arc<Mutex<Vec<AckSample>>>;
 
@@ -3061,6 +3067,12 @@ impl CongestionControl for TestCc {
     fn pacing_rate(&self) -> Option<u64> {
         self.rate
     }
+    fn send_quantum(&self) -> Option<u32> {
+        self.quantum
+    }
+    fn take_app_limited_request(&mut self) -> bool {
+        self.request.swap(false, Ordering::Relaxed)
+    }
 }
 
 /// Segment payload with peer MSS 1460.
@@ -3083,7 +3095,7 @@ impl Fixture {
             rate,
             cwnd,
             samples: samples.clone(),
-            calls: Calls::default(),
+            ..Default::default()
         };
         let mut f = Fixture::with(cfg, Box::new(cc), h);
         assert_eq!(
@@ -3369,10 +3381,9 @@ fn sack_resend_after_mark() -> (Fixture, Samples) {
     let cfg = ConnectConfig::default();
     let h = PlainHooks::new(&cfg);
     let cc = TestCc {
-        rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
-        calls: Calls::default(),
+        ..Default::default()
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -3878,10 +3889,9 @@ fn sack_sample_from_newest_newly_delivered_record() {
     let cfg = ConnectConfig::default();
     let h = PlainHooks::new(&cfg);
     let cc = TestCc {
-        rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
-        calls: Calls::default(),
+        ..Default::default()
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -3931,10 +3941,9 @@ fn dsack_below_new_ack_sample_from_newest_record() {
     let cfg = ConnectConfig::default();
     let h = PlainHooks::new(&cfg);
     let cc = TestCc {
-        rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
-        calls: Calls::default(),
+        ..Default::default()
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -4160,13 +4169,15 @@ impl<H: Hooks> Fixture<H> {
     /// ESTABLISHED at t(0) from ISS `isn` with a logging `TestCc` (fixed cwnd `cwnd`), peer MSS
     /// 1000, WS 0, window `BIG`, SACK if `sack`; the handshake ACK is sent and the log cleared.
     fn logged(isn: SeqNum, sack: bool, cwnd: u32, h: H) -> (Self, Calls) {
-        let calls = Calls::default();
         let cc = TestCc {
-            rate: None,
             cwnd,
-            samples: Samples::default(),
-            calls: calls.clone(),
+            ..Default::default()
         };
+        Self::logged_with(isn, sack, cc, h)
+    }
+    /// `logged` with the prepared `cc`.
+    fn logged_with(isn: SeqNum, sack: bool, cc: TestCc, h: H) -> (Self, Calls) {
+        let calls = cc.calls.clone();
         let cfg = ConnectConfig::default();
         let addrs = v4();
         let mut f = Fixture {
@@ -4506,4 +4517,220 @@ fn newreno_losses_reach_bbr_hooks() {
     let c = take(&calls);
     assert!(!losses(&c).is_empty());
     assert!(losses(&c).iter().all(|e| !e.sack));
+}
+
+// ---- App-limited check sites, cwnd room, send quantum and start/transmit (BBRv3 Task 4) ----
+
+/// `logged` from `ISN` with `PlainHooks` and the prepared `cc`.
+fn logged_cc(sack: bool, cc: TestCc) -> (Fixture, Calls) {
+    let h = PlainHooks::new(&ConnectConfig::default());
+    Fixture::logged_with(ISN, sack, cc, h)
+}
+
+fn cc_with_cwnd(cwnd: u32) -> TestCc {
+    TestCc {
+        cwnd,
+        ..Default::default()
+    }
+}
+
+/// The check at the start of an ACK (spec §1.6) sees the state before its transitions: this
+/// ACK's SACK blocks declare segment 0 lost, so the check at its end does not qualify.
+#[test]
+fn app_limited_at_ack_start() {
+    let (mut f, _) = logged_flight(true, BIG_CWND, 10_000);
+    assert!(!f.tcb.sampler().is_app_limited());
+    f.sack_ack(tm(10), data(0), &[(data(1000), data(4000))]);
+    assert_eq!(f.tcb.sampler().lost_out(), 1000);
+    assert!(f.tcb.sampler().is_app_limited());
+}
+
+/// The check at the end of an ACK (spec §1.6): cwnd was full before this ACK, and its
+/// delivery leaves room with nothing queued.
+#[test]
+fn app_limited_at_ack_end() {
+    let (mut f, _) = logged_flight(false, 2000, 2000);
+    assert_eq!(f.tcb.cwnd_room(), 0);
+    f.ack(tm(10), data(1000), BIG);
+    assert!(f.tcb.sampler().is_app_limited());
+}
+
+/// The check at the start of an RTO (spec §1.6): the sender qualifies just before it, and the
+/// mark survives the RTO, so the resends are sent app-limited.
+#[test]
+fn app_limited_at_rto_start_keeps_mark() {
+    let (mut f, calls) = logged_flight(false, BIG_CWND, 2000);
+    assert!(!f.tcb.sampler().is_app_limited());
+    let rto = f.tcb.rto_deadline().unwrap();
+    assert_eq!(f.timeout(rto), Reaction::None);
+    assert_eq!(f.tcb.sampler().lost_out(), 2000);
+    assert!(f.tcb.sampler().is_app_limited());
+    assert_eq!(f.drain(rto).len(), 2, "go-back");
+    take(&calls);
+    f.ack(rto + Duration::from_millis(10), data(1000), BIG);
+    let s = rate_samples(&take(&calls));
+    assert!(s[0].delivery.unwrap().is_app_limited);
+}
+
+/// Review Focus 3: a peer window of 2 SMSS under a cwnd of 20 SMSS, data queued. The flow is
+/// receiver-limited: no sample is app-limited or `cwnd_filled`.
+#[test]
+fn rwnd_limited_is_not_app_limited_nor_cwnd_filled() {
+    let (mut f, calls) = logged_cc(false, cc_with_cwnd(20_000));
+    f.write(&pattern(20_000));
+    // The peer's window shrinks to 2 SMSS.
+    f.ack(t(0), data(0), 2000);
+    for k in 1..=5 {
+        assert_eq!(f.drain(tm(10 * k)).len(), 2);
+        f.ack(tm(10 * k + 5), data(2000 * k as u32), 2000);
+    }
+    let s = rate_samples(&take(&calls));
+    assert_eq!(s.len(), 6);
+    assert!(
+        s.iter()
+            .all(|s| !s.cwnd_filled && !s.delivery.is_some_and(|d| d.is_app_limited)),
+        "{s:?}"
+    );
+    assert!(!f.tcb.sampler().is_app_limited());
+}
+
+/// `cwnd_filled` (spec §1.8): a send since the last sample left less than one SMSS of cwnd
+/// unused. Exactly one SMSS left is not filled; the sample clears the latch.
+#[test]
+fn cwnd_filled_set_when_room_below_smss() {
+    for (cwnd, filled) in [(4500, true), (5000, false)] {
+        let (mut f, calls) = logged_cc(false, cc_with_cwnd(cwnd));
+        f.write(&pattern(4000));
+        assert_eq!(f.drain(t(0)).len(), 4);
+        f.ack(tm(10), data(1000), BIG);
+        f.ack(tm(11), data(2000), BIG);
+        let s: Vec<_> = rate_samples(&take(&calls))
+            .iter()
+            .map(|s| s.cwnd_filled)
+            .collect();
+        assert_eq!(s, [filled, false], "cwnd {cwnd}");
+    }
+}
+
+/// The send that leaves less than one SMSS of room latches `cwnd_filled`, on the new-data
+/// path and on the go-back path; the RTO's forced resend bypasses cwnd and does not.
+#[test]
+fn cwnd_filled_by_the_send_that_fills_cwnd() {
+    let (mut f, _) = logged_cc(false, cc_with_cwnd(2000));
+    f.write(&pattern(2000));
+    f.send(t(0)).unwrap();
+    assert!(!f.tcb.cwnd_filled);
+    f.send(t(0)).unwrap();
+    assert!(f.tcb.cwnd_filled);
+    // A duplicate ACK's sample clears it.
+    f.ack(tm(5), data(0), BIG);
+    assert!(!f.tcb.cwnd_filled);
+    let rto = f.tcb.rto_deadline().unwrap();
+    f.timeout(rto);
+    assert_eq!(f.send(rto).unwrap().seq, data(0));
+    assert!(!f.tcb.cwnd_filled);
+    assert_eq!(f.send(rto).unwrap().seq, data(1000));
+    assert!(f.tcb.cwnd_filled);
+}
+
+/// A controller's send quantum replaces `pacing_quantum` as the pacer's burst (spec §3.3).
+#[test]
+fn send_quantum_override_sets_burst() {
+    let cc = TestCc {
+        rate: Some(RATE),
+        cwnd: BIG_CWND,
+        quantum: Some(3000),
+        ..Default::default()
+    };
+    let (mut f, _) = logged_cc(false, cc);
+    let n = 10_000;
+    let b = f.tcb.send_budget(t(0), n, n, false, 0, &f.h);
+    assert_eq!((b.seg_payload, b.full_segments), (1000, 3));
+    f.write(&pattern(n));
+    assert_eq!(f.drain(t(0)).len(), 3);
+}
+
+/// `on_start` follows `init` once, at ESTABLISHED, with no RTT sample yet and SACK as
+/// negotiated (spec §3.2).
+#[test]
+fn on_start_once_after_init() {
+    for sack in [false, true] {
+        let cc = cc_with_cwnd(BIG_CWND);
+        let calls = cc.calls.clone();
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(cc), h);
+        let o = if sack {
+            sack_opts()
+        } else {
+            opts(Some(MSS), Some(0))
+        };
+        assert_eq!(f.synack(BIG, &o), Reaction::Established);
+        let c = take(&calls);
+        assert_eq!(names(&c), ["Init", "Start"]);
+        let Call::Start(s) = c[1] else { unreachable!() };
+        assert_eq!(
+            (s.smss, s.syn_lost, s.srtt, s.sack, s.now),
+            (1000, false, None, sack, t(0))
+        );
+        f.write(&pattern(3000));
+        f.drain(t(0));
+        f.ack(tm(10), data(3000), BIG);
+        assert!(!names(&take(&calls)).contains(&"Start"));
+    }
+}
+
+/// `on_transmit` precedes a data send only when the sampler has nothing in flight (spec §3.2).
+#[test]
+fn on_transmit_only_at_zero_inflight() {
+    let (mut f, calls) = logged_cc(false, cc_with_cwnd(BIG_CWND));
+    f.write(&pattern(3000));
+    assert_eq!(f.drain(t(0)).len(), 3);
+    let first = Transmit {
+        inflight: 0,
+        app_limited: false,
+        now: t(0),
+    };
+    assert_eq!(take(&calls), [Call::Transmit(first)]);
+    f.ack(tm(10), data(1000), BIG);
+    f.write(&pattern(1000));
+    assert_eq!(f.drain(tm(10)).len(), 1);
+    assert!(!names(&take(&calls)).contains(&"Transmit"));
+    // All delivered and nothing queued: the end-of-ACK check marks the sampler.
+    f.ack(tm(20), data(4000), BIG);
+    f.write(&pattern(1000));
+    assert_eq!(f.drain(tm(30)).len(), 1);
+    let restart = Transmit {
+        inflight: 0,
+        app_limited: true,
+        now: tm(30),
+    };
+    let c = take(&calls);
+    assert_eq!(names(&c), ["Ack", "RateSample", "Transmit"]);
+    assert_eq!(c[2], Call::Transmit(restart));
+}
+
+/// A controller's request (ProbeRTT's MarkConnectionAppLimited) marks the sampler without
+/// the predicate, taken after `on_transmit` and after `on_rate_sample` (spec §2).
+#[test]
+fn app_limited_request_forced() {
+    let cc = cc_with_cwnd(2000);
+    let request = cc.request.clone();
+    let (mut f, _) = logged_cc(false, cc);
+    // Data stays queued: the predicate never holds.
+    f.write(&pattern(10_000));
+    request.store(true, Ordering::Relaxed);
+    assert_eq!(f.drain(t(0)).len(), 2);
+    assert!(!request.load(Ordering::Relaxed), "taken after on_transmit");
+    assert!(f.tcb.sampler().is_app_limited());
+    // The first ACK delivers past the mark, max(0 + 0, 1), and clears it.
+    f.ack(tm(10), data(1000), BIG);
+    assert!(!f.tcb.sampler().is_app_limited());
+    request.store(true, Ordering::Relaxed);
+    f.ack(tm(20), data(2000), BIG);
+    assert!(
+        !request.load(Ordering::Relaxed),
+        "taken after on_rate_sample"
+    );
+    assert!(f.tcb.sampler().is_app_limited());
 }

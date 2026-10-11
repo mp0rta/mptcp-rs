@@ -3,7 +3,6 @@
 pub mod cc;
 mod cubic;
 mod hooks;
-#[cfg_attr(not(test), allow(dead_code))]
 mod rate;
 mod recovery;
 pub(crate) mod rtt;

@@ -9,7 +9,7 @@ use rangemap::RangeSet;
 
 use super::cc::{
     AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck, RecoveryKind,
-    RecoveryStart,
+    RecoveryStart, Start, Transmit,
 };
 use super::cubic::Cubic;
 use super::hooks::{AckPurpose, Hooks};
@@ -310,6 +310,9 @@ pub struct Tcb {
     /// (the flow was cwnd-limited, RFC 7661 §3); an ACK up to it is `AckSample::cwnd_limited`.
     /// Cleared by an ACK beyond it.
     cwnd_full_at: Option<SeqNum>,
+    /// A send since the last rate sample left less than one SMSS of cwnd room (spec §1.8);
+    /// each sample takes it.
+    cwnd_filled: bool,
     /// Pacing release time: no data segment goes out before it, beyond the burst opened at
     /// the previous release. Reaching it consumes it.
     next_send_at: Option<Instant>,
@@ -422,6 +425,7 @@ impl Tcb {
             app_limited_until: None,
             app_limited: None,
             cwnd_full_at: None,
+            cwnd_filled: false,
             next_send_at: None,
             burst_left: 0,
             unsent: false,
@@ -554,7 +558,7 @@ impl Tcb {
     }
 
     /// Processes every timer expiry due at `now` (spec §3.1).
-    pub fn on_timeout(&mut self, now: Instant, _h: &mut impl Hooks) -> Reaction {
+    pub fn on_timeout(&mut self, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
             TcpState::SynSent => self.on_timeout_syn_sent(now),
             // A `close` in SYN-SENT, reported once.
@@ -570,7 +574,7 @@ impl Tcb {
                 }
                 Reaction::None
             }
-            _ => self.on_timeout_data(now),
+            _ => self.on_timeout_data(now, h),
         }
     }
 
@@ -618,13 +622,13 @@ impl Tcb {
         } else {
             0
         };
-        // ponytail: one quantum per release (Linux tcp_tso_autosize); BBR may later set its own.
+        // ponytail: one quantum per release (Linux tcp_tso_autosize), or the CC's own.
         let full_segments = match self.cc.pacing_rate() {
             Some(rate) => {
                 let allowance = if self.next_send_at.is_some_and(|t| t > now) {
                     self.burst_left as usize
                 } else {
-                    pacing_quantum(rate, mss)
+                    self.burst(rate, mss)
                 };
                 len.min(allowance) / mss
             }
@@ -670,6 +674,59 @@ impl Tcb {
             room
         };
         self.snd_wnd.saturating_sub(sent).min(room)
+    }
+
+    /// cwnd less the send gate's admission measure (spec §1.8): pipe in SACK loss recovery,
+    /// else `sent_below_nxt` (FlightSize outside a go-back). Taken before the peer's window,
+    /// pacing and the multipath layer limit the send.
+    pub(crate) fn cwnd_room(&self) -> u32 {
+        let measure = if self.sack.in_recovery() {
+            self.pipe_to(self.snd_max)
+        } else {
+            self.sent_below_nxt()
+        };
+        self.cc.cwnd().saturating_sub(measure)
+    }
+
+    /// SND.NXT − SND.UNA; after a go-back, less what the receiver has SACKed below SND.NXT,
+    /// which has left the network.
+    fn sent_below_nxt(&self) -> u32 {
+        let sent = self.snd_una.distance(self.snd_nxt) as u32;
+        if self.snd_nxt.lt(self.snd_max) && self.sack_permitted {
+            let nxt = self.abs(self.snd_nxt);
+            return sent - self.sack.sacked_in(self.delivered, nxt) as u32;
+        }
+        sent
+    }
+
+    /// CheckIfApplicationLimited (spec §1.6), independent of the legacy marker: nothing
+    /// assigned is unsent, no application data waits beyond it (or this sender was just
+    /// `offered_no_data`), and at least one SMSS of cwnd room.
+    pub(crate) fn check_app_limited(&mut self, h: &impl Hooks, offered_no_data: bool) {
+        // A due resend is a loss not yet resent (draft: lost_out > retrans_out); NewReno
+        // declares it lost only at the send (spec §1.4).
+        let unsent = self.data_len(self.snd_nxt, self.iss.wrapping_add(h.assigned_end())) > 0
+            || (self.fin_rel.is_some() && !self.fin_sent())
+            || self.retransmit_due;
+        let no_unsent = !unsent && (offered_no_data || !h.more_app_data());
+        let room = self.cwnd_room() >= u32::from(self.eff_mss);
+        self.rate.check_app_limited(no_unsent, room);
+    }
+
+    /// The CC's MarkConnectionAppLimited request, taken after `on_rate_sample` and
+    /// `on_transmit` (spec §2).
+    fn app_limited_request(&mut self) {
+        if self.cc.take_app_limited_request() {
+            self.rate.force_app_limited();
+        }
+    }
+
+    /// Octets one pacing release may send: the CC's send quantum, else `pacing_quantum`
+    /// (spec §3.3).
+    fn burst(&self, rate: u64, seg: usize) -> usize {
+        self.cc
+            .send_quantum()
+            .map_or_else(|| pacing_quantum(rate, seg), |q| q as usize)
     }
 
     /// pipe (RFC 6675 SetPipe) with SND.MAX at `max`.
@@ -919,13 +976,15 @@ impl Tcb {
     /// flight is marked app-limited. Refreshed on every call that qualifies. A no-op unless
     /// ESTABLISHED or CLOSE-WAIT, nothing assigned is unsent, nothing is due for resending
     /// and min(cwnd, SND.WND) − in-flight holds a full segment. A pending pacing release does
-    /// not prevent it: it leaves the sender with nothing to send all the same.
+    /// not prevent it: it leaves the sender with nothing to send all the same. The sampler's own
+    /// check (spec §1.6) runs first, whatever this guard decides.
     pub(crate) fn mark_unused_opportunity(
         &mut self,
         now: Instant,
         reason: AppLimited,
         h: &impl Hooks,
     ) {
+        self.check_app_limited(h, reason == AppLimited::NotScheduled);
         let seg = self.seg_payload(h.data_option_len());
         let room = self.window_room(self.send_cwnd(now), self.in_flight());
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
@@ -1195,7 +1254,15 @@ impl Tcb {
         if syn_lost {
             self.rtt.reinit_after_syn_retransmission();
         }
-        self.cc.init(u32::from(self.eff_mss), syn_lost);
+        let smss = u32::from(self.eff_mss);
+        self.cc.init(smss, syn_lost);
+        self.cc.on_start(&Start {
+            smss,
+            syn_lost,
+            srtt: self.rtt.srtt(),
+            sack: self.sack_permitted,
+            now,
+        });
         self.rate = RateSampler::new(now, self.sack_permitted);
         // A SYN retransmission made due by an RTO that fired just before is now moot.
         self.syn_due = false;
@@ -1504,6 +1571,8 @@ impl Tcb {
             let r = self.abort_with(CloseReason::Reset, h.reset_option(), now);
             return ControlFlow::Break(r);
         }
+        // Spec §1.6: before any transition.
+        self.check_app_limited(h, false);
         self.rate.begin_ack();
         let lost_end = self.sack.lost_end();
         // Recovery this ACK enters, and whether it ends one (spec §1.7).
@@ -1666,11 +1735,12 @@ impl Tcb {
         let ctx = SampleCtx {
             in_recovery: self.loss_recovery != LossRecovery::None,
             recovery_exit: exit,
-            // Task 4 latches it.
-            cwnd_filled: false,
+            cwnd_filled: std::mem::take(&mut self.cwnd_filled),
         };
         let rs = self.rate.sample(now, ctx);
         self.cc.on_rate_sample(&rs);
+        self.app_limited_request();
+        self.check_app_limited(h, false);
         if self.snd_wl1.lt(seg.seq) || (self.snd_wl1 == seg.seq && self.snd_wl2.le(seg.ack)) {
             self.snd_wnd = wnd;
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
@@ -1697,7 +1767,7 @@ impl Tcb {
         ControlFlow::Continue(())
     }
 
-    fn on_timeout_data(&mut self, now: Instant) -> Reaction {
+    fn on_timeout_data(&mut self, now: Instant, h: &impl Hooks) -> Reaction {
         // Reaching the release time consumes it, whether or not anything can go out then.
         if self.next_send_at.is_some_and(|t| now >= t) {
             self.next_send_at = None;
@@ -1706,6 +1776,8 @@ impl Tcb {
             return self.terminate(CloseReason::Timeout, now);
         }
         if self.rto_deadline().is_some_and(|t| now >= t) {
+            // Spec §1.6: before any transition.
+            self.check_app_limited(h, false);
             // RFC 6298 §5.4–5.6: the retransmission restarts the timer when it is sent.
             self.rto_at = None;
             self.rto_not_before = None;
@@ -1870,17 +1942,17 @@ impl Tcb {
             self.sack.on_retransmit(self.abs(seq), self.abs(e), rescue);
             self.rtt_timed = None;
             self.on_data_sent(seq, &meta, now, true);
+            self.cwnd_filled |= self.cwnd_room() < u32::from(self.eff_mss);
             return Some(meta);
         }
 
         // RFC 5681 §2: nothing beyond SND.UNA + min(cwnd, rwnd); after a go-back the octets
         // between SND.NXT and SND.MAX count as lost, and those SACKed since the RTO as gone.
-        let mut sent = self.snd_una.distance(self.snd_nxt) as u32;
+        let sent = self.sent_below_nxt();
         let resend = self.snd_nxt.distance(self.snd_max) as u32;
         let mut sacked_ahead = u32::MAX;
         if resend > 0 && self.sack_permitted {
             let nxt = self.abs(self.snd_nxt);
-            sent -= self.sack.sacked_in(self.delivered, nxt) as u32;
             sacked_ahead = (self.sack.next_start(nxt) - nxt).min(u64::from(u32::MAX)) as u32;
         }
         let usable = self.window_room(self.cc.cwnd(), sent);
@@ -1896,6 +1968,7 @@ impl Tcb {
             let meta = self.write_data(self.snd_nxt, len, fin, now, h, out)?;
             self.on_data_sent(self.snd_nxt, &meta, now, true);
             self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
+            self.cwnd_filled |= self.cwnd_room() < u32::from(self.eff_mss);
             return Some(meta);
         }
         let sws_override = self.sws_override;
@@ -1933,6 +2006,7 @@ impl Tcb {
         self.sws_override = false;
         self.snd_nxt = self.snd_nxt.wrapping_add(seq_len(&meta));
         self.snd_max = self.snd_nxt;
+        self.cwnd_filled |= self.cwnd_room() < u32::from(self.eff_mss);
         // New data only (SEQ = SND.MAX): resends never get here (Karn).
         self.rtt_timed.get_or_insert((self.snd_nxt, now));
         Some(meta)
@@ -1942,6 +2016,15 @@ impl Tcb {
     /// §4.1.2.2 OnPacketSent) and, if the CC paces, moves the release time past it. A resend
     /// replaces the records it covers.
     fn on_data_sent(&mut self, seq: SeqNum, meta: &SentMeta, now: Instant, resent: bool) {
+        // Draft OnTransmit (spec §3.2), before the sampler charges this send.
+        if self.rate.inflight() == 0 {
+            self.cc.on_transmit(&Transmit {
+                inflight: 0,
+                app_limited: self.rate.is_app_limited(),
+                now,
+            });
+            self.app_limited_request();
+        }
         self.tx_count += 1;
         let rec = SentRecord {
             end: seq.wrapping_add(seq_len(meta)),
@@ -1989,7 +2072,7 @@ impl Tcb {
         if let Some(rate) = self.cc.pacing_rate().filter(|_| meta.len > 0) {
             if !self.next_send_at.is_some_and(|t| t > now) {
                 // At a release: a new burst of one quantum.
-                self.burst_left = pacing_quantum(rate, usize::from(self.eff_mss)) as u32;
+                self.burst_left = self.burst(rate, usize::from(self.eff_mss)) as u32;
             }
             // A remainder smaller than this segment closes the burst.
             self.burst_left = self

@@ -3474,6 +3474,31 @@ fn connection_window_exhausted_is_not_app_limited() {
     });
 }
 
+/// Spec §1.6: `Connection::write` runs the sampler's app-limited check on the queue state
+/// from before it enqueues. A plain TCP connection that has sent nothing is app-limited when
+/// written to, so its first data goes out marked.
+#[test]
+fn app_limited_marked_before_write() {
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(31));
+    let h = ep
+        .connect(
+            Instant::from_nanos(0),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2:80".parse().unwrap(),
+            ConnectConfig::default(),
+        )
+        .unwrap();
+    let bytes = transmit(&mut ep, Instant::from_nanos(0));
+    let syn = packet::parse(&bytes).unwrap();
+    reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
+    transmit(&mut ep, Instant::from_nanos(1));
+    let marked =
+        |ep: &Endpoint<ChaCha20Rng>| ep.conns[&h].subflows[0].tcb.sampler().is_app_limited();
+    assert!(!marked(&ep));
+    ep.connection(h).unwrap().write(&[1; 1000]).unwrap();
+    assert!(marked(&ep));
+}
+
 #[test]
 fn idle_scheduler_marks_not_scheduled() {
     let (mut ep, h, syn, _) = connected_scaled(1 << 20);

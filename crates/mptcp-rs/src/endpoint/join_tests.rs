@@ -1570,6 +1570,32 @@ fn unchosen_subflow_marked_while_other_sends() {
     assert!(b.contains(&true), "{b:?}");
 }
 
+fn sampler_marked(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle, k: usize) -> bool {
+    ep.conns[&h].subflows[k].tcb.sampler().is_app_limited()
+}
+
+/// Spec §1.6: a subflow offered data and given none (`AppLimited::NotScheduled`) is
+/// app-limited for its own sampler.
+#[test]
+fn not_scheduled_marks_app_limited() {
+    // MinRTT prefers A (the first on equal RTTs) and gives it all the data; B is passed over.
+    let (mut ep, h, syn, jsyn, _, _) = two_paths_queued(recording, recording_b, 1000);
+    assert!(!sampler_marked(&ep, h, 1));
+    let out = drain(&mut ep, ms(20));
+    assert_eq!(data_on(&out, &syn).len(), 1);
+    assert!(data_on(&out, &jsyn).is_empty());
+    assert!(sampler_marked(&ep, h, 1));
+    // Pinned to A with data still queued for the connection: only being passed over marks B.
+    let (mut ep, h, ..) = two_paths_queued(big_a, big_b, 4 << 20);
+    let (_, rogue) = install_probe(&mut ep, h);
+    *rogue.lock().unwrap() = Some(Rogue::Pin(SubflowId(0)));
+    assert!(!sampler_marked(&ep, h, 1));
+    drain(&mut ep, ms(20));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert!(d.send.next != d.send.end, "data still queued");
+    assert!(sampler_marked(&ep, h, 1));
+}
+
 /// A pass interrupted by an input is not over: a subflow passed over in its last step may be
 /// filled in the next one (MinRTT moves on once A's budget is spent), so nothing is marked
 /// mid-pass. Marking there froze path B's CUBIC cwnd under the TUN client (Task 9c).

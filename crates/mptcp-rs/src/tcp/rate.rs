@@ -378,10 +378,12 @@ impl RateSampler {
         self.inflight
     }
 
+    #[cfg(test)]
     pub(crate) fn lost_out(&self) -> u64 {
         self.lost_out
     }
 
+    #[cfg(test)]
     pub(crate) fn delivered(&self) -> u64 {
         self.delivered
     }
@@ -390,6 +392,7 @@ impl RateSampler {
         self.app_limited != 0
     }
 
+    #[cfg(test)]
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt
     }

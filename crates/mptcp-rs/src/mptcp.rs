@@ -956,6 +956,12 @@ impl SendBuf for SubflowHooks<'_> {
     fn unassigned_len(&self) -> usize {
         self.conn.unassigned_len()
     }
+    fn more_app_data(&self) -> bool {
+        self.conn
+            .data
+            .as_ref()
+            .is_some_and(|d| d.send.next != d.send.end)
+    }
 
     fn segment_limit(&self, ssn: u32) -> usize {
         if self.conn.data.is_some() {
