@@ -235,12 +235,16 @@ fn may_assign(conn: &ConnectionHooks, sf: &SubflowMp, tcb: &Tcb) -> bool {
             || (tcb.state() == TcpState::CloseWait && (d.fallback || d.recv.has_fin())))
 }
 
-/// Spec §4 rule 1: `k × seg_payload` with `1 <= k <= full_segments`, or at most `partial`.
-fn fits(b: SendBudget, bytes: u32) -> bool {
+/// Spec §4 rule 1: `k × seg_payload` with `1 <= k <= full_segments`, or a short mapping:
+/// exactly `partial` for new data (a shorter one may wait for the sender's SWS timer), at most
+/// `partial` for reinjected data, which the `Tcb` sends regardless of SWS.
+fn fits(b: SendBudget, bytes: u32, reinjected: bool) -> bool {
     let n = bytes as usize;
     n > 0
         && b.seg_payload > 0
-        && ((n % b.seg_payload == 0 && n / b.seg_payload <= b.full_segments) || n <= b.partial)
+        && ((n % b.seg_payload == 0 && n / b.seg_payload <= b.full_segments)
+            || n == b.partial
+            || (reinjected && n <= b.partial))
 }
 
 /// Validates a plan against the snapshot it was made from (boundary invariant 5): the named
@@ -261,13 +265,14 @@ pub(crate) fn accept_plan(
     let s = &snapshots[i];
     let ok = s.state == SubflowState::Active
         && match payload {
-            Payload::New { bytes } => fits(s.new_budget, bytes),
+            Payload::New { bytes } => fits(s.new_budget, bytes, false),
             Payload::Reinject { dsn, len } => {
                 head.is_some_and(|(start, c)| start == dsn && len <= c)
-                    && fits(s.reinject_budget, len)
+                    && fits(s.reinject_budget, len, true)
             }
             Payload::Opportunistic { dsn, len } => {
-                opp.is_some_and(|(start, c)| start == dsn && len <= c) && fits(s.opp_budget, len)
+                opp.is_some_and(|(start, c)| start == dsn && len <= c)
+                    && fits(s.opp_budget, len, true)
             }
         };
     ok.then_some((i, payload))
