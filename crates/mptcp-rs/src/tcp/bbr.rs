@@ -96,7 +96,8 @@ impl SplitMix64 {
 const WINDOW_SLOTS: usize = EXTRA_ACKED_FILTER_LEN as usize;
 
 /// UpdateWindowedMaxFilter (§5.5.5, §5.5.9) over a virtual time: the exact maximum of the
-/// values seen at times `t` with `now - t < window_length`, one maximum per time slot. The
+/// values seen at times `t` with `now - t < window_length`, one maximum per time slot. Each
+/// update drops what has left its window, as Nichols' filter does. The
 /// draft allows Kathleen Nichols' approximation; this is exact for windows up to
 /// `WINDOW_SLOTS`.
 #[derive(Debug, Clone, Default)]
@@ -108,17 +109,19 @@ struct WindowedMax {
 impl WindowedMax {
     fn update(&mut self, value: u64, time: u64, window_length: u64) -> u64 {
         debug_assert!(window_length as usize <= WINDOW_SLOTS);
+        // Samples outside the window are forgotten for good, so a later, wider window does
+        // not bring them back.
+        for slot in &mut self.slots {
+            if slot.0 > time || time - slot.0 >= window_length {
+                slot.1 = 0;
+            }
+        }
         let slot = &mut self.slots[(time % WINDOW_SLOTS as u64) as usize];
         if slot.0 != time {
             *slot = (time, 0);
         }
         slot.1 = slot.1.max(value);
-        self.slots
-            .iter()
-            .filter(|(t, _)| *t <= time && time - t < window_length)
-            .map(|&(_, v)| v)
-            .max()
-            .unwrap_or(0)
+        self.slots.iter().map(|&(_, v)| v).max().unwrap_or(0)
     }
 }
 
@@ -1000,7 +1003,11 @@ mod tests {
         assert_eq!(f.update(4, 2, 2), 4, "time 0 left the 2-long window");
         assert_eq!(f.update(1, 2, 1), 4, "same time slot");
         assert_eq!(f.update(1, 3, 1), 1);
-        assert_eq!(f.update(0, 3, 10), 5, "a wider window sees older slots");
+        assert_eq!(
+            f.update(0, 3, 10),
+            1,
+            "a wider window does not revive forgotten slots"
+        );
         assert_eq!(f.update(0, 20, 10), 0);
     }
 
@@ -1019,6 +1026,12 @@ mod tests {
         // In Startup the filter remembers one round.
         ack(&mut bbr, 100, ms(10), ms(10), at(22));
         assert_eq!(bbr.extra_acked, 12_100 - 1_200);
+        // Past Startup the window widens to 10 rounds, but round 3's 11 400, dropped while
+        // the window was 1, stays dropped: the max is round 4's 10 900 (this round's sample:
+        // 12 200 − 1 800 = 10 400).
+        bbr.full_bw_reached = true;
+        ack(&mut bbr, 100, ms(10), ms(10), at(23));
+        assert_eq!(bbr.extra_acked, 10_900);
     }
 
     #[test]
