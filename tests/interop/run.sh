@@ -7,18 +7,18 @@ if [ "${1:-}" != --inner ]; then
   case "${1:-}:${2:-}" in
     m0:|m1:|syn-strip:|dataack-strip:|zero-server:|zero-client:|m2-mtu:) ;;
     base-a:c2s|base-a:s2c|base-b:c2s|base-b:s2c|base-unshaped:c2s|base-unshaped:s2c) ;;
-    m2-goodput:c2s|m2-goodput:s2c|m2-blackhole-a:c2s|m2-blackhole-a:s2c|m2-blackhole-b:c2s|m2-blackhole-b:s2c) ;;
-    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-blackhole-a|m2-blackhole-b c2s|s2c" >&2; exit 2;;
+    m2-goodput:c2s|m2-goodput:s2c|m2-blackhole-a:c2s|m2-blackhole-a:s2c|m2-blackhole-b:c2s|m2-blackhole-b:s2c|m2-lossy:c2s|m2-lossy:s2c) ;;
+    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-lossy|m2-blackhole-a|m2-blackhole-b c2s|s2c" >&2; exit 2;;
   esac
   docker build -t mptcp-rs-m1-test:local tests/interop
-  exec docker run --rm --init --network none --privileged -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash tests/interop/run.sh --inner "$1" "${2:-}"
+  exec docker run --rm --init --network none --privileged -e MPTCP_RS_CC -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash tests/interop/run.sh --inner "$1" "${2:-}"
 fi
-scenario=$2; dir=${3:-}
+scenario=$2; dir=${3:-}; cc=${MPTCP_RS_CC:-cubic}
 mkdir -p "artifacts/interop/$scenario${dir:+-$dir}"
 out=$(mktemp -d "artifacts/interop/$scenario${dir:+-$dir}/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")
 echo "artifacts: $out"
 chmod 755 "$out"
-sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,blackhole.sh,Dockerfile} >"$out/inputs.sha256"
+sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,retrans.py,blackhole.sh,Dockerfile} >"$out/inputs.sha256"
 uname -a >"$out/kernel.txt"
 mode=mptcp; [ "$scenario" != m0 ] || mode=tcp
 ip netns add cli; ip netns add srv
@@ -42,11 +42,15 @@ ip -n cli rule add from 10.0.9.2 table 100; ip -n cli route add 10.0.1.0/24 dev 
 ip -n cli rule add from 10.0.8.2 table 200; ip -n cli route add 10.0.1.2 via 10.0.2.2 dev b0 table 200
 # mqvpn asym netem on both egress directions of a leg; limit = 2*BDP in 1500 B packets:
 # A 300 Mbit x 20 ms RTT = 750000 B = 500 pkts -> 1000; B 80 Mbit x 60 ms = 600000 B = 400 pkts -> 800.
-case "$scenario" in base-a|base-b|m2-goodput|m2-blackhole-*)
+# m2-lossy: the same paths plus 1 % random loss on all four egress qdiscs.
+loss=(); [ "$scenario" != m2-lossy ] || loss=(loss 1%)
+case "$scenario" in base-a|base-b|m2-goodput|m2-lossy|m2-blackhole-*)
   for x in "cli a0 10 300 1000" "srv a1 10 300 1000" "cli b0 30 80 800" "srv b1 30 80 800"; do
-    set -- $x; ip netns exec "$1" tc qdisc add dev "$2" root netem delay "$3"ms rate "$4"mbit limit "$5"
+    set -- $x; ip netns exec "$1" tc qdisc add dev "$2" root netem delay "$3"ms rate "$4"mbit limit "$5" "${loss[@]}"
   done;;
 esac
+for ns in cli srv; do echo "# $ns"; ip netns exec "$ns" tc qdisc show; done >"$out/qdisc.txt"
+echo "$cc" >"$out/cc.txt"
 # Path B MTU 1280 with offloads off, so the B link pcap shows wire-sized packets (no GSO/GRO).
 if [ "$scenario" = m2-mtu ]; then
   ip -n cli link set b0 mtu 1280; ip -n srv link set b1 mtu 1280
@@ -102,7 +106,7 @@ ip netns exec srv timeout 910 python3 tests/interop/server.py --mode "$mode" --p
 srvpid=$!
 for _ in $(seq 50); do grep -qs listening "$out/server.log" && break; sleep 0.1; done
 sleep 1
-ip netns exec cli timeout 910 target/release/mptcp-rs-tun --mode "$mode" --tun mtun0 --local "$cip" --remote 10.0.1.2:5201 "${cargs[@]}" "${joins[@]}" --pause-read-ms "$client_pause" >"$out/client.log" 2>&1 &
+ip netns exec cli timeout 910 target/release/mptcp-rs-tun --mode "$mode" --tun mtun0 --local "$cip" --remote 10.0.1.2:5201 "${cargs[@]}" "${joins[@]}" --pause-read-ms "$client_pause" --cc "$cc" >"$out/client.log" 2>&1 &
 clipid=$!
 case "$scenario" in
   m2-blackhole-a) bash tests/interop/blackhole.sh "$out/client.log" a0 >"$out/blackhole.log" 2>&1 & bhpid=$!;;

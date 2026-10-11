@@ -8,13 +8,19 @@
 //! Time ([`Instant`]) and randomness (a [`rand_core::CryptoRng`]) are injected, and the
 //! crate contains no `unsafe` code.
 //!
-//! # Scope at 0.1.0
+//! # Scope at 0.2.0
 //!
 //! Client role only. Implemented: MP_CAPABLE, DSS and DATA_ACK, MP_JOIN with multiple
 //! subflows over IPv4 and IPv6 (including mixed families), a MinRTT scheduler with
 //! reinjection, opportunistic retransmission and penalization, stale-subflow detection,
 //! fallback to TCP (including the infinite mapping); CUBIC with HyStart++ and pacing, and
 //! SACK-based loss recovery; plain TCP connections.
+//!
+//! Congestion control is chosen per connection with [`ConnectConfig::congestion_control`]:
+//! [`CongestionControlKind::Cubic`] (the default) or [`CongestionControlKind::BbrV3`], BBRv3
+//! (draft-ietf-ccwg-bbr-06, experimental). Every subflow runs the same controller, and the
+//! subflows are not coupled: two subflows that share one bottleneck take about the share of
+//! two TCP flows, with either controller.
 //!
 //! Path management is driven by the application: [`Endpoint::add_subflow`] joins a new path
 //! (optionally with the backup bit), [`Endpoint::set_backup`] sends MP_PRIO,
@@ -84,5 +90,5 @@ pub use endpoint::{
 pub use mptcp::DebugStats;
 pub use mptcp::SubflowId;
 pub use seq::SeqNum;
-pub use tcp::{CloseReason, ConnectConfig};
+pub use tcp::{CloseReason, CongestionControlKind, ConnectConfig};
 pub use time::Instant;

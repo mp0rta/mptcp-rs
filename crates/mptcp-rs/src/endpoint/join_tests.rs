@@ -1570,6 +1570,32 @@ fn unchosen_subflow_marked_while_other_sends() {
     assert!(b.contains(&true), "{b:?}");
 }
 
+fn sampler_marked(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle, k: usize) -> bool {
+    ep.conns[&h].subflows[k].tcb.sampler().is_app_limited()
+}
+
+/// Spec §1.6: a subflow offered data and given none (`AppLimited::NotScheduled`) is
+/// app-limited for its own sampler.
+#[test]
+fn not_scheduled_marks_app_limited() {
+    // MinRTT prefers A (the first on equal RTTs) and gives it all the data; B is passed over.
+    let (mut ep, h, syn, jsyn, _, _) = two_paths_queued(recording, recording_b, 1000);
+    assert!(!sampler_marked(&ep, h, 1));
+    let out = drain(&mut ep, ms(20));
+    assert_eq!(data_on(&out, &syn).len(), 1);
+    assert!(data_on(&out, &jsyn).is_empty());
+    assert!(sampler_marked(&ep, h, 1));
+    // Pinned to A with data still queued for the connection: only being passed over marks B.
+    let (mut ep, h, ..) = two_paths_queued(big_a, big_b, 4 << 20);
+    let (_, rogue) = install_probe(&mut ep, h);
+    *rogue.lock().unwrap() = Some(Rogue::Pin(SubflowId(0)));
+    assert!(!sampler_marked(&ep, h, 1));
+    drain(&mut ep, ms(20));
+    let d = ep.conns[&h].hooks.data.as_ref().unwrap();
+    assert!(d.send.next != d.send.end, "data still queued");
+    assert!(sampler_marked(&ep, h, 1));
+}
+
 /// A pass interrupted by an input is not over: a subflow passed over in its last step may be
 /// filled in the next one (MinRTT moves on once A's budget is spent), so nothing is marked
 /// mid-pass. Marking there froze path B's CUBIC cwnd under the TUN client (Task 9c).
@@ -4650,6 +4676,85 @@ fn opp_episode_deadline_from_install_and_data_ack_advance() {
     assert_eq!((s.opp_episodes, s.opp_repairs), (2, 0));
     peer.run(&mut ep, h, moved, moved + Duration::from_secs(3));
     assert_eq!(peer.received(), data);
+}
+
+// BBRv3 Task 8: the controller chosen by `ConnectConfig::congestion_control`.
+
+fn bbr_connected() -> Connected {
+    let cfg = ConnectConfig {
+        recv_buffer: 1 << 20,
+        congestion_control: crate::tcp::CongestionControlKind::BbrV3,
+        ..ConnectConfig::default()
+    };
+    let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
+    open_window(&mut ep, &syn, h);
+    (ep, h, syn, dsn)
+}
+/// Per subflow: whether it runs BBR, which alone has a send quantum.
+fn runs_bbr(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<bool> {
+    let subflows = ep.conns[&h].subflows.iter();
+    subflows
+        .map(|s| s.tcb.cc().send_quantum().is_some())
+        .collect()
+}
+
+/// A join inherits the connection's `BbrV3` (spec §4.1), and data over both subflows arrives
+/// byte-exact.
+#[test]
+fn mptcp_two_subflows_bbr() {
+    let (mut ep, h, syn, _) = bbr_connected();
+    let (_, jsyn) = joined(&mut ep, h, ms(10), JOIN_IP, 1500, 7);
+    assert_eq!(runs_bbr(&ep, h), [true, true]);
+    let n = 400_000;
+    let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&data), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 30), (&jsyn, 10)]);
+    let t = ms(10);
+    peer.run(&mut ep, h, t, t + Duration::from_secs(30));
+    assert_eq!(una(&ep, h), head + n as u64);
+    assert_eq!(peer.received(), data);
+    for path in [0, 1] {
+        assert!(peer.log.iter().any(|l| l.1 == path), "data on {path}");
+    }
+}
+
+/// Review Focus 4: after an infinite-mapping fallback the subflow keeps its BBR as it was, with
+/// no reset (spec §4.2), and plain TCP carries on under it.
+#[test]
+fn fallback_keeps_bbr() {
+    let (mut ep, h, syn, peer_dsn) = bbr_connected();
+    let n = 200_000;
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&vec![3; n]), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 20)]);
+    let now = peer.run(&mut ep, h, ms(10), ms(10_000));
+    assert_eq!(una(&ep, h), head + n as u64);
+    let cc = |ep: &Endpoint<ChaCha20Rng>| {
+        let c = ep.conns[&h].subflows[0].tcb.cc();
+        (c.cwnd(), c.pacing_rate(), c.send_quantum())
+    };
+    let before = cc(&ep);
+    assert!(
+        before.0 > 10 * 1432,
+        "grown past the initial window: {before:?}"
+    );
+    let inf = mapping(1, peer_dsn, 0);
+    let seg = Segment {
+        ack: peer.next[0],
+        wnd: 65535,
+        ..peer_data(&syn, 5001, &inf, &[])
+    };
+    input_at(&mut ep, &seg, now);
+    assert!(events(&mut ep).contains(&Event::FellBack));
+    assert_eq!(cc(&ep), before, "unchanged by the fallback");
+    let head = una(&ep, h);
+    assert_eq!(ep.connection(h).unwrap().write(&vec![4; n]), Ok(n));
+    let mut peer = Peer::new(head, n, &[(&syn, 20)]);
+    peer.strip[0] = true;
+    peer.run(&mut ep, h, now, now + Duration::from_secs(10));
+    assert_eq!(una(&ep, h), head + n as u64, "plain TCP delivered it");
+    assert_eq!(runs_bbr(&ep, h), [true]);
 }
 
 // M3 Task 4: path-management API groundwork, reusing the helpers above.

@@ -7,4 +7,4 @@ cd "$(dirname "$0")/../../.."
 script=run_suite.py
 [ "${1:-}" != --probe ] || { script=probe.py; shift; }
 docker build -q -t mptcp-rs-m1-test:local tests/interop >/dev/null
-exec docker run --rm --init --network none --privileged -v "$PWD":/w -w /w mptcp-rs-m1-test:local python3 "tests/interop/suite/$script" "$@"
+exec docker run --rm --init --network none --privileged -e MPTCP_RS_CC -v "$PWD":/w -w /w mptcp-rs-m1-test:local python3 "tests/interop/suite/$script" "$@"

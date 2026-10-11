@@ -14,15 +14,15 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use mptcp_rs::{
-    CloseReason, ConnectConfig, ConnectionHandle, DebugStats, Endpoint, Event, Instant, ReadError,
-    SubflowId,
+    CloseReason, CongestionControlKind, ConnectConfig, ConnectionHandle, DebugStats, Endpoint,
+    Event, Instant, ReadError, SubflowId,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use script::{Action, Ev, Script};
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -57,6 +57,8 @@ struct Args {
     send_rate: Option<f64>,
     /// `--event-log`: a JSON line per event and action, with a clock pair at start and end.
     event_log: Option<String>,
+    /// `--cc`: the congestion controller; CUBIC without it.
+    cc: CongestionControlKind,
 }
 
 impl Args {
@@ -84,6 +86,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let mut joins = Vec::new();
     let mut abort_after = None;
     let (mut script, mut send_rate, mut event_log) = (None, None, None);
+    let mut cc = CongestionControlKind::Cubic;
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -106,6 +109,13 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             "--script" => script = Some(v),
             "--send-rate" => send_rate = Some(v.parse().ok().filter(|r: &f64| *r > 0.0)?),
             "--event-log" => event_log = Some(v),
+            "--cc" => {
+                cc = match v.as_str() {
+                    "cubic" => CongestionControlKind::Cubic,
+                    "bbr3" => CongestionControlKind::BbrV3,
+                    _ => return None,
+                }
+            }
             "--send-secs" => {
                 send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
             }
@@ -137,6 +147,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         script,
         send_rate,
         event_log,
+        cc,
     })
 }
 
@@ -159,6 +170,7 @@ fn run(a: Args) -> Result<String, String> {
         Endpoint::connect
     };
     let mut cfg = ConnectConfig::default();
+    cfg.congestion_control = a.cc;
     if !a.pause_read.is_zero() {
         cfg.recv_buffer = 16384;
     }
@@ -770,6 +782,21 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn cc_arg() {
+        let base =
+            "--mode mptcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 5 --expect 5";
+        let cc = |extra: &str| {
+            let s = format!("{base}{extra}");
+            parse_args(s.split(' ').map(String::from)).map(|a| a.cc)
+        };
+        assert_eq!(cc(""), Some(CongestionControlKind::Cubic));
+        assert_eq!(cc(" --cc cubic"), Some(CongestionControlKind::Cubic));
+        assert_eq!(cc(" --cc bbr3"), Some(CongestionControlKind::BbrV3));
+        assert_eq!(cc(" --cc bbr"), None);
+        assert_eq!(cc(" --cc"), None);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
-use crate::mptcp::{DebugStats, Episode, Repair, Subflow, SubflowId};
+use crate::mptcp::{DebugStats, Episode, Repair, Subflow, SubflowHooks, SubflowId};
 use crate::tcp::{ConnectConfig, TcpState};
 
 pub(crate) type ConnectionHooks = crate::mptcp::ConnectionHooks;
@@ -84,6 +84,16 @@ impl Connection {
         let closed = self.subflows[0].tcb.state() == TcpState::Closed && !self.hooks.retained();
         if self.closed_by_app || self.reset || closed {
             return Err(WriteError::Closed);
+        }
+        // The sampler's app-limited check (BBRv3 spec §1.6), on the queue before this write.
+        if !data.is_empty() {
+            for sf in &mut self.subflows {
+                let hk = SubflowHooks {
+                    conn: &mut self.hooks,
+                    sf: &mut sf.mp,
+                };
+                sf.tcb.check_app_limited(&hk, false);
+            }
         }
         Ok(self.hooks.write(data))
     }

@@ -7,11 +7,12 @@ Linux kernel. You give it incoming packets and the current time. It gives you ba
 send and data to read. So it can run over any packet I/O, such as a TUN device or a userspace
 network stack.
 
-Status: 0.1.0, client only.
+Status: 0.2.0, client only.
 
 ## Features
 
-- TCP: CUBIC with HyStart++, pacing, and SACK loss recovery (RFC 6675).
+- TCP: CUBIC with HyStart++, pacing, and SACK loss recovery (RFC 6675). BBRv3
+  (draft-ietf-ccwg-bbr-06, experimental) is opt-in.
 - MPTCP v1: MP_CAPABLE, DSS, DATA_ACK, DATA_FIN, MP_TCPRST, and MP_FASTCLOSE in both
   directions. Falls back to plain TCP when MPTCP cannot be used.
 - Multiple paths: MP_JOIN, a MinRTT scheduler with reinjection, and opportunistic
@@ -64,6 +65,23 @@ sudo target/release/mptcp-rs-tun --mode mptcp --tun mtun0 \
 
 Rust 1.85 or later is required.
 
+## Congestion control
+
+Two congestion controllers are available, chosen per connection with
+`ConnectConfig::congestion_control`:
+
+- `CongestionControlKind::Cubic` (the default): CUBIC with HyStart++ and pacing.
+- `CongestionControlKind::BbrV3`: BBRv3 (draft-ietf-ccwg-bbr-06, experimental).
+
+```rust
+let mut cfg = ConnectConfig::default();
+cfg.congestion_control = CongestionControlKind::BbrV3;
+```
+
+`mptcp-rs-tun` takes `--cc cubic|bbr3`. Every subflow of a connection runs the same
+controller, and the subflows are not coupled: two subflows that share one bottleneck take about
+the share of two TCP flows, with either controller.
+
 ## Testing
 
 Run `cargo test --workspace` for the unit and integration tests.
@@ -82,8 +100,8 @@ Each run saves pcaps and logs under `artifacts/interop/`.
 
 ## Roadmap
 
-Next: the server role, checksums and MP_FAIL. TCP work continues alongside: RACK-TLP,
-timestamps and BBR. Async runtime integration, `no_std` and coupled congestion control are not
+Next: the server role, checksums and MP_FAIL. TCP work continues alongside: RACK-TLP
+and timestamps. Async runtime integration, `no_std` and coupled congestion control are not
 planned yet.
 
 ## License

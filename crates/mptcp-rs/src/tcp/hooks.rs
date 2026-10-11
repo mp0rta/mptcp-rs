@@ -32,6 +32,11 @@ pub trait SendBuf {
     fn unassigned_len(&self) -> usize {
         0
     }
+    /// Application data exists beyond what is assigned to this `Tcb`, whatever any window
+    /// admits (the app-limited check, BBRv3 spec §1.6). Plain TCP assigns every written octet.
+    fn more_app_data(&self) -> bool {
+        false
+    }
     /// Relative SSN one past the last assigned octet.
     fn assigned_end(&self) -> u32;
     /// Releases every octet below `rel_ssn_una`.
