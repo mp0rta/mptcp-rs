@@ -8,7 +8,9 @@ pub(crate) mod rtt;
 mod sack;
 mod tcb;
 
-pub use cc::AppLimited;
+pub use cc::{
+    AppLimited, Delivery, LossEvent, RateSample, RecoveryKind, RecoveryStart, Start, Transmit,
+};
 pub use hooks::{AckPurpose, Hooks, PlainHooks, SegmentHooks, SendBuf};
 pub use tcb::{
     CloseReason, ConnectConfig, Reaction, SegmentWriter, SendBudget, SentMeta, Tcb, TcpState,

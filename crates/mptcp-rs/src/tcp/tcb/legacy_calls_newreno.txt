@@ -1,0 +1,16 @@
+init smss=1000 syn_lost=false cwnd=4000
+on_ack acked=1000 rtt=Some(1000000) in_flight=3000 now=1000000 delivered=1000 app_limited=false cwnd_limited=true cwnd=5000
+on_ack acked=1000 rtt=Some(2000000) in_flight=4000 now=2000000 delivered=2000 app_limited=false cwnd_limited=true cwnd=6000
+on_ack acked=1000 rtt=Some(3000000) in_flight=5000 now=3000000 delivered=3000 app_limited=false cwnd_limited=true cwnd=7000
+on_ack acked=1000 rtt=Some(4000000) in_flight=6000 now=4000000 delivered=4000 app_limited=false cwnd_limited=true cwnd=8000
+on_ack acked=1000 rtt=Some(4000000) in_flight=7000 now=5000000 delivered=5000 app_limited=false cwnd_limited=true cwnd=9000
+on_ack acked=1000 rtt=Some(5000000) in_flight=8000 now=6000000 delivered=6000 app_limited=false cwnd_limited=true cwnd=10000
+on_ack acked=1000 rtt=Some(5000000) in_flight=9000 now=7000000 delivered=7000 app_limited=false cwnd_limited=true cwnd=11000
+on_ack acked=1000 rtt=Some(6000000) in_flight=10000 now=8000000 delivered=8000 app_limited=false cwnd_limited=true cwnd=12000
+on_ack acked=1000 rtt=Some(6000000) in_flight=11000 now=9000000 delivered=9000 app_limited=false cwnd_limited=true cwnd=13000
+on_ack acked=1000 rtt=Some(7000000) in_flight=12000 now=10000000 delivered=10000 app_limited=false cwnd_limited=true cwnd=14000
+on_congestion ev=FastRetransmit in_flight=14000 now=30000000 cwnd=12800
+on_recovery_ack Partial { acked: 3000 } cwnd=10800
+on_recovery_ack Partial { acked: 3000 } cwnd=8800
+on_recovery_ack Full { in_flight: 0 } cwnd=2000
+on_ack acked=2000 rtt=Some(10000000) in_flight=0 now=100000000 delivered=26000 app_limited=false cwnd_limited=true cwnd=3000

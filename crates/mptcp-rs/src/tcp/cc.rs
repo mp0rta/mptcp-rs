@@ -19,6 +19,7 @@ pub enum CongestionEvent {
 
 /// What one ACK that advanced SND.UNA outside fast recovery measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AckSample {
     /// Octets newly acknowledged.
     pub acked: u32,
@@ -50,6 +51,97 @@ pub enum AppLimited {
     NoData,
     /// Data was queued, and this sender was offered it and given none.
     NotScheduled,
+}
+
+/// Why a loss recovery episode starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecoveryKind {
+    Fast,
+    Rto,
+}
+
+/// A loss recovery episode begins (see `CongestionControl::on_recovery_start`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecoveryStart {
+    pub kind: RecoveryKind,
+    pub inflight: u64,
+    pub now: Instant,
+}
+
+/// One range of octets newly marked lost (see `CongestionControl::on_loss`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LossEvent {
+    /// Absolute octet offsets, `end` exclusive; `len = end - start`.
+    pub start: u64,
+    pub end: u64,
+    pub len: u64,
+    /// The sampler's `P.tx_in_flight` for the lost range.
+    pub tx_in_flight: u64,
+    /// `C.lost - P.lost`.
+    pub lost_since_tx: u64,
+    pub is_app_limited: bool,
+    /// `C.delivered` now.
+    pub delivered: u64,
+    pub sack: bool,
+    pub now: Instant,
+}
+
+/// The delivery-rate part of a `RateSample`, present when an ACK delivered new data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Delivery {
+    pub prior_delivered: u64,
+    pub prior_time: Instant,
+    /// `RS.delivered = C.delivered - prior_delivered`.
+    pub delivered: u64,
+    pub newly_acked: u64,
+    pub is_app_limited: bool,
+    /// `RS.tx_in_flight`.
+    pub tx_in_flight: u64,
+    /// `RS.lost`.
+    pub lost: u64,
+    /// `(RS.delivered, RS.interval)` when valid.
+    pub rate: Option<(u64, Duration)>,
+}
+
+/// Everything one ACK told the sampler (see `CongestionControl::on_rate_sample`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateSample {
+    pub delivery: Option<Delivery>,
+    pub rtt: Option<Duration>,
+    pub newly_lost: u64,
+    pub delivered: u64,
+    pub lost: u64,
+    pub inflight: u64,
+    pub in_recovery: bool,
+    pub recovery_exit: bool,
+    pub cwnd_filled: bool,
+    pub sack: bool,
+    pub now: Instant,
+}
+
+/// The connection's parameters at `CongestionControl::on_start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Start {
+    pub smss: u32,
+    pub syn_lost: bool,
+    pub srtt: Option<Duration>,
+    pub sack: bool,
+    pub now: Instant,
+}
+
+/// One data transmission (see `CongestionControl::on_transmit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Transmit {
+    pub inflight: u64,
+    pub app_limited: bool,
+    pub now: Instant,
 }
 
 /// An ACK during fast recovery (RFC 6582 §3.2); the recovery module classifies it.
@@ -89,6 +181,31 @@ pub trait CongestionControl: Send {
     fn on_idle_restart(&mut self) {}
     /// Octets that may be outstanding.
     fn cwnd(&self) -> u32;
+    /// Called once when the connection reaches ESTABLISHED, immediately after `init`, with the
+    /// parameters `init` took plus the SYN round trip and SACK negotiation. Default: nothing.
+    fn on_start(&mut self, _: &Start) {}
+    /// Called for each data transmission, new or retransmitted, after the `Tcb` has counted it
+    /// in flight and before the next one. Default: nothing.
+    fn on_transmit(&mut self, _: &Transmit) {}
+    /// Called when loss recovery begins, just before the legacy `on_congestion` for the same
+    /// event. Default: nothing.
+    fn on_recovery_start(&mut self, _: &RecoveryStart) {}
+    /// Called once per range newly marked lost, in ascending offset order, before the
+    /// `on_rate_sample` of the ACK (or timeout) that detected it. Default: nothing.
+    fn on_loss(&mut self, _: &LossEvent) {}
+    /// Called once per ACK that carried news, after that ACK's `on_loss` calls and before the
+    /// legacy `on_ack` / `on_recovery_ack` for it. Default: nothing.
+    fn on_rate_sample(&mut self, _: &RateSample) {}
+    /// Octets the sender should aim to release per pacing burst. `None` leaves the choice to
+    /// the `Tcb`. Queried on each send decision; no side effects.
+    fn send_quantum(&self) -> Option<u32> {
+        None
+    }
+    /// Asked after each callback; `true` asks the `Tcb` to treat the flow as application-limited
+    /// from the next transmission on, and is cleared by being read.
+    fn take_app_limited_request(&mut self) -> bool {
+        false
+    }
     /// Side-effect-free window after an idle restart.
     fn restart_cwnd(&self) -> u32 {
         self.cwnd()

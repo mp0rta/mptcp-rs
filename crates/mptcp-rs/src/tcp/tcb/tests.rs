@@ -3925,3 +3925,174 @@ fn hostile_alternating_sack_bounded() {
     }
     panic!("transfer stalled at {:?}", f.tcb.snd_una);
 }
+
+// ---- CUBIC's legacy callback sequence, frozen (BBRv3 Task 1) ----
+
+/// Delegates every legacy `CongestionControl` method to a real `Cubic` and logs one line
+/// per callback: method, event, arguments, `now` in nanos since `t(0)`, and cwnd after.
+struct RecordingCubic {
+    inner: crate::tcp::cubic::Cubic,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingCubic {
+    fn line(&self, s: String) {
+        let s = format!("{s} cwnd={}", self.inner.cwnd());
+        self.log.lock().unwrap().push(s);
+    }
+}
+
+fn ns(now: Instant) -> u64 {
+    now.as_nanos() - t(0).as_nanos()
+}
+
+impl CongestionControl for RecordingCubic {
+    fn init(&mut self, smss: u32, syn_lost: bool) {
+        self.inner.init(smss, syn_lost);
+        self.line(format!("init smss={smss} syn_lost={syn_lost}"));
+    }
+    fn on_ack(&mut self, a: &AckSample) {
+        self.inner.on_ack(a);
+        self.line(format!(
+            "on_ack acked={} rtt={:?} in_flight={} now={} delivered={} app_limited={} cwnd_limited={}",
+            a.acked,
+            a.rtt.map(|d| d.as_nanos()),
+            a.in_flight,
+            ns(a.now),
+            a.delivered,
+            a.app_limited,
+            a.cwnd_limited
+        ));
+    }
+    fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, now: Instant) {
+        self.inner.on_congestion(ev, in_flight, now);
+        self.line(format!(
+            "on_congestion ev={ev:?} in_flight={in_flight} now={}",
+            ns(now)
+        ));
+    }
+    fn on_recovery_ack(&mut self, ack: RecoveryAck) {
+        self.inner.on_recovery_ack(ack);
+        self.line(format!("on_recovery_ack {ack:?}"));
+    }
+    fn on_idle_restart(&mut self) {
+        self.inner.on_idle_restart();
+        self.line("on_idle_restart".to_string());
+    }
+    fn cwnd(&self) -> u32 {
+        self.inner.cwnd()
+    }
+    fn restart_cwnd(&self) -> u32 {
+        self.inner.restart_cwnd()
+    }
+    fn pacing_rate(&self) -> Option<u64> {
+        self.inner.pacing_rate()
+    }
+}
+
+impl Fixture {
+    /// Like `ramp`, but with a recording `Cubic` and no assertion on its window: ten ACKs of
+    /// one segment each at 1..10 ms, draining after every one.
+    fn cubic_ramp(sack: bool, bytes: &[u8]) -> (Self, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cc = RecordingCubic {
+            inner: crate::tcp::cubic::Cubic::new(),
+            log: log.clone(),
+        };
+        let cfg = ConnectConfig::default();
+        let h = PlainHooks::new(&cfg);
+        let mut f = Fixture::with(cfg, Box::new(cc), h);
+        let o = if sack {
+            sack_opts()
+        } else {
+            opts(Some(MSS), Some(0))
+        };
+        assert_eq!(f.synack(BIG, &o), Reaction::Established);
+        assert_eq!(f.tcb.sack_permitted, sack);
+        f.drain(t(0));
+        f.write(bytes);
+        f.drain(t(0));
+        for k in 1..=10 {
+            f.ack(tm(k), data(k as u32 * 1000), BIG);
+            f.drain(tm(k));
+        }
+        (f, log)
+    }
+}
+
+/// Compares the log with `legacy_calls_<name>.txt` next to this file, or rewrites the file
+/// when `UPDATE_LEGACY_FIXTURE` is set.
+fn check_legacy_fixture(name: &str, log: &Arc<Mutex<Vec<String>>>) {
+    let got = log.lock().unwrap().join("\n") + "\n";
+    let path = format!(
+        "{}/src/tcp/tcb/legacy_calls_{name}.txt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if std::env::var_os("UPDATE_LEGACY_FIXTURE").is_some() {
+        std::fs::write(&path, &got).unwrap();
+    } else {
+        let want = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, want, "legacy CC call sequence changed ({path})");
+    }
+}
+
+#[test]
+fn legacy_calls_sack() {
+    let (mut f, log) = Fixture::cubic_ramp(true, &pattern(40_000));
+    let mut got = RangeSet::new();
+    for k in [11, 12, 14, 15, 17, 18, 19, 20] {
+        f.peer_gets(tm(30), &mut got, k, 10_000);
+    }
+    assert!(f.tcb.sack.in_recovery());
+    f.peer_gets(tm(50), &mut got, 10, 13_000);
+    let top = f.tcb.snd_max;
+    assert_eq!(f.sack_ack(tm(50), top, &[]), Reaction::None);
+    assert!(!f.tcb.sack.in_recovery());
+    f.drain(tm(50));
+    f.ack(tm(60), f.tcb.snd_max, BIG);
+    check_legacy_fixture("sack", &log);
+}
+
+#[test]
+fn legacy_calls_newreno() {
+    let (mut f, log) = Fixture::cubic_ramp(false, &pattern(40_000));
+    for _ in 0..3 {
+        f.ack(tm(30), data(10_000), BIG);
+        f.drain(tm(30));
+    }
+    f.ack(tm(50), data(13_000), BIG);
+    f.drain(tm(50));
+    f.ack(tm(70), data(16_000), BIG);
+    f.drain(tm(70));
+    f.ack(tm(90), f.tcb.snd_max, BIG);
+    f.drain(tm(90));
+    f.ack(tm(100), f.tcb.snd_max, BIG);
+    check_legacy_fixture("newreno", &log);
+}
+
+#[test]
+fn legacy_calls_rto() {
+    let (mut f, log) = Fixture::cubic_ramp(false, &pattern(40_000));
+    let old_max = f.tcb.snd_max;
+    let rto = f.tcb.rto_at.unwrap(); // poll_send_at may be a pacing deadline
+    assert_eq!(f.timeout(rto), Reaction::None);
+    f.drain(rto);
+    let at = rto + Duration::from_millis(20);
+    f.ack(at, old_max, BIG);
+    // Pacing spreads the new window; let it all out.
+    let at = at + Duration::from_millis(100);
+    f.drain(at);
+    // Recovery after the go-back: three duplicate ACKs, then the full ACK.
+    // The duplicate ACKs must cover more than the RTO's recover point (RFC 6582 §4).
+    let una = old_max.wrapping_add(1000);
+    let at = at + Duration::from_millis(20);
+    f.ack(at, una, BIG);
+    f.drain(at);
+    for _ in 0..3 {
+        f.ack(at + Duration::from_millis(5), una, BIG);
+        f.drain(at + Duration::from_millis(5));
+    }
+    let end = at + Duration::from_millis(40);
+    f.ack(end, f.tcb.snd_max, BIG);
+    check_legacy_fixture("rto", &log);
+}
