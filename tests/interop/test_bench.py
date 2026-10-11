@@ -86,5 +86,62 @@ class KernelClient(unittest.TestCase):
             self.assertNotEqual(run().returncode, 0)
 
 
+SS_SAMPLE = """ESTAB 0      0          10.0.1.2:5201     10.0.1.1:40000
+\t cubic wscale:7,7 rto:204 rtt:0.05/0.02 mss:1448 bytes_sent:20 bytes_acked:10 bytes_received:1000 segs_out:5 tcp-ulp-mptcp flags:Mmec
+ESTAB 0      0          10.0.1.2:5201     10.0.2.1:40001
+\t cubic wscale:7,7 rto:204 rtt:0.05/0.02 mss:1448 bytes_received:500 segs_out:3 tcp-ulp-mptcp flags:Jjec
+"""
+
+
+class CpuSampler(unittest.TestCase):
+    def test_parse_ss(self):
+        import cpu
+        socks = cpu.parse_ss(SS_SAMPLE)
+        self.assertEqual(socks, {("10.0.1.2:5201", "10.0.1.1:40000"): {"received": 1000, "acked": 10},
+                                 ("10.0.1.2:5201", "10.0.2.1:40001"): {"received": 500, "acked": 0}})
+        self.assertEqual(cpu.window_payload({}, socks), {"a": {"received": 1000, "acked": 10}, "b": {"received": 500, "acked": 0}})
+
+    def test_window_payload(self):
+        import cpu
+        k1, k2 = ("10.0.1.2:5201", "10.0.1.1:1"), ("10.0.1.2:5201", "10.0.2.1:2")
+        c = lambda r, a: {"received": r, "acked": a}
+        self.assertEqual(cpu.window_payload({k1: c(100, 5)}, {k1: c(250, 9), k2: c(40, 0)}),
+                         {"a": c(150, 4), "b": c(40, 0)})
+        self.assertIsNone(cpu.window_payload({k1: c(100, 5), k2: c(1, 0)}, {k1: c(250, 9)}))  # k2 vanished
+        self.assertIsNone(cpu.window_payload({k1: c(100, 5)}, {k1: c(90, 9)}))  # decreased
+
+    def test_direction_total(self):
+        import cpu
+        acked_only = {"a": {"received": 0, "acked": 7}, "b": {"received": 0, "acked": 3}}
+        self.assertEqual(cpu.data_total(acked_only, "c2s"), 0)
+        self.assertEqual(cpu.data_total(acked_only, "s2c"), 10)
+
+    def run_cpu(self, client_cmd, start="0.5"):
+        busy = subprocess.Popen(client_cmd)
+        idle = subprocess.Popen(["sleep", "10"])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                out = Path(d) / "cpu.json"
+                subprocess.run([sys.executable, str(HERE / "cpu.py"), str(out), "--client", str(busy.pid), "--server", str(idle.pid),
+                                "--direction", "c2s", "--start", start, "--len", "1"], check=True, timeout=30)
+                import json
+                return json.loads(out.read_text())
+        finally:
+            busy.kill(); idle.kill()
+
+    def test_cpu_window(self):
+        r = self.run_cpu([sys.executable, "-c", "while True: pass"])
+        self.assertTrue(0.7 <= r["client"]["user_s"] <= 1.3, r)
+        self.assertLess(r["server"]["user_s"] + r["server"]["sys_s"], 0.1)
+        self.assertGreaterEqual(r["host_busy_cpus"], 0.7)
+        self.assertFalse(r["valid"])
+        self.assertIn("ss", r["reason"])  # the host has no srv netns
+
+    def test_cpu_pid_gone(self):
+        r = self.run_cpu(["sleep", "0.2"])
+        self.assertFalse(r["valid"])
+        self.assertIn("pid", r["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
