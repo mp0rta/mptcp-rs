@@ -73,6 +73,11 @@ impl Sack {
         self.recovery.is_some()
     }
 
+    /// IsLost(s) holds exactly for s < `lost_end()`.
+    pub(crate) fn lost_end(&self) -> u64 {
+        self.lost_end
+    }
+
     #[cfg(test)]
     pub(crate) fn ranges(&self) -> usize {
         self.sacked.len()

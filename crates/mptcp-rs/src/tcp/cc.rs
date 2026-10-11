@@ -187,14 +187,15 @@ pub trait CongestionControl: Send {
     /// Called for each data transmission, new or retransmitted, after the `Tcb` has counted it
     /// in flight and before the next one. Default: nothing.
     fn on_transmit(&mut self, _: &Transmit) {}
-    /// Called when loss recovery begins, just before the legacy `on_congestion` for the same
-    /// event. Default: nothing.
+    /// Called when loss recovery begins (fast retransmit, or every RTO), after the legacy
+    /// callbacks for the same ACK or timeout. Default: nothing.
     fn on_recovery_start(&mut self, _: &RecoveryStart) {}
     /// Called once per range newly marked lost, in ascending offset order, before the
-    /// `on_rate_sample` of the ACK (or timeout) that detected it. Default: nothing.
+    /// `on_rate_sample` of the ACK (or timeout) that detected it; a fast-retransmit resend
+    /// reports its own range when it is sent. Default: nothing.
     fn on_loss(&mut self, _: &LossEvent) {}
-    /// Called once per ACK that carried news, after that ACK's `on_loss` calls and before the
-    /// legacy `on_ack` / `on_recovery_ack` for it. Default: nothing.
+    /// Called once per ACK with SND.UNA ≤ SEG.ACK ≤ SND.MAX, after its legacy callbacks, its
+    /// `on_recovery_start` and its `on_loss` calls; never for a timeout. Default: nothing.
     fn on_rate_sample(&mut self, _: &RateSample) {}
     /// Octets the sender should aim to release per pacing burst. `None` leaves the choice to
     /// the `Tcb`. Queried on each send decision; no side effects.

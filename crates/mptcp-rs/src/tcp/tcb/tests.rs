@@ -1,5 +1,8 @@
 use super::*;
-use crate::tcp::cc::{CongestionEvent, RecoveryAck, Reno, Unbounded};
+use crate::tcp::cc::{
+    CongestionEvent, LossEvent, RateSample, RecoveryAck, RecoveryKind, RecoveryStart, Reno, Start,
+    Transmit, Unbounded,
+};
 use crate::tcp::{PlainHooks, SegmentHooks, SendBuf};
 use rangemap::RangeSet;
 use std::sync::{Arc, Mutex};
@@ -2993,15 +2996,65 @@ struct TestCc {
     rate: Option<u64>,
     cwnd: u32,
     samples: Samples,
+    calls: Calls,
 }
 type Samples = Arc<Mutex<Vec<AckSample>>>;
 
+/// One `CongestionControl` callback with its complete argument.
+#[derive(Debug, Clone, PartialEq)]
+enum Call {
+    Init { smss: u32, syn_lost: bool },
+    Ack(AckSample),
+    Congestion(CongestionEvent, u32),
+    RecoveryAck(RecoveryAck),
+    IdleRestart,
+    Start(Start),
+    Transmit(Transmit),
+    RecoveryStart(RecoveryStart),
+    Loss(LossEvent),
+    RateSample(RateSample),
+}
+/// Every callback `TestCc` receives, in order.
+type Calls = Arc<Mutex<Vec<Call>>>;
+
+impl TestCc {
+    fn log(&self, c: Call) {
+        self.calls.lock().unwrap().push(c);
+    }
+}
+
 impl CongestionControl for TestCc {
+    fn init(&mut self, smss: u32, syn_lost: bool) {
+        self.log(Call::Init { smss, syn_lost });
+    }
     fn on_ack(&mut self, a: &AckSample) {
         self.samples.lock().unwrap().push(*a);
+        self.log(Call::Ack(*a));
     }
-    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
-    fn on_recovery_ack(&mut self, _: RecoveryAck) {}
+    fn on_congestion(&mut self, ev: CongestionEvent, in_flight: u32, _: Instant) {
+        self.log(Call::Congestion(ev, in_flight));
+    }
+    fn on_recovery_ack(&mut self, ack: RecoveryAck) {
+        self.log(Call::RecoveryAck(ack));
+    }
+    fn on_idle_restart(&mut self) {
+        self.log(Call::IdleRestart);
+    }
+    fn on_start(&mut self, s: &Start) {
+        self.log(Call::Start(*s));
+    }
+    fn on_transmit(&mut self, x: &Transmit) {
+        self.log(Call::Transmit(*x));
+    }
+    fn on_recovery_start(&mut self, r: &RecoveryStart) {
+        self.log(Call::RecoveryStart(*r));
+    }
+    fn on_loss(&mut self, e: &LossEvent) {
+        self.log(Call::Loss(*e));
+    }
+    fn on_rate_sample(&mut self, r: &RateSample) {
+        self.log(Call::RateSample(*r));
+    }
     fn cwnd(&self) -> u32 {
         self.cwnd
     }
@@ -3030,6 +3083,7 @@ impl Fixture {
             rate,
             cwnd,
             samples: samples.clone(),
+            calls: Calls::default(),
         };
         let mut f = Fixture::with(cfg, Box::new(cc), h);
         assert_eq!(
@@ -3318,6 +3372,7 @@ fn sack_resend_after_mark() -> (Fixture, Samples) {
         rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
+        calls: Calls::default(),
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -3826,6 +3881,7 @@ fn sack_sample_from_newest_newly_delivered_record() {
         rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
+        calls: Calls::default(),
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -3878,6 +3934,7 @@ fn dsack_below_new_ack_sample_from_newest_record() {
         rate: None,
         cwnd: BIG_CWND,
         samples: samples.clone(),
+        calls: Calls::default(),
     };
     let mut f = Fixture::with(cfg, Box::new(cc), h);
     f.synack(BIG, &sack_opts());
@@ -4095,4 +4152,358 @@ fn legacy_calls_rto() {
     let end = at + Duration::from_millis(40);
     f.ack(end, f.tcb.snd_max, BIG);
     check_legacy_fixture("rto", &log);
+}
+
+// ---- The rate sampler, the loss-recovery lifecycle and the BBR hook order (BBRv3 Task 3) ----
+
+impl<H: Hooks> Fixture<H> {
+    /// ESTABLISHED at t(0) from ISS `isn` with a logging `TestCc` (fixed cwnd `cwnd`), peer MSS
+    /// 1000, WS 0, window `BIG`, SACK if `sack`; the handshake ACK is sent and the log cleared.
+    fn logged(isn: SeqNum, sack: bool, cwnd: u32, h: H) -> (Self, Calls) {
+        let calls = Calls::default();
+        let cc = TestCc {
+            rate: None,
+            cwnd,
+            samples: Samples::default(),
+            calls: calls.clone(),
+        };
+        let cfg = ConnectConfig::default();
+        let addrs = v4();
+        let mut f = Fixture {
+            tcb: Tcb::with_cc(&cfg, addrs.0, addrs.1, isn, t(0), Box::new(cc)),
+            h,
+            out: SegmentWriter::default(),
+            addrs,
+        };
+        let o = if sack {
+            sack_opts()
+        } else {
+            opts(Some(MSS), Some(0))
+        };
+        f.send(t(0)).unwrap();
+        let synack = TcpFlags::SYN | TcpFlags::ACK;
+        assert_eq!(
+            f.recv(synack, isn.wrapping_add(1), BIG, &o),
+            Reaction::Established
+        );
+        assert_eq!(f.tcb.sack_permitted, sack);
+        f.drain(t(0));
+        calls.lock().unwrap().clear();
+        (f, calls)
+    }
+}
+
+/// `logged` from `ISN` with `PlainHooks`, `bytes` written and the first flight sent at t(0).
+fn logged_flight(sack: bool, cwnd: u32, bytes: usize) -> (Fixture, Calls) {
+    let h = PlainHooks::new(&ConnectConfig::default());
+    let (mut f, calls) = Fixture::logged(ISN, sack, cwnd, h);
+    f.write(&pattern(bytes));
+    f.drain(t(0));
+    (f, calls)
+}
+
+/// The calls logged since the last `take`.
+fn take(calls: &Calls) -> Vec<Call> {
+    std::mem::take(&mut *calls.lock().unwrap())
+}
+
+fn name(c: &Call) -> &'static str {
+    match c {
+        Call::Init { .. } => "Init",
+        Call::Ack(_) => "Ack",
+        Call::Congestion(..) => "Congestion",
+        Call::RecoveryAck(_) => "RecoveryAck",
+        Call::IdleRestart => "IdleRestart",
+        Call::Start(_) => "Start",
+        Call::Transmit(_) => "Transmit",
+        Call::RecoveryStart(_) => "RecoveryStart",
+        Call::Loss(_) => "Loss",
+        Call::RateSample(_) => "RateSample",
+    }
+}
+
+fn names(calls: &[Call]) -> Vec<&'static str> {
+    calls.iter().map(name).collect()
+}
+
+fn losses(calls: &[Call]) -> Vec<LossEvent> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Loss(e) => Some(*e),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rate_samples(calls: &[Call]) -> Vec<RateSample> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::RateSample(s) => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ACK that enters SACK recovery: the legacy calls, then `on_recovery_start`, `on_loss`
+/// and `on_rate_sample` (spec §1.7). The (4.3) retransmission that follows reports nothing:
+/// the ACK already declared its range lost.
+#[test]
+fn hook_order_on_sack_entry_ack() {
+    let (mut f, calls) = logged_flight(true, 10_000, 20_000);
+    assert_eq!(f.tcb.snd_max, data(10_000));
+    // 0 is lost; 1, 2 and 3 arrive.
+    for k in 2..=3 {
+        f.sack_ack(tm(10), data(0), &[(data(1000), data(k * 1000))]);
+    }
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+    take(&calls);
+    f.sack_ack(tm(10), data(0), &[(data(1000), data(4000))]);
+    let c = take(&calls);
+    assert_eq!(
+        names(&c),
+        [
+            "Congestion",
+            "RecoveryAck",
+            "RecoveryStart",
+            "Loss",
+            "RateSample"
+        ]
+    );
+    assert_eq!(
+        c[0],
+        Call::Congestion(CongestionEvent::FastRetransmit, 10_000)
+    );
+    let Call::RecoveryStart(r) = c[2] else {
+        unreachable!()
+    };
+    // Ten segments, three SACKed, one lost.
+    assert_eq!(
+        (r.kind, r.inflight, r.now),
+        (RecoveryKind::Fast, 6000, tm(10))
+    );
+    let Call::Loss(e) = c[3] else { unreachable!() };
+    assert_eq!((e.start, e.end, e.len, e.sack), (0, 1000, 1000, true));
+    let Call::RateSample(s) = c[4] else {
+        unreachable!()
+    };
+    assert!(s.in_recovery && !s.recovery_exit && s.sack && !s.cwnd_filled);
+    assert_eq!((s.newly_lost, s.inflight, s.lost), (1000, 6000, 1000));
+    assert_eq!(s.delivery.unwrap().newly_acked, 1000);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Fast);
+    let segs = f.drain(tm(10));
+    assert_eq!(segs[0].0.seq, data(0));
+    assert!(take(&calls).is_empty());
+}
+
+/// A NewReno fast retransmission shrunk by 12 octets of protocol options declares exactly
+/// the 988 octets it resends lost, at the send (spec §1.4).
+#[test]
+fn forced_retransmit_declares_exact_range() {
+    let cfg = ConnectConfig::default();
+    let h = ShortRuns(PlainHooks::new(&cfg), 0);
+    let (mut f, calls) = Fixture::logged(ISN, false, 10_000, h);
+    assert_eq!(f.h.0.write(&pattern(20_000)), 20_000);
+    assert_eq!(f.drain(t(0)).len(), 10);
+    for _ in 0..3 {
+        f.ack(tm(10), data(0), BIG);
+    }
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Fast);
+    let c = take(&calls);
+    assert!(losses(&c).is_empty(), "nothing is lost before the send");
+    f.h.1 = 12;
+    assert_eq!(seq_lens(&f.drain(tm(10))), [(data(0), 988)]);
+    let c = take(&calls);
+    assert_eq!(names(&c), ["Loss"]);
+    let e = losses(&c)[0];
+    assert_eq!((e.start, e.end, e.len, e.sack), (0, 988, 988, false));
+    assert_eq!((e.tx_in_flight, e.lost_since_tx), (1000, 988));
+    // The resend is charged again: ten segments outstanding.
+    assert_eq!(f.tcb.sampler().inflight(), 10_000);
+}
+
+/// An RTO in fast recovery moves the lifecycle to `Rto` without an exit; the ACK reaching
+/// its point ends it.
+#[test]
+fn rto_from_fast_is_transition() {
+    let (mut f, calls) = logged_flight(false, 10_000, 20_000);
+    for _ in 0..3 {
+        f.ack(tm(10), data(0), BIG);
+    }
+    f.drain(tm(10));
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Fast);
+    take(&calls);
+    let rto = f.tcb.rto_deadline().unwrap();
+    assert_eq!(f.timeout(rto), Reaction::None);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Rto { point: 10_000 });
+    let c = take(&calls);
+    assert_eq!(names(&c[..2]), ["Congestion", "RecoveryStart"]);
+    let Call::RecoveryStart(r) = c[1] else {
+        unreachable!()
+    };
+    assert_eq!((r.kind, r.inflight), (RecoveryKind::Rto, 0));
+    // No sample after an RTO; each transmission is its own loss event, in offset order.
+    let ev: Vec<_> = losses(&c).iter().map(|e| (e.start, e.end)).collect();
+    let want: Vec<_> = (0..10).map(|k| (k * 1000, k * 1000 + 1000)).collect();
+    assert_eq!(ev, want);
+    assert_eq!(c.len(), 12);
+    f.drain(rto);
+    f.ack(rto + Duration::from_millis(10), data(10_000), BIG);
+    let s = rate_samples(&take(&calls));
+    assert_eq!(s.len(), 1);
+    assert!(s[0].recovery_exit && !s[0].in_recovery);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+}
+
+/// `recovery_exit` is set only on the ACK that moves SND.UNA to the RTO's point.
+#[test]
+fn rto_exit_at_point() {
+    let (mut f, calls) = logged_flight(true, 10_000, 20_000);
+    let rto = f.tcb.rto_deadline().unwrap();
+    f.timeout(rto);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Rto { point: 10_000 });
+    assert_eq!(f.drain(rto).len(), 10, "go-back");
+    take(&calls);
+    let at = rto + Duration::from_millis(10);
+    let mut exits = Vec::new();
+    for k in [4, 9, 10, 12] {
+        f.ack(at, data(k * 1000), BIG);
+        f.drain(at);
+        let s = rate_samples(&take(&calls));
+        assert_eq!(s.len(), 1);
+        exits.push((s[0].in_recovery, s[0].recovery_exit));
+    }
+    assert_eq!(
+        exits,
+        [(true, false), (true, false), (false, true), (false, false)]
+    );
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+}
+
+/// A second RTO moves the point to SND.MAX at that RTO.
+#[test]
+fn repeated_rto_moves_point() {
+    let (mut f, calls) = logged_flight(false, 10_000, 30_000);
+    let rto = f.tcb.rto_deadline().unwrap();
+    f.timeout(rto);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Rto { point: 10_000 });
+    f.drain(rto);
+    let at = rto + Duration::from_millis(10);
+    f.ack(at, data(5000), BIG);
+    f.drain(at);
+    assert_eq!(f.tcb.snd_max, data(15_000));
+    let rto2 = f.tcb.rto_deadline().unwrap();
+    take(&calls);
+    f.timeout(rto2);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Rto { point: 15_000 });
+    let c = take(&calls);
+    assert_eq!(names(&c[..2]), ["Congestion", "RecoveryStart"]);
+    f.drain(rto2);
+    let at = rto2 + Duration::from_millis(10);
+    f.ack(at, data(10_000), BIG);
+    assert!(!rate_samples(&take(&calls))[0].recovery_exit);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Rto { point: 15_000 });
+    f.ack(at, data(15_000), BIG);
+    assert!(rate_samples(&take(&calls))[0].recovery_exit);
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::None);
+}
+
+/// Without loss, the sampler's inflight is FlightSize after every send and ACK.
+#[test]
+fn inflight_matches_flight_without_loss() {
+    let (mut f, calls) = logged_flight(false, 10_000, 40_000);
+    let check = |f: &Fixture| {
+        assert_eq!(f.tcb.sampler().inflight(), u64::from(f.tcb.in_flight()));
+    };
+    check(&f);
+    assert_eq!(f.tcb.in_flight(), 10_000);
+    for k in 1..=20 {
+        f.ack(tm(10 * k), data(2000 * k as u32), BIG);
+        check(&f);
+        f.drain(tm(10 * k));
+        check(&f);
+    }
+    assert_eq!(f.tcb.snd_una, f.tcb.snd_max);
+    assert_eq!(f.tcb.sampler().delivered(), 40_000);
+    let c = take(&calls);
+    assert!(losses(&c).is_empty());
+    assert!(
+        rate_samples(&c)
+            .iter()
+            .all(|s| s.newly_lost == 0 && s.lost == 0)
+    );
+}
+
+/// Review Focus 1: ISS 2^32 − 3000, so the sequence space wraps inside segment 2, which is
+/// lost and repaired with SACK. Offsets, the loss event, inflight and delivered stay exact.
+#[test]
+fn wrap_sampling_exact() {
+    let isn = SeqNum(u32::MAX - 2999);
+    let d = |n: u32| isn.wrapping_add(1 + n);
+    let h = PlainHooks::new(&ConnectConfig::default());
+    let (mut f, calls) = Fixture::logged(isn, true, 20_000, h);
+    f.write(&pattern(20_000));
+    assert_eq!(f.drain(t(0)).len(), 20);
+    assert!(f.tcb.snd_max.0 < isn.0, "SND.MAX has wrapped");
+    assert_eq!(f.tcb.sampler().inflight(), 20_000);
+    f.sack_ack(tm(10), d(2000), &[]);
+    for k in 4..=6 {
+        f.sack_ack(tm(10), d(2000), &[(d(3000), d(k * 1000))]);
+    }
+    assert_eq!(f.tcb.loss_recovery, LossRecovery::Fast);
+    let segs = f.drain(tm(10));
+    assert_eq!(segs[0].0.seq, d(2000));
+    f.sack_ack(tm(20), d(20_000), &[]);
+    let c = take(&calls);
+    let ev: Vec<_> = losses(&c).iter().map(|e| (e.start, e.end)).collect();
+    assert_eq!(ev, [(2000, 3000)]);
+    let s = rate_samples(&c);
+    let acked: Vec<_> = s
+        .iter()
+        .map(|s| s.delivery.map_or(0, |x| x.newly_acked))
+        .collect();
+    assert_eq!(acked, [2000, 1000, 1000, 1000, 15_000]);
+    let delivered: Vec<_> = s.iter().map(|s| s.delivered).collect();
+    assert_eq!(delivered, [2000, 3000, 4000, 5000, 20_000]);
+    let last = s.last().unwrap();
+    assert!(last.recovery_exit);
+    assert_eq!((last.inflight, last.lost), (0, 1000));
+    assert_eq!(last.rtt, Some(Duration::from_millis(20)));
+}
+
+/// Review Focus 2: without SACK, the NewReno fast retransmit, its partial-ACK retransmission
+/// and the RTO all reach `on_loss`, and every event and sample carries `sack: false`.
+#[test]
+fn newreno_losses_reach_bbr_hooks() {
+    let (mut f, calls) = logged_flight(false, 10_000, 40_000);
+    // 0 and 3 are lost.
+    for _ in 0..3 {
+        f.ack(tm(10), data(0), BIG);
+    }
+    f.drain(tm(10));
+    f.ack(tm(20), data(3000), BIG);
+    f.drain(tm(20));
+    let c = take(&calls);
+    let starts: Vec<_> = c
+        .iter()
+        .filter_map(|c| match c {
+            Call::RecoveryStart(r) => Some(r.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, [RecoveryKind::Fast]);
+    let ev: Vec<_> = losses(&c)
+        .iter()
+        .map(|e| (e.start, e.end, e.sack))
+        .collect();
+    assert_eq!(ev, [(0, 1000, false), (3000, 4000, false)]);
+    let s = rate_samples(&c);
+    assert_eq!(s.len(), 4);
+    assert!(s.iter().all(|s| !s.sack && s.newly_lost == 0));
+    let rto = f.tcb.rto_deadline().unwrap();
+    f.timeout(rto);
+    let c = take(&calls);
+    assert!(!losses(&c).is_empty());
+    assert!(losses(&c).iter().all(|e| !e.sack));
 }

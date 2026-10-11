@@ -7,9 +7,13 @@ use std::time::Duration;
 
 use rangemap::RangeSet;
 
-use super::cc::{AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck};
+use super::cc::{
+    AckSample, AppLimited, CongestionControl, CongestionEvent, RecoveryAck, RecoveryKind,
+    RecoveryStart,
+};
 use super::cubic::Cubic;
 use super::hooks::{AckPurpose, Hooks};
+use super::rate::{RateSampler, SampleCtx};
 use super::recovery::{DupAck, NewAck, NewReno};
 use super::rtt::{INITIAL_RTO, RttEstimator};
 use super::sack::{DupAck as SackDupAck, Sack};
@@ -197,6 +201,18 @@ struct SentRecord {
     sacked: bool,
 }
 
+/// The loss-recovery lifecycle BBR sees (spec §1.7); CUBIC's recovery state is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossRecovery {
+    None,
+    /// From the fast-retransmit entry (SACK or NewReno) to its exit or an RTO.
+    Fast,
+    /// Until SND.UNA reaches `point`, the absolute offset of SND.MAX at the latest RTO.
+    Rto {
+        point: u64,
+    },
+}
+
 #[derive(Debug)]
 pub struct Tcb {
     cfg: ConnectConfig,
@@ -260,6 +276,9 @@ pub struct Tcb {
     /// Loss recovery with SACK (RFC 6675): used instead of `recovery` once both SYNs carried
     /// SACK-Permitted (`sack_permitted`).
     sack: Sack,
+    /// Delivery-rate and loss accounting for the CC hooks (spec §1.1).
+    rate: RateSampler,
+    loss_recovery: LossRecovery,
 
     // Timers.
     rtt: RttEstimator,
@@ -355,7 +374,7 @@ impl Tcb {
         _local: SocketAddr,
         remote: SocketAddr,
         isn: SeqNum,
-        _now: Instant,
+        now: Instant,
         cc: Box<dyn CongestionControl>,
     ) -> Tcb {
         let mut tcb = Tcb {
@@ -389,6 +408,9 @@ impl Tcb {
             cc,
             recovery: NewReno::new(isn),
             sack: Sack::default(),
+            // Replaced at ESTABLISHED, once SACK is negotiated.
+            rate: RateSampler::new(now, false),
+            loss_recovery: LossRecovery::None,
             rtt: RttEstimator::new(),
             rto_streak: 0,
             rto_at: None,
@@ -693,7 +715,7 @@ impl Tcb {
     /// D-SACK block below SEG.ACK, RFC 2883, is nothing new); marks the records wholly inside
     /// newly SACKed ranges. Returns the newly SACKed octets and, of the records they
     /// delivered, the one sent last. Runs before SND.UNA advances to SEG.ACK.
-    fn sack_update(&mut self, seg: &Segment) -> (u64, Option<SentRecord>) {
+    fn sack_update(&mut self, seg: &Segment, now: Instant) -> (u64, Option<SentRecord>) {
         let (una, max, base) = (self.snd_una, self.snd_max, self.delivered);
         let floor = seg.ack;
         let abs = |s: SeqNum| base.wrapping_add_signed(i64::from(una.distance(s)));
@@ -710,11 +732,12 @@ impl Tcb {
                 let l = if l.lt(floor) { floor } else { l };
                 (r.gt(floor) && r.le(max) && l.lt(r)).then(|| abs(l)..abs(r))
             });
-        let sent = &mut self.sent;
+        let (sent, rate) = (&mut self.sent, &mut self.rate);
         let mut newest: Option<SentRecord> = None;
         let new = self
             .sack
             .update(base, u32::from(self.eff_mss), blocks, |g| {
+                rate.on_delivered(g.clone(), now);
                 let at = |a: u64| una.wrapping_add((a - base) as u32);
                 let (s0, s1) = (at(g.start), at(g.end));
                 let mut i = sent.partition_point(|r| r.end.le(s0));
@@ -886,6 +909,10 @@ impl Tcb {
     #[cfg(test)]
     pub(crate) fn cwnd(&self) -> u32 {
         self.cc.cwnd()
+    }
+    #[cfg(test)]
+    pub(crate) fn sampler(&self) -> &RateSampler {
+        &self.rate
     }
     /// This sender had a sending opportunity and nothing to send (draft-ietf-ccwg-bbr-06
     /// §4.1.2.4 MarkConnectionAppLimited): data sent until `delivered` passes the data now in
@@ -1169,6 +1196,7 @@ impl Tcb {
             self.rtt.reinit_after_syn_retransmission();
         }
         self.cc.init(u32::from(self.eff_mss), syn_lost);
+        self.rate = RateSampler::new(now, self.sack_permitted);
         // A SYN retransmission made due by an RTO that fired just before is now moot.
         self.syn_due = false;
         self.rto_at = None;
@@ -1476,9 +1504,14 @@ impl Tcb {
             let r = self.abort_with(CloseReason::Reset, h.reset_option(), now);
             return ControlFlow::Break(r);
         }
+        self.rate.begin_ack();
+        let lost_end = self.sack.lost_end();
+        // Recovery this ACK enters, and whether it ends one (spec §1.7).
+        let mut entered = None;
+        let mut exit = false;
         // RFC 6675 §5: the scoreboard first (Update), from SND.UNA before this ACK.
         let (sacked_new, sack_newest) = if self.sack_permitted {
-            self.sack_update(seg)
+            self.sack_update(seg, now)
         } else {
             (0, None)
         };
@@ -1498,6 +1531,7 @@ impl Tcb {
                     self.cc
                         .on_congestion(CongestionEvent::FastRetransmit, flight, now);
                     self.retransmit_due = true;
+                    entered = Some(RecoveryKind::Fast);
                 }
                 DupAck::Inflate => self.cc.on_recovery_ack(RecoveryAck::Duplicate),
             }
@@ -1509,6 +1543,11 @@ impl Tcb {
             self.delivered += u64::from(acked);
             if self.sack_permitted {
                 self.sack.ack(old, self.delivered, u32::from(self.eff_mss));
+            }
+            self.rate.on_delivered(old..self.delivered, now);
+            self.rate.drop_below(self.delivered);
+            if let LossRecovery::Rto { point } = self.loss_recovery {
+                exit |= self.delivered >= point;
             }
             self.rto_streak = 0;
             if self.rto_not_before.is_some_and(|(end, _)| end.le(seg.ack)) {
@@ -1567,7 +1606,7 @@ impl Tcb {
                 if !self.sack.in_recovery() {
                     self.cc.on_ack(&sample);
                 }
-                self.sack.exit_if_covered(self.delivered);
+                exit |= self.sack.exit_if_covered(self.delivered);
                 None
             } else {
                 Some(self.recovery.on_new_ack(seg.ack))
@@ -1580,13 +1619,23 @@ impl Tcb {
                     self.retransmit_due = true;
                     restart_rto = first;
                 }
-                Some(NewAck::Full) => self.cc.on_recovery_ack(RecoveryAck::Full { in_flight }),
+                Some(NewAck::Full) => {
+                    self.cc.on_recovery_ack(RecoveryAck::Full { in_flight });
+                    exit = true;
+                }
             }
             let restart = (in_flight > 0).then_some(now);
             if restart_rto {
                 self.rto_at = restart.map(|t| t + self.rtt.rto());
             }
             self.r2_since = restart;
+        }
+        // IsLost's point rose: the never-resent `Pending` octets below it are lost (spec §1.4).
+        // Below SND.UNA everything is delivered, so the range starts there at the lowest.
+        let new_lost_end = self.sack.lost_end();
+        if new_lost_end > lost_end {
+            self.rate
+                .declare_lost(lost_end.max(self.delivered)..new_lost_end, now, true);
         }
         // RFC 6675 §5: a newly SACKing ACK is a duplicate ACK; DupThresh of them, or
         // IsLost(HighACK + 1), starts loss recovery. As for RFC 5681 duplicates, one carrying
@@ -1604,8 +1653,24 @@ impl Tcb {
                 self.sack.enter(self.delivered, self.abs(self.snd_max));
                 // (4.3): HighACK + 1 first, regardless of pipe.
                 self.retransmit_due = true;
+                entered = Some(RecoveryKind::Fast);
             }
         }
+        if exit {
+            self.loss_recovery = LossRecovery::None;
+        }
+        if entered.is_some() {
+            self.loss_recovery = LossRecovery::Fast;
+        }
+        self.recovery_hooks(entered, now);
+        let ctx = SampleCtx {
+            in_recovery: self.loss_recovery != LossRecovery::None,
+            recovery_exit: exit,
+            // Task 4 latches it.
+            cwnd_filled: false,
+        };
+        let rs = self.rate.sample(now, ctx);
+        self.cc.on_rate_sample(&rs);
         if self.snd_wl1.lt(seg.seq) || (self.snd_wl1 == seg.seq && self.snd_wl2.le(seg.ack)) {
             self.snd_wnd = wnd;
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
@@ -1664,6 +1729,7 @@ impl Tcb {
             // so only an ACK that delivers no post-RTO resend is still marked.
             self.app_limited_until = None;
             self.app_limited = None;
+            self.rate.on_rto(now);
             if self.sack_permitted {
                 self.sack.rto(self.abs(self.snd_max));
                 for r in &mut self.sent {
@@ -1674,6 +1740,10 @@ impl Tcb {
             // window under slow start as ACKs return.
             self.snd_nxt = self.snd_una;
             self.retransmit_due = true;
+            self.loss_recovery = LossRecovery::Rto {
+                point: self.abs(self.snd_max),
+            };
+            self.recovery_hooks(Some(RecoveryKind::Rto), now);
         }
         if self.persist_at.is_some_and(|t| now >= t) {
             self.probe_due = true;
@@ -1724,6 +1794,11 @@ impl Tcb {
             let fin = self.fin_sent();
             let meta = self.write_data(self.snd_una, len, fin, now, h, out)?;
             let end = self.snd_una.wrapping_add(seq_len(&meta));
+            // The (4.3), fast-retransmit and partial-ACK resends declare exactly what they
+            // resend lost (spec §1.4), outside any ACK; after an RTO nothing here is Pending.
+            self.rate
+                .declare_lost(self.delivered..self.abs(end), now, false);
+            self.report_losses();
             self.sack
                 .on_retransmit(self.delivered, self.abs(end), false);
             self.on_data_sent(self.snd_una, &meta, now, true);
@@ -1893,6 +1968,9 @@ impl Tcb {
                 break;
             }
         }
+        let start = self.abs(seq);
+        self.rate
+            .on_send(start..start + u64::from(seq_len(meta)), now, resent);
         // The flow filled cwnd: what is outstanding now was sent cwnd-limited.
         let max = if rec.end.gt(self.snd_max) {
             rec.end
@@ -1993,6 +2071,27 @@ impl Tcb {
     fn data_len(&self, seq: SeqNum, end: SeqNum) -> u32 {
         let end = self.fin_seq().filter(|f| f.lt(end)).unwrap_or(end);
         seq.distance(end).max(0) as u32
+    }
+
+    /// The end of an ACK's or RTO's processing, after its legacy callbacks (spec §1.7):
+    /// `on_recovery_start` if it `entered` recovery, then `on_loss` for its events.
+    fn recovery_hooks(&mut self, entered: Option<RecoveryKind>, now: Instant) {
+        if let Some(kind) = entered {
+            let inflight = self.rate.inflight();
+            self.cc.on_recovery_start(&RecoveryStart {
+                kind,
+                inflight,
+                now,
+            });
+        }
+        self.report_losses();
+    }
+
+    /// `on_loss` for each loss event queued in the sampler, in offset order.
+    fn report_losses(&mut self) {
+        for e in self.rate.take_loss_events() {
+            self.cc.on_loss(&e);
+        }
     }
 
     /// Relative SSN of `seq`: ISS + 1 is SSN 1 (spec §5.3).
@@ -2158,6 +2257,8 @@ impl Tcb {
 
     fn terminate(&mut self, reason: CloseReason, now: Instant) -> Reaction {
         self.state = TcpState::Closed;
+        // Closing ends recovery silently (spec §1.7).
+        self.loss_recovery = LossRecovery::None;
         self.closed_at = Some(now);
         Reaction::Closed(reason)
     }
