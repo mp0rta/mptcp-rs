@@ -6,6 +6,7 @@ Usage: run_suite.py [--case NAME]... [--runs N] [--ci] [--shard K/N]. Build the 
 import argparse
 import json
 import operator
+import os
 import platform
 import re
 import subprocess
@@ -169,6 +170,9 @@ def run_case(case, out):
         cargs += ["--script", out / "script.txt"]
     cargs += ["--send-rate", c["send_rate"]] if c["send_rate"] else []
     cargs += ["--event-log", out / "events.jsonl"]
+    cc = os.environ.get("MPTCP_RS_CC", "cubic")
+    (out / "cc.txt").write_text(cc + "\n")
+    cargs += ["--cc", cc]
     until = time.time() + case["watchdog_s"]
     srv = subprocess.Popen(["ip", "netns", "exec", "srv", "python3", "tests/interop/server.py", "--mode", "mptcp",
                             "--port", "5201", *sargs], stdout=open(out / "server.log", "w"), stderr=subprocess.STDOUT)
