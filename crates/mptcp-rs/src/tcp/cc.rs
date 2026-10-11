@@ -184,8 +184,10 @@ pub trait CongestionControl: Send {
     /// Called once when the connection reaches ESTABLISHED, immediately after `init`, with the
     /// parameters `init` took plus the SYN round trip and SACK negotiation. Default: nothing.
     fn on_start(&mut self, _: &Start) {}
-    /// Called for each data transmission, new or retransmitted, after the `Tcb` has counted it
-    /// in flight and before the next one. Default: nothing.
+    /// Called before a data transmission, new or retransmitted, that starts from nothing in
+    /// flight (the rate sampler's inflight is 0), before the `Tcb` counts it in flight: the
+    /// draft's OnTransmit restart-from-idle point. Not called for other transmissions.
+    /// Default: nothing.
     fn on_transmit(&mut self, _: &Transmit) {}
     /// Called when loss recovery begins (fast retransmit, or every RTO), after the legacy
     /// callbacks for the same ACK or timeout. Default: nothing.
@@ -202,8 +204,9 @@ pub trait CongestionControl: Send {
     fn send_quantum(&self) -> Option<u32> {
         None
     }
-    /// Asked after each callback; `true` asks the `Tcb` to treat the flow as application-limited
-    /// from the next transmission on, and is cleared by being read.
+    /// Asked after every `on_rate_sample` and every `on_transmit`, and only then; `true` marks
+    /// the flow application-limited at once, without the `Tcb`'s own app-limited test, so the
+    /// following transmissions are sent app-limited. Reading it clears the request.
     fn take_app_limited_request(&mut self) -> bool {
         false
     }
