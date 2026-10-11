@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::cc::{
     AckSample, CongestionControl, CongestionEvent, LossEvent, RateSample, RecoveryAck,
-    RecoveryKind, RecoveryStart, Start, initial_window,
+    RecoveryKind, RecoveryStart, Start, Transmit, initial_window,
 };
 use crate::time::Instant;
 
@@ -45,6 +45,9 @@ const MAX_BW_FILTER_LEN: u64 = 2;
 const EXTRA_ACKED_FILTER_LEN: u64 = 10;
 const MIN_RTT_FILTER_LEN: Duration = Duration::from_secs(10);
 const PROBE_RTT_INTERVAL: Duration = Duration::from_secs(5);
+/// §2.16: 0.5.
+const PROBE_RTT_CWND_GAIN: Gain = (1, 2);
+const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
 /// §5.6.3: 64 KBytes.
 const MAX_SEND_QUANTUM: u64 = 64 * 1024;
 
@@ -207,6 +210,23 @@ pub(crate) struct Bbr {
     // min_rtt estimation inside the ProbeRTT machinery (§2.16, §5.3.4.3).
     probe_rtt_min_delay: Duration,
     probe_rtt_min_stamp: Instant,
+    probe_rtt_expired: bool,
+    /// The draft's 0 is `None`.
+    probe_rtt_done_stamp: Option<Instant>,
+    probe_rtt_round_done: bool,
+    idle_restart: bool,
+    /// MarkConnectionAppLimited, until the `Tcb` takes it.
+    app_limited_request: bool,
+    /// C.delivered as of the last ACK; nothing is delivered between ACKs.
+    delivered: u64,
+    // Loss recovery (§5.6.4.4).
+    prior_cwnd: u64,
+    /// InLossRecovery(): from `on_recovery_start` to the ACK that carries `recovery_exit`.
+    in_loss_recovery: bool,
+    // SaveStateUponLoss (§5.5.11.1); kept for a spurious-loss undo not yet implemented.
+    undo_bw_shortterm: u64,
+    undo_inflight_shortterm: u64,
+    undo_inflight_longterm: u64,
 }
 
 impl Bbr {
@@ -271,6 +291,17 @@ impl Bbr {
             cwnd_limited_last_round: false,
             probe_rtt_min_delay: INFINITE_RTT,
             probe_rtt_min_stamp: Instant::from_nanos(0),
+            probe_rtt_expired: false,
+            probe_rtt_done_stamp: None,
+            probe_rtt_round_done: false,
+            idle_restart: false,
+            app_limited_request: false,
+            delivered: 0,
+            prior_cwnd: 0,
+            in_loss_recovery: false,
+            undo_bw_shortterm: INFINITE,
+            undo_inflight_shortterm: INFINITE,
+            undo_inflight_longterm: INFINITE,
         }
     }
 
@@ -307,6 +338,7 @@ impl Bbr {
         self.check_drain_done(rs);
         self.update_probe_bw_cycle_phase(rs);
         self.update_min_rtt(rs);
+        self.check_probe_rtt(rs);
         self.advance_latest_delivery_signals(rs);
         self.bound_bw_for_model();
     }
@@ -644,6 +676,90 @@ impl Bbr {
             .max(self.min_pipe_cwnd())
     }
 
+    // ProbeRTT (§5.3.4).
+
+    fn check_probe_rtt(&mut self, rs: &RateSample) {
+        if self.state != State::ProbeRtt && self.probe_rtt_expired && !self.idle_restart {
+            self.enter_probe_rtt();
+            self.save_cwnd();
+            self.probe_rtt_done_stamp = None;
+            self.ack_phase = AckPhase::ProbeStopping;
+            self.start_round(rs.delivered);
+        }
+        if self.state == State::ProbeRtt {
+            self.handle_probe_rtt(rs);
+        }
+        if rs.delivery.is_some_and(|d| d.delivered > 0) {
+            self.idle_restart = false;
+        }
+    }
+
+    fn enter_probe_rtt(&mut self) {
+        self.state = State::ProbeRtt;
+        self.pacing_gain = UNITY_GAIN;
+        self.cwnd_gain = PROBE_RTT_CWND_GAIN;
+    }
+
+    fn handle_probe_rtt(&mut self, rs: &RateSample) {
+        // Ignore low rate samples during ProbeRTT.
+        self.mark_connection_app_limited();
+        if let Some(done_stamp) = self.probe_rtt_done_stamp {
+            if self.round_start {
+                self.probe_rtt_round_done = true;
+            }
+            if self.probe_rtt_round_done {
+                self.check_probe_rtt_done(rs.now, done_stamp);
+            }
+        } else if rs.inflight <= self.probe_rtt_cwnd() {
+            // At least ProbeRTTDuration and one round from here.
+            self.probe_rtt_done_stamp = Some(rs.now + PROBE_RTT_DURATION);
+            self.probe_rtt_round_done = false;
+            self.start_round(rs.delivered);
+        }
+    }
+
+    /// The draft's `BBR.probe_rtt_done_stamp != 0` test is the caller's.
+    fn check_probe_rtt_done(&mut self, now: Instant, done_stamp: Instant) {
+        if now > done_stamp {
+            // The next ProbeRTT is due ProbeRTTInterval from here.
+            self.probe_rtt_min_stamp = now;
+            self.restore_cwnd();
+            self.exit_probe_rtt(now);
+        }
+    }
+
+    fn exit_probe_rtt(&mut self, now: Instant) {
+        self.reset_short_term_model();
+        if self.full_bw_reached {
+            self.start_probe_bw_down(now, self.delivered);
+            self.start_probe_bw_cruise();
+        } else {
+            self.enter_startup();
+        }
+    }
+
+    /// The `Tcb` takes the request after this callback (spec §2).
+    fn mark_connection_app_limited(&mut self) {
+        self.app_limited_request = true;
+    }
+
+    /// §5.4: called before a send that starts from nothing in flight.
+    fn handle_restart_from_idle(&mut self, t: &Transmit) {
+        if t.inflight != 0 || !t.app_limited {
+            return;
+        }
+        self.idle_restart = true;
+        self.extra_acked_interval_start = t.now;
+        if self.is_in_a_probe_bw_state() {
+            self.set_pacing_rate_with_gain(UNITY_GAIN);
+        } else if let Some(done_stamp) = self
+            .probe_rtt_done_stamp
+            .filter(|_| self.state == State::ProbeRtt)
+        {
+            self.check_probe_rtt_done(t.now, done_stamp);
+        }
+    }
+
     // The model (§5.5).
 
     /// UpdateRound (§5.5.1), for an ACK that delivered data sent after `prior_delivered`.
@@ -686,9 +802,9 @@ impl Bbr {
     /// The min_rtt filter of §5.5.7.2, as the draft integrates it with ProbeRTT (§5.3.4.3).
     fn update_min_rtt(&mut self, rs: &RateSample) {
         let now = rs.now;
-        let probe_rtt_expired = now > self.probe_rtt_min_stamp + PROBE_RTT_INTERVAL;
+        self.probe_rtt_expired = now > self.probe_rtt_min_stamp + PROBE_RTT_INTERVAL;
         if let Some(rtt) = rs.rtt {
-            if rtt < self.probe_rtt_min_delay || probe_rtt_expired {
+            if rtt < self.probe_rtt_min_delay || self.probe_rtt_expired {
                 self.probe_rtt_min_delay = rtt;
                 self.probe_rtt_min_stamp = now;
             }
@@ -863,6 +979,39 @@ impl Bbr {
 
     // Control parameters (§5.6).
 
+    /// §5.6.4.5.
+    fn probe_rtt_cwnd(&self) -> u64 {
+        self.bdp_multiple(PROBE_RTT_CWND_GAIN)
+            .max(self.min_pipe_cwnd())
+    }
+
+    fn bound_cwnd_for_probe_rtt(&mut self) {
+        if self.state == State::ProbeRtt {
+            self.cwnd = self.cwnd.min(self.probe_rtt_cwnd());
+        }
+    }
+
+    /// §5.6.4.4: the last-known good cwnd, unmodulated by loss recovery or ProbeRTT.
+    fn save_cwnd(&mut self) {
+        if !self.in_loss_recovery && self.state != State::ProbeRtt {
+            self.prior_cwnd = self.cwnd;
+        } else {
+            self.prior_cwnd = self.prior_cwnd.max(self.cwnd);
+        }
+    }
+
+    fn restore_cwnd(&mut self) {
+        self.cwnd = self.cwnd.max(self.prior_cwnd);
+    }
+
+    /// §5.5.11.1.
+    fn save_state_upon_loss(&mut self) {
+        self.save_cwnd();
+        self.undo_bw_shortterm = self.bw_shortterm;
+        self.undo_inflight_shortterm = self.inflight_shortterm;
+        self.undo_inflight_longterm = self.inflight_longterm;
+    }
+
     fn init_pacing_rate(&mut self, srtt: Option<Duration>) {
         let (num, den) = STARTUP_PACING_GAIN;
         let srtt = srtt.unwrap_or(Duration::from_millis(1)).as_nanos();
@@ -941,6 +1090,12 @@ impl Bbr {
             self.cwnd = self.cwnd.saturating_add(newly_acked);
         }
         self.cwnd = self.cwnd.max(self.min_pipe_cwnd());
+        // Recovery ends on this ACK: RestoreCwnd before the final bounds (§5.6.4.4).
+        if rs.recovery_exit {
+            self.in_loss_recovery = false;
+            self.restore_cwnd();
+        }
+        self.bound_cwnd_for_probe_rtt();
         self.bound_cwnd_for_model();
     }
 
@@ -1022,13 +1177,31 @@ impl CongestionControl for Bbr {
 
     /// UpdateOnACK (§5.2.3); the sampler has already generated the rate sample.
     fn on_rate_sample(&mut self, rs: &RateSample) {
+        self.delivered = rs.delivered;
         self.update_model_and_state(rs);
         self.update_control_parameters(rs);
     }
 
-    /// Records when fast recovery began, for Startup's loss exit (§5.3.1.3).
+    /// OnEnterFastRecovery / OnEnterRTO (§5.6.4.4), and when fast recovery began, for
+    /// Startup's loss exit (§5.3.1.3).
     fn on_recovery_start(&mut self, r: &RecoveryStart) {
         self.fast_recovery_round = (r.kind == RecoveryKind::Fast).then_some(self.round_count);
+        // The draft calls SaveCwnd and then SaveStateUponLoss, which calls it again to the
+        // same effect.
+        self.save_state_upon_loss();
+        self.in_loss_recovery = true;
+        if r.kind == RecoveryKind::Rto {
+            // C.inflight + 1 packet.
+            self.cwnd = r.inflight + self.smss;
+        }
+    }
+
+    fn on_transmit(&mut self, t: &Transmit) {
+        self.handle_restart_from_idle(t);
+    }
+
+    fn take_app_limited_request(&mut self) -> bool {
+        std::mem::take(&mut self.app_limited_request)
     }
 
     fn on_loss(&mut self, e: &LossEvent) {
@@ -1037,7 +1210,26 @@ impl CongestionControl for Bbr {
 
     fn on_ack(&mut self, _: &AckSample) {}
 
-    fn on_congestion(&mut self, _: CongestionEvent, _: u32, _: Instant) {}
+    /// The MPTCP penalty (spec §4.2), an immediate decrease; draft-06 has no such event.
+    /// Loss recovery reaches BBR through `on_recovery_start` and `on_loss` instead.
+    fn on_congestion(&mut self, ev: CongestionEvent, _: u32, _: Instant) {
+        // Recovery already cut the window, and RestoreCwnd decides the result.
+        if ev != CongestionEvent::Penalized || self.in_loss_recovery {
+            return;
+        }
+        self.init_lower_bounds();
+        self.pacing_rate = times_beta(self.pacing_rate);
+        // Never raised: at or below MinPipeCwnd cwnd stays as it is.
+        self.cwnd = self
+            .cwnd
+            .min(times_beta(self.cwnd).max(self.min_pipe_cwnd()));
+        // Beta on the bounds themselves, so stale *_latest values cannot cancel it.
+        self.bw_shortterm = times_beta(self.bw_shortterm);
+        self.inflight_shortterm = times_beta(self.inflight_shortterm).min(self.cwnd);
+        // No SetCwnd on a stale sample.
+        self.bound_bw_for_model();
+        self.prior_cwnd = times_beta(self.prior_cwnd);
+    }
 
     fn on_recovery_ack(&mut self, _: RecoveryAck) {}
 
@@ -1969,5 +2161,498 @@ mod tests {
         bbr.cwnd = unbounded;
         bbr.bound_cwnd_for_model();
         assert_eq!(bbr.cwnd, 4_000);
+    }
+
+    fn penalize(bbr: &mut Bbr) {
+        bbr.on_congestion(CongestionEvent::Penalized, 0, T0);
+    }
+
+    /// A transmission that starts from nothing in flight.
+    fn transmit(bbr: &mut Bbr, app_limited: bool, now: Instant) {
+        bbr.on_transmit(&Transmit {
+            inflight: 0,
+            app_limited,
+            now,
+        });
+    }
+
+    /// `ack_with` in loss recovery; `exit` marks the ACK that ends it.
+    fn recovery_ack(bbr: &mut Bbr, delivered: u64, inflight: u64, now: Instant, exit: bool) {
+        let mut rs = sample(bbr, delivered, ms(10), ms(10), now);
+        rs.inflight = inflight;
+        rs.in_recovery = true;
+        rs.recovery_exit = exit;
+        bbr.on_rate_sample(&rs);
+    }
+
+    /// `ack_with` for an ACK that ends no round.
+    fn ack_no_round(bbr: &mut Bbr, delivered: u64, inflight: u64, now: Instant) {
+        let mut rs = sample(bbr, delivered, ms(10), ms(10), now);
+        rs.inflight = inflight;
+        rs.delivery.as_mut().expect("delivery").prior_delivered = 0;
+        bbr.on_rate_sample(&rs);
+    }
+
+    /// ProbeBW, then the first ACK more than ProbeRTTInterval after the first round's 10 ms
+    /// RTT sample, with C.inflight above ProbeRTTCwnd. Returns its time.
+    fn to_probe_rtt(bbr: &mut Bbr) -> Instant {
+        to_probe_bw_down(bbr);
+        ack_with(bbr, 100_000, 300_000, at(5_010));
+        let t = at(5_011);
+        ack_with(bbr, 100_000, 300_000, t);
+        assert_eq!(bbr.view().state, State::ProbeRtt);
+        t
+    }
+
+    #[test]
+    fn probe_rtt_after_5s() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        // Later 10 ms samples do not refresh the first round's.
+        assert_eq!(bbr.probe_rtt_min_stamp, at(10));
+        // Exactly ProbeRTTInterval later is not yet expired.
+        ack_with(&mut bbr, 100_000, 300_000, at(5_010));
+        assert_ne!(bbr.view().state, State::ProbeRtt);
+        assert!(!bbr.take_app_limited_request());
+        let cwnd = bbr.cwnd;
+        ack_with(&mut bbr, 100_000, 300_000, at(5_011));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeRtt);
+        assert_eq!(v.phase, AckPhase::ProbeStopping);
+        assert_eq!(bbr.pacing_gain, UNITY_GAIN);
+        assert_eq!(bbr.cwnd_gain, PROBE_RTT_CWND_GAIN);
+        assert_eq!(bbr.prior_cwnd, cwnd, "SaveCwnd");
+        // C.inflight 300 000 is above ProbeRTTCwnd: no exit timer yet.
+        assert_eq!(bbr.probe_rtt_done_stamp, None);
+        // ProbeRTTCwnd = max(0.5 × BBR.bdp, MinPipeCwnd) bounds cwnd.
+        assert_eq!(bbr.probe_rtt_cwnd(), 50_000);
+        assert_eq!(v.cwnd, 50_000);
+        // 1.0 × 10 MB/s × 99%.
+        assert_eq!(v.pacing_rate, 9_900_000);
+        assert!(bbr.take_app_limited_request(), "MarkConnectionAppLimited");
+        assert!(!bbr.take_app_limited_request(), "taking it clears it");
+    }
+
+    #[test]
+    fn probe_rtt_exit_after_200ms_and_round() {
+        // 200 ms first, then the round.
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_rtt(&mut bbr);
+        let prior_cwnd = bbr.prior_cwnd;
+        assert!(prior_cwnd > 50_000);
+        // C.inflight within ProbeRTTCwnd: at least 200 ms and one round from here.
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(10));
+        assert_eq!(bbr.probe_rtt_done_stamp, Some(t + ms(210)));
+        assert!(!bbr.probe_rtt_round_done);
+        ack_no_round(&mut bbr, 10_000, 50_000, t + ms(300));
+        assert_eq!(bbr.view().state, State::ProbeRtt, "no round yet");
+        ack_with(&mut bbr, 1_000, 50_000, t + ms(310));
+        let v = bbr.view();
+        // ProbeBW_DOWN, then CRUISE at once.
+        assert_eq!(v.state, State::ProbeBwCruise);
+        assert_eq!(bbr.cycle_stamp, t + ms(310));
+        assert_eq!(
+            bbr.probe_rtt_min_stamp,
+            t + ms(310),
+            "the next ProbeRTT in 5 s"
+        );
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, INFINITE));
+        // RestoreCwnd, then SetCwnd: + newly_acked, at most max_inflight.
+        assert_eq!(v.cwnd, (prior_cwnd + 1_000).min(bbr.max_inflight));
+        assert_eq!(v.pacing_rate, 9_900_000);
+
+        // The round first, then 200 ms (strictly).
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_rtt(&mut bbr);
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(10));
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(20));
+        assert!(bbr.probe_rtt_round_done);
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(210));
+        assert_eq!(bbr.view().state, State::ProbeRtt, "200 ms not yet passed");
+        ack_no_round(&mut bbr, 10_000, 50_000, t + ms(211));
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+
+        // Before the pipe was filled, ProbeRTT exits to Startup. Its samples are app-limited.
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        ack_with(&mut bbr, 100_000, 300_000, at(5_011));
+        assert_eq!(bbr.view().state, State::ProbeRtt);
+        let probe_rtt_ack = |bbr: &mut Bbr, now| {
+            let mut rs = sample(bbr, 10_000, ms(10), ms(10), now);
+            rs.inflight = 4_000;
+            rs.delivery.as_mut().expect("delivery").is_app_limited = true;
+            bbr.on_rate_sample(&rs);
+        };
+        probe_rtt_ack(&mut bbr, at(5_021));
+        probe_rtt_ack(&mut bbr, at(5_300));
+        assert_eq!(bbr.view().state, State::Startup);
+        assert!(!bbr.full_bw_reached);
+        assert_eq!(bbr.pacing_gain, STARTUP_PACING_GAIN);
+    }
+
+    #[test]
+    fn probe_rtt_requests_app_limited_even_on_exit_ack() {
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_rtt(&mut bbr);
+        assert!(bbr.take_app_limited_request());
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(10));
+        assert!(bbr.take_app_limited_request());
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(300));
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+        assert!(bbr.take_app_limited_request(), "the exiting ACK too");
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(310));
+        assert!(!bbr.take_app_limited_request(), "not after ProbeRTT");
+    }
+
+    #[test]
+    fn idle_restart_paces_at_bw() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let cwnd = bbr.cwnd;
+        assert_eq!(bbr.view().pacing_rate, 8_910_000);
+        // Not app-limited, or something in flight: not a restart from idle.
+        transmit(&mut bbr, false, at(100));
+        bbr.on_transmit(&Transmit {
+            inflight: 1_000,
+            app_limited: true,
+            now: at(100),
+        });
+        assert_eq!(bbr.view().pacing_rate, 8_910_000);
+        assert!(!bbr.idle_restart);
+        // SetPacingRateWithGain(1): BBR.bw less the pacing margin. cwnd stays.
+        transmit(&mut bbr, true, at(200));
+        assert_eq!(bbr.view().pacing_rate, 9_900_000);
+        assert_eq!(bbr.cwnd, cwnd);
+        assert!(bbr.idle_restart);
+        assert_eq!(bbr.extra_acked_interval_start, at(200));
+        assert!(!bbr.take_app_limited_request());
+        // Idle past ProbeRTTInterval: the first ACK after the restart takes a fresh sample
+        // instead of entering ProbeRTT.
+        ack_with(&mut bbr, 100_000, 100_000, at(6_000));
+        assert_ne!(bbr.view().state, State::ProbeRtt);
+        assert!(!bbr.idle_restart);
+        assert_eq!(bbr.probe_rtt_min_stamp, at(6_000));
+
+        // In ProbeRTT a restart from idle checks the exit (timer only).
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_rtt(&mut bbr);
+        let prior_cwnd = bbr.prior_cwnd;
+        ack_with(&mut bbr, 10_000, 50_000, t + ms(10));
+        transmit(&mut bbr, true, t + ms(210));
+        assert_eq!(bbr.view().state, State::ProbeRtt);
+        transmit(&mut bbr, true, t + ms(211));
+        assert_eq!(bbr.view().state, State::ProbeBwCruise);
+        assert_eq!(bbr.cwnd, prior_cwnd, "RestoreCwnd");
+        assert_eq!(bbr.probe_rtt_min_stamp, t + ms(211));
+    }
+
+    #[test]
+    fn save_and_restore_cwnd_across_fast_recovery() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        // A loss round leaves finite short-term bounds.
+        bbr.on_loss(&loss(&bbr, 2_000_000, 1_000, 1_000_000, 1_000));
+        ack_with(&mut bbr, 50_000, 300_000, at(90));
+        let v = bbr.view();
+        assert_ne!(v.inflight_shortterm, INFINITE);
+        let c0 = v.cwnd;
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        assert!(bbr.in_loss_recovery);
+        assert_eq!(bbr.prior_cwnd, c0, "SaveCwnd");
+        assert_eq!(bbr.cwnd, c0, "fast recovery leaves cwnd to the model");
+        assert_eq!(
+            (
+                bbr.undo_bw_shortterm,
+                bbr.undo_inflight_shortterm,
+                bbr.undo_inflight_longterm
+            ),
+            (v.bw_shortterm, v.inflight_shortterm, INFINITE),
+            "SaveStateUponLoss"
+        );
+        // As a cut during recovery would leave it.
+        bbr.cwnd = 20_000;
+        recovery_ack(&mut bbr, 1_000, 300_000, at(100), false);
+        assert_eq!(bbr.cwnd, 21_000, "not restored before the exit");
+        recovery_ack(&mut bbr, 1_000, 300_000, at(110), true);
+        assert_eq!(bbr.cwnd, c0, "RestoreCwnd");
+        assert!(!bbr.in_loss_recovery);
+    }
+
+    #[test]
+    fn rto_then_restore() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        recovery_start(&mut bbr, RecoveryKind::Rto);
+        assert_eq!(bbr.cwnd, 1_000, "C.inflight (0) + 1 SMSS");
+        assert_eq!(bbr.prior_cwnd, c0);
+        recovery_ack(&mut bbr, 1_000, 1_000, at(90), false);
+        assert_eq!(bbr.cwnd, 4_000, "+ newly_acked, at least MinPipeCwnd");
+        recovery_ack(&mut bbr, 1_000, 1_000, at(100), true);
+        assert_eq!(bbr.cwnd, c0);
+    }
+
+    #[test]
+    fn repeated_rto_save_cwnd_max() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        recovery_start(&mut bbr, RecoveryKind::Rto);
+        recovery_start(&mut bbr, RecoveryKind::Rto);
+        assert_eq!(bbr.cwnd, 1_000);
+        assert_eq!(bbr.prior_cwnd, c0, "max(prior_cwnd, cwnd) in recovery");
+        recovery_ack(&mut bbr, 1_000, 300_000, at(90), true);
+        assert_eq!(bbr.cwnd, c0);
+
+        // An RTO during fast recovery keeps the larger value too.
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        bbr.cwnd = 20_000;
+        recovery_start(&mut bbr, RecoveryKind::Rto);
+        assert_eq!(bbr.prior_cwnd, c0);
+
+        // A new episode after the exit saves afresh.
+        recovery_ack(&mut bbr, 1_000, 300_000, at(90), true);
+        bbr.prior_cwnd = 10 * c0;
+        recovery_start(&mut bbr, RecoveryKind::Fast);
+        assert_eq!(bbr.prior_cwnd, c0);
+    }
+
+    #[test]
+    fn penalty_infinite_bounds() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        assert_eq!(bbr.view().pacing_rate, 8_910_000);
+        penalize(&mut bbr);
+        let v = bbr.view();
+        // InitLowerBounds (max_bw, cwnd), then Beta on the outputs and the bounds.
+        assert_eq!(v.cwnd, c0 * 7 / 10);
+        assert_eq!(v.pacing_rate, 6_237_000);
+        assert_eq!(v.bw_shortterm, 7_000_000);
+        assert_eq!(v.inflight_shortterm, c0 * 7 / 10);
+        assert_eq!(bbr.bw, 7_000_000, "BoundBWForModel");
+        // The next ACK keeps them: 0.9 × 7 MB/s × 99%.
+        ack_with(&mut bbr, 100_000, 300_000, at(90));
+        assert_eq!(bbr.view().cwnd, c0 * 7 / 10);
+        assert_eq!(bbr.view().pacing_rate, 6_237_000);
+    }
+
+    #[test]
+    fn penalty_in_startup_before_full_bw() {
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (104_000, 27_423_000));
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (72_800, 19_196_100));
+        assert_eq!(bbr.view().bw_shortterm, 7_000_000);
+        // Startup's increase-only pacing and growing cwnd do not undo it.
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(20));
+        assert_eq!(bbr.view().state, State::Startup);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (72_800, 19_196_100));
+    }
+
+    #[test]
+    fn penalty_in_drain() {
+        let mut bbr = started(SMSS, None);
+        to_drain(&mut bbr);
+        let c0 = bbr.cwnd;
+        assert_eq!(bbr.pacing_rate, 4_950_000);
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c0 * 7 / 10, 3_465_000));
+        ack_with(&mut bbr, 100_000, 300_000, at(50));
+        assert_eq!(bbr.view().state, State::Drain);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c0 * 7 / 10, 3_465_000));
+    }
+
+    #[test]
+    fn penalty_in_each_probe_bw_phase() {
+        for (state, pacing, penalized) in [
+            (State::ProbeBwDown, 8_910_000, 6_237_000),
+            (State::ProbeBwCruise, 9_900_000, 6_930_000),
+            (State::ProbeBwRefill, 9_900_000, 6_930_000),
+            (State::ProbeBwUp, 12_375_000, 8_662_500),
+        ] {
+            let mut bbr = started(SMSS, None);
+            match state {
+                State::ProbeBwDown => to_probe_bw_down(&mut bbr),
+                State::ProbeBwCruise => {
+                    to_probe_bw_down(&mut bbr);
+                    ack_with(&mut bbr, 100_000, 100_000, at(90));
+                }
+                State::ProbeBwRefill => _ = to_probe_bw_refill(&mut bbr),
+                _ => _ = to_probe_bw_up(&mut bbr),
+            }
+            assert_eq!(bbr.view().state, state);
+            let c0 = bbr.cwnd;
+            assert_eq!(bbr.pacing_rate, pacing, "{state:?}");
+            penalize(&mut bbr);
+            let v = bbr.view();
+            assert_eq!(
+                (v.cwnd, v.pacing_rate),
+                (c0 * 7 / 10, penalized),
+                "{state:?}"
+            );
+            assert_eq!(v.bw_shortterm, 7_000_000);
+            assert_eq!(v.inflight_shortterm, c0 * 7 / 10);
+        }
+    }
+
+    #[test]
+    fn penalty_in_probe_rtt_survives_exit() {
+        let mut bbr = started(SMSS, None);
+        let t = to_probe_rtt(&mut bbr);
+        let prior_cwnd = bbr.prior_cwnd;
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (50_000, 9_900_000));
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (35_000, 6_930_000));
+        assert_eq!(
+            bbr.prior_cwnd,
+            prior_cwnd * 7 / 10,
+            "so RestoreCwnd keeps it"
+        );
+        ack_with(&mut bbr, 1_000, 30_000, t + ms(10));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (35_000, 6_930_000));
+        ack_with(&mut bbr, 1_000, 30_000, t + ms(300));
+        let v = bbr.view();
+        assert_eq!(v.state, State::ProbeBwCruise);
+        // RestoreCwnd brings back the penalized prior_cwnd, + newly_acked.
+        assert_eq!(v.cwnd, (prior_cwnd * 7 / 10 + 1_000).min(bbr.max_inflight));
+        assert!(v.cwnd < prior_cwnd);
+        // ExitProbeRTT's ResetShortTermModel releases the bandwidth bound.
+        assert_eq!(v.pacing_rate, 9_900_000);
+    }
+
+    #[test]
+    fn penalty_ignored_in_recovery() {
+        for kind in [RecoveryKind::Rto, RecoveryKind::Fast] {
+            let mut bbr = started(SMSS, None);
+            to_probe_bw_down(&mut bbr);
+            let c0 = bbr.cwnd;
+            recovery_start(&mut bbr, kind);
+            let before = (bbr.view(), bbr.prior_cwnd, bbr.bw);
+            penalize(&mut bbr);
+            assert_eq!((bbr.view(), bbr.prior_cwnd, bbr.bw), before, "{kind:?}");
+            assert_eq!(bbr.pacing_rate, 8_910_000);
+            // After the exit it applies again.
+            recovery_ack(&mut bbr, 1_000, 300_000, at(90), true);
+            // After the RTO's 1-SMSS cwnd, T_reno starts REFILL at once (pacing 1.0).
+            assert_eq!(bbr.cwnd, c0);
+            let pacing = bbr.pacing_rate;
+            assert_eq!(
+                pacing,
+                if kind == RecoveryKind::Rto {
+                    9_900_000
+                } else {
+                    8_910_000
+                }
+            );
+            penalize(&mut bbr);
+            assert_eq!((bbr.cwnd, bbr.pacing_rate), (c0 * 7 / 10, pacing * 7 / 10));
+        }
+    }
+
+    #[test]
+    fn penalty_stale_latest() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        // As a lossy round and then a faster one leave them: *_latest above the bounds.
+        bbr.bw_shortterm = 5_000_000;
+        bbr.inflight_shortterm = 60_000;
+        ack_with(&mut bbr, 100_000, 300_000, at(90));
+        assert_eq!((bbr.bw_latest, bbr.inflight_latest), (10_000_000, 100_000));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (60_000, 4_455_000));
+        penalize(&mut bbr);
+        let v = bbr.view();
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (3_500_000, 42_000));
+        assert_eq!((v.cwnd, v.pacing_rate), (42_000, 3_118_500));
+        ack_with(&mut bbr, 100_000, 300_000, at(100));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (42_000, 3_118_500));
+    }
+
+    #[test]
+    fn penalty_bound_above_cwnd() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        bbr.inflight_shortterm = 10 * c0;
+        penalize(&mut bbr);
+        let v = bbr.view();
+        // min(Beta × bound, cwnd): reconciled with the cut cwnd, not 7 × c0.
+        assert_eq!(v.inflight_shortterm, c0 * 7 / 10);
+        assert_eq!((v.cwnd, v.pacing_rate), (c0 * 7 / 10, 6_237_000));
+        ack_with(&mut bbr, 100_000, 300_000, at(90));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c0 * 7 / 10, 6_237_000));
+    }
+
+    #[test]
+    fn penalty_at_min_pipe() {
+        // C.InitialCwnd is 4 SMSS here: MinPipeCwnd.
+        let mut bbr = started(SMSS, None);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 11_080_000));
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 7_756_000));
+        assert_eq!(bbr.view().inflight_shortterm, 2_800);
+
+        // Just above it, the floor stops the cut.
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        bbr.cwnd = 5_000;
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 6_237_000));
+    }
+
+    #[test]
+    fn penalty_below_min_pipe_1_2_3_smss() {
+        for (smss, syn_lost, iw) in [(1460, true, 1460), (3000, false, 6000), (1460, false, 4380)] {
+            let mut bbr = Bbr::new(SEED);
+            bbr.init(smss, syn_lost);
+            bbr.on_start(&Start {
+                smss,
+                syn_lost,
+                srtt: None,
+                sack: true,
+                now: T0,
+            });
+            let pacing = bbr.pacing_rate;
+            assert_eq!(bbr.cwnd, iw);
+            penalize(&mut bbr);
+            // Never raised to the floor.
+            assert_eq!(bbr.cwnd, iw, "{smss} {syn_lost}");
+            assert_eq!(bbr.pacing_rate, pacing * 7 / 10);
+        }
+    }
+
+    #[test]
+    fn penalty_after_ack_with_newly_acked() {
+        let mut bbr = started(SMSS, None);
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        let (max_inflight, extra_acked, round_count) =
+            (bbr.max_inflight, bbr.extra_acked, bbr.round_count);
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (72_800, 19_196_100));
+        // No SetCwnd on the stale sample: max_inflight is still the ACK's.
+        assert_eq!(
+            (bbr.max_inflight, bbr.extra_acked, bbr.round_count),
+            (max_inflight, extra_acked, round_count)
+        );
+    }
+
+    #[test]
+    fn penalty_twice() {
+        let mut bbr = started(SMSS, None);
+        to_probe_bw_down(&mut bbr);
+        let c0 = bbr.cwnd;
+        penalize(&mut bbr);
+        ack_with(&mut bbr, 100_000, 300_000, at(90));
+        let c1 = c0 * 7 / 10;
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c1, 6_237_000));
+        penalize(&mut bbr);
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c1 * 7 / 10, 4_365_900));
+        assert_eq!(bbr.view().bw_shortterm, 4_900_000);
+        ack_with(&mut bbr, 100_000, 300_000, at(100));
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (c1 * 7 / 10, 4_365_900));
     }
 }
