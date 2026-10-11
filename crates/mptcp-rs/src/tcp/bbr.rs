@@ -1217,14 +1217,23 @@ impl CongestionControl for Bbr {
         if ev != CongestionEvent::Penalized || self.in_loss_recovery {
             return;
         }
-        self.init_lower_bounds();
+        // As InitLowerBounds, except that with no bandwidth sample yet bw_shortterm stays
+        // Infinity: a zero bound models no measurement and would pin BBR.bw at 0 until REFILL.
+        if self.bw_shortterm == INFINITE && self.max_bw > 0 {
+            self.bw_shortterm = self.max_bw;
+        }
+        if self.inflight_shortterm == INFINITE {
+            self.inflight_shortterm = self.cwnd;
+        }
         self.pacing_rate = times_beta(self.pacing_rate);
         // Never raised: at or below MinPipeCwnd cwnd stays as it is.
         self.cwnd = self
             .cwnd
             .min(times_beta(self.cwnd).max(self.min_pipe_cwnd()));
         // Beta on the bounds themselves, so stale *_latest values cannot cancel it.
-        self.bw_shortterm = times_beta(self.bw_shortterm);
+        if self.bw_shortterm != INFINITE {
+            self.bw_shortterm = times_beta(self.bw_shortterm);
+        }
         self.inflight_shortterm = times_beta(self.inflight_shortterm).min(self.cwnd);
         // No SetCwnd on a stale sample.
         self.bound_bw_for_model();
@@ -2602,6 +2611,23 @@ mod tests {
         bbr.cwnd = 5_000;
         penalize(&mut bbr);
         assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 6_237_000));
+    }
+
+    #[test]
+    fn penalty_before_first_rate_sample() {
+        let mut bbr = started(SMSS, None);
+        penalize(&mut bbr);
+        // The immediate cut still happens; only bw_shortterm stays Infinity.
+        assert_eq!((bbr.cwnd, bbr.pacing_rate), (4_000, 7_756_000));
+        let v = bbr.view();
+        assert_eq!((v.bw_shortterm, v.inflight_shortterm), (INFINITE, 2_800));
+        // Real rates raise BBR.bw and Startup's pacing: 2.77 × 10, then 20 MB/s × 99%.
+        ack(&mut bbr, 100_000, ms(10), ms(10), at(10));
+        assert_eq!((bbr.bw, bbr.pacing_rate), (10_000_000, 27_423_000));
+        ack(&mut bbr, 200_000, ms(10), ms(10), at(20));
+        assert_eq!((bbr.bw, bbr.pacing_rate), (20_000_000, 54_846_000));
+        // inflight_shortterm (2 800) still holds cwnd at MinPipeCwnd until it is reset.
+        assert_eq!(bbr.cwnd, 4_000);
     }
 
     #[test]
