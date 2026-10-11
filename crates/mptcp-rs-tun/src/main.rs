@@ -22,7 +22,7 @@ use rand_core::SeedableRng;
 use script::{Action, Ev, Script};
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3] [--verify on|off]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -59,6 +59,8 @@ struct Args {
     event_log: Option<String>,
     /// `--cc`: the congestion controller; CUBIC without it.
     cc: CongestionControlKind,
+    /// `--verify off`: count received bytes without checking the pattern (CPU benchmark).
+    verify: bool,
 }
 
 impl Args {
@@ -87,6 +89,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let mut abort_after = None;
     let (mut script, mut send_rate, mut event_log) = (None, None, None);
     let mut cc = CongestionControlKind::Cubic;
+    let mut verify = true;
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -113,6 +116,13 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
                 cc = match v.as_str() {
                     "cubic" => CongestionControlKind::Cubic,
                     "bbr3" => CongestionControlKind::BbrV3,
+                    _ => return None,
+                }
+            }
+            "--verify" => {
+                verify = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
                     _ => return None,
                 }
             }
@@ -148,6 +158,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         send_rate,
         event_log,
         cc,
+        verify,
     })
 }
 
@@ -299,7 +310,7 @@ fn run(a: Args) -> Result<String, String> {
                     Ok(0) => st.eof = true,
                     Ok(n) => {
                         if a.expect.is_some_and(|e| st.verified + n as u64 > e)
-                            || !verify_pattern(st.verified, &rbuf[..n])
+                            || (a.verify && !verify_pattern(st.verified, &rbuf[..n]))
                         {
                             return Err(format!("verification mismatch at byte {}", st.verified));
                         }
@@ -773,6 +784,16 @@ mod tests {
             "\nat Connected +0 join fd00:92::2 [dead:beef:1::2]:5201 mtu 1500"
         );
         assert!(Script::parse(&text).is_ok());
+        let a = parse_args(v(&format!("{timed} --send 5"))).unwrap();
+        assert!(a.verify);
+        let a = parse_args(v(&format!("{timed} --send 5 --verify off"))).unwrap();
+        assert!(!a.verify);
+        assert!(
+            parse_args(v(&format!("{timed} --send 5 --verify on")))
+                .unwrap()
+                .verify
+        );
+        assert!(parse_args(v(&format!("{timed} --send 5 --verify maybe"))).is_none());
         let a = parse_args(v(&format!("{timed} --send 5 --script /nonexistent"))).unwrap();
         assert!(a.scenario().is_err());
         assert!(parse_args(v(&format!("{timed} --send 5 --abort-after-ms x"))).is_none());
