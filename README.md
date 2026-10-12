@@ -38,6 +38,13 @@ paths:
   of two paths is blackholed for 15 seconds.
 - Two paths with different speeds give at least 1.2× the goodput of the better single path.
 
+Goodput next to the Linux kernel MPTCP client, with the same server and links:
+
+![Goodput of mptcp-rs and the Linux kernel MPTCP client over two netem paths](docs/images/kernel-compare.svg)
+
+Paths A (10 ms one-way, 300 Mbit/s) and B (30 ms, 80 Mbit/s) are netem on veth on one host; CUBIC, median of 5 runs, one segment per packet at netem; the dashed line is each client's ceiling after header overhead.
+Without netem, where the CPU is the limit, the kernel is far ahead on one connection: about 34 Gbit/s against 1.4 Gbit/s for mptcp-rs over TUN.
+
 It has not been tested against other MPTCP implementations yet.
 
 ## Known limits
