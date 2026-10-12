@@ -259,6 +259,11 @@ pub struct Endpoint<R: CryptoRng> {
     /// Keyed by local address and port; an unspecified IP matches every local address.
     listeners: BTreeMap<SocketAddr, Listener>,
     /// Congestion controller for new connections; `None` is the default (CUBIC).
+    /// Live connections by local token; unique across both roles (RFC 8684 L791–796).
+    tokens: BTreeMap<u32, ConnectionHandle>,
+    /// Test-only keys, popped before the RNG by `new_negotiation`.
+    #[cfg(test)]
+    pub(crate) keys: VecDeque<u64>,
     #[cfg(test)]
     pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
 }
@@ -281,8 +286,27 @@ impl<R: CryptoRng> Endpoint<R> {
             scratch: SegmentWriter::default(),
             pending_joins: BTreeSet::new(),
             listeners: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            #[cfg(test)]
+            keys: VecDeque::new(),
             #[cfg(test)]
             cc: None,
+        }
+    }
+
+    /// Draws a key whose token no live connection uses and reserves the token for `h`
+    /// (RFC 8684 L791–796). The entry lives until `free`, through TIME-WAIT and fallback.
+    pub(crate) fn new_negotiation(&mut self, h: ConnectionHandle) -> crate::mptcp::Negotiation {
+        loop {
+            #[cfg(test)]
+            let key = self.keys.pop_front().unwrap_or_else(|| self.rng.next_u64());
+            #[cfg(not(test))]
+            let key = self.rng.next_u64();
+            let n = crate::mptcp::Negotiation::new(key);
+            if let std::collections::btree_map::Entry::Vacant(e) = self.tokens.entry(n.token) {
+                e.insert(h);
+                return n;
+            }
         }
     }
 
@@ -420,6 +444,9 @@ impl<R: CryptoRng> Endpoint<R> {
     /// Removes connection `h` and its demux entries at once.
     fn free(&mut self, h: ConnectionHandle) {
         let c = self.conns.remove(&h).unwrap();
+        if let Some(n) = &c.hooks.negotiation {
+            self.tokens.remove(&n.token);
+        }
         for sf in &c.subflows {
             let key = (sf.local, sf.remote);
             if self.demux.get(&key) == Some(&(h, sf.id)) {
@@ -761,19 +788,7 @@ impl<R: CryptoRng> Endpoint<R> {
         cfg: ConnectConfig,
     ) -> Result<ConnectionHandle, ConnectError> {
         let h = self.connect(now, local, remote, cfg)?;
-        // ponytail: scan live connections; use a token set if connect volume warrants it.
-        // Keeping the token on its connection also retains it through TIME_WAIT.
-        let negotiation = loop {
-            let candidate = crate::mptcp::Negotiation::new(self.rng.next_u64());
-            if !self.conns.values().any(|c| {
-                c.hooks
-                    .negotiation
-                    .as_ref()
-                    .is_some_and(|m| m.token == candidate.token)
-            }) {
-                break candidate;
-            }
-        };
+        let negotiation = self.new_negotiation(h);
         self.conns.get_mut(&h).unwrap().hooks.negotiation = Some(negotiation);
         Ok(h)
     }
@@ -1380,7 +1395,7 @@ impl<R: CryptoRng> Endpoint<R> {
             Self::free_ended(&mut self.demux, h, c);
         }
         let (demux, events) = (&mut self.demux, &mut self.events);
-        let listeners = &mut self.listeners;
+        let (listeners, tokens) = (&mut self.listeners, &mut self.tokens);
         self.conns.retain(|&h, c| {
             if c.hooks.retained() || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
                 return true;
@@ -1403,6 +1418,11 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && c.hooks.has_unread();
+            if !c.detached
+                && let Some(n) = &c.hooks.negotiation
+            {
+                tokens.remove(&n.token);
+            }
             c.detached
         });
     }
