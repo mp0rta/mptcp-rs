@@ -831,16 +831,10 @@ pub fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
 /// `run_apps` where RSTs may have been sent (a refused or reset subflow).
 pub fn run_apps_with_rst(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
     let deadline = n.now + Duration::from_secs(secs);
-    let ok = n.run_until(deadline, |n| {
-        for i in 0..apps.len() {
-            let side = apps[i].on_b;
-            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
-            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
-            apps[i].drive(n, &claimed);
-        }
-        flush(n);
+    let done = |n: &mut Net<ChaCha20Rng>, apps: &[App]| {
         apps.iter().all(|a| a.eof && !a.closed(n).is_empty())
-    });
+    };
+    let ok = run_apps_until(n, apps, deadline, done);
     assert!(ok, "transfer did not finish by {deadline:?}");
     for pair in apps.chunks(2) {
         assert!(pair[0].got == pair[1].out, "server to client bytes differ");
@@ -849,6 +843,25 @@ pub fn run_apps_with_rst(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) 
     for a in apps.iter() {
         assert_eq!(a.closed(n), [CloseReason::Normal]);
     }
+}
+
+/// Drives `apps` until `done` holds (`true`) or `deadline` passes (`false`).
+pub fn run_apps_until(
+    n: &mut Net<ChaCha20Rng>,
+    apps: &mut [App],
+    deadline: Instant,
+    mut done: impl FnMut(&mut Net<ChaCha20Rng>, &[App]) -> bool,
+) -> bool {
+    n.run_until(deadline, |n| {
+        for i in 0..apps.len() {
+            let side = apps[i].on_b;
+            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
+            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
+            apps[i].drive(n, &claimed);
+        }
+        flush(n);
+        done(n, apps)
+    })
 }
 
 /// The handles of every `Accepted`, MPTCP or not.
