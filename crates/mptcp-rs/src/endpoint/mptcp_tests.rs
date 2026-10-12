@@ -3626,3 +3626,6 @@ fn confirmed_pure_ack_carries_three_sack_blocks() {
         );
     }
 }
+
+/// Server MP_CAPABLE, one test per negotiation-table row (M4a Task 5).
+mod server_capable;

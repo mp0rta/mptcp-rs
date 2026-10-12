@@ -11,8 +11,8 @@ use crate::SeqNum;
 use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
 use crate::mptcp::{
-    Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState, fastclose,
-    tcprst,
+    Join, Negotiation, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp,
+    SubflowState, SynCapable, fastclose, syn_capable, syn_scale, tcprst,
 };
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
 use crate::wire::mptcp::is_join;
@@ -258,12 +258,12 @@ pub struct Endpoint<R: CryptoRng> {
     pending_joins: BTreeSet<ConnectionHandle>,
     /// Keyed by local address and port; an unspecified IP matches every local address.
     listeners: BTreeMap<SocketAddr, Listener>,
-    /// Congestion controller for new connections; `None` is the default (CUBIC).
     /// Live connections by local token; unique across both roles (RFC 8684 L791–796).
     tokens: BTreeMap<u32, ConnectionHandle>,
     /// Test-only keys, popped before the RNG by `new_negotiation`.
     #[cfg(test)]
     pub(crate) keys: VecDeque<u64>,
+    /// Congestion controller for new connections; `None` is the default (CUBIC).
     #[cfg(test)]
     pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
 }
@@ -295,14 +295,19 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// Draws a key whose token no live connection uses and reserves the token for `h`
-    /// (RFC 8684 L791–796). The entry lives until `free`, through TIME-WAIT and fallback.
-    pub(crate) fn new_negotiation(&mut self, h: ConnectionHandle) -> crate::mptcp::Negotiation {
+    /// (RFC 8684 L791–796); `make` builds the role's negotiation from it. The entry lives
+    /// until `free`, through TIME-WAIT and fallback.
+    pub(crate) fn new_negotiation(
+        &mut self,
+        h: ConnectionHandle,
+        make: fn(u64) -> Negotiation,
+    ) -> Negotiation {
         loop {
             #[cfg(test)]
             let key = self.keys.pop_front().unwrap_or_else(|| self.rng.next_u64());
             #[cfg(not(test))]
             let key = self.rng.next_u64();
-            let n = crate::mptcp::Negotiation::new(key);
+            let n = make(key);
             if let std::collections::btree_map::Entry::Vacant(e) = self.tokens.entry(n.token) {
                 e.insert(h);
                 return n;
@@ -418,15 +423,16 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// A SYN to listener `key` opens a half-open connection (RFC 9293 §3.10.7.2), or is
-    /// dropped silently while the listener is at its cap (spec G9).
+    /// dropped silently while the listener is at its cap (spec G9). With MPTCP on and a valid
+    /// MP_CAPABLE (`syn_capable`) its key is drawn now, before the SYN/ACK carries it; else it
+    /// is plain TCP, with no MPTCP option in the SYN/ACK (RFC 8684 L992–993).
     fn accept(&mut self, now: Instant, key: SocketAddr, syn: &Segment) {
         let l = self.listeners.get_mut(&key).unwrap();
         if l.half_open >= l.cfg.max_half_open {
             return;
         }
         l.half_open += 1;
-        // Every accepted connection is plain TCP until the server MP_CAPABLE exists: no MPTCP
-        // option in the SYN/ACK.
+        let mptcp = l.cfg.mptcp;
         let cfg = l.cfg.connection.clone();
         let (local, remote) = (syn.dst, syn.src);
         let isn = self.isn.isn(now, local, remote);
@@ -438,7 +444,14 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         #[cfg(not(test))]
         let tcb = Tcb::new_passive(&cfg, local, syn, isn, now, seed);
-        self.insert(cfg, tcb, local, remote, Some(key));
+        let h = self.insert(cfg, tcb, local, remote, Some(key));
+        if let (true, SynCapable::V1 { peer_c }) = (mptcp, syn_capable(syn)) {
+            let mut n = self.new_negotiation(h, Negotiation::new_passive);
+            n.peer_c = peer_c;
+            let c = self.conns.get_mut(&h).unwrap();
+            c.hooks.negotiation = Some(n);
+            c.subflows[0].mp.peer_scale = syn_scale(syn);
+        }
     }
 
     /// Removes connection `h` and its demux entries at once.
@@ -490,10 +503,11 @@ impl<R: CryptoRng> Endpoint<R> {
     /// MTU. `backup` is the preference the join advertises, the MP_JOIN SYN's B bit: whether
     /// the peer should send on it only as a backup (`set_backup` changes it later; our own use
     /// of the subflow is `set_local_backup`).
-    /// Before the connection is Confirmed (the peer's first DSS) the join is queued and starts
-    /// at the first `poll_transmit` after that (RFC 8684 L884–887); a queued join that can no
-    /// longer start (fallback, C=1) ends with `SubflowDown { Reset }`. `SubflowUp` follows the
-    /// peer's acknowledgement of the third ACK; data goes only to subflows that are up.
+    /// Until a DSS from the peer has arrived (on an accepted connection, too) the join is
+    /// queued and starts at the first `poll_transmit` after that (RFC 8684 L884–887); a queued
+    /// join that can no longer start (fallback, C=1) ends with `SubflowDown { Reset }`.
+    /// `SubflowUp` follows the peer's acknowledgement of the third ACK; data goes only to
+    /// subflows that are up.
     pub fn add_subflow(
         &mut self,
         now: Instant,
@@ -537,7 +551,7 @@ impl<R: CryptoRng> Endpoint<R> {
             backup,
             local_backup: false,
         };
-        if m.state == State::Confirmed {
+        if m.state == State::Confirmed && m.peer_dss_seen {
             self.start_join(now, h, join)?;
         } else {
             c.queued_joins.push(join);
@@ -758,17 +772,16 @@ impl<R: CryptoRng> Endpoint<R> {
             let m = c.hooks.negotiation.as_ref().unwrap();
             let open = !c.reset && !c.detached && !closed(c);
             let (state, peer_c, initial) = (m.state, m.peer_c, c.subflows[0].remote);
-            let waiting = open && matches!(state, State::SynSent | State::PreConfirmed);
+            // Our joins wait for a DSS from the peer (RFC 8684 L884–887).
+            let ready = state == State::Confirmed && m.peer_dss_seen;
+            let waiting = open && !ready && state != State::FellBack;
             let mut kept = Vec::new();
             for q in std::mem::take(&mut c.queued_joins) {
                 let subflow = q.id;
                 let allowed = open && !(peer_c && q.remote == initial);
                 if allowed && waiting {
                     kept.push(q);
-                } else if !(allowed
-                    && state == State::Confirmed
-                    && self.start_join(now, h, q).is_ok())
-                {
+                } else if !(allowed && ready && self.start_join(now, h, q).is_ok()) {
                     (self.events).push_back((h, down(subflow, CloseReason::Reset, None)));
                 }
             }
@@ -788,7 +801,7 @@ impl<R: CryptoRng> Endpoint<R> {
         cfg: ConnectConfig,
     ) -> Result<ConnectionHandle, ConnectError> {
         let h = self.connect(now, local, remote, cfg)?;
-        let negotiation = self.new_negotiation(h);
+        let negotiation = self.new_negotiation(h, Negotiation::new);
         self.conns.get_mut(&h).unwrap().hooks.negotiation = Some(negotiation);
         Ok(h)
     }

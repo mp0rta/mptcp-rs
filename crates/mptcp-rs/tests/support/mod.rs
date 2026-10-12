@@ -7,7 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use mptcp_rs::wire::packet::{Segment, TcpFlags, build, parse};
-use mptcp_rs::{ConnectConfig, ConnectionHandle, Endpoint, Event, Instant, SeqNum};
+use mptcp_rs::{
+    CloseReason, ConnectConfig, ConnectionHandle, Endpoint, Event, Instant, ReadError, SeqNum,
+};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, Rng, SeedableRng};
 
@@ -690,4 +692,163 @@ impl<R: CryptoRng> Net<R> {
             self.step();
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-endpoint sessions (M4a): addresses, segment predicates and `App`.
+
+pub fn sa(last: u8, port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), port)
+}
+
+pub fn idle_net() -> Net<ChaCha20Rng> {
+    Net::new(
+        endpoint(1),
+        endpoint(2),
+        Link::new(1, 0, 0),
+        Link::new(2, 0, 0),
+    )
+}
+
+pub fn is_synack(s: &Seg) -> bool {
+    s.flags == TcpFlags::SYN | TcpFlags::ACK
+}
+
+/// The pure ACK that completes a handshake (and any later pure ACK).
+pub fn is_pure_ack(s: &Seg) -> bool {
+    s.flags == TcpFlags::ACK && s.payload.is_empty()
+}
+
+/// One application: writes `out`, then closes; reads until EOF. A client (`h` set) starts
+/// once `Connected`, a server once it takes an unclaimed `Accepted` on its side.
+pub struct App {
+    pub on_b: bool,
+    pub h: Option<ConnectionHandle>,
+    pub out: Vec<u8>,
+    pub written: usize,
+    pub got: Vec<u8>,
+    pub eof: bool,
+    pub closing: bool,
+    /// Writes nothing until it has read some data.
+    pub hold: bool,
+}
+
+impl App {
+    pub fn new(on_b: bool, h: Option<ConnectionHandle>, len: usize, salt: usize) -> Self {
+        let out = pattern(len, salt);
+        let (written, got, eof, closing) = (0, Vec::new(), false, false);
+        App {
+            on_b,
+            h,
+            out,
+            written,
+            got,
+            eof,
+            closing,
+            hold: false,
+        }
+    }
+
+    pub fn events<'a>(&self, n: &'a Net<ChaCha20Rng>) -> &'a [(ConnectionHandle, Event)] {
+        if self.on_b { &n.events_b } else { &n.events_a }
+    }
+
+    pub fn up(&self, n: &Net<ChaCha20Rng>) -> bool {
+        let up = |(h, e): &(ConnectionHandle, Event)| {
+            Some(*h) == self.h && matches!(e, Event::Connected { .. } | Event::Accepted { .. })
+        };
+        self.events(n).iter().any(up)
+    }
+
+    pub fn closed(&self, n: &Net<ChaCha20Rng>) -> Vec<CloseReason> {
+        let closed = |(h, e): &(ConnectionHandle, Event)| match e {
+            Event::Closed { reason } if Some(*h) == self.h => Some(*reason),
+            _ => None,
+        };
+        self.events(n).iter().filter_map(closed).collect()
+    }
+
+    pub fn drive(&mut self, n: &mut Net<ChaCha20Rng>, claimed: &[ConnectionHandle]) {
+        if self.h.is_none() {
+            let free = accepted_any(self.events(n))
+                .into_iter()
+                .find(|h| !claimed.contains(h));
+            self.h = free;
+        }
+        let Some(h) = self.h.filter(|_| self.up(n)) else {
+            return;
+        };
+        let ep = if self.on_b { &mut n.b } else { &mut n.a };
+        // Freed after `Closed` (a close waits out TIME-WAIT on one side only).
+        let Some(c) = ep.connection(h) else {
+            return;
+        };
+        let held = self.hold && self.got.is_empty();
+        while self.written < self.out.len() && !held {
+            let w = c.write(&self.out[self.written..]).unwrap();
+            if w == 0 {
+                break;
+            }
+            self.written += w;
+        }
+        if self.written == self.out.len() && !self.closing && !held {
+            c.close();
+            self.closing = true;
+        }
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(k) => self.got.extend_from_slice(&buf[..k]),
+                Err(ReadError::WouldBlock) => break,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+}
+
+/// Sends what the applications' calls made due (driver contract of `poll_transmit`).
+pub fn flush(n: &mut Net<ChaCha20Rng>) {
+    let mut buf = [0u8; MTU];
+    while let Some(k) = n.a.poll_transmit(n.now, &mut buf) {
+        n.send(Dir::AtoB, buf[..k].to_vec());
+    }
+    while let Some(k) = n.b.poll_transmit(n.now, &mut buf) {
+        n.send(Dir::BtoA, buf[..k].to_vec());
+    }
+}
+
+/// Runs `apps` until each has read EOF and seen `Closed`; each pair (client, server) must
+/// have exchanged its bytes exactly, closed `Normal`, and no RST may have been sent.
+pub fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
+    let deadline = n.now + Duration::from_secs(secs);
+    let ok = n.run_until(deadline, |n| {
+        for i in 0..apps.len() {
+            let side = apps[i].on_b;
+            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
+            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
+            apps[i].drive(n, &claimed);
+        }
+        flush(n);
+        apps.iter().all(|a| a.eof && !a.closed(n).is_empty())
+    });
+    assert!(ok, "transfer did not finish by {deadline:?}");
+    for pair in apps.chunks(2) {
+        assert!(pair[0].got == pair[1].out, "server to client bytes differ");
+        assert!(pair[1].got == pair[0].out, "client to server bytes differ");
+    }
+    for a in apps.iter() {
+        assert_eq!(a.closed(n), [CloseReason::Normal]);
+    }
+    assert!(n.taps.iter().all(|t| !t.1.flags.contains(TcpFlags::RST)));
+}
+
+/// The handles of every `Accepted`, MPTCP or not.
+pub fn accepted_any(events: &[(ConnectionHandle, Event)]) -> Vec<ConnectionHandle> {
+    let acc =
+        |(h, e): &(ConnectionHandle, Event)| matches!(e, Event::Accepted { .. }).then_some(*h);
+    events.iter().filter_map(acc).collect()
 }

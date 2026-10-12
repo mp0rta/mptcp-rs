@@ -2,17 +2,12 @@ mod support;
 
 use mptcp_rs::wire::packet::TcpFlags;
 use mptcp_rs::{
-    CloseReason, ConnectConfig, ConnectionHandle, Event, ListenConfig, ListenError, ReadError,
-    SeqNum,
+    CloseReason, ConnectConfig, ConnectionHandle, Event, ListenConfig, ListenError, SeqNum,
 };
 use rand_chacha::ChaCha20Rng;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use support::*;
-
-fn sa(last: u8, port: u16) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), port)
-}
 
 /// An RST is never answered, so idle endpoints stay silent.
 fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, payload: &[u8]) -> Vec<u8> {
@@ -24,15 +19,6 @@ fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, payload: &[u8]) -> Vec<u8> {
         TcpFlags::RST,
         &[],
         payload,
-    )
-}
-
-fn idle_net() -> Net<ChaCha20Rng> {
-    Net::new(
-        endpoint(1),
-        endpoint(2),
-        Link::new(1, 0, 0),
-        Link::new(2, 0, 0),
     )
 }
 
@@ -149,135 +135,6 @@ fn accepted(events: &[(ConnectionHandle, Event)]) -> Vec<ConnectionHandle> {
     let acc =
         |(h, e): &(ConnectionHandle, Event)| (*e == Event::Accepted { mptcp: false }).then_some(*h);
     events.iter().filter_map(acc).collect()
-}
-
-fn is_synack(s: &Seg) -> bool {
-    s.flags == TcpFlags::SYN | TcpFlags::ACK
-}
-
-/// The pure ACK that completes a handshake (and any later pure ACK).
-fn is_pure_ack(s: &Seg) -> bool {
-    s.flags == TcpFlags::ACK && s.payload.is_empty()
-}
-
-/// One application: writes `out`, then closes; reads until EOF. A client (`h` set) starts
-/// once `Connected`, a server once it takes an unclaimed `Accepted` on its side.
-struct App {
-    on_b: bool,
-    h: Option<ConnectionHandle>,
-    out: Vec<u8>,
-    written: usize,
-    got: Vec<u8>,
-    eof: bool,
-    closing: bool,
-}
-
-impl App {
-    fn new(on_b: bool, h: Option<ConnectionHandle>, len: usize, salt: usize) -> Self {
-        let out = pattern(len, salt);
-        let (written, got, eof, closing) = (0, Vec::new(), false, false);
-        App {
-            on_b,
-            h,
-            out,
-            written,
-            got,
-            eof,
-            closing,
-        }
-    }
-
-    fn events<'a>(&self, n: &'a Net<ChaCha20Rng>) -> &'a [(ConnectionHandle, Event)] {
-        if self.on_b { &n.events_b } else { &n.events_a }
-    }
-
-    fn up(&self, n: &Net<ChaCha20Rng>) -> bool {
-        let up = |(h, e): &(ConnectionHandle, Event)| {
-            Some(*h) == self.h && matches!(e, Event::Connected { .. } | Event::Accepted { .. })
-        };
-        self.events(n).iter().any(up)
-    }
-
-    fn closed(&self, n: &Net<ChaCha20Rng>) -> Vec<CloseReason> {
-        let closed = |(h, e): &(ConnectionHandle, Event)| match e {
-            Event::Closed { reason } if Some(*h) == self.h => Some(*reason),
-            _ => None,
-        };
-        self.events(n).iter().filter_map(closed).collect()
-    }
-
-    fn drive(&mut self, n: &mut Net<ChaCha20Rng>, claimed: &[ConnectionHandle]) {
-        if self.h.is_none() {
-            let free = accepted(self.events(n))
-                .into_iter()
-                .find(|h| !claimed.contains(h));
-            self.h = free;
-        }
-        let Some(h) = self.h.filter(|_| self.up(n)) else {
-            return;
-        };
-        let ep = if self.on_b { &mut n.b } else { &mut n.a };
-        let c = ep.connection(h).expect("live connection");
-        while self.written < self.out.len() {
-            let w = c.write(&self.out[self.written..]).unwrap();
-            if w == 0 {
-                break;
-            }
-            self.written += w;
-        }
-        if self.written == self.out.len() && !self.closing {
-            c.close();
-            self.closing = true;
-        }
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match c.read(&mut buf) {
-                Ok(0) => {
-                    self.eof = true;
-                    break;
-                }
-                Ok(k) => self.got.extend_from_slice(&buf[..k]),
-                Err(ReadError::WouldBlock) => break,
-                Err(e) => panic!("{e:?}"),
-            }
-        }
-    }
-}
-
-/// Sends what the applications' calls made due (driver contract of `poll_transmit`).
-fn flush(n: &mut Net<ChaCha20Rng>) {
-    let mut buf = [0u8; MTU];
-    while let Some(k) = n.a.poll_transmit(n.now, &mut buf) {
-        n.send(Dir::AtoB, buf[..k].to_vec());
-    }
-    while let Some(k) = n.b.poll_transmit(n.now, &mut buf) {
-        n.send(Dir::BtoA, buf[..k].to_vec());
-    }
-}
-
-/// Runs `apps` until each has read EOF and seen `Closed`; each pair (client, server) must
-/// have exchanged its bytes exactly, closed `Normal`, and no RST may have been sent.
-fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
-    let deadline = n.now + Duration::from_secs(secs);
-    let ok = n.run_until(deadline, |n| {
-        for i in 0..apps.len() {
-            let side = apps[i].on_b;
-            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
-            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
-            apps[i].drive(n, &claimed);
-        }
-        flush(n);
-        apps.iter().all(|a| a.eof && !a.closed(n).is_empty())
-    });
-    assert!(ok, "transfer did not finish by {deadline:?}");
-    for pair in apps.chunks(2) {
-        assert!(pair[0].got == pair[1].out, "server to client bytes differ");
-        assert!(pair[1].got == pair[0].out, "client to server bytes differ");
-    }
-    for a in apps.iter() {
-        assert_eq!(a.closed(n), [CloseReason::Normal]);
-    }
-    assert!(n.taps.iter().all(|t| !t.1.flags.contains(TcpFlags::RST)));
 }
 
 /// `b` listens on `listen`; `a` connects from `local` to `remote` and both send `len` bytes.

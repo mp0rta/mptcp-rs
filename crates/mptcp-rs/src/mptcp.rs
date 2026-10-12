@@ -31,7 +31,7 @@ use crate::tcp::{
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
-    mptcp::{self, CAP_C, CAP_H, MpCapable, MptcpOption},
+    mptcp::{self, CAP_A, CAP_B, CAP_C, CAP_H, MpCapable, MptcpOption},
     tcp_options::{TcpOpt, walk},
 };
 use std::net::SocketAddr;
@@ -1175,6 +1175,15 @@ impl SegmentHooks for SubflowHooks<'_> {
         if self.sf.keepalive.is_some_and(|k| k.sent > 0) {
             self.sf.keepalive = None;
         }
+        // Listener: the final ACK decides, before any early return below (spec G2b). A DATA_ACK
+        // is due at once, so that an idle client is confirmed too (RFC 8684 L832–835).
+        let scale = self.sf.peer_scale;
+        if let Some(m) = (self.conn.negotiation.as_mut()).filter(|m| m.state == State::AwaitingKey)
+        {
+            if !seg.flags.contains(TcpFlags::RST) && m.take_key(seg, scale) {
+                self.sf.ack_now = true;
+            }
+        }
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
         let (mut removed, mut added) = (Vec::new(), Vec::new());
@@ -1183,7 +1192,9 @@ impl SegmentHooks for SubflowHooks<'_> {
                 Err(_) => return,
                 Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
                     Ok(MptcpOption::Dss(v)) if dss.is_none() => dss = Some(v),
-                    Ok(MptcpOption::Capable(v)) if capable.is_none() => capable = Some(v),
+                    Ok(MptcpOption::Capable(v)) if capable.is_none() => {
+                        capable = Some((v, raw.len()))
+                    }
                     Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
                         fastclose = Some(receiver_key)
                     }
@@ -1247,12 +1258,12 @@ impl SegmentHooks for SubflowHooks<'_> {
                 ssn = ssn.wrapping_add(n as u32);
                 self.conn.plain.mark_acked(ssn);
             }
+            let mut recv =
+                RecvAssembler::new(m.peer_idsn.unwrap().wrapping_add(1), self.conn.recv_cap, 64);
+            // The edge our SYN or SYN/ACK advertised, unscaled.
+            recv.right_edge = recv.next.wrapping_add(self.conn.recv_cap.min(65535) as u64);
             self.conn.data = Some(DataState {
-                recv: RecvAssembler::new(
-                    m.peer_idsn.unwrap().wrapping_add(1),
-                    self.conn.recv_cap,
-                    64,
-                ),
+                recv,
                 send,
                 close: close::Close::default(),
                 sanity_failures: 0,
@@ -1264,15 +1275,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                 settling: false,
             });
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
+            // Our ISS: the SYN/ACK's ACK (initiator) or the final ACK's (listener) is ISS + 1.
             self.sf.local_isn = seg.ack.wrapping_add(u32::MAX);
-        }
-        if seg.flags.contains(TcpFlags::SYN) {
-            if let Some(d) = &mut self.conn.data {
-                d.recv.right_edge = d
-                    .recv
-                    .next
-                    .wrapping_add(self.conn.recv_cap.min(65535) as u64);
-            }
         }
         if seg.flags.contains(TcpFlags::SYN) || seg.flags.contains(TcpFlags::RST) {
             return;
@@ -1300,22 +1304,31 @@ impl SegmentHooks for SubflowHooks<'_> {
                 }
             }
         }
-        if let Some(c) = capable {
+        // An MP_CAPABLE after the handshake (or the one that confirmed): with data parameters it
+        // is a DSS mapping of SSN 1 to the peer's IDSN + 1 (RFC 8684 L836–873), and one that
+        // fails `capable_ack_ok` or names another key is an invalid mapping. Without data
+        // parameters it maps nothing; an invalid one is ignored, as before the server role.
+        if let Some((c, raw_len)) = capable {
+            let payload = !seg.payload.is_empty();
+            let valid =
+                capable_ack_ok(&c, raw_len, payload, m.local_key) && c.sender_key == m.peer_key;
+            if c.data_len.is_some() && !valid {
+                self.sf.reset = true;
+                return;
+            }
+            m.peer_c |= valid && c.flags & CAP_C != 0;
             if let Some(len) = c.data_len {
-                if c.sender_key != m.peer_key
-                    || c.receiver_key != Some(m.local_key)
-                    || !self
-                        .sf
-                        .rx
-                        .install(1, m.peer_idsn.unwrap().wrapping_add(1), u32::from(len))
-                {
+                let dsn = m.peer_idsn.unwrap().wrapping_add(1);
+                if !self.sf.rx.install(1, dsn, u32::from(len)) {
                     self.sf.reset = true;
                     return;
                 }
+                m.peer_dss_seen = true;
                 self.sf.unmapped = 0;
             }
         }
         if let Some(v) = dss {
+            m.peer_dss_seen = true;
             if let Some(mapping) = v.mapping {
                 let dsn = match mapping.dsn {
                     mptcp::Dsn::Dsn32(x) => promote32(x, d.recv.next),
@@ -1538,24 +1551,107 @@ impl DataState {
     }
 }
 
+/// The initiator goes `SynSent → PreConfirmed → Confirmed`, the listener `AwaitingKey →
+/// Confirmed`; either may end in `FellBack`. From `Confirmed` on both roles share every path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
     SynSent,
     PreConfirmed,
+    /// Listener only: our SYN/ACK carried our key; the segment that completes the TCP
+    /// handshake brings the client's key, or makes us fall back (spec G2a, G2b).
+    AwaitingKey,
     Confirmed,
     FellBack,
+}
+
+/// What a listener makes of a SYN's MP_CAPABLE (spec G2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SynCapable {
+    Plain,
+    /// `peer_c`: the client set C=1 (RFC 8684 L924–932).
+    V1 {
+        peer_c: bool,
+    },
+}
+
+/// Exactly one MP_CAPABLE, of length 4, version 1 or higher (we answer with 1, RFC 8684
+/// L716–722), A=0 (no checksums until M4b, L958–970), B=0 (L906–922) and H=1, whatever D–G
+/// say: only HMAC-SHA256 is supported (L942–944, L972–982). Anything else is plain TCP.
+pub(crate) fn syn_capable(seg: &Segment<'_>) -> SynCapable {
+    let mut found = None;
+    for opt in walk(seg.options) {
+        match opt {
+            Err(_) => return SynCapable::Plain,
+            // A second MP_CAPABLE.
+            Ok(TcpOpt::Mptcp(raw)) if mptcp::is_capable(raw) && found.replace(raw).is_some() => {
+                return SynCapable::Plain;
+            }
+            _ => {}
+        }
+    }
+    let Some(raw) = found.filter(|raw| raw.len() == 4) else {
+        return SynCapable::Plain;
+    };
+    match mptcp::parse(raw) {
+        Ok(MptcpOption::Capable(c))
+            if c.version >= 1 && c.flags & (CAP_A | CAP_B) == 0 && c.flags & CAP_H != 0 =>
+        {
+            SynCapable::V1 {
+                peer_c: c.flags & CAP_C != 0,
+            }
+        }
+        _ => SynCapable::Plain,
+    }
+}
+
+/// The send window scale a SYN (or SYN/ACK) sets: its WS, capped at 14, 0 without one (RFC
+/// 7323 §2.3).
+pub(crate) fn syn_scale(seg: &Segment<'_>) -> u8 {
+    walk(seg.options)
+        .filter_map(|o| match o {
+            Ok(TcpOpt::WindowScale(s)) => Some(s.min(14)),
+            _ => None,
+        })
+        .next()
+        .unwrap_or(0)
+}
+
+/// The one acceptance test for an MP_CAPABLE after our SYN/ACK, of `raw_len` octets on a
+/// segment with or without payload: version 1, flags exactly H with C free (C=1 is allowed,
+/// L924–932), the sender's key, our key echoed, and the length for the form: 20 without data,
+/// 22 with a Data-Level Length and data (L751–758; 24 means checksums, not supported).
+pub(crate) fn capable_ack_ok(
+    c: &MpCapable,
+    raw_len: usize,
+    has_payload: bool,
+    local_key: u64,
+) -> bool {
+    c.version == 1
+        && c.flags & !CAP_C == CAP_H
+        && c.sender_key.is_some()
+        && c.receiver_key == Some(local_key)
+        && match raw_len {
+            20 => !has_payload,
+            22 => c.data_len.is_some() && has_payload,
+            _ => false,
+        }
 }
 
 pub(crate) struct Negotiation {
     pub state: State,
     pub token: u32,
     pub local_key: u64,
-    /// The peer's SYN/ACK MP_CAPABLE had C=1: it accepts no MP_JOIN to its source address.
+    /// The peer's MP_CAPABLE had C=1 (the initiator: on its SYN/ACK; the listener: on its SYN
+    /// or a validated confirming option): it accepts no MP_JOIN to its source address. Never
+    /// cleared (RFC 8684 L924–932).
     pub peer_c: bool,
     pub peer_idsn: Option<u64>,
     pub peer_key: Option<u64>,
     pub local_idsn: u64,
     pub send_right_edge: Option<u64>,
+    /// A DSS, or an MP_CAPABLE data mapping, arrived from the peer: our own joins may start
+    /// (RFC 8684 L884–887). Joins we answer need only `Confirmed` (spec G2a).
+    pub peer_dss_seen: bool,
     syns_sent: u8,
     connected_pending: bool,
 }
@@ -1570,11 +1666,61 @@ impl Negotiation {
             local_idsn,
             peer_c: false,
             send_right_edge: None,
+            peer_dss_seen: false,
             peer_idsn: None,
             peer_key: None,
             syns_sent: 0,
             connected_pending: false,
         }
+    }
+
+    /// A listener's negotiation, created with the SYN: `AwaitingKey`.
+    pub fn new_passive(local_key: u64) -> Self {
+        Self {
+            state: State::AwaitingKey,
+            ..Self::new(local_key)
+        }
+    }
+
+    /// Listener, on the segment that completes the TCP handshake (with or without payload):
+    /// exactly one MP_CAPABLE that passes `capable_ack_ok` confirms, taking the client's key
+    /// (RFC 8684 L836–855). No MP_CAPABLE (L993–999), more than one, a malformed option list
+    /// or one that fails the test (L877–883, L958–970) falls back. Returns whether it
+    /// confirmed. `peer_scale`: the SYN's WS, for the scaled window of this segment.
+    fn take_key(&mut self, seg: &Segment<'_>, peer_scale: u8) -> bool {
+        let mut found = None;
+        let mut valid = true;
+        for opt in walk(seg.options) {
+            match opt {
+                Err(_) => valid = false,
+                Ok(TcpOpt::Mptcp(raw)) if mptcp::is_capable(raw) => {
+                    valid &= found.replace(raw).is_none();
+                }
+                _ => {}
+            }
+        }
+        let has_payload = !seg.payload.is_empty();
+        let key = found
+            .filter(|_| valid)
+            .and_then(|raw| match mptcp::parse(raw) {
+                Ok(MptcpOption::Capable(c))
+                    if capable_ack_ok(&c, raw.len(), has_payload, self.local_key) =>
+                {
+                    c.sender_key
+                }
+                _ => None,
+            });
+        let Some(key) = key else {
+            self.state = State::FellBack;
+            return false;
+        };
+        self.peer_key = Some(key);
+        self.peer_idsn = Some(key_token_idsn(key).1);
+        // Not a SYN: the window is scaled (RFC 7323 §2.2).
+        let wnd = u64::from(seg.wnd) << peer_scale;
+        self.send_right_edge = Some(self.local_idsn.wrapping_add(1).wrapping_add(wnd));
+        self.state = State::Confirmed;
+        true
     }
 
     fn on_valid_segment(&mut self, seg: &Segment<'_>, peer_scale: &mut u8) {
@@ -1598,6 +1744,7 @@ impl Negotiation {
             }
             if dss {
                 self.state = State::Confirmed;
+                self.peer_dss_seen = true;
             }
         }
         if !seg.flags.contains(TcpFlags::SYN | TcpFlags::ACK) || seg.flags.contains(TcpFlags::RST) {
@@ -1633,13 +1780,7 @@ impl Negotiation {
                 _ => {}
             }
         }
-        *peer_scale = walk(seg.options)
-            .filter_map(|o| match o {
-                Ok(TcpOpt::WindowScale(s)) => Some(s.min(14)),
-                _ => None,
-            })
-            .next()
-            .unwrap_or(0);
+        *peer_scale = syn_scale(seg);
         self.peer_key = peer_key;
         self.peer_idsn = peer_key.map(|key| key_token_idsn(key).1);
         self.send_right_edge =
@@ -1660,6 +1801,9 @@ impl Negotiation {
             State::PreConfirmed if flags.contains(TcpFlags::ACK) => {
                 (Some(self.local_key), self.peer_key)
             }
+            // The SYN/ACK, also each repeat of it: our key, flags exactly H (RFC 8684 L753,
+            // L972–982), our C=0.
+            State::AwaitingKey if flags.contains(TcpFlags::SYN) => (Some(self.local_key), None),
             State::Confirmed if flags.contains(TcpFlags::ACK) => {
                 return mptcp::encode(
                     &MptcpOption::Dss(mptcp::Dss {
