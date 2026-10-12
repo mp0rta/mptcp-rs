@@ -1175,51 +1175,57 @@ impl SegmentHooks for SubflowHooks<'_> {
         if self.sf.keepalive.is_some_and(|k| k.sent > 0) {
             self.sf.keepalive = None;
         }
-        // Listener: the final ACK decides, before any early return below (spec G2b). A DATA_ACK
-        // is due at once, so that an idle client is confirmed too (RFC 8684 L832–835).
-        let scale = self.sf.peer_scale;
-        if let Some(m) = (self.conn.negotiation.as_mut()).filter(|m| m.state == State::AwaitingKey)
-        {
-            if !seg.flags.contains(TcpFlags::RST) && m.take_key(seg, scale) {
-                self.sf.ack_now = true;
-            }
-        }
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
         let (mut removed, mut added) = (Vec::new(), Vec::new());
-        for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
-            match opt {
-                Err(_) => return,
-                Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
-                    Ok(MptcpOption::Dss(v)) if dss.is_none() => dss = Some(v),
-                    Ok(MptcpOption::Capable(v)) if capable.is_none() => {
-                        capable = Some((v, raw.len()))
-                    }
-                    Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
-                        fastclose = Some(receiver_key)
-                    }
-                    Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
-                    Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
-                    // E=1 echoes our ADD_ADDR, and we send none.
-                    Ok(MptcpOption::AddAddr {
-                        echo: false,
-                        id,
-                        addr,
-                        port,
-                        hmac: Some(hmac),
-                    }) => added.push((signal::Echo { id, addr, port }, hmac)),
-                    // A malformed signal-only option is ignored, like an unknown one.
-                    Err(_) if mptcp::is_signal(raw) => {}
-                    Ok(
-                        MptcpOption::Dss(_)
-                        | MptcpOption::Capable(_)
-                        | MptcpOption::FastClose { .. },
-                    )
-                    | Err(_) => return,
+        let options_ok = 'opts: {
+            for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
+                match opt {
+                    Err(_) => break 'opts false,
+                    Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
+                        Ok(MptcpOption::Dss(v)) if dss.is_none() => dss = Some(v),
+                        Ok(MptcpOption::Capable(v)) if capable.is_none() => {
+                            capable = Some((v, raw.len()))
+                        }
+                        Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
+                            fastclose = Some(receiver_key)
+                        }
+                        Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
+                        Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
+                        // E=1 echoes our ADD_ADDR, and we send none.
+                        Ok(MptcpOption::AddAddr {
+                            echo: false,
+                            id,
+                            addr,
+                            port,
+                            hmac: Some(hmac),
+                        }) => added.push((signal::Echo { id, addr, port }, hmac)),
+                        // A malformed signal-only option is ignored, like an unknown one.
+                        Err(_) if mptcp::is_signal(raw) => {}
+                        Ok(
+                            MptcpOption::Dss(_)
+                            | MptcpOption::Capable(_)
+                            | MptcpOption::FastClose { .. },
+                        )
+                        | Err(_) => break 'opts false,
+                        _ => {}
+                    },
                     _ => {}
-                },
-                _ => {}
+                }
             }
+            true
+        };
+        // Listener: the final ACK decides (spec G2b); a rejected option list falls back. A
+        // DATA_ACK is due at once, so that an idle client is confirmed too (RFC 8684 L832–835).
+        let scale = self.sf.peer_scale;
+        let awaiting = |m: &&mut Negotiation| m.state == State::AwaitingKey;
+        if let Some(m) = (self.conn.negotiation.as_mut()).filter(awaiting) {
+            if !seg.flags.contains(TcpFlags::RST) {
+                self.sf.ack_now = m.take_key(seg, capable.filter(|_| options_ok), scale);
+            }
+        }
+        if !options_ok {
+            return;
         }
         self.sf.valid_data_ack = if dss.is_some_and(|v| v.data_ack.is_some()) {
             None
@@ -1305,14 +1311,15 @@ impl SegmentHooks for SubflowHooks<'_> {
             }
         }
         // An MP_CAPABLE after the handshake (or the one that confirmed): with data parameters it
-        // is a DSS mapping of SSN 1 to the peer's IDSN + 1 (RFC 8684 L836–873), and one that
-        // fails `capable_ack_ok` or names another key is an invalid mapping. Without data
-        // parameters it maps nothing; an invalid one is ignored, as before the server role.
+        // is a DSS mapping of SSN 1 to the peer's IDSN + 1 (RFC 8684 L836–873). One that fails
+        // `capable_ack_ok` or names another key is an invalid mapping, and at a listener so is
+        // any invalid one; an initiator still ignores one without data parameters (its peer
+        // sends none after the SYN/ACK).
         if let Some((c, raw_len)) = capable {
             let payload = !seg.payload.is_empty();
             let valid =
                 capable_ack_ok(&c, raw_len, payload, m.local_key) && c.sender_key == m.peer_key;
-            if c.data_len.is_some() && !valid {
+            if !valid && (c.data_len.is_some() || m.passive) {
                 self.sf.reset = true;
                 return;
             }
@@ -1652,6 +1659,8 @@ pub(crate) struct Negotiation {
     /// A DSS, or an MP_CAPABLE data mapping, arrived from the peer: our own joins may start
     /// (RFC 8684 L884–887). Joins we answer need only `Confirmed` (spec G2a).
     pub peer_dss_seen: bool,
+    /// The listener's negotiation (`new_passive`).
+    pub passive: bool,
     syns_sent: u8,
     connected_pending: bool,
 }
@@ -1667,6 +1676,7 @@ impl Negotiation {
             peer_c: false,
             send_right_edge: None,
             peer_dss_seen: false,
+            passive: false,
             peer_idsn: None,
             peer_key: None,
             syns_sent: 0,
@@ -1678,39 +1688,27 @@ impl Negotiation {
     pub fn new_passive(local_key: u64) -> Self {
         Self {
             state: State::AwaitingKey,
+            passive: true,
             ..Self::new(local_key)
         }
     }
 
     /// Listener, on the segment that completes the TCP handshake (with or without payload):
-    /// exactly one MP_CAPABLE that passes `capable_ack_ok` confirms, taking the client's key
-    /// (RFC 8684 L836–855). No MP_CAPABLE (L993–999), more than one, a malformed option list
-    /// or one that fails the test (L877–883, L958–970) falls back. Returns whether it
-    /// confirmed. `peer_scale`: the SYN's WS, for the scaled window of this segment.
-    fn take_key(&mut self, seg: &Segment<'_>, peer_scale: u8) -> bool {
-        let mut found = None;
-        let mut valid = true;
-        for opt in walk(seg.options) {
-            match opt {
-                Err(_) => valid = false,
-                Ok(TcpOpt::Mptcp(raw)) if mptcp::is_capable(raw) => {
-                    valid &= found.replace(raw).is_none();
-                }
-                _ => {}
-            }
-        }
+    /// `capable`, the segment's one MP_CAPABLE with its length, from an option list that
+    /// passed validation (`None` otherwise), confirms if it passes `capable_ack_ok`, taking
+    /// the client's key (RFC 8684 L836–855). No MP_CAPABLE (L993–999), more than one, a
+    /// rejected option list or one that fails the test (L877–883, L958–970) falls back.
+    /// Returns whether it confirmed. `peer_scale`: the SYN's WS, for this segment's window.
+    fn take_key(
+        &mut self,
+        seg: &Segment<'_>,
+        capable: Option<(MpCapable, usize)>,
+        peer_scale: u8,
+    ) -> bool {
         let has_payload = !seg.payload.is_empty();
-        let key = found
-            .filter(|_| valid)
-            .and_then(|raw| match mptcp::parse(raw) {
-                Ok(MptcpOption::Capable(c))
-                    if capable_ack_ok(&c, raw.len(), has_payload, self.local_key) =>
-                {
-                    c.sender_key
-                }
-                _ => None,
-            });
-        let Some(key) = key else {
+        let ok =
+            |(c, len): &(MpCapable, usize)| capable_ack_ok(c, *len, has_payload, self.local_key);
+        let Some(key) = capable.filter(ok).and_then(|(c, _)| c.sender_key) else {
             self.state = State::FellBack;
             return false;
         };

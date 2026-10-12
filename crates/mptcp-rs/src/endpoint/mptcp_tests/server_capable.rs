@@ -21,6 +21,10 @@ fn started() -> Script {
 /// in `out` (the server's answer to the final ACK) or later.
 fn fell_back(s: &mut Script, out: &[Vec<u8>], payload: &[u8]) {
     assert_eq!(s.events(), [Event::Accepted { mptcp: false }]);
+    let c = &s.ep.conns[&ConnectionHandle(0)];
+    let state = c.hooks.negotiation.as_ref().map(|n| n.state);
+    assert!(matches!(state, None | Some(State::FellBack)), "{state:?}");
+    assert!(c.hooks.data.is_none());
     assert!(out.iter().all(|p| mptcp_of(p).is_empty()));
     assert_eq!(s.read_all(), payload);
     s.assert_plain_after();
@@ -287,8 +291,8 @@ fn server_later_capable_22_is_a_mapping() {
     assert!(s.negotiation().peer_dss_seen);
 }
 
-/// A later MP_CAPABLE data mapping that fails `capable_ack_ok` resets its subflow, as a key
-/// mismatch did. One without data parameters maps nothing and is ignored.
+/// A later MP_CAPABLE that fails `capable_ack_ok` resets the listener's subflow, as a key
+/// mismatch on a data mapping did; with or without data parameters.
 #[test]
 fn server_later_capable_invalid_resets_subflow() {
     let keys = (Some(CLIENT_KEY), Some(SERVER_KEY));
@@ -299,17 +303,40 @@ fn server_later_capable_invalid_resets_subflow() {
         ),
         (cap(1, CAP_A | CAP_H, keys.0, keys.1, Some(5)), b"hello"),
         (ack_cap(CAP_H, Some(5)), b""),
+        (cap(0, CAP_H | CAP_C, keys.0, keys.1, None), b""),
+        (cap(1, CAP_H, keys.0, Some(SERVER_KEY ^ 1), None), b""),
+        (cap(1, CAP_B | CAP_H, keys.0, keys.1, None), b""),
+        (ack_cap(CAP_H, None), b"hello"),
     ];
     for (option, payload) in cases {
         let mut s = started();
         let out = s.send(65535, &ack_cap(CAP_H, None), &[]);
         confirmed(&mut s, &out, 0);
         assert!(has_rst(&s.send(65535, &option, payload)), "{option:?}");
+        assert!(!s.negotiation().peer_c, "C of an invalid option");
     }
-    let mut s = started();
-    let out = s.send(65535, &ack_cap(CAP_H, None), &[]);
-    confirmed(&mut s, &out, 0);
-    let v0 = cap(0, CAP_H | CAP_C, keys.0, keys.1, None);
-    assert!(!has_rst(&s.send(65535, &v0, &[])));
-    assert!(!s.negotiation().peer_c, "C of an invalid option");
+}
+
+/// A valid MP_CAPABLE on a final ACK whose option list is rejected (a malformed DSS, a second
+/// DSS, a malformed TCP option): fallback, consistently: no MPTCP data state, the payload as
+/// plain TCP, no MPTCP option afterwards, and C not taken.
+#[test]
+fn server_final_ack_rejected_options_fall_back() {
+    let bad_dss = vec![30, 4, 0x20, 0xff];
+    // A DSS with neither DATA_ACK nor mapping, twice.
+    let dss = vec![30, 4, 0x20, 0];
+    for (form, payload) in [(None, &b""[..]), (Some(5), &b"hello"[..])] {
+        let good = ack_cap(CAP_H | CAP_C, form);
+        for extra in [
+            bad_dss.clone(),
+            [dss.clone(), dss.clone()].concat(),
+            vec![8, 1],
+        ] {
+            let mut s = started();
+            let out = s.send(65535, &[good.clone(), extra.clone()].concat(), payload);
+            assert!(!s.negotiation().peer_c, "{extra:?}");
+            fell_back(&mut s, &out, payload);
+            assert_eq!(s.negotiation().state, State::FellBack);
+        }
+    }
 }
