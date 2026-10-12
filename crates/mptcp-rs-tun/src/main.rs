@@ -1,4 +1,4 @@
-//! Test client: one TCP connection through a TUN device, pattern in both directions.
+//! Test client and server: one TCP connection through a TUN device, pattern in both directions.
 #![deny(unsafe_code)]
 
 #[allow(unsafe_code)]
@@ -15,14 +15,14 @@ use std::time::{Duration, SystemTime};
 
 use mptcp_rs::{
     CloseReason, CongestionControlKind, ConnectConfig, ConnectionHandle, DebugStats, Endpoint,
-    Event, Instant, ReadError, SubflowId,
+    Event, Instant, ListenConfig, ReadError, SubflowId,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use script::{Action, Ev, Script};
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3] [--verify on|off]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT|--listen IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3] [--verify on|off]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -36,12 +36,19 @@ fn verify_pattern(offset: u64, data: &[u8]) -> bool {
         .all(|(b, i)| *b == pattern_byte(i))
 }
 
+/// How the connection starts: `--local IP --remote IP:PORT`, or `--listen IP:PORT`, which
+/// serves the first accepted connection and aborts any other.
+#[derive(Debug, PartialEq)]
+enum Role {
+    Connect { local: IpAddr, remote: SocketAddr },
+    Listen(SocketAddr),
+}
+
 struct Args {
     mptcp: bool,
     pause_read: Duration,
     tun: String,
-    local: IpAddr,
-    remote: SocketAddr,
+    role: Role,
     send: u64,
     /// Timed sending: write the pattern for this long after `Connected`, then close.
     send_secs: Option<Duration>,
@@ -70,8 +77,11 @@ impl Args {
             Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
             None => String::new(),
         };
-        for (ip, mtu) in &self.joins {
-            text += &format!("\nat Connected +0 join {ip} {} mtu {mtu}", self.remote);
+        // `--listen` takes no `--join` (`parse_args`).
+        if let Role::Connect { remote, .. } = self.role {
+            for (ip, mtu) in &self.joins {
+                text += &format!("\nat Connected +0 join {ip} {remote} mtu {mtu}");
+            }
         }
         if let Some(d) = self.abort_after {
             text += &format!("\nat Connected +{} abort", d.as_millis());
@@ -82,6 +92,7 @@ impl Args {
 
 fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let (mut tun, mut local, mut remote, mut send, mut expect) = (None, None, None, None, None);
+    let mut listen = None;
     let mut send_secs = None;
     let mut mode = None;
     let mut pause_read = Duration::ZERO;
@@ -104,6 +115,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             "--tun" => tun = Some(v),
             "--local" => local = v.parse().ok(),
             "--remote" => remote = v.parse().ok(),
+            "--listen" => listen = Some(v.parse().ok()?),
             "--send" => send = v.parse().ok(),
             // The TUN device's MTU, which the initial subflow also uses.
             "--join" => joins.push((v.parse().ok()?, ConnectConfig::default().mtu)),
@@ -139,12 +151,18 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             _ => return None,
         }
     }
+    let role = match (listen, local, remote) {
+        (None, Some(local), Some(remote)) => Role::Connect { local, remote },
+        (Some(l), None, None) if joins.is_empty() && script.is_none() && abort_after.is_none() => {
+            Role::Listen(l)
+        }
+        _ => return None,
+    };
     Some(Args {
         mptcp: mode?,
         pause_read,
         tun: tun?,
-        local: local?,
-        remote: remote?,
+        role,
         send: match (send, send_secs) {
             (Some(n), None) => n,
             (None, Some(_)) => 0,
@@ -186,11 +204,27 @@ fn run(a: Args) -> Result<String, String> {
         cfg.recv_buffer = 16384;
     }
     let mtu = cfg.mtu;
-    let h = connect(&mut ep, now(start), a.local, a.remote, cfg)
-        .map_err(|e| format!("connect: {e:?}"))?;
+    // The connection: known at once in client mode, at its `Accepted` in server mode.
+    let (mut h, subs) = match a.role {
+        Role::Connect { local, remote } => {
+            let h = connect(&mut ep, now(start), local, remote, cfg)
+                .map_err(|e| format!("connect: {e:?}"))?;
+            (
+                Some(h),
+                vec![(SubflowId::INITIAL, local, remote, mtu, false)],
+            )
+        }
+        Role::Listen(addr) => {
+            let mut l = ListenConfig::default();
+            l.connection = cfg;
+            l.mptcp = a.mptcp;
+            ep.listen(addr, l).map_err(|e| format!("listen: {e:?}"))?;
+            (None, Vec::new())
+        }
+    };
     let mut drv = Driver {
         script: Script::parse(&a.scenario()?)?,
-        subs: vec![(SubflowId::INITIAL, a.local, a.remote, mtu, false)],
+        subs,
         down: Vec::new(),
         log: match &a.event_log {
             Some(path) => Some(EventLog::create(path, start).map_err(io_err("event log"))?),
@@ -248,10 +282,11 @@ fn run(a: Args) -> Result<String, String> {
             ep.handle_timeout(t);
         }
         // Events first: a reset or R2 timeout frees the TCB in the same iteration.
-        st.events(&mut ep, &a, start.elapsed(), &mut drv)?;
-        // Then the scenario's due actions.
+        st.events(&mut ep, &mut h, &a, start.elapsed(), &mut drv)?;
+        // Then the scenario's due actions (server mode has none).
         let elapsed = start.elapsed();
         for action in drv.script.due(elapsed) {
+            let h = h.ok_or("script before Accepted")?;
             drv.act(&mut ep, h, now(start), &action, &mut st)?;
         }
         // Every directive has run: the suite requires this line (M3 spec §5.3).
@@ -261,7 +296,7 @@ fn run(a: Args) -> Result<String, String> {
             drv.log("script", "complete");
         }
         // After a normal close the connection is gone unless data is still unread.
-        if st.drives(ep.connection(h).is_some()) {
+        if let Some(h) = h.filter(|&h| st.drives(ep.connection(h).is_some())) {
             let conn = ep.connection(h).ok_or("connection gone")?;
             st.stats = conn.debug_stats();
             while !st.closing && !st.send_done(&a, start.elapsed()) {
@@ -343,7 +378,7 @@ fn run(a: Args) -> Result<String, String> {
                 drv.script.on_event(Ev::Stop, start.elapsed());
             }
         }
-        st.events(&mut ep, &a, start.elapsed(), &mut drv)?;
+        st.events(&mut ep, &mut h, &a, start.elapsed(), &mut drv)?;
 
         // Drain before returning: the final ACK of the active close must go out.
         while let Some(n) = ep.poll_transmit(now(start), &mut pkt) {
@@ -383,12 +418,20 @@ fn run(a: Args) -> Result<String, String> {
                     st.verified
                 );
             }
-            return Ok(format!(
-                "ok: sent {} bytes, verified {} bytes, eof=true",
-                st.sent, st.verified
-            ));
+            return Ok(match st.peer {
+                Some(peer) => server_ok_line(st.verified, st.sent, peer),
+                None => format!(
+                    "ok: sent {} bytes, verified {} bytes, eof=true",
+                    st.sent, st.verified
+                ),
+            });
         }
     }
+}
+
+/// Server mode's success line: the server contract that `check.py` parses.
+fn server_ok_line(verified: u64, sent: u64, peer: SocketAddr) -> String {
+    format!("server ok: received {verified} sent {sent} from {peer} eof=true")
 }
 
 /// Service the single connection's current ACK before another input can coalesce it.
@@ -423,6 +466,8 @@ struct State {
     verified: u64,
     connected: bool,
     connected_at: Option<Duration>,
+    /// Server mode: the accepted connection's client address.
+    peer: Option<SocketAddr>,
     send_stop: bool,
     first_rx: Option<Duration>,
     last_rx: Duration,
@@ -469,16 +514,30 @@ impl State {
         a.expect.map_or(self.eof, |e| self.verified == e)
     }
 
+    /// Handles the events of connection `h`; server mode takes the first `Accepted` as `h`
+    /// and aborts any later connection.
     fn events(
         &mut self,
         ep: &mut Endpoint<ChaCha20Rng>,
+        h: &mut Option<ConnectionHandle>,
         a: &Args,
         now: Duration,
         drv: &mut Driver,
     ) -> Result<(), String> {
         // Subflow events carry the time since `Connected` (the harness's blackhole clock).
         let at = |c: Option<Duration>| c.map_or(0.0, |c| (now - c).as_secs_f64());
-        while let Some((_, ev)) = ep.poll_event() {
+        while let Some((eh, ev)) = ep.poll_event() {
+            if let (None, Event::Accepted { .. }) = (*h, ev) {
+                *h = Some(eh);
+                self.peer = ep.connection(eh).map(|c| c.remote());
+            }
+            if *h != Some(eh) {
+                if let (Event::Accepted { .. }, Some(c)) = (ev, ep.connection(eh)) {
+                    eprintln!("aborted: another connection from {}", c.remote());
+                    c.abort();
+                }
+                continue;
+            }
             let t = at(self.connected_at);
             let text = match ev {
                 Event::FellBack => "FellBack".into(),
@@ -502,6 +561,11 @@ impl State {
                     self.connected = true;
                     self.connected_at = Some(now);
                     format!("Connected mptcp={mptcp}")
+                }
+                Event::Accepted { mptcp } => {
+                    self.connected = true;
+                    self.connected_at = Some(now);
+                    format!("Accepted mptcp={mptcp}")
                 }
                 Event::Closed { reason } => format!("Closed {reason:?}"),
                 other => format!("{other:?}"),
@@ -558,7 +622,7 @@ impl Driver {
         }
         let n = |id: &SubflowId| self.subs.iter().position(|s| s.0 == *id);
         let ev = match ev {
-            Event::Connected { .. } => Some(Ev::Connected),
+            Event::Connected { .. } | Event::Accepted { .. } => Some(Ev::Connected),
             Event::SubflowUp { subflow } => n(subflow).map(Ev::Up),
             Event::SubflowDown { subflow, rst, .. } => n(subflow).map(|sub| Ev::Down {
                 sub,
@@ -803,6 +867,125 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    fn parse(s: &str) -> Option<Args> {
+        parse_args(s.split(' ').map(String::from))
+    }
+
+    const LISTEN: &str = "--mode mptcp --tun t0 --listen 10.0.7.2:5201 --send 5 --expect any";
+
+    #[test]
+    fn listen_conflicts_with_join() {
+        assert!(parse(LISTEN).is_some());
+        for extra in ["--join 10.0.8.2", "--script s.txt", "--abort-after-ms 2000"] {
+            assert!(parse(&format!("{LISTEN} {extra}")).is_none(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn listen_replaces_remote() {
+        let a = parse(LISTEN).unwrap();
+        assert_eq!(a.role, Role::Listen("10.0.7.2:5201".parse().unwrap()));
+        assert_eq!(a.scenario().unwrap(), "");
+        for extra in ["--remote 10.0.1.2:5201", "--local 10.0.9.2"] {
+            assert!(parse(&format!("{LISTEN} {extra}")).is_none(), "{extra}");
+        }
+        assert!(parse(&LISTEN.replace("10.0.7.2:5201", "10.0.7.2")).is_none());
+        // Client mode needs both of its addresses.
+        let base = "--mode mptcp --tun t0 --send 5 --expect 5";
+        assert!(parse(&format!("{base} --local 10.0.9.2")).is_none());
+        assert!(parse(&format!("{base} --remote 10.0.7.2:5201")).is_none());
+    }
+
+    #[test]
+    fn server_ok_line_matches_check_py() {
+        // check.py's server contract: ^server ok: received (\d+) sent (\d+) from \S+ eof=true$
+        let line = server_ok_line(67108864, 12, "10.0.9.2:40000".parse().unwrap());
+        assert_eq!(
+            line,
+            "server ok: received 67108864 sent 12 from 10.0.9.2:40000 eof=true"
+        );
+        // The regex by hand (no regex crate): anchored literals around \d+, \d+ and \S+.
+        let middle = (line.strip_prefix("server ok: received "))
+            .and_then(|r| r.strip_suffix(" eof=true"))
+            .unwrap();
+        let t: Vec<&str> = middle.split(' ').collect();
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        assert!(
+            t.len() == 5
+                && digits(t[0])
+                && t[1] == "sent"
+                && digits(t[2])
+                && t[3] == "from"
+                && !t[4].is_empty()
+                && !line.contains(['\n', '\t', '\r']),
+            "{line}"
+        );
+    }
+
+    /// Delivers every queued packet between the server and the clients (by destination IP).
+    fn pump(srv: &mut Endpoint<ChaCha20Rng>, clients: &mut [(IpAddr, Endpoint<ChaCha20Rng>)]) {
+        let t = Instant::from_nanos(0);
+        let mut pkt = vec![0; 65535];
+        for _ in 0..4 {
+            for (_, c) in clients.iter_mut() {
+                while let Some(n) = c.poll_transmit(t, &mut pkt) {
+                    srv.handle_packet(t, &pkt[..n]);
+                }
+            }
+            while let Some(n) = srv.poll_transmit(t, &mut pkt) {
+                let dst = mptcp_rs::wire::packet::parse(&pkt[..n]).unwrap().dst.ip();
+                let c = clients.iter_mut().find(|c| c.0 == dst).unwrap();
+                c.1.handle_packet(t, &pkt[..n]);
+            }
+        }
+    }
+
+    #[test]
+    fn server_serves_the_first_accepted_and_aborts_the_others() {
+        let t = Instant::from_nanos(0);
+        let addr: SocketAddr = "10.0.7.2:5201".parse().unwrap();
+        let mut srv = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
+        srv.listen(addr, ListenConfig::default()).unwrap();
+        let mut clients: Vec<_> = (["10.0.9.2", "10.0.1.1"].iter().enumerate())
+            .map(|(i, ip)| {
+                let ip: IpAddr = ip.parse().unwrap();
+                let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(2 + i as u64));
+                ep.connect_mptcp(t, ip, addr, ConnectConfig::default())
+                    .unwrap();
+                (ip, ep)
+            })
+            .collect();
+        pump(&mut srv, &mut clients);
+        let a = parse(LISTEN).unwrap();
+        let mut drv = Driver {
+            script: Script::parse("").unwrap(),
+            subs: Vec::new(),
+            down: Vec::new(),
+            log: None,
+            complete: false,
+        };
+        let (mut st, mut h) = (State::default(), None);
+        st.events(&mut srv, &mut h, &a, Duration::ZERO, &mut drv)
+            .unwrap();
+        let h = h.expect("first Accepted");
+        assert_eq!(srv.connection(h).unwrap().remote().ip(), clients[0].0);
+        assert_eq!(st.peer.map(|p| p.ip()), Some(clients[0].0));
+        assert!(st.connected);
+        // The other connection is aborted: its client sees the reset.
+        pump(&mut srv, &mut clients);
+        let reset = std::iter::from_fn(|| clients[1].1.poll_event()).any(|(_, e)| {
+            e == Event::Closed {
+                reason: CloseReason::Reset,
+            }
+        });
+        assert!(reset, "second client not reset");
+        // Its Closed is not this connection's: no error.
+        srv.handle_timeout(t);
+        st.events(&mut srv, &mut Some(h), &a, Duration::ZERO, &mut drv)
+            .unwrap();
+        assert!(srv.connection(h).is_some());
     }
 
     #[test]

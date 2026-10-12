@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Assert wire acceptance, using raw (not Wireshark-relative) MPTCP numbers."""
+import argparse
 import bisect
 import csv
 import io
@@ -9,11 +10,21 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from endpoints import endpoints, removed_flow_exempt  # noqa: E402
+
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
-scenario, directory, want_c2s, want_s2c, *mode = sys.argv[1:]
-assert mode in ([], ["logs-only"]), mode
-out = Path(directory)
+# --client/--server: which end is Linux (kernel) and which is mptcp-rs (run.sh's INTEROP_*).
+ap = argparse.ArgumentParser()
+for name in ["scenario", "directory", "want_c2s", "want_s2c"]:
+    ap.add_argument(name)
+ap.add_argument("mode", nargs="?", choices=["logs-only"])
+ap.add_argument("--client", choices=["kernel", "mptcp-rs"], default="mptcp-rs")
+ap.add_argument("--server", choices=["kernel", "mptcp-rs"], default="kernel")
+args = ap.parse_args()
+scenario, want_c2s, want_s2c, mode = args.scenario, args.want_c2s, args.want_s2c, args.mode
+out = Path(args.directory)
 client = (out / "client.log").read_text()
 server = (out / "server.log").read_text()
 m = re.search(r"^ok: sent (\d+) bytes, verified (\d+) bytes, eof=true$", client, re.M)
@@ -28,9 +39,8 @@ if mode:
     print(f"PASS {scenario} (logs only)")
     sys.exit(0)
 m2 = scenario.startswith("m2-")
-# Client addresses: M2 has the initial subflow from 10.0.9.2 (path A) and a join from 10.0.8.2 (B).
-cips = {"10.0.9.2", "10.0.8.2"} if m2 else {"10.0.8.2" if scenario == "base-b" else "10.0.9.2"}
-SRV = "10.0.1.2"
+# M2: the initial subflow on path A and a join from JOIN on path B.
+SRV, cips, JOIN = endpoints(scenario, args.client, args.server)
 fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport"]
 def capture(name):
     cmd = ["tshark", "-r", str(out / name), "-Y", "tcp", "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"]
@@ -40,8 +50,12 @@ def capture(name):
     return [[{"True": "1", "False": "0"}.get(v, v) for v in r] for r in rows]
 def count(name, flt):
     return len(subprocess.check_output(["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-e", "frame.number"], text=True).split())
-# M2: both legs, as seen by the server (a1, b1), in time order.
-rows = capture("server.pcap") + (capture("server-b.pcap") if m2 else [])
+# M2: both legs, as seen by the server (a1, b1), in time order; the mptcp-rs server's own TUN
+# sees every subflow.
+if args.server == "mptcp-rs":
+    rows = capture("server-tun.pcap")
+else:
+    rows = capture("server.pcap") + (capture("server-b.pcap") if m2 else [])
 rows.sort(key=lambda r: float(r[0]))
 assert rows, "empty pcap"
 flow = lambda r: frozenset([(r[1], r[20]), (r[19], r[21])])
@@ -78,6 +92,11 @@ def data_fin_acked(side, n):
     return min(acked)
 rsts = [r for r in rows if r[7] == "1"]
 no_rst, srv_reset, cli_reset = "no RST", set(), set()
+# m2-remove: the deleted kernel endpoint's subflow may end with a RST and no FIN.
+removed = {flow(r) for r in rows if removed_flow_exempt(scenario, args.client, flow(r))}
+if any(flow(r) in removed for r in rsts):
+    no_rst = f"no RST except {sum(flow(r) in removed for r in rsts)} on the removed subflow {[sorted(f) for f in removed]}"
+    rsts = [r for r in rsts if flow(r) not in removed]
 if scenario.startswith("m2-blackhole-") and want_s2c == "0":
     # c2s, on the blackholed 4-tuple only, after both DATA_FINs are DATA_ACKed (RFC 8684
     # L1600-1611). The server's RST: the subflow keeps retransmitting its own stranded TCP data
@@ -113,13 +132,13 @@ if m2:
     for f in data:
         # A subflow the client reset after close needs no FIN; one the server reset after close
         # (above) needs only the server's FIN.
-        sides = [] if f in cli_reset else [{SRV}] if f in srv_reset else [cips, {SRV}]
+        sides = [] if f in cli_reset | removed else [{SRV}] if f in srv_reset else [cips, {SRV}]
         for side in sides:
             assert any(flow(r) == f and r[1] in side and r[6] == "1" for r in rows), f"subflow {sorted(f)}: no FIN from {side}"
     join = [r for r in rows if r[9] == "1"]
-    assert any(r[1] == "10.0.8.2" and (r[5], r[18]) == ("1", "0") for r in join), "no MP_JOIN SYN"
+    assert any(r[1] == JOIN and (r[5], r[18]) == ("1", "0") for r in join), "no MP_JOIN SYN"
     assert any(r[1] == SRV and (r[5], r[18]) == ("1", "1") for r in join), "no MP_JOIN SYN/ACK"
-    assert any(r[1] == "10.0.8.2" and r[5] == "0" for r in join), "no MP_JOIN third ACK"
+    assert any(r[1] == JOIN and r[5] == "0" for r in join), "no MP_JOIN third ACK"
     split = {}  # client endpoint -> [c2s, s2c] payload bytes
     for r in rows:
         if flow(r) in data:
@@ -130,7 +149,11 @@ if scenario in ["m0", "syn-strip"]:
     assert "Connected mptcp=false" in client
     assert not any(r[9] and r[5] != "1" for r in rows), "MPTCP after SYN fallback"
 else:
-    assert "Connected mptcp=true" in client
+    # The kernel client prints no events: the mptcp-rs server's Accepted shows MPTCP.
+    if args.client == "kernel":
+        assert "event: Accepted mptcp=true" in server, "server: no Accepted mptcp=true"
+    else:
+        assert "Connected mptcp=true" in client
     assert any(r[10] == "1" for r in rows), "MPTCP v1 missing"
     if scenario == "dataack-strip":
         assert client.count("event: FellBack") == 1, "fallback event count"
@@ -138,9 +161,12 @@ else:
         rules = (out / "server-rules.txt").read_text()
         assert re.search(r"\[[1-9][0-9]*:[0-9]+\].*TCPOPTSTRIP", rules), "strip rule unused"
     else:
-        assert "FellBack" not in client
+        assert "FellBack" not in client + server
         for side, n in [(cips, c2s), ({SRV}, s2c)]:
             data_fin_acked(side, n)
+if scenario == "m2-remove":
+    assert re.search(r"^event: SubflowDown ", server, re.M), "server: no SubflowDown after the endpoint delete"
+    assert re.search(r"^event: Closed Normal$", server, re.M), "server: no Closed Normal"
 if scenario.startswith("m2-blackhole-"):
     joins = dict(re.findall(r"^join: (SubflowId\(\d+\)) local (\S+)", client, re.M))
     holed = "SubflowId(0)" if scenario.endswith("-a") else next(i for i, ip in joins.items() if ip == "10.0.8.2")
