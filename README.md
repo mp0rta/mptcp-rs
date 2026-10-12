@@ -43,7 +43,17 @@ Goodput next to the Linux kernel MPTCP client, with the same server and links:
 ![Goodput of mptcp-rs and the Linux kernel MPTCP client over two netem paths](docs/images/kernel-compare.svg)
 
 Paths A (10 ms one-way, 300 Mbit/s) and B (30 ms, 80 Mbit/s) are netem on veth on one host; CUBIC, median of 5 runs, one segment per packet at netem; the dashed line is each client's ceiling after header overhead.
-Without netem, where the CPU is the limit, the kernel is far ahead on one connection: about 34 Gbit/s against 1.4 Gbit/s for mptcp-rs over TUN.
+
+Without netem the CPU is the limit, and the kernel is far ahead (same paths A+B, offloads at their defaults, median of 5 runs):
+
+| direction | client | goodput | host CPU per GB |
+|---|---|---|---|
+| c2s (client sending) | mptcp-rs over TUN | 1.44 Gbit/s | 12.4 s |
+| c2s (client sending) | Linux kernel | 34.3 Gbit/s | 0.53 s |
+| s2c (client receiving) | mptcp-rs over TUN | 1.31 Gbit/s | 10.9 s |
+| s2c (client receiving) | Linux kernel | 35.7 Gbit/s | 0.45 s |
+
+The kernel figures are one connection with one sending thread saturating a core. In s2c the kernel server sends in both cases, so those rows compare the clients as receivers. Host CPU per GB is all busy CPU time on the host over a 20 s window of the transfer, divided by the TCP payload the server's subflows moved in that window.
 
 It has not been tested against other MPTCP implementations yet.
 
