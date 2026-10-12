@@ -38,7 +38,14 @@ paths:
   of two paths is blackholed for 15 seconds.
 - Two paths with different speeds give at least 1.2× the goodput of the better single path.
 
-Goodput next to the Linux kernel MPTCP client, with the same server and links:
+Goodput next to the Linux kernel MPTCP client, with the same server and links. Setup
+(`tests/interop/run.sh`, `bench.py`): two network namespaces, client and server, joined by two
+veth pairs, path A and path B, with netem on both directions of each. The server is a kernel
+MPTCP socket in every run. On the mptcp-rs side, `mptcp-rs-tun` runs the whole TCP/MPTCP stack
+in userspace and reads and writes IP packets on a TUN device; the client namespace's kernel
+routes them out over path A or B by source address. The kernel client is an `IPPROTO_MPTCP`
+socket in the same namespace, with an `ip mptcp endpoint` on path B. Each run is a 30 s
+transfer in one direction, and both clients open the first subflow on A and join on B:
 
 ![Goodput of mptcp-rs and the Linux kernel MPTCP client over two netem paths](docs/images/kernel-compare.svg)
 
