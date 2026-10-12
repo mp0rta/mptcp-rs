@@ -113,8 +113,8 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
             }
             "--pause-read-ms" => pause_read = Duration::from_millis(v.parse().ok()?),
             "--tun" => tun = Some(v),
-            "--local" => local = v.parse().ok(),
-            "--remote" => remote = v.parse().ok(),
+            "--local" => local = Some(v.parse().ok()?),
+            "--remote" => remote = Some(v.parse().ok()?),
             "--listen" => listen = Some(v.parse().ok()?),
             "--send" => send = v.parse().ok(),
             // The TUN device's MTU, which the initial subflow also uses.
@@ -888,7 +888,15 @@ mod tests {
         let a = parse(LISTEN).unwrap();
         assert_eq!(a.role, Role::Listen("10.0.7.2:5201".parse().unwrap()));
         assert_eq!(a.scenario().unwrap(), "");
-        for extra in ["--remote 10.0.1.2:5201", "--local 10.0.9.2"] {
+        // Also malformed: a flag given is a flag used.
+        for extra in [
+            "--remote 10.0.1.2:5201",
+            "--local 10.0.9.2",
+            "--remote x",
+            "--local x",
+            "--local 10.0.9.2:1",
+            "--remote 10.0.1.2",
+        ] {
             assert!(parse(&format!("{LISTEN} {extra}")).is_none(), "{extra}");
         }
         assert!(parse(&LISTEN.replace("10.0.7.2:5201", "10.0.7.2")).is_none());
