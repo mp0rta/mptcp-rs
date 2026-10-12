@@ -5153,3 +5153,69 @@ fn passive_syn_lost_rtt_rule() {
     // RFC 6298 §5.7: RTO 3 s, not the backed-off 2 s.
     assert_eq!(f.tcb.poll_send_at(), Some(t(4)));
 }
+
+#[test]
+fn passive_in_window_syn_returns_to_listen() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    // Not the peer's SYN again: a new one inside our window (RFC 9293 L3652–3658).
+    let mut syn = peer_syn(f.addrs, &[]);
+    syn.seq = pdata(5);
+    let r = f.tcb.on_segment(&syn, t(0), &mut f.h);
+    assert_eq!(r, Reaction::Closed(CloseReason::Reset));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    // Freed silently: no RST, no ACK.
+    assert_eq!(f.send(t(0)), None);
+}
+
+/// Requests a reset once a segment is valid, as a join rejecting a bad HMAC does.
+struct ResetOnValid(PlainHooks, bool);
+
+impl SendBuf for ResetOnValid {
+    fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.0.peek_with(rel_ssn, max, f)
+    }
+    fn assigned_end(&self) -> u32 {
+        self.0.assigned_end()
+    }
+    fn mark_acked(&mut self, rel_ssn_una: u32) {
+        self.0.mark_acked(rel_ssn_una)
+    }
+}
+
+impl SegmentHooks for ResetOnValid {
+    fn on_valid_segment(&mut self, _seg: &Segment<'_>) {
+        self.1 = true;
+    }
+    fn reset_requested(&self) -> bool {
+        self.1
+    }
+    fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
+        self.0.accept_payload(rel_ssn, data)
+    }
+    fn recv_window(&self) -> u32 {
+        self.0.recv_window()
+    }
+}
+
+#[test]
+fn passive_final_ack_reset_by_hooks_is_not_established() {
+    let cfg = ConnectConfig::default();
+    let addrs = v4();
+    let o = syn_opts(Some(7));
+    let syn = peer_syn(addrs, &o);
+    let mut f = Fixture {
+        tcb: Tcb::passive_with_cc(&cfg, addrs.0, &syn, ISN, t(0), Box::new(Unbounded)),
+        h: ResetOnValid(PlainHooks::new(&cfg), false),
+        out: SegmentWriter::default(),
+        addrs,
+    };
+    f.send(t(0)).unwrap();
+    let r = f.seg_ack(t(0), 0, ISN.wrapping_add(1), TcpFlags::ACK, &pattern(100));
+    assert_eq!(r, Reaction::Closed(CloseReason::Reset));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    // The payload is not delivered; a RST <SEQ=SND.MAX> goes out.
+    assert!(!f.h.0.has_unread());
+    let meta = f.send(t(0)).unwrap();
+    assert_eq!((meta.flags, meta.seq), (TcpFlags::RST, ISN.wrapping_add(1)));
+}

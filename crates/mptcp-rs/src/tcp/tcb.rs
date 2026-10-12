@@ -617,8 +617,12 @@ impl Tcb {
                 let r = self.on_segment_syn_received(seg, now, h);
                 if r == Reaction::Established {
                     h.on_valid_segment(seg);
-                    // Text and FIN on the final ACK, from RCV.NXT, once ESTABLISHED.
-                    self.on_text_and_fin(seg, now, h);
+                    // Text and FIN on the final ACK, from RCV.NXT, once ESTABLISHED. A reset
+                    // the hooks request there (a join's bad HMAC) ends it before it is reported.
+                    let closed = self.on_text_and_fin(seg, now, h);
+                    if matches!(closed, Reaction::Closed(_)) {
+                        return closed;
+                    }
                 }
                 r
             }
@@ -1390,11 +1394,16 @@ impl Tcb {
             self.syn_due = true;
             return Reaction::None;
         }
-        // First step (L3491–3530), then the fourth: any other SYN draws a challenge ACK
-        // (RFC 5961 §4).
-        if !self.acceptable(seg) || syn {
+        // First step (L3491–3530).
+        if !self.acceptable(seg) {
             self.ack_due = true;
             return Reaction::None;
+        }
+        // Fourth step (L3652–3658): a passive open returns to LISTEN, which the endpoint does
+        // by freeing the TCB silently. Simultaneous open (later) takes the synchronized states'
+        // challenge ACK here instead.
+        if syn {
+            return self.terminate(CloseReason::Reset, now);
         }
         if !seg.flags.contains(TcpFlags::ACK) {
             return Reaction::None;
