@@ -647,8 +647,9 @@ impl<R: CryptoRng> Net<R> {
         .min()
     }
 
-    /// Advances to the earliest link delivery or timeout and handles it.
-    /// Returns `false` when nothing is pending.
+    /// Handles exactly one event: the earliest link delivery or endpoint timeout (ties:
+    /// a->b delivery, b->a delivery, a's timeout, b's timeout). Returns `false` when
+    /// nothing is pending.
     pub fn step(&mut self) -> bool {
         self.pump();
         let Some(next) = self.next_event() else {
@@ -656,18 +657,15 @@ impl<R: CryptoRng> Net<R> {
         };
         self.now = self.now.max(next);
         let now = self.now;
-        while let Some(p) = self.ab.recv(now) {
+        if let Some(p) = self.ab.recv(now) {
             self.delivered.push((Dir::AtoB, now, parse_owned(&p)));
             self.b.handle_packet(now, &p);
-        }
-        while let Some(p) = self.ba.recv(now) {
+        } else if let Some(p) = self.ba.recv(now) {
             self.delivered.push((Dir::BtoA, now, parse_owned(&p)));
             self.a.handle_packet(now, &p);
-        }
-        if self.a.poll_timeout().is_some_and(|t| t <= now) {
+        } else if self.a.poll_timeout().is_some_and(|t| t <= now) {
             self.a.handle_timeout(now);
-        }
-        if self.b.poll_timeout().is_some_and(|t| t <= now) {
+        } else {
             self.b.handle_timeout(now);
         }
         self.pump();
@@ -682,10 +680,10 @@ impl<R: CryptoRng> Net<R> {
         mut done: impl FnMut(&mut Self) -> bool,
     ) -> bool {
         loop {
+            self.pump();
             if done(self) {
                 return true;
             }
-            self.pump();
             if self.next_event().is_none_or(|t| t > deadline) {
                 return false;
             }
