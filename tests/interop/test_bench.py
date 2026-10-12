@@ -197,6 +197,15 @@ class Driver(unittest.TestCase):
             probe.unlink()
         self.assertEqual(bench.fingerprint(), fp)
 
+    def test_append_refuses_stale_fingerprint(self):
+        import bench
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "r.jsonl"
+            self.assertFalse(bench.append_record(path, {"fingerprint": "built-before-a-rebuild"}))
+            self.assertFalse(path.exists())
+            self.assertTrue(bench.append_record(path, {"fingerprint": bench.fingerprint()}))
+            self.assertEqual(len(path.read_text().splitlines()), 1)
+
     def test_pending_order(self):
         import bench
         todo = bench.pending([], 2, "base-a")

@@ -65,6 +65,15 @@ def check_run(scen, d, out, art):
     return rec, None
 
 
+def append_record(path, rec):
+    """Append unless the build or harness changed since the run began (then the run is not data)."""
+    if rec["fingerprint"] != fingerprint():
+        return False
+    with Path(path).open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return True
+
+
 def run_one(scen, d, client, rep, fp):
     env = {**os.environ, "INTEROP_BENCH": "1", "MPTCP_RS_CC": "cubic", "INTEROP_CLIENT": client}
     p = subprocess.run(["bash", str(HERE / "run.sh"), scen, d], cwd=ROOT, env=env, text=True,
@@ -94,8 +103,9 @@ def main():
     todo = pending(done, a.reps, a.only)
     for i, (scen, d, client, rep) in enumerate(todo, 1):
         rec = run_one(scen, d, client, rep, fp)
-        with path.open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+        if not append_record(path, rec):
+            print(f"build or harness changed during {scen} {d} {client} rep {rep}; run discarded, start a new file", file=sys.stderr)
+            sys.exit(2)
         print(f"[{i}/{len(todo)}] {scen} {d} {client} rep {rep}: {rec['goodput_mbps']} Mbit/s {rec['error'] or 'ok'}", flush=True)
 
 
