@@ -1470,6 +1470,112 @@ fn tcp_acked_without_data_ack_reinjects_with_new_ssn_and_backoff() {
     assert_eq!(packet::parse(&retry).unwrap().payload, b"lost");
 }
 
+/// `connected_with_capacity`, "first" sent and ACKed without any MPTCP option, so the
+/// connection falls back (RFC 8684 L2313–2328). Returns the endpoint, its handle, our SYN and
+/// the head DSN.
+fn stripped_fallback() -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    u64,
+) {
+    let (mut ep, h, syn, _) = connected_with_capacity(64);
+    let syn = packet::parse(syn.leak()).unwrap();
+    let head = ep.conns[&h].hooks.data.as_ref().unwrap().send.una;
+    ep.connection(h).unwrap().write(b"first").unwrap();
+    let sent = transmit(&mut ep, Instant::from_nanos(2));
+    let sent = packet::parse(&sent).unwrap();
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.ack = sent.seq.wrapping_add(5);
+    ack.wnd = 65535;
+    input(&mut ep, &ack);
+    assert_eq!(
+        ep.conns[&h].hooks.negotiation.as_ref().unwrap().state,
+        crate::mptcp::State::FellBack
+    );
+    (ep, h, syn, head)
+}
+
+/// The DSN of `seg`'s first payload octet by the infinite mapping it carries.
+fn placed_by_infinite_mapping(seg: &Segment, syn: &Segment) -> u64 {
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(seg.options)[0]).unwrap() else {
+        panic!("no DSS")
+    };
+    let m = d.mapping.expect("a mapping");
+    assert_eq!((m.data_len, d.data_ack), (0, None), "the infinite mapping");
+    let mptcp::Dsn::Dsn64(dsn) = m.dsn else {
+        panic!()
+    };
+    dsn + u64::from(seg.seq.0.wrapping_sub(syn.seq.0).wrapping_sub(m.ssn))
+}
+
+/// The ACK-only copy of our infinite mapping and the data segment after it are both lost: the
+/// retransmission carries the mapping and places its octets at their DSN. Once the peer
+/// acknowledges it, data goes as plain TCP.
+#[test]
+fn infinite_mapping_rides_on_retransmission() {
+    let (mut ep, h, syn, head) = stripped_fallback();
+    let now = Instant::from_nanos(3);
+    let copy = transmit(&mut ep, now);
+    let copy = packet::parse(&copy).unwrap();
+    // At SND.MAX, where "second" will start.
+    assert!(copy.payload.is_empty());
+    assert_eq!(placed_by_infinite_mapping(&copy, &syn), head + 5);
+    ep.connection(h).unwrap().write(b"second").unwrap();
+    let lost = transmit(&mut ep, now);
+    let lost = packet::parse(&lost).unwrap();
+    assert_eq!(lost.payload, b"second");
+    assert_eq!(placed_by_infinite_mapping(&lost, &syn), head + 5);
+    // The RTO resends it.
+    let mut buf = [0; 1500];
+    let (n, at) = loop {
+        let at = ep.poll_timeout().unwrap();
+        ep.handle_timeout(at);
+        if let Some(n) = ep.poll_transmit(at, &mut buf) {
+            break (n, at);
+        }
+    };
+    let retrans = packet::parse(&buf[..n]).unwrap();
+    assert_eq!((retrans.seq, retrans.payload), (lost.seq, &b"second"[..]));
+    assert_eq!(placed_by_infinite_mapping(&retrans, &syn), head + 5);
+    let mut ack = peer_data(&syn, 5001, &[], &[]);
+    ack.ack = retrans.seq.wrapping_add(6);
+    input(&mut ep, &ack);
+    ep.connection(h).unwrap().write(b"third").unwrap();
+    let third = transmit(&mut ep, at);
+    let third = packet::parse(&third).unwrap();
+    assert_eq!(third.payload, b"third");
+    assert!(mpc(third.options).is_empty(), "plain TCP once acknowledged");
+}
+
+/// Data written after the ACK-only copy carries the mapping itself, so a network that lets it
+/// overtake the copy (which then falls below the peer's RCV.NXT) still places every octet.
+#[test]
+fn data_overtaking_infinite_mapping_copy_carries_it() {
+    let (mut ep, h, syn, head) = stripped_fallback();
+    let now = Instant::from_nanos(3);
+    let copy = transmit(&mut ep, now);
+    assert!(packet::parse(&copy).unwrap().payload.is_empty());
+    // Four segments: the initial window at this MSS (no Nagle hold on the last).
+    let data: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+    ep.connection(h).unwrap().set_nodelay(true);
+    ep.connection(h).unwrap().write(&data).unwrap();
+    let mut got = vec![None; data.len()];
+    let mut buf = [0; 1500];
+    let mut segs = 0;
+    while let Some(n) = ep.poll_transmit(now, &mut buf) {
+        segs += 1;
+        let seg = packet::parse(&buf[..n]).unwrap();
+        let at = (placed_by_infinite_mapping(&seg, &syn) - head - 5) as usize;
+        for (k, &b) in seg.payload.iter().enumerate() {
+            got[at + k] = Some(b);
+        }
+    }
+    assert!(segs > 1, "{segs}");
+    let got: Vec<u8> = got.into_iter().map(|b| b.expect("every octet")).collect();
+    assert_eq!(got, data);
+}
+
 #[test]
 fn lost_data_ack_falls_back_once_preserving_both_streams() {
     let (mut ep, h, syn, peer_dsn) = connected_with_capacity(64);
@@ -1503,7 +1609,8 @@ fn lost_data_ack_falls_back_once_preserving_both_streams() {
     let queued = packet::parse(&queued).unwrap();
     assert_eq!(queued.seq, sent.seq.wrapping_add(5));
     assert_eq!(queued.payload, b"queued");
-    assert!(mpc(queued.options).is_empty());
+    // The infinite mapping rides on the data after it until that data is acknowledged.
+    assert_eq!(mpc(queued.options), mpc(final_dss.options));
     let mut out = [0; 20];
     assert_eq!(ep.connection(h).unwrap().read(&mut out), Ok(6));
     assert_eq!(&out[..6], b"oldnew");
@@ -1644,7 +1751,12 @@ fn received_infinite_mapping_is_permanent_and_keeps_inflight_send() {
     let retrans = packet::parse(&retrans).unwrap();
     assert_eq!(retrans.seq, sent.seq);
     assert_eq!(retrans.payload, b"outstanding");
-    assert!(mpc(retrans.options).is_empty());
+    // Our infinite mapping (SSN 1, retroactive) rides on the retransmission too, until the
+    // data it maps is acknowledged.
+    let MptcpOption::Dss(d) = mptcp::parse(mpc(retrans.options)[0]).unwrap() else {
+        panic!()
+    };
+    assert_eq!(d.mapping.map(|m| (m.ssn, m.data_len)), Some((1, 0)));
     let mut ack = peer_data(&syn, 5006, &[], &[]);
     ack.ack = sent.seq.wrapping_add(11);
     input(&mut ep, &ack);

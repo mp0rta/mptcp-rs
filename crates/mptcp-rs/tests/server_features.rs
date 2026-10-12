@@ -34,18 +34,13 @@ fn server() -> SocketAddr {
 }
 
 /// `b` listens on 10.0.0.2:80 with `cc`; `a` opens an MPTCP connection to it from `A1`, over
-/// lossy links seeded with `seed` (`lossy` false: no loss, no reordering).
-fn net_with(
-    seed: u64,
-    lossy: bool,
-    cc: CongestionControlKind,
-) -> (Net<ChaCha20Rng>, ConnectionHandle) {
-    let (loss, reorder) = if lossy { (10, 20) } else { (0, 0) };
+/// lossy links seeded with `seed`.
+fn net_with(seed: u64, cc: CongestionControlKind) -> (Net<ChaCha20Rng>, ConnectionHandle) {
     let mut n = Net::new(
         endpoint(1 + 2 * seed),
         endpoint(2 + 2 * seed),
-        Link::new(100 + seed, loss, reorder),
-        Link::new(200 + seed, loss, reorder),
+        Link::new(100 + seed, 10, 20),
+        Link::new(200 + seed, 10, 20),
     );
     let mut l = ListenConfig::default();
     l.connection.congestion_control = cc;
@@ -56,8 +51,8 @@ fn net_with(
     (n, h)
 }
 
-fn net(lossy: bool) -> (Net<ChaCha20Rng>, ConnectionHandle) {
-    net_with(1, lossy, CongestionControlKind::Cubic)
+fn net() -> (Net<ChaCha20Rng>, ConnectionHandle) {
+    net_with(1, CongestionControlKind::Cubic)
 }
 
 /// `a` joins from `A2`.
@@ -165,7 +160,7 @@ fn joined(
 
 /// Runs the apps to the end; the first DATA_FIN goes in direction `first`.
 fn close_first(first: Dir) {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     join(&mut n, h);
     let mut apps = apps(h, 100_000, 100_000);
     // The other side writes 1 MiB, only after it has read: its DATA_FIN comes last.
@@ -194,7 +189,7 @@ fn close_from_client_side() {
 /// RST it sends carries MP_FASTCLOSE with the other side's key (one on each path), and the
 /// other side reports one `Closed { Reset }` and no `SubflowDown`.
 fn abort_by(server_aborts: bool) {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     join(&mut n, h);
     let mut apps = apps(h, 1 << 20, 1 << 20);
     let (hb, _) = joined(&mut n, h, &mut apps);
@@ -263,26 +258,27 @@ fn without_mptcp(options: &[u8], subtype: Option<u8>) -> Vec<u8> {
 /// RFC 8684 L2306–2328 on the server's only subflow: a middlebox strips the client's DSS
 /// options, so no DATA_ACK ever confirms the server's DSS. The server writes first; its data is
 /// ACKed without a DATA_ACK, so it falls back and sends the infinite mapping, on which the
-/// client falls back too. The data is byte-exact both ways. No loss or reordering: our infinite
-/// mapping goes out once, on whatever segment is next, so a link that loses or overtakes that
-/// segment loses the switch (see the Task 7 report).
+/// client falls back too. The data is byte-exact both ways. Seed 48 reorders the data after
+/// the switch ahead of the ACK-only copy of the infinite mapping.
 #[test]
 fn server_dss_stripped_before_confirm_single_subflow_falls_back() {
-    let (mut n, h) = net(false);
-    n.rewrite(Dir::AtoB, |s| {
-        s.options = without_mptcp(&s.options, Some(2));
-        true
-    });
-    let mut apps = apps(h, 200_000, 200_000);
-    apps[0].hold = true;
-    run_apps(&mut n, &mut apps, SECS);
-    assert!(has(&n.events_a, &Event::FellBack));
-    assert!(has(&n.events_b, &Event::FellBack));
-    let inf = |t: &(Dir, Seg)| {
-        let m = dss(&t.1).and_then(|d| d.mapping);
-        t.0 == Dir::BtoA && m.is_some_and(|m| m.data_len == 0)
-    };
-    assert!(n.taps.iter().any(inf));
+    for seed in [1, 48] {
+        let (mut n, h) = net_with(seed, CongestionControlKind::Cubic);
+        n.rewrite(Dir::AtoB, |s| {
+            s.options = without_mptcp(&s.options, Some(2));
+            true
+        });
+        let mut apps = apps(h, 200_000, 200_000);
+        apps[0].hold = true;
+        run_apps(&mut n, &mut apps, SECS);
+        assert!(has(&n.events_a, &Event::FellBack));
+        assert!(has(&n.events_b, &Event::FellBack));
+        let inf = |t: &(Dir, Seg)| {
+            let m = dss(&t.1).and_then(|d| d.mapping);
+            t.0 == Dir::BtoA && m.is_some_and(|m| m.data_len == 0)
+        };
+        assert!(n.taps.iter().any(inf));
+    }
 }
 
 /// The counterpart of the client's `joined_subflow_stripping_resets_only_it`: once the join is
@@ -291,7 +287,7 @@ fn server_dss_stripped_before_confirm_single_subflow_falls_back() {
 /// initial subflow.
 #[test]
 fn server_joined_subflow_stripping_resets_only_it() {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     let j = join(&mut n, h);
     let mut apps = apps(h, 20_000, 1 << 20);
     apps[0].hold = true;
@@ -323,11 +319,10 @@ fn server_joined_subflow_stripping_resets_only_it() {
 /// join up and everything so far DATA_ACKed, a middlebox turns the client's mappings on the
 /// joined subflow into infinite mappings. The server falls back onto that subflow and resets
 /// the initial one; the client follows on the server's own infinite mapping, and the rest of
-/// the transfer is byte-exact on the joined subflow. No loss or reordering, as for
-/// `server_dss_stripped_before_confirm_single_subflow_falls_back`.
+/// the transfer is byte-exact on the joined subflow.
 #[test]
 fn server_receives_infinite_mapping_with_join_keeps_one_subflow() {
-    let (mut n, h) = net(false);
+    let (mut n, h) = net();
     join(&mut n, h);
     let first = pattern(100_000, 3);
     n.a.connection(h).unwrap().write(&first).unwrap();
@@ -402,7 +397,7 @@ fn server_receives_infinite_mapping_with_join_keeps_one_subflow() {
 /// exchange; the transfer completes on the initial subflow without a RST.
 #[test]
 fn set_backup_and_close_subflow_on_server() {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     let j = join(&mut n, h);
     let mut apps = apps(h, 1 << 20, 1 << 20);
     let (hb, sb) = joined(&mut n, h, &mut apps);
@@ -441,7 +436,7 @@ fn set_backup_and_close_subflow_on_server() {
 /// address id and `SubflowDown` for the join, and the transfer completes on the initial subflow.
 #[test]
 fn remove_address_from_client_seen_by_server() {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     join(&mut n, h);
     let mut apps = apps(h, 1 << 20, 1 << 20);
     let (_, sb) = joined(&mut n, h, &mut apps);
@@ -469,7 +464,7 @@ fn remove_address_from_client_seen_by_server() {
 /// the server reports `AddressAnnounced` and echoes it.
 #[test]
 fn server_receives_add_addr() {
-    let (mut n, h) = net(true);
+    let (mut n, h) = net();
     join(&mut n, h);
     let mut apps = apps(h, 1 << 20, 1 << 20);
     joined(&mut n, h, &mut apps);
@@ -520,7 +515,7 @@ fn server_receives_add_addr() {
 fn transfer_bbr_and_cubic_lossy() {
     for cc in [CongestionControlKind::Cubic, CongestionControlKind::BbrV3] {
         for seed in 0..5 {
-            let (mut n, h) = net_with(seed, true, cc);
+            let (mut n, h) = net_with(seed, cc);
             join(&mut n, h);
             run_apps(&mut n, &mut apps(h, 4 << 20, 4 << 20), SECS);
             assert_eq!((ups(&n.events_a).len(), ups(&n.events_b).len()), (1, 1));

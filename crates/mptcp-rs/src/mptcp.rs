@@ -1022,6 +1022,11 @@ impl SendBuf for SubflowHooks<'_> {
                     if from.is_some_and(|f| ssn.wrapping_sub(f) as i32 >= 0) {
                         self.sf.infinite_from = None;
                     }
+                    // The peer has an octet that only ever travelled with our infinite mapping.
+                    let first_new = self.sf.infinite.map(|(_, new)| new);
+                    if first_new.is_some_and(|new| ssn.wrapping_sub(new) as i32 > 0) {
+                        self.sf.infinite = None;
+                    }
                 }
             }
             None => self.conn.plain.mark_acked(ssn),
@@ -1047,6 +1052,8 @@ impl SegmentHooks for SubflowHooks<'_> {
     fn data_option_len(&self) -> usize {
         if self.conn.data.as_ref().is_some_and(|d| !d.fallback) {
             28
+        } else if self.conn.data.is_some() && self.sf.infinite.is_some() {
+            20
         } else {
             0
         }
@@ -1057,7 +1064,18 @@ impl SegmentHooks for SubflowHooks<'_> {
         };
         let below_infinite = |from: u32| (ssn.wrapping_sub(from) as i32) < 0;
         if d.fallback && !self.sf.infinite_from.is_some_and(below_infinite) {
-            return self.options_for(TcpFlags::ACK, out);
+            let Some((mapping, _)) = self.sf.infinite else {
+                return self.options_for(TcpFlags::ACK, out);
+            };
+            let dss = mptcp::Dss {
+                data_fin: false,
+                data_ack: None,
+                mapping: Some(mapping),
+            };
+            let n = mptcp::encode(&MptcpOption::Dss(dss), out).expect("infinite mapping fits");
+            let padded = n.next_multiple_of(4);
+            out[n..padded].fill(1);
+            return padded;
         }
         let mapping = self.sf.tx.mapping(ssn).expect("payload has mapping");
         let data_fin = self.sf.tx.data_fin(ssn);
@@ -1575,12 +1593,14 @@ impl DataState {
             (1, m.local_idsn.wrapping_add(1))
         };
         sf.infinite_from = Some(ssn);
-        sf.final_mapping = Some(mptcp::Mapping {
+        let mapping = mptcp::Mapping {
             dsn: mptcp::Dsn::Dsn64(dsn),
             ssn,
             data_len: 0,
             checksum: None,
-        });
+        };
+        sf.final_mapping = Some(mapping);
+        sf.infinite = Some((mapping, sf.tx.assigned_end()));
     }
 }
 

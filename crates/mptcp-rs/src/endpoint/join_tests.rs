@@ -2161,7 +2161,8 @@ fn fallen_back_peer(
             let rel = s.seq.0.wrapping_sub(syn.seq.0);
             let dsn = match dss_map(&s) {
                 Some((ssn, dsn, 0)) => {
-                    assert!(inf.is_none(), "one infinite mapping");
+                    // One mapping, repeated on the data it maps until acknowledged.
+                    assert!(inf.is_none_or(|i| i == (ssn, dsn)), "one infinite mapping");
                     inf = Some((ssn, dsn));
                     dsn.wrapping_add(u64::from(rel.wrapping_sub(ssn)))
                 }
@@ -3211,8 +3212,8 @@ fn stale_then_stripped_single_subflow_falls_back() {
     assert_eq!(data.len(), 1);
     assert_eq!((data[0].seq, data[0].payload), (end(&sent), &b"second"[..]));
     assert!(
-        mpc(data[0].options).is_empty(),
-        "plain TCP after the switch"
+        infinite_mapping(data[0]),
+        "the data after the switch carries the infinite mapping until acknowledged"
     );
 }
 

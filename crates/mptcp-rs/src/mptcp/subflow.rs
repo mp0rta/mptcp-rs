@@ -85,10 +85,14 @@ pub(crate) struct SubflowMp {
     pub valid_data_ack: Option<bool>,
     pub ack_now: bool,
     pub capable_ack_due: bool,
-    /// Our infinite mapping, due until a segment carries it.
+    /// Our infinite mapping, due on an ACK-only segment until any segment carries it.
     pub final_mapping: Option<mptcp::Mapping>,
     /// SSN where our infinite mapping starts; data below it keeps its finite mapping.
     pub infinite_from: Option<u32>,
+    /// Our infinite mapping and the SSN of the first data sent after it: every data segment
+    /// not below the mapping, retransmissions included, carries it until the peer's TCP ACK
+    /// passes that SSN, so no octet it maps can arrive without it (RFC 8684 L2406–2407).
+    pub infinite: Option<(mptcp::Mapping, u32)>,
     /// The highest DSN end of any mapping ever installed on this subflow (fallback data loss).
     pub dsn_end: Option<u64>,
     pub rx_infinite: Option<(u32, u64)>,
@@ -167,6 +171,7 @@ impl SubflowMp {
             capable_ack_due: false,
             final_mapping: None,
             infinite_from: None,
+            infinite: None,
             dsn_end: None,
             rx_infinite: None,
             peer_scale: 0,
