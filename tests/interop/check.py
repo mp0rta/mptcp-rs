@@ -10,7 +10,9 @@ import subprocess
 import sys
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
-scenario, directory, want_c2s, want_s2c = sys.argv[1:]
+# logs-only (the kernel comparison bench): the byte counts below, no wire checks.
+scenario, directory, want_c2s, want_s2c, *mode = sys.argv[1:]
+assert mode in ([], ["logs-only"]), mode
 out = Path(directory)
 client = (out / "client.log").read_text()
 server = (out / "server.log").read_text()
@@ -22,6 +24,9 @@ assert m, server
 assert (int(m[1]), int(m[2])) == (c2s, s2c), f"sender/receiver byte counts differ: client sent {c2s} server got {m[1]}, server sent {m[2]} client got {s2c}"
 for name, got, want in [("c2s", c2s, want_c2s), ("s2c", s2c, want_s2c)]:
     assert got > 0 if want == "any" else got == int(want), f"{name}: {got} bytes, expected {want}"
+if mode:
+    print(f"PASS {scenario} (logs only)")
+    sys.exit(0)
 m2 = scenario.startswith("m2-")
 # Client addresses: M2 has the initial subflow from 10.0.9.2 (path A) and a join from 10.0.8.2 (B).
 cips = {"10.0.9.2", "10.0.8.2"} if m2 else {"10.0.8.2" if scenario == "base-b" else "10.0.9.2"}

@@ -8,17 +8,25 @@ if [ "${1:-}" != --inner ]; then
     m0:|m1:|syn-strip:|dataack-strip:|zero-server:|zero-client:|m2-mtu:) ;;
     base-a:c2s|base-a:s2c|base-b:c2s|base-b:s2c|base-unshaped:c2s|base-unshaped:s2c) ;;
     m2-goodput:c2s|m2-goodput:s2c|m2-blackhole-a:c2s|m2-blackhole-a:s2c|m2-blackhole-b:c2s|m2-blackhole-b:s2c|m2-lossy:c2s|m2-lossy:s2c) ;;
-    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-lossy|m2-blackhole-a|m2-blackhole-b c2s|s2c" >&2; exit 2;;
+    m2-unshaped:c2s|m2-unshaped:s2c) ;;
+    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-lossy|m2-unshaped|m2-blackhole-a|m2-blackhole-b c2s|s2c" >&2; exit 2;;
   esac
   docker build -t mptcp-rs-m1-test:local tests/interop
-  exec docker run --rm --init --network none --privileged -e MPTCP_RS_CC -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash tests/interop/run.sh --inner "$1" "${2:-}"
+  exec docker run --rm --init --network none --privileged -e MPTCP_RS_CC -e INTEROP_CLIENT -e INTEROP_BENCH -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash tests/interop/run.sh --inner "$1" "${2:-}"
 fi
 scenario=$2; dir=${3:-}; cc=${MPTCP_RS_CC:-cubic}
+# Kernel comparison bench (see test_bench.py): INTEROP_CLIENT=kernel runs the Linux MPTCP client
+# (kclient.py) instead of mptcp-rs-tun; INTEROP_BENCH=1 gives both clients the same conditions.
+client=${INTEROP_CLIENT:-mptcp-rs}; bench=${INTEROP_BENCH:-}
+case "$client:$scenario" in
+  mptcp-rs:*|kernel:base-a|kernel:base-b|kernel:m2-goodput|kernel:m2-lossy|kernel:m2-unshaped) ;;
+  *) echo "INTEROP_CLIENT=$client: unsupported for $scenario" >&2; exit 2;;
+esac
 mkdir -p "artifacts/interop/$scenario${dir:+-$dir}"
 out=$(mktemp -d "artifacts/interop/$scenario${dir:+-$dir}/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")
 echo "artifacts: $out"
 chmod 755 "$out"
-sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,retrans.py,blackhole.sh,Dockerfile} >"$out/inputs.sha256"
+sha256sum target/release/mptcp-rs-tun tests/interop/{run.sh,server.py,check.py,check_fin_mutation.py,check_rst_mutation.py,goodput.py,retrans.py,blackhole.sh,Dockerfile,kclient.py,cpu.py,ceiling.py,bench.py} >"$out/inputs.sha256"
 uname -a >"$out/kernel.txt"
 mode=mptcp; [ "$scenario" != m0 ] || mode=tcp
 ip netns add cli; ip netns add srv
@@ -47,8 +55,16 @@ loss=(); [ "$scenario" != m2-lossy ] || loss=(loss 1%)
 case "$scenario" in base-a|base-b|m2-goodput|m2-lossy|m2-blackhole-*)
   for x in "cli a0 10 300 1000" "srv a1 10 300 1000" "cli b0 30 80 800" "srv b1 30 80 800"; do
     set -- $x; ip netns exec "$1" tc qdisc add dev "$2" root netem delay "$3"ms rate "$4"mbit limit "$5" "${loss[@]}"
+    # Bench: one segment per skb at netem for both clients. TCP builds software-GSO skbs even
+    # with device GSO off (split after the qdisc), so gso_max_segs 1 is what caps them.
+    [ -z "$bench" ] || { ip netns exec "$1" ethtool -K "$2" tso off gso off gro off; ip -n "$1" link set "$2" gso_max_segs 1; }
   done;;
 esac
+echo "$client" >"$out/client.txt"
+for x in "cli a0" "cli b0" "srv a1" "srv b1"; do
+  set -- $x; echo "# $2"; ip netns exec "$1" ethtool -k "$2"; ip -n "$1" -d link show "$2"
+done >"$out/ethtool.txt"
+for ns in cli srv; do echo "# $ns"; ip netns exec "$ns" sysctl net.mptcp net.ipv4.tcp_congestion_control; done >"$out/sysctl.txt"
 for ns in cli srv; do echo "# $ns"; ip netns exec "$ns" tc qdisc show; done >"$out/qdisc.txt"
 echo "$cc" >"$out/cc.txt"
 # Path B MTU 1280 with offloads off, so the B link pcap shows wire-sized packets (no GSO/GRO).
@@ -58,6 +74,13 @@ if [ "$scenario" = m2-mtu ]; then
 fi
 cip=10.0.9.2; sif=a1; cif=a0
 [ "$scenario" != base-b ] || { cip=10.0.8.2; sif=b1; cif=b0; }
+if [ "$client" = kernel ]; then
+  # The kernel client sources from the veth addresses; 10.0.2.1 leaves on leg B (table 200).
+  cip=10.0.1.1; [ "$scenario" != base-b ] || cip=10.0.2.1
+  ip -n cli rule add from 10.0.2.1 table 200
+  ip netns exec cli ip mptcp limits set subflows 2
+  [[ "$scenario" != m2-* ]] || ip netns exec cli ip mptcp endpoint add 10.0.2.1 dev b0 subflow
+fi
 # M2: the initial subflow on A from 10.0.9.2, one join on B from 10.0.8.2 (captured on b1 too).
 joins=(); m2=
 if [[ "$scenario" = m2-* ]]; then
@@ -81,17 +104,21 @@ if [[ "$scenario" = zero-* ]]; then
   ip netns exec cli iptables -t mangle -A REOPEN -j CONNMARK --set-mark 2
   ip netns exec cli iptables -t mangle -A REOPEN -j DROP
 fi
-ip netns exec srv tcpdump -Z root -i "$sif" -U -s 160 -w "$out/server.pcap" >"$out/capture.log" 2>&1 &
-tdpid=$!
-ip netns exec cli tcpdump -Z root -i "$cif" -U -s 160 -w "$out/client.pcap" >"$out/client-capture.log" 2>&1 &
-tdcli=$!
-tdb=
-if [ -n "$m2" ]; then
-  ip netns exec srv tcpdump -Z root -i b1 -U -s 160 -w "$out/server-b.pcap" >"$out/capture-b.log" 2>&1 &
-  tdb=$!
+# m2-unshaped (CPU-bound): no capture at all. Bench: no TUN capture either, for either client.
+cap=1; [ "$scenario" != m2-unshaped ] || cap=
+tdpid=; tdcli=; tdb=
+if [ -n "$cap" ]; then
+  ip netns exec srv tcpdump -Z root -i "$sif" -U -s 160 -w "$out/server.pcap" >"$out/capture.log" 2>&1 &
+  tdpid=$!
+  ip netns exec cli tcpdump -Z root -i "$cif" -U -s 160 -w "$out/client.pcap" >"$out/client-capture.log" 2>&1 &
+  tdcli=$!
+  if [ -n "$m2" ]; then
+    ip netns exec srv tcpdump -Z root -i b1 -U -s 160 -w "$out/server-b.pcap" >"$out/capture-b.log" 2>&1 &
+    tdb=$!
+  fi
 fi
-tdtun=; bhpid=
-trap 'kill "$tdpid" "$tdcli" ${tdb:-} ${tdtun:-} ${bhpid:-} 2>/dev/null || true' EXIT
+tdtun=; bhpid=; cpupid=
+trap 'kill ${tdpid:-} ${tdcli:-} ${tdb:-} ${tdtun:-} ${bhpid:-} ${cpupid:-} 2>/dev/null || true' EXIT
 # Fixed cases: N bytes each way. Timed cases: 30 s in $dir, the other direction idle.
 # Blackhole cases: 1 GiB in $dir, the other direction idle (outlasts the 15 s blackhole).
 sargs=(--bytes "$N"); cargs=(--send "$N" --expect "$N"); want_c2s=$N; want_s2c=$N
@@ -102,32 +129,57 @@ case "$scenario:$dir" in
   *:c2s) sargs=(--expect any --send-bytes 0); cargs=(--send-secs 30 --expect 0); want_c2s=any; want_s2c=0;;
   *:s2c) sargs=(--expect 0 --send-secs 30); cargs=(--send 0 --expect any); want_c2s=0; want_s2c=any;;
 esac
-ip netns exec srv timeout 910 python3 tests/interop/server.py --mode "$mode" --port 5201 "${sargs[@]}" --pause-read-ms "$server_pause" >"$out/server.log" 2>&1 &
+verify=(); [ "$scenario" != m2-unshaped ] || verify=(--verify off)
+ip netns exec srv timeout 910 python3 tests/interop/server.py --mode "$mode" --port 5201 "${sargs[@]}" --pause-read-ms "$server_pause" "${verify[@]}" >"$out/server.log" 2>&1 &
 srvpid=$!
 for _ in $(seq 50); do grep -qs listening "$out/server.log" && break; sleep 0.1; done
 sleep 1
-ip netns exec cli timeout 910 target/release/mptcp-rs-tun --mode "$mode" --tun mtun0 --local "$cip" --remote 10.0.1.2:5201 "${cargs[@]}" "${joins[@]}" --pause-read-ms "$client_pause" --cc "$cc" >"$out/client.log" 2>&1 &
+if [ "$client" = kernel ]; then
+  ip netns exec cli timeout 910 python3 tests/interop/kclient.py --local "$cip" --remote 10.0.1.2:5201 "${cargs[@]}" "${verify[@]}" >"$out/client.log" 2>&1 &
+else
+  ip netns exec cli timeout 910 target/release/mptcp-rs-tun --mode "$mode" --tun mtun0 --local "$cip" --remote 10.0.1.2:5201 "${cargs[@]}" "${joins[@]}" --pause-read-ms "$client_pause" --cc "$cc" "${verify[@]}" >"$out/client.log" 2>&1 &
+fi
 clipid=$!
+if [ -n "$bench" ]; then
+  # CPU over the steady window: the programs themselves are the children of `timeout`.
+  child() { local c=; for _ in $(seq 50); do c=$(pgrep -P "$1" | head -1) && [ -n "$c" ] && break; sleep 0.1; done; echo "$c"; }
+  python3 tests/interop/cpu.py "$out/cpu.json" --client "$(child "$clipid")" --server "$(child "$srvpid")" --direction "$dir" >"$out/cpu.log" 2>&1 &
+  cpupid=$!
+fi
 case "$scenario" in
   m2-blackhole-a) bash tests/interop/blackhole.sh "$out/client.log" a0 >"$out/blackhole.log" 2>&1 & bhpid=$!;;
   m2-blackhole-b) bash tests/interop/blackhole.sh "$out/client.log" b0 >"$out/blackhole.log" 2>&1 & bhpid=$!;;
 esac
-for _ in $(seq 50); do ip -n cli link show mtun0 >/dev/null 2>&1 && break; sleep 0.1; done
-ip -n cli link set mtun0 up
-ip netns exec cli tcpdump -Z root -i mtun0 -U -s 160 -w "$out/tun.pcap" >"$out/tun-capture.log" 2>&1 &
-tdtun=$!
-sleep 1
-ip -n cli addr add 10.0.9.1/24 dev mtun0; ip -n cli addr add 10.0.8.1/24 dev mtun0
+if [ "$client" = mptcp-rs ]; then
+  for _ in $(seq 50); do ip -n cli link show mtun0 >/dev/null 2>&1 && break; sleep 0.1; done
+  ip -n cli link set mtun0 up
+  if [ -n "$cap" ] && [ -z "$bench" ]; then
+    ip netns exec cli tcpdump -Z root -i mtun0 -U -s 160 -w "$out/tun.pcap" >"$out/tun-capture.log" 2>&1 &
+    tdtun=$!
+  fi
+  sleep 1
+  ip -n cli addr add 10.0.9.1/24 dev mtun0; ip -n cli addr add 10.0.8.1/24 dev mtun0
+fi
 cli_rc=0; wait "$clipid" || cli_rc=$?
 srv_rc=0; wait "$srvpid" || srv_rc=$?
 bh_rc=0; [ -z "$bhpid" ] || wait "$bhpid" || bh_rc=$?
+[ -z "$cpupid" ] || wait "$cpupid" || true
 sleep 1
-kill "$tdpid" "$tdcli" $tdb "$tdtun" 2>/dev/null || true
-wait "$tdpid" "$tdcli" $tdb "$tdtun" 2>/dev/null || true
+kill $tdpid $tdcli $tdb $tdtun 2>/dev/null || true
+wait $tdpid $tdcli $tdb $tdtun 2>/dev/null || true
 trap - EXIT
 ip netns exec cli iptables-save -c >"$out/client-rules.txt"
 ip netns exec srv iptables-save -c >"$out/server-rules.txt"
 cat "$out/client.log" "$out/server.log"
 [ -z "$bhpid" ] || cat "$out/blackhole.log"
 [ "$cli_rc" = 0 ] && [ "$srv_rc" = 0 ] && [ "$bh_rc" = 0 ] || { echo "FAIL client=$cli_rc server=$srv_rc blackhole=$bh_rc"; exit 1; }
-python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" | tee "$out/result.log"
+if [ -n "$bench" ] || [ "$client" = kernel ]; then
+  # Both clients face the same checks: byte counts, and for A+B a completed MP_JOIN.
+  if [[ "$scenario" = m2-* ]]; then
+    joins_rx=$(ip netns exec srv nstat -asz MPTcpExtMPJoinAckRx | awk '$1 == "MPTcpExtMPJoinAckRx" {print $2}')
+    [ "${joins_rx:-0}" -ge 1 ] || { echo "FAIL no join"; exit 1; }
+  fi
+  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" logs-only | tee "$out/result.log"
+else
+  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" | tee "$out/result.log"
+fi
