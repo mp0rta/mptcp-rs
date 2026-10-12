@@ -67,10 +67,12 @@ fn is_join_syn(s: &Seg) -> bool {
     s.flags == TcpFlags::SYN && mptcp_opts(s).iter().any(syn)
 }
 
-/// The initiator's third ACK, or a retransmission of it.
+/// The initiator's third ACK, or a repeat of it (on any ACK it sends while joining, a FIN
+/// included).
 fn is_join_ack(s: &Seg) -> bool {
     let ack = |o: &MptcpOption| matches!(o, MptcpOption::Join(MpJoin::Ack { .. }));
-    s.flags == TcpFlags::ACK && mptcp_opts(s).iter().any(ack)
+    let f = s.flags;
+    f.contains(TcpFlags::ACK) && !f.contains(TcpFlags::SYN) && mptcp_opts(s).iter().any(ack)
 }
 
 fn has_dss(s: &Seg) -> bool {
@@ -149,8 +151,7 @@ fn join_at(s: &Seg, len: u8) -> Option<usize> {
     None
 }
 
-/// Runs until join `j` of `a` is up on both sides or down on `a`. The server's application
-/// has not closed yet: joins to a closing connection are refused.
+/// Runs until join `j` of `a` is up on both sides or down on `a`.
 fn settle(n: &mut Net<ChaCha20Rng>, j: SubflowId) {
     let done = |n: &mut Net<ChaCha20Rng>| {
         let up = ups(&n.events_a).iter().any(|u| u.1 == j) && !ups(&n.events_b).is_empty();
@@ -171,7 +172,6 @@ fn assert_refused(n: &Net<ChaCha20Rng>, j: SubflowId, from_b: Option<u8>) {
 fn join_from_second_address() {
     let (mut n, h) = net();
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps(&mut n, &mut apps(h, 1 << 20), SECS);
     assert_eq!(ups(&n.events_a), [(h, j)]);
     assert_eq!(ups(&n.events_b).len(), 1);
@@ -208,7 +208,6 @@ fn join_from_unseen_address() {
         true
     });
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps(&mut n, &mut apps(h, 100_000), SECS);
     assert_eq!(ups(&n.events_a), [(h, j)]);
     assert_eq!(ups(&n.events_b).len(), 1);
@@ -225,7 +224,6 @@ fn join_bad_token_rst() {
         true
     });
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps_with_rst(&mut n, &mut apps(h, 100_000), SECS);
     assert_refused(&n, j, Some(1));
 }
@@ -238,7 +236,6 @@ fn join_bad_hmac_rst_connection_survives() {
         true
     });
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps_with_rst(&mut n, &mut apps(h, 100_000), SECS);
     assert_refused(&n, j, Some(1));
 }
@@ -253,7 +250,6 @@ fn third_ack_without_mp_join_rst() {
         true
     });
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps_with_rst(&mut n, &mut apps(h, 100_000), SECS);
     assert_refused(&n, j, Some(1));
 }
@@ -265,7 +261,6 @@ fn lost_third_join_ack() {
     let (mut n, h) = net();
     n.drop_next(Dir::AtoB, is_join_ack);
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps(&mut n, &mut apps(h, 100_000), SECS);
     assert_eq!(ups(&n.events_a), [(h, j)]);
     assert_eq!(ups(&n.events_b).len(), 1);
@@ -278,11 +273,18 @@ fn lost_third_join_ack() {
 #[test]
 fn lost_fourth_join_ack() {
     let (mut n, h) = net();
-    n.drop_next(Dir::BtoA, |s| {
-        s.dst.ip() == ip(A2) && !s.flags.contains(TcpFlags::SYN)
+    // Everything the server sends on the join after its SYN/ACK is lost until the third ACK
+    // has been sent twice.
+    let sent = Rc::new(Cell::new(0));
+    let seen = sent.clone();
+    n.rewrite(Dir::AtoB, move |s| {
+        seen.set(seen.get() + usize::from(is_join_ack(s)));
+        true
+    });
+    n.rewrite(Dir::BtoA, move |s| {
+        s.dst.ip() != ip(A2) || s.flags.contains(TcpFlags::SYN) || sent.get() >= 2
     });
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps(&mut n, &mut apps(h, 100_000), SECS);
     assert_eq!(ups(&n.events_a), [(h, j)]);
     assert_eq!(ups(&n.events_b).len(), 1);
@@ -356,7 +358,6 @@ fn join_beats_clients_first_dss() {
 fn join_to_unlistened_port_rst() {
     let (mut n, h) = net();
     let j = add(&mut n, h, A2, sa(2, 81), false);
-    settle(&mut n, j);
     run_apps_with_rst(&mut n, &mut apps(h, 100_000), SECS);
     assert_refused(&n, j, None);
 }
@@ -368,7 +369,6 @@ fn join_after_unlisten_rst() {
     assert!(n.run_until(t(5), |n| !accepted_any(&n.events_b).is_empty()));
     assert!(n.b.unlisten(server()));
     let j = add(&mut n, h, A2, server(), false);
-    settle(&mut n, j);
     run_apps_with_rst(&mut n, &mut apps, SECS);
     assert_refused(&n, j, None);
 }
@@ -453,7 +453,6 @@ fn pending_join_via_other_listener() {
     let (mut n, h) = net();
     n.b.listen(sa(2, 81), ListenConfig::default()).unwrap();
     let j = add(&mut n, h, A2, sa(2, 81), false);
-    settle(&mut n, j);
     run_apps(&mut n, &mut apps(h, 100_000), SECS);
     assert_eq!(ups(&n.events_a), [(h, j)]);
     assert_eq!(ups(&n.events_b).len(), 1);
@@ -565,4 +564,82 @@ fn server_add_subflow_to_client_listener() {
     let joined = |t: &(Dir, Seg)| t.0 == Dir::BtoA && t.1.dst == a_listen;
     assert!(b_to_a(&mut n, h, hb, 1 << 20));
     assert!(n.taps.iter().any(|t| joined(t) && !t.1.payload.is_empty()));
+}
+
+/// The server's application writes its whole response and closes before the join arrives:
+/// the connection is still live, so the join comes up and carries the client's upload.
+#[test]
+fn join_after_server_app_closed() {
+    let (mut n, h) = net();
+    // The join starts once `a` is Confirmed; its path is slower, so the server has closed by
+    // the time the SYN arrives.
+    n.delay(Dir::AtoB, |s| {
+        (s.src.ip() == ip(A2)).then_some(Duration::from_millis(50))
+    });
+    let j = add(&mut n, h, A2, server(), false);
+    let mut apps = [
+        App::new(false, Some(h), 1 << 20, 0),
+        App::new(true, None, 10_000, 1),
+    ];
+    let closed = n.run_until(t(5), |n| {
+        for i in 0..apps.len() {
+            let side = apps[i].on_b;
+            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
+            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
+            apps[i].drive(n, &claimed);
+        }
+        flush(n);
+        apps[1].closing
+    });
+    assert!(closed);
+    assert!(!n.delivered.iter().any(|d| is_join_syn(&d.2)));
+    run_apps(&mut n, &mut apps, SECS);
+    assert_eq!(ups(&n.events_a), [(h, j)]);
+    assert_eq!(ups(&n.events_b).len(), 1);
+    let up = |t: &(Dir, Seg)| t.0 == Dir::AtoB && t.1.src.ip() == ip(A2);
+    assert!(n.taps.iter().any(|t| up(t) && !t.1.payload.is_empty()));
+}
+
+/// RFC 8684 L2191–2196: a RST with MP_FASTCLOSE and the server's key, on a join the server is
+/// answering (its third ACK lost), tears the whole connection down.
+#[test]
+fn fastclose_rst_on_pending_join() {
+    let (mut n, h) = net();
+    n.drop_next(Dir::AtoB, is_join_ack);
+    add(&mut n, h, A2, server(), false);
+    let lost = |n: &mut Net<ChaCha20Rng>| n.taps.iter().any(|t| is_join_ack(&t.1));
+    assert!(n.run_until(t(5), lost));
+    let syn = n.taps.iter().find(|t| is_join_syn(&t.1)).unwrap().1.clone();
+    let synack = &n.taps.iter().find(|t| is_synack(&t.1)).unwrap().1;
+    let key = mptcp_opts(synack).into_iter().find_map(|o| match o {
+        MptcpOption::Capable(c) => c.sender_key,
+        _ => None,
+    });
+    let mut opts = [0; 12];
+    let fc = MptcpOption::FastClose {
+        receiver_key: key.unwrap(),
+    };
+    mptcp::encode(&fc, &mut opts).unwrap();
+    let seq = syn.seq.wrapping_add(1);
+    let rst = pkt(syn.src, syn.dst, seq, SeqNum(0), TcpFlags::RST, &opts, &[]);
+    n.send(Dir::AtoB, rst);
+    let ended =
+        |n: &mut Net<ChaCha20Rng>| (n.events_b.iter()).any(|e| matches!(e.1, Event::Closed { .. }));
+    assert!(n.run_until(n.now + Duration::from_millis(100), ended));
+    let closed: Vec<_> = (n.events_b.iter())
+        .filter(|e| matches!(e.1, Event::Closed { .. }))
+        .collect();
+    let hb = accepted(&n);
+    let reset = Event::Closed {
+        reason: CloseReason::Reset,
+    };
+    assert_eq!(closed, [&(hb, reset)]);
+    assert!(ups(&n.events_b).is_empty() && downs(&n.events_b).is_empty());
+    // The initial subflow is reset too.
+    let to_a1 = |t: &(Dir, Seg)| t.0 == Dir::BtoA && t.1.dst.ip() == ip(A1);
+    assert!(
+        n.taps
+            .iter()
+            .any(|t| to_a1(t) && t.1.flags.contains(TcpFlags::RST))
+    );
 }

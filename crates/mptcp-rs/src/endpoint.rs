@@ -489,7 +489,8 @@ impl<R: CryptoRng> Endpoint<R> {
 
     /// An MP_JOIN SYN to listener `key` (RFC 8684 §3.2; spec G3, G3b, G4, G4a). Its token
     /// alone picks the connection, whatever its role and wherever the SYN comes from. An
-    /// unknown token, a connection not Confirmed (or closing), a listener without MPTCP or at
+    /// unknown token, a connection not Confirmed (or reset or closed; one the application has
+    /// closed still takes joins while its data drains), a listener without MPTCP or at
     /// its half-open cap draws a RST with MP_TCPRST "Unspecified MPTCP error"; a connection at
     /// its subflow cap, "Lack of resources" (L1114–1119, L1222–1231, L2254). Neither leaves
     /// state. Otherwise a Joining subflow answers with the SYN/ACK, holding a half-open slot
@@ -513,7 +514,7 @@ impl<R: CryptoRng> Endpoint<R> {
             let m = c.hooks.negotiation.as_ref();
             !c.half_open
                 && m.is_some_and(|m| m.state == State::Confirmed)
-                && !(c.closed_by_app || c.reset || c.detached || closed(c))
+                && !(c.reset || c.detached || closed(c))
         };
         let found = parsed.filter(|_| listener_ok).and_then(|(.., token, _)| {
             let h = *self.tokens.get(&token)?;

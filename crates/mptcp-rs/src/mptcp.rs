@@ -1028,6 +1028,21 @@ impl SendBuf for SubflowHooks<'_> {
         }
     }
 }
+impl SubflowHooks<'_> {
+    /// An ACK or RST of a TCP-valid segment carries MP_FASTCLOSE with our key (`key`) once the
+    /// keys are exchanged: every subflow is torn down and the connection closes (RFC 8684
+    /// L2168–2172, L2191–2196).
+    fn fast_close(&mut self, key: Option<u64>, seg: &Segment<'_>) -> bool {
+        let hit = self.conn.negotiation.as_ref().is_some_and(|m| {
+            key == Some(m.local_key)
+                && matches!(m.state, State::PreConfirmed | State::Confirmed)
+                && (seg.flags.contains(TcpFlags::ACK) || seg.flags.contains(TcpFlags::RST))
+        });
+        self.conn.fast_closed |= hit;
+        hit
+    }
+}
+
 impl SegmentHooks for SubflowHooks<'_> {
     fn data_option_len(&self) -> usize {
         if self.conn.data.as_ref().is_some_and(|d| !d.fallback) {
@@ -1226,14 +1241,17 @@ impl SegmentHooks for SubflowHooks<'_> {
                 self.sf.ack_now = m.take_key(seg, capable.filter(|_| options_ok), scale);
             }
         }
-        // The responder's third ACK completes or fails its join, and nothing else (spec G3).
+        // The responder's third ACK completes or fails its join, and nothing else (spec G3),
+        // unless it carries a valid MP_FASTCLOSE, which ends the whole connection.
         if self
             .sf
             .join
             .as_ref()
             .is_some_and(|j| j.role == JoinRole::Responder && j.joining())
         {
-            self.join_third_ack(seg, options_ok);
+            if !(options_ok && self.fast_close(fastclose, seg)) {
+                self.join_third_ack(seg, options_ok);
+            }
             return;
         }
         if !options_ok {
@@ -1252,16 +1270,12 @@ impl SegmentHooks for SubflowHooks<'_> {
                 return;
             }
         }
+        if self.fast_close(fastclose, seg) {
+            return;
+        }
         let Some(m) = &mut self.conn.negotiation else {
             return;
         };
-        if fastclose == Some(m.local_key)
-            && matches!(m.state, State::PreConfirmed | State::Confirmed)
-            && (seg.flags.contains(TcpFlags::ACK) || seg.flags.contains(TcpFlags::RST))
-        {
-            self.conn.fast_closed = true;
-            return;
-        }
         m.on_valid_segment(seg, &mut self.sf.peer_scale);
         if self.conn.data.is_none() && matches!(m.state, State::PreConfirmed | State::Confirmed) {
             let mut send = SendStore::new(m.local_idsn.wrapping_add(1), self.conn.send_cap);
