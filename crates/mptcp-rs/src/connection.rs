@@ -92,6 +92,13 @@ impl Connection {
         }
     }
 
+    /// Subflows counted against `SUBFLOW_CAP` (spec G3b): every one not ended, whether up,
+    /// joining (ours or one a listener answered) or in SYN-SENT, plus queued joins.
+    pub(crate) fn subflow_slots(&self) -> usize {
+        let open = self.subflows.iter().filter(|sf| !sf.ended()).count();
+        open + self.queued_joins.len()
+    }
+
     /// The initial subflow's local address (after a fallback: the surviving subflow's).
     pub fn local(&self) -> SocketAddr {
         self.subflows[0].local

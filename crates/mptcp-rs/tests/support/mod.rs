@@ -824,6 +824,12 @@ pub fn flush(n: &mut Net<ChaCha20Rng>) {
 /// Runs `apps` until each has read EOF and seen `Closed`; each pair (client, server) must
 /// have exchanged its bytes exactly, closed `Normal`, and no RST may have been sent.
 pub fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
+    run_apps_with_rst(n, apps, secs);
+    assert!(n.taps.iter().all(|t| !t.1.flags.contains(TcpFlags::RST)));
+}
+
+/// `run_apps` where RSTs may have been sent (a refused or reset subflow).
+pub fn run_apps_with_rst(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
     let deadline = n.now + Duration::from_secs(secs);
     let ok = n.run_until(deadline, |n| {
         for i in 0..apps.len() {
@@ -843,7 +849,6 @@ pub fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
     for a in apps.iter() {
         assert_eq!(a.closed(n), [CloseReason::Normal]);
     }
-    assert!(n.taps.iter().all(|t| !t.1.flags.contains(TcpFlags::RST)));
 }
 
 /// The handles of every `Accepted`, MPTCP or not.

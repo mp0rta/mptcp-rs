@@ -67,7 +67,8 @@ impl Subflow {
 
 /// MPTCP state tied to one subflow's TCP sequence space, options or window scale. The creator
 /// must set `local_isn`, `tcp_acked_dsn` and (from its SYN/ACK) `peer_scale`: the MP_CAPABLE
-/// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`.
+/// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`, an
+/// answered join in `Endpoint::answer_join` (from the SYN).
 pub(crate) struct SubflowMp {
     pub tx: TxMaps,
     pub rx: RxMaps,
@@ -124,7 +125,8 @@ pub(crate) struct SubflowMp {
     pub join_failed: Option<Option<crate::MpTcpRst>>,
     /// Our own transmit policy (`Endpoint::set_local_backup`).
     pub local_backup: bool,
-    /// The peer's MP_JOIN SYN/ACK B bit, then its latest MP_PRIO (RFC 8684 L1849–1852).
+    /// The peer's MP_JOIN SYN/ACK B bit, or its SYN's on a join we answered (RFC 8684
+    /// L1101–1109), then its latest MP_PRIO (L1849–1852).
     pub peer_backup: bool,
     /// An MP_PRIO arrived with this B bit: `Event::PeerPriority` is due.
     pub peer_prio: Option<bool>,

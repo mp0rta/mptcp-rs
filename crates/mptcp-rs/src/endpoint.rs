@@ -11,11 +11,11 @@ use crate::SeqNum;
 use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
 use crate::mptcp::{
-    Join, Negotiation, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp,
+    Join, JoinRole, Negotiation, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp,
     SubflowState, SynCapable, fastclose, syn_capable, syn_scale, tcprst,
 };
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
-use crate::wire::mptcp::is_join;
+use crate::wire::mptcp::{self, MpJoin, MptcpOption, is_join};
 use crate::wire::packet::{self, Segment, TcpFlags};
 use crate::wire::tcp_options::{TcpOpt, walk};
 
@@ -58,7 +58,9 @@ pub enum Event {
     Closed {
         reason: CloseReason,
     },
-    /// A joined subflow completed its MP_JOIN handshake and can carry data.
+    /// A joined subflow completed its MP_JOIN handshake and can carry data. For a join the
+    /// peer opened through a listener (on any connection, whatever its role) this is the first
+    /// event naming it; one that fails before it is never reported.
     SubflowUp {
         subflow: SubflowId,
     },
@@ -136,7 +138,7 @@ pub enum AddSubflowError {
     /// All ephemeral ports from `local` to the remote are in use.
     NoPort,
     /// The connection has 8 open subflows (not ended: TIME-WAIT does not count), queued joins
-    /// included.
+    /// and joins a listener is answering included.
     TooManySubflows,
     /// The connection has bound 256 local IPs, each to its own address ID, and `local` is
     /// another one.
@@ -235,8 +237,9 @@ struct PendingRst {
     seq: SeqNum,
     ack: SeqNum,
     flags: TcpFlags,
-    /// MP_FASTCLOSE, on the RSTs of an aborted subflow (M3 spec §3.5).
-    option: Option<[u8; 12]>,
+    /// MP_FASTCLOSE, on the RSTs of an aborted subflow (M3 spec §3.5), or MP_TCPRST on a
+    /// refused join; empty for none.
+    option: Vec<u8>,
 }
 
 pub struct Endpoint<R: CryptoRng> {
@@ -263,6 +266,9 @@ pub struct Endpoint<R: CryptoRng> {
     /// Test-only keys, popped before the RNG by `new_negotiation`.
     #[cfg(test)]
     pub(crate) keys: VecDeque<u64>,
+    /// Test-only MP_JOIN nonces, popped before the RNG by `nonce`.
+    #[cfg(test)]
+    pub(crate) nonces: VecDeque<u32>,
     /// Congestion controller for new connections; `None` is the default (CUBIC).
     #[cfg(test)]
     pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
@@ -290,6 +296,8 @@ impl<R: CryptoRng> Endpoint<R> {
             #[cfg(test)]
             keys: VecDeque::new(),
             #[cfg(test)]
+            nonces: VecDeque::new(),
+            #[cfg(test)]
             cc: None,
         }
     }
@@ -313,6 +321,15 @@ impl<R: CryptoRng> Endpoint<R> {
                 return n;
             }
         }
+    }
+
+    /// A fresh MP_JOIN nonce (RFC 8684 L2691–2692).
+    fn nonce(&mut self) -> u32 {
+        #[cfg(test)]
+        if let Some(n) = self.nonces.pop_front() {
+            return n;
+        }
+        self.rng.next_u32()
     }
 
     pub fn connect(
@@ -395,11 +412,24 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// Stops accepting on `local`; `false` if it had no listener. Its half-open connections
-    /// are dropped silently; established ones carry on.
+    /// are dropped silently, and joins it answered that are not up yet are reset; established
+    /// connections and subflows carry on.
     pub fn unlisten(&mut self, local: SocketAddr) -> bool {
         let key = SocketAddr::new(local.ip(), local.port());
         if self.listeners.remove(&key).is_none() {
             return false;
+        }
+        // Its pending joins are reset at the next `handle_timeout`, which `poll_timeout` makes
+        // due at once (as `Connection::abort`), or by their next segment. A join holds its
+        // listener's slot only while it is open (`free_ended`), so only these can.
+        for c in self.conns.values_mut() {
+            for sf in &mut c.subflows {
+                if sf.mp.join.is_some() && sf.pending_via == Some(key) {
+                    sf.pending_via = None;
+                    sf.mp.reset = true;
+                    sf.mp.reset_option = Some(tcprst(0x01, false));
+                }
+            }
         }
         let pending = |(_, c): &(&ConnectionHandle, &Connection)| {
             c.half_open && c.subflows[0].pending_via == Some(key)
@@ -435,15 +465,7 @@ impl<R: CryptoRng> Endpoint<R> {
         let mptcp = l.cfg.mptcp;
         let cfg = l.cfg.connection.clone();
         let (local, remote) = (syn.dst, syn.src);
-        let isn = self.isn.isn(now, local, remote);
-        let seed = self.rng.next_u64();
-        #[cfg(test)]
-        let tcb = match self.cc {
-            Some(cc) => Tcb::passive_with_cc(&cfg, local, syn, isn, now, cc()),
-            None => Tcb::new_passive(&cfg, local, syn, isn, now, seed),
-        };
-        #[cfg(not(test))]
-        let tcb = Tcb::new_passive(&cfg, local, syn, isn, now, seed);
+        let (tcb, _) = self.passive_tcb(&cfg, syn, now);
         let h = self.insert(cfg, tcb, local, remote, Some(key));
         if let (true, SynCapable::V1 { peer_c }) = (mptcp, syn_capable(syn)) {
             let mut n = self.new_negotiation(h, Negotiation::new_passive);
@@ -454,9 +476,104 @@ impl<R: CryptoRng> Endpoint<R> {
         }
     }
 
+    /// A SYN-RECEIVED `Tcb` answering `syn`, and its ISS.
+    fn passive_tcb(&mut self, cfg: &ConnectConfig, syn: &Segment, now: Instant) -> (Tcb, SeqNum) {
+        let isn = self.isn.isn(now, syn.dst, syn.src);
+        let seed = self.rng.next_u64();
+        #[cfg(test)]
+        if let Some(cc) = self.cc {
+            return (Tcb::passive_with_cc(cfg, syn.dst, syn, isn, now, cc()), isn);
+        }
+        (Tcb::new_passive(cfg, syn.dst, syn, isn, now, seed), isn)
+    }
+
+    /// An MP_JOIN SYN to listener `key` (RFC 8684 §3.2; spec G3, G3b, G4, G4a). Its token
+    /// alone picks the connection, whatever its role and wherever the SYN comes from. An
+    /// unknown token, a connection not Confirmed (or closing), a listener without MPTCP or at
+    /// its half-open cap draws a RST with MP_TCPRST "Unspecified MPTCP error"; a connection at
+    /// its subflow cap, "Lack of resources" (L1114–1119, L1222–1231, L2254). Neither leaves
+    /// state. Otherwise a Joining subflow answers with the SYN/ACK, holding a half-open slot
+    /// of the listener until it is up or ends (`release_pending`).
+    fn answer_join(&mut self, now: Instant, key: SocketAddr, syn: &Segment) {
+        let parsed = walk(syn.options).find_map(|o| match o {
+            Ok(TcpOpt::Mptcp(raw)) => match mptcp::parse(raw) {
+                Ok(MptcpOption::Join(MpJoin::Syn {
+                    backup,
+                    addr_id,
+                    token,
+                    nonce,
+                })) => Some((backup, addr_id, token, nonce)),
+                _ => None,
+            },
+            _ => None,
+        });
+        let l = &self.listeners[&key];
+        let listener_ok = l.cfg.mptcp && l.half_open < l.cfg.max_half_open;
+        let confirmed = |c: &&Connection| {
+            let m = c.hooks.negotiation.as_ref();
+            !c.half_open
+                && m.is_some_and(|m| m.state == State::Confirmed)
+                && !(c.closed_by_app || c.reset || c.detached || closed(c))
+        };
+        let found = parsed.filter(|_| listener_ok).and_then(|(.., token, _)| {
+            let h = *self.tokens.get(&token)?;
+            self.conns.get(&h).filter(confirmed).map(|_| h)
+        });
+        let (Some((backup, peer_addr_id, _, peer_nonce)), Some(h)) = (parsed, found) else {
+            return self.queue_rst_with(syn, now, tcprst(0x01, false).to_vec());
+        };
+        let c = self.conns.get_mut(&h).unwrap();
+        let id = SubflowId(c.next_subflow);
+        let next = c.next_subflow.checked_add(1);
+        let slot = c.subflow_slots() < SUBFLOW_CAP;
+        // The local IP's address ID, as for our own joins; the initial one's is 0.
+        let addr_id = next
+            .filter(|_| slot)
+            .and_then(|_| c.local_addrs.bind(syn.dst.ip()));
+        let Some(addr_id) = addr_id else {
+            return self.queue_rst_with(syn, now, tcprst(0x02, true).to_vec());
+        };
+        let cfg = c.cfg.clone();
+        let (mut tcb, isn) = self.passive_tcb(&cfg, syn, now);
+        let nonce = self.nonce();
+        self.listeners.get_mut(&key).unwrap().half_open += 1;
+        let c = self.conns.get_mut(&h).unwrap();
+        tcb.set_nodelay(c.nodelay);
+        // As `start_join`, plus what the initiator learns from the SYN/ACK: the peer's
+        // window scale and its backup request, here from the SYN (spec G3c, L1101–1109).
+        let mut mp = SubflowMp::new();
+        mp.local_isn = isn;
+        mp.tcp_acked_dsn = c.hooks.data.as_ref().map_or(0, |d| d.send.una);
+        mp.peer_scale = syn_scale(syn);
+        mp.peer_backup = backup;
+        mp.join = Some(Join::responder(
+            nonce,
+            addr_id,
+            peer_nonce,
+            peer_addr_id,
+            false,
+        ));
+        c.hooks.cancel_no_subflow_wait();
+        c.hooks.signals.cancel_remove(addr_id);
+        c.next_subflow = next.unwrap();
+        self.demux.insert((syn.dst, syn.src), (h, id));
+        c.subflows.push(Subflow {
+            id,
+            tcb,
+            local: syn.dst,
+            remote: syn.src,
+            state: SubflowState::Joining,
+            mp,
+            pending_via: Some(key),
+        });
+    }
+
     /// Removes connection `h` and its demux entries at once.
     fn free(&mut self, h: ConnectionHandle) {
-        let c = self.conns.remove(&h).unwrap();
+        let mut c = self.conns.remove(&h).unwrap();
+        for sf in &mut c.subflows {
+            release_pending(&mut self.listeners, sf);
+        }
         if let Some(n) = &c.hooks.negotiation {
             self.tokens.remove(&n.token);
         }
@@ -532,8 +649,7 @@ impl<R: CryptoRng> Endpoint<R> {
         if mtu < min {
             return Err(E::InvalidMtu);
         }
-        let open = c.subflows.iter().filter(|sf| !sf.ended()).count();
-        if open + c.queued_joins.len() >= SUBFLOW_CAP {
+        if c.subflow_slots() >= SUBFLOW_CAP {
             return Err(E::TooManySubflows);
         }
         let id = SubflowId(c.next_subflow);
@@ -738,7 +854,7 @@ impl<R: CryptoRng> Endpoint<R> {
         let local = (self.free_port(now, q.local, remote)).ok_or(AddSubflowError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
         let mut tcb = self.new_tcb(&cfg, local, remote, isn, now);
-        let nonce = self.rng.next_u32();
+        let nonce = self.nonce();
         let c = self.conns.get_mut(&h).unwrap();
         tcb.set_nodelay(c.nodelay);
         // SubflowMp fields the MP_CAPABLE path would set: this subflow's own ISN, and nothing
@@ -828,14 +944,18 @@ impl<R: CryptoRng> Endpoint<R> {
             let f = seg.flags;
             let (syn, ack) = (f.contains(TcpFlags::SYN), f.contains(TcpFlags::ACK));
             let ctl = syn || ack || f.contains(TcpFlags::RST);
-            // An MP_JOIN SYN is refused until joins are answered (spec G4a).
+            // A SYN with an MP_JOIN asks to join a connection, whatever its role (spec G4a).
             let join = walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(m)) if is_join(m)));
             match self.listener_for(seg.dst) {
                 // LISTEN (RFC 9293 §3.10.7.2): a RST is ignored and an ACK draws a RST
                 // (`queue_rst`); without SYN, ACK or RST the segment is dropped (L3340–3346).
                 Some(_) if !ctl => {}
-                Some(key) if syn && !ack && !f.contains(TcpFlags::RST) && !join => {
-                    self.accept(now, key, &seg)
+                Some(key) if syn && !ack && !f.contains(TcpFlags::RST) => {
+                    if join {
+                        self.answer_join(now, key, &seg);
+                    } else {
+                        self.accept(now, key, &seg);
+                    }
                 }
                 _ => self.queue_rst(&seg, now),
             }
@@ -920,9 +1040,8 @@ impl<R: CryptoRng> Endpoint<R> {
         // bare FIN on the same segment retires it (`SubflowUp`, then the Closing path).
         let sf = &mut c.subflows[i];
         if i != 0 {
-            let joining = sf.mp.joining();
-            let view = (sf.id, &mut sf.state, &sf.tcb, sf.mp.rst);
-            Self::subflow_event(&mut self.events, &c.hooks, h, view, joining, r);
+            let view = (sf.id, &mut sf.state, &sf.tcb, &sf.mp);
+            Self::subflow_event(&mut self.events, &c.hooks, h, view, r);
         } else if r != Reaction::None {
             let rst = sf.mp.rst;
             Self::push_event(&mut self.events, &c.hooks, &mut c.reset, h, r, !last, rst);
@@ -968,7 +1087,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 free = !sf.tcb.reset_pending();
             }
         }
-        Self::free_ended(&mut self.demux, h, c);
+        Self::free_ended(&mut self.demux, &mut self.listeners, h, c);
         if free {
             self.free(h);
         }
@@ -976,12 +1095,19 @@ impl<R: CryptoRng> Endpoint<R> {
 
     /// Frees the ended subflows (TCB Closed, no RST left to send) other than `subflows[0]`,
     /// with their demux entries and ports, as soon as they end. A subflow in TIME-WAIT is not
-    /// Closed, so it keeps its 4-tuple until 2·MSL.
+    /// Closed, so it keeps its 4-tuple until 2·MSL. A join we answered gives its listener's
+    /// half-open slot back once it is up or Closed.
     fn free_ended(
         demux: &mut BTreeMap<(SocketAddr, SocketAddr), (ConnectionHandle, SubflowId)>,
+        listeners: &mut BTreeMap<SocketAddr, Listener>,
         h: ConnectionHandle,
         c: &mut Connection,
     ) {
+        for sf in &mut c.subflows {
+            if sf.mp.join.is_some() && (!sf.mp.joining() || sf.tcb.state() == TcpState::Closed) {
+                release_pending(listeners, sf);
+            }
+        }
         let mut first = true;
         let freed = &mut c.hooks.freed_dsn_end;
         let signals = &mut c.hooks.signals;
@@ -1024,9 +1150,8 @@ impl<R: CryptoRng> Endpoint<R> {
             sf: &mut sf.mp,
         };
         if i != 0 {
-            let joining = hk.sf.joining();
-            let view = (sf.id, &mut sf.state, &sf.tcb, hk.sf.rst);
-            Self::subflow_event(events, hk.conn, h, view, joining, r);
+            let view = (sf.id, &mut sf.state, &sf.tcb, &*hk.sf);
+            Self::subflow_event(events, hk.conn, h, view, r);
         } else {
             let rst = hk.sf.rst;
             Self::push_event(events, hk.conn, &mut c.reset, h, r, !last, rst);
@@ -1061,16 +1186,18 @@ impl<R: CryptoRng> Endpoint<R> {
     }
 
     /// The events of a subflow other than `subflows[0]`: `SubflowDown` when its TCB ends
-    /// (not for an MP_FASTCLOSE reset), else `SubflowUp` once its join completes (`joining`
-    /// false), which also makes it Active.
+    /// (not for an MP_FASTCLOSE reset, nor for a join we answered that never came up: the
+    /// application never saw it), else `SubflowUp` once its join completes (`joining` false),
+    /// which also makes it Active.
     fn subflow_event(
         events: &mut VecDeque<(ConnectionHandle, Event)>,
         hooks: &ConnectionHooks,
         h: ConnectionHandle,
-        (subflow, state, tcb, rst): (SubflowId, &mut SubflowState, &Tcb, Option<MpTcpRst>),
-        joining: bool,
+        (subflow, state, tcb, mp): (SubflowId, &mut SubflowState, &Tcb, &SubflowMp),
         r: Reaction,
     ) {
+        let (joining, rst) = (mp.joining(), mp.rst);
+        let answered = (mp.join.as_ref()).is_some_and(|j| j.role == JoinRole::Responder);
         let reason = match r {
             Reaction::Closed(reason) => Some(reason),
             // A SYN/ACK the join rejects resets the TCB inside its `Established` processing.
@@ -1078,7 +1205,7 @@ impl<R: CryptoRng> Endpoint<R> {
             _ => None,
         };
         if let Some(reason) = reason {
-            if !hooks.fast_closed {
+            if !hooks.fast_closed && !(answered && *state == SubflowState::Joining) {
                 events.push_back((h, down(subflow, reason, rst)));
             }
         } else if *state == SubflowState::Joining && !joining {
@@ -1143,7 +1270,8 @@ impl<R: CryptoRng> Endpoint<R> {
                     continue;
                 }
                 let (src, dst) = (sf.local, sf.remote);
-                let (ack, flags, option) = (SeqNum(0), TcpFlags::RST, key.map(fastclose));
+                let (ack, flags) = (SeqNum(0), TcpFlags::RST);
+                let option = key.map_or(Vec::new(), |k| fastclose(k).to_vec());
                 // Not bounded by MAX_PENDING_RST: at most one per subflow, once per connection.
                 (self.pending_rst).push_back(PendingRst {
                     src,
@@ -1166,6 +1294,12 @@ impl<R: CryptoRng> Endpoint<R> {
     /// RFC 9293 §3.10.7.1: segment arrives in CLOSED. Never in reply to a RST. On a retained
     /// aborted 4-tuple the RST carries MP_FASTCLOSE (M3 spec §3.5).
     fn queue_rst(&mut self, seg: &Segment, now: Instant) {
+        self.queue_rst_with(seg, now, Vec::new());
+    }
+
+    /// `queue_rst` whose RST carries `option` (a refused join's MP_TCPRST) unless it carries
+    /// MP_FASTCLOSE.
+    fn queue_rst_with(&mut self, seg: &Segment, now: Instant, option: Vec<u8>) {
         if seg.flags.contains(TcpFlags::RST) || self.pending_rst.len() >= MAX_PENDING_RST {
             return;
         }
@@ -1181,7 +1315,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 TcpFlags::RST | TcpFlags::ACK,
             )
         };
-        let option = self.aborted.key((seg.dst, seg.src), now).map(fastclose);
+        let key = self.aborted.key((seg.dst, seg.src), now);
+        let option = key.map_or(option, |k| fastclose(k).to_vec());
         self.pending_rst.push_back(PendingRst {
             src: seg.dst,
             dst: seg.src,
@@ -1209,7 +1344,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 ack: r.ack,
                 flags: r.flags,
                 wnd: 0,
-                options: r.option.as_ref().map_or(&[], |o| o),
+                options: &r.option,
                 payload: &[],
             };
             if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
@@ -1301,7 +1436,7 @@ impl<R: CryptoRng> Endpoint<R> {
                         self.events.push_back((*h, Event::Connected { mptcp }));
                     }
                     if w.flags.contains(TcpFlags::RST) {
-                        Self::free_ended(&mut self.demux, *h, c);
+                        Self::free_ended(&mut self.demux, &mut self.listeners, *h, c);
                     }
                     return Some(n);
                 }
@@ -1335,7 +1470,10 @@ impl<R: CryptoRng> Endpoint<R> {
                         let strand = sf.mp.strand_at.filter(|_| open);
                         let keepalive = sf.mp.keepalive.and_then(|k| k.deadline);
                         let keepalive = keepalive.filter(|_| open);
-                        tcb.into_iter().chain(join).chain(strand).chain(keepalive)
+                        let unlisten = (sf.tcb.state() == TcpState::SynReceived && sf.mp.reset)
+                            .then_some(Instant::from_nanos(0));
+                        let tcb = tcb.into_iter().chain(join).chain(strand).chain(keepalive);
+                        tcb.chain(unlisten)
                     })
                     .chain(c.hooks.recovery_deadline())
                     .chain(c.opp_deadline())
@@ -1365,7 +1503,14 @@ impl<R: CryptoRng> Endpoint<R> {
                 };
                 let mut r = Reaction::None;
                 let syn_sent = sf.tcb.state() == TcpState::SynSent;
-                if hk.sf.strand_at.is_some_and(|t| t <= now) && sf.tcb.state() != TcpState::Closed {
+                if sf.tcb.state() == TcpState::SynReceived && hk.sf.reset {
+                    // A join whose listener was removed (`unlisten`): RFC 9293 §3.10.5 ABORT.
+                    r = sf
+                        .tcb
+                        .abort_with(CloseReason::Reset, hk.sf.reset_option, now);
+                } else if hk.sf.strand_at.is_some_and(|t| t <= now)
+                    && sf.tcb.state() != TcpState::Closed
+                {
                     // Like a FIN exchange's end, a joined subflow reports `SubflowDown`.
                     r = sf
                         .tcb
@@ -1405,7 +1550,7 @@ impl<R: CryptoRng> Endpoint<R> {
             if c.half_open {
                 self.events.truncate(mark);
             }
-            Self::free_ended(&mut self.demux, h, c);
+            Self::free_ended(&mut self.demux, &mut self.listeners, h, c);
         }
         let (demux, events) = (&mut self.demux, &mut self.events);
         let (listeners, tokens) = (&mut self.listeners, &mut self.tokens);

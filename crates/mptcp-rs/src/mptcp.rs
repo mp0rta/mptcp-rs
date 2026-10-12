@@ -9,7 +9,7 @@ pub(crate) mod signal;
 mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
-pub(crate) use join::Join;
+pub(crate) use join::{Join, JoinRole};
 pub(crate) use opp::Cand;
 pub use opp::DebugStats;
 pub(crate) use opp::{Episode, Repair};
@@ -606,7 +606,9 @@ impl Connection {
     pub(crate) fn note_join_failure(&mut self, i: usize) {
         let cancelled = self.closed_by_app;
         let sf = &mut self.subflows[i];
-        if let Some(rst) = sf.mp.join_failed.take() {
+        // A responder's peer address is where the peer joined from, never one it announced.
+        let initiator = (sf.mp.join.as_ref()).is_some_and(|j| j.role == JoinRole::Initiator);
+        if let Some(rst) = sf.mp.join_failed.take().filter(|_| initiator) {
             let cancelled = cancelled || sf.state == SubflowState::Closing;
             if !rst.is_some_and(|r| r.transient) && !cancelled {
                 self.peer_addrs.fail(sf.remote);
@@ -1223,6 +1225,16 @@ impl SegmentHooks for SubflowHooks<'_> {
             if !seg.flags.contains(TcpFlags::RST) {
                 self.sf.ack_now = m.take_key(seg, capable.filter(|_| options_ok), scale);
             }
+        }
+        // The responder's third ACK completes or fails its join, and nothing else (spec G3).
+        if self
+            .sf
+            .join
+            .as_ref()
+            .is_some_and(|j| j.role == JoinRole::Responder && j.joining())
+        {
+            self.join_third_ack(seg, options_ok);
+            return;
         }
         if !options_ok {
             return;
