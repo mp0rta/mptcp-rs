@@ -2,7 +2,7 @@
 //! (spec §1, §3.1).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use rand_core::CryptoRng;
 
@@ -10,13 +10,14 @@ use crate::Instant;
 use crate::SeqNum;
 use crate::connection::{Connection, ConnectionHooks, QueuedJoin};
 use crate::crypto::IsnGenerator;
-use crate::mptcp::addr::{LocalAddrs, PeerAddrs};
 use crate::mptcp::{
     Join, SUBFLOW_CAP, State, Subflow, SubflowHooks, SubflowId, SubflowMp, SubflowState, fastclose,
     tcprst,
 };
 use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpState};
+use crate::wire::mptcp::is_join;
 use crate::wire::packet::{self, Segment, TcpFlags};
+use crate::wire::tcp_options::{TcpOpt, walk};
 
 mod aborted;
 
@@ -33,6 +34,12 @@ pub struct ConnectionHandle(u64);
 #[non_exhaustive]
 pub enum Event {
     Connected {
+        mptcp: bool,
+    },
+    /// A listener's connection completed its handshake: the first event on its handle, and
+    /// `Endpoint::connection` finds it only from now on. Passive opens get this instead of
+    /// `Connected`; a handshake that fails before it leaves no trace.
+    Accepted {
         mptcp: bool,
     },
     /// The connection continues as plain TCP on one subflow; every other one was reset (no
@@ -179,6 +186,49 @@ pub enum ConnectError {
     FamilyMismatch,
 }
 
+/// What `Endpoint::listen` accepts connections with. Build it from `ListenConfig::default()`
+/// and assign the fields to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListenConfig {
+    /// The configuration of each accepted connection.
+    pub connection: ConnectConfig,
+    /// Offer MPTCP to clients that ask for it.
+    pub mptcp: bool,
+    /// Connections still in their handshake at most; SYNs beyond it are dropped silently.
+    pub max_half_open: usize,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        ListenConfig {
+            connection: ConnectConfig::default(),
+            mptcp: true,
+            max_half_open: 256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ListenError {
+    /// This address and port already has a listener.
+    InUse,
+    PortZero,
+    /// IPv4 needs an MTU of at least 68, IPv6 at least 1280.
+    InvalidMtu,
+    /// `send_buffer` and `recv_buffer` must be within 1 and 2^30.
+    InvalidBuffer,
+    /// `max_half_open` must be at least 1.
+    InvalidHalfOpen,
+}
+
+struct Listener {
+    cfg: ListenConfig,
+    /// Its passive subflows not yet up (`Subflow::pending_via`).
+    half_open: usize,
+}
+
 struct PendingRst {
     src: SocketAddr,
     dst: SocketAddr,
@@ -206,6 +256,8 @@ pub struct Endpoint<R: CryptoRng> {
     scratch: SegmentWriter,
     /// Connections with queued joins (`Connection::queued_joins`).
     pending_joins: BTreeSet<ConnectionHandle>,
+    /// Keyed by local address and port; an unspecified IP matches every local address.
+    listeners: BTreeMap<SocketAddr, Listener>,
     /// Congestion controller for new connections; `None` is the default (CUBIC).
     #[cfg(test)]
     pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
@@ -228,6 +280,7 @@ impl<R: CryptoRng> Endpoint<R> {
             aborted: Default::default(),
             scratch: SegmentWriter::default(),
             pending_joins: BTreeSet::new(),
+            listeners: BTreeMap::new(),
             #[cfg(test)]
             cc: None,
         }
@@ -247,46 +300,132 @@ impl<R: CryptoRng> Endpoint<R> {
         if cfg.mtu < min_mtu {
             return Err(ConnectError::InvalidMtu);
         }
-        if [cfg.send_buffer, cfg.recv_buffer]
-            .iter()
-            .any(|b| !(1..=1 << 30).contains(b))
-        {
+        if !buffers_ok(&cfg) {
             return Err(ConnectError::InvalidBuffer);
         }
-        let initial_ip = local;
         let local = (self.free_port(now, local, remote)).ok_or(ConnectError::NoPort)?;
         let isn = self.isn.isn(now, local, remote);
         let tcb = self.new_tcb(&cfg, local, remote, isn, now);
+        Ok(self.insert(cfg, tcb, local, remote, None))
+    }
+
+    /// Adds a connection whose initial subflow is `tcb`, with its demux entry; `pending_via`:
+    /// the listener that accepted it, which keeps it half-open until `Accepted`.
+    fn insert(
+        &mut self,
+        cfg: ConnectConfig,
+        tcb: Tcb,
+        local: SocketAddr,
+        remote: SocketAddr,
+        pending_via: Option<SocketAddr>,
+    ) -> ConnectionHandle {
         let h = ConnectionHandle(self.next_handle);
         self.next_handle += 1;
         self.demux.insert((local, remote), (h, SubflowId(0)));
-        self.conns.insert(
-            h,
-            Connection {
-                subflows: vec![Subflow {
-                    id: SubflowId(0),
-                    tcb,
-                    local,
-                    remote,
-                    state: SubflowState::Active,
-                    mp: SubflowMp::new(),
-                }],
-                hooks: ConnectionHooks::new(&cfg),
-                closed_by_app: false,
-                aborting: false,
-                reset: false,
-                detached: false,
-                cfg,
-                nodelay: false,
-                queued_joins: Vec::new(),
-                next_subflow: 1,
-                local_addrs: LocalAddrs::new(initial_ip),
-                peer_addrs: PeerAddrs::default(),
-                opp: None,
-                repair: Default::default(),
-            },
-        );
-        Ok(h)
+        let sf = Subflow {
+            id: SubflowId(0),
+            tcb,
+            local,
+            remote,
+            state: SubflowState::Active,
+            mp: SubflowMp::new(),
+            pending_via,
+        };
+        let mut c = Connection::new(cfg, sf);
+        c.half_open = pending_via.is_some();
+        self.conns.insert(h, c);
+        h
+    }
+
+    /// Accepts connections to `local` (an unspecified IP: to every local address) on port
+    /// `local.port()` until `unlisten`. Each completed handshake is an `Event::Accepted` on
+    /// the new connection's handle; a half-open connection has no handle the application
+    /// can use (spec G10).
+    pub fn listen(&mut self, local: SocketAddr, cfg: ListenConfig) -> Result<(), ListenError> {
+        use ListenError as E;
+        // Only IP and port reach the wire (`connect`).
+        let local = SocketAddr::new(local.ip(), local.port());
+        if self.listeners.contains_key(&local) {
+            return Err(E::InUse);
+        }
+        if local.port() == 0 {
+            return Err(E::PortZero);
+        }
+        if cfg.connection.mtu < min_mtu(local.ip(), local.ip()).unwrap() {
+            return Err(E::InvalidMtu);
+        }
+        if !buffers_ok(&cfg.connection) {
+            return Err(E::InvalidBuffer);
+        }
+        if cfg.max_half_open == 0 {
+            return Err(E::InvalidHalfOpen);
+        }
+        let half_open = 0;
+        self.listeners.insert(local, Listener { cfg, half_open });
+        Ok(())
+    }
+
+    /// Stops accepting on `local`; `false` if it had no listener. Its half-open connections
+    /// are dropped silently; established ones carry on.
+    pub fn unlisten(&mut self, local: SocketAddr) -> bool {
+        let key = SocketAddr::new(local.ip(), local.port());
+        if self.listeners.remove(&key).is_none() {
+            return false;
+        }
+        let pending = |(_, c): &(&ConnectionHandle, &Connection)| {
+            c.half_open && c.subflows[0].pending_via == Some(key)
+        };
+        let gone: Vec<_> = self.conns.iter().filter(pending).map(|(&h, _)| h).collect();
+        for h in gone {
+            self.free(h);
+        }
+        true
+    }
+
+    /// The listener for a segment to `dst`: the exact key, else the wildcard of its family.
+    fn listener_for(&self, dst: SocketAddr) -> Option<SocketAddr> {
+        let any: IpAddr = match dst {
+            SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+            SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+        };
+        [dst, SocketAddr::new(any, dst.port())]
+            .into_iter()
+            .find(|k| self.listeners.contains_key(k))
+    }
+
+    /// A SYN to listener `key` opens a half-open connection (RFC 9293 §3.10.7.2), or is
+    /// dropped silently while the listener is at its cap (spec G9).
+    fn accept(&mut self, now: Instant, key: SocketAddr, syn: &Segment) {
+        let l = self.listeners.get_mut(&key).unwrap();
+        if l.half_open >= l.cfg.max_half_open {
+            return;
+        }
+        l.half_open += 1;
+        // Every accepted connection is plain TCP until the server MP_CAPABLE exists: no MPTCP
+        // option in the SYN/ACK.
+        let cfg = l.cfg.connection.clone();
+        let (local, remote) = (syn.dst, syn.src);
+        let isn = self.isn.isn(now, local, remote);
+        let seed = self.rng.next_u64();
+        #[cfg(test)]
+        let tcb = match self.cc {
+            Some(cc) => Tcb::passive_with_cc(&cfg, local, syn, isn, now, cc()),
+            None => Tcb::new_passive(&cfg, local, syn, isn, now, seed),
+        };
+        #[cfg(not(test))]
+        let tcb = Tcb::new_passive(&cfg, local, syn, isn, now, seed);
+        self.insert(cfg, tcb, local, remote, Some(key));
+    }
+
+    /// Removes connection `h` and its demux entries at once.
+    fn free(&mut self, h: ConnectionHandle) {
+        let c = self.conns.remove(&h).unwrap();
+        for sf in &c.subflows {
+            let key = (sf.local, sf.remote);
+            if self.demux.get(&key) == Some(&(h, sf.id)) {
+                self.demux.remove(&key);
+            }
+        }
     }
 
     /// A free ephemeral port from `local` to `remote`, searched from a random start. A retained
@@ -390,7 +529,7 @@ impl<R: CryptoRng> Endpoint<R> {
         h: ConnectionHandle,
         [none, not_mptcp, closed_err]: [E; 3],
     ) -> Result<&mut Connection, E> {
-        let c = self.conns.get_mut(&h).ok_or(none)?;
+        let c = (self.conns.get_mut(&h).filter(|c| !c.half_open)).ok_or(none)?;
         if !(c.hooks.negotiation.as_ref()).is_some_and(|m| m.state != State::FellBack) {
             return Err(not_mptcp);
         }
@@ -577,6 +716,7 @@ impl<R: CryptoRng> Endpoint<R> {
             remote,
             state: SubflowState::Joining,
             mp,
+            pending_via: None,
         });
         Ok(())
     }
@@ -638,10 +778,11 @@ impl<R: CryptoRng> Endpoint<R> {
         Ok(h)
     }
 
-    /// `None` once the connection is freed. A closed (not reset) connection with unread data
-    /// stays reachable, without its port, until the data is read and `handle_timeout` runs.
+    /// `None` once the connection is freed, and before `Accepted`. A closed (not reset)
+    /// connection with unread data stays reachable, without its port, until the data is read
+    /// and `handle_timeout` runs.
     pub fn connection(&mut self, h: ConnectionHandle) -> Option<&mut Connection> {
-        self.conns.get_mut(&h)
+        self.conns.get_mut(&h).filter(|c| !c.half_open)
     }
 
     pub fn poll_event(&mut self) -> Option<(ConnectionHandle, Event)> {
@@ -656,12 +797,22 @@ impl<R: CryptoRng> Endpoint<R> {
         };
         self.apply_aborts(now);
         let Some(&(h, id)) = self.demux.get(&(seg.dst, seg.src)) else {
-            self.queue_rst(&seg, now);
+            let f = seg.flags;
+            let syn = f.contains(TcpFlags::SYN)
+                && !f.contains(TcpFlags::ACK)
+                && !f.contains(TcpFlags::RST);
+            // An MP_JOIN SYN is refused until joins are answered (spec G4a).
+            let join = walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(m)) if is_join(m)));
+            match self.listener_for(seg.dst) {
+                Some(key) if syn && !join => self.accept(now, key, &seg),
+                _ => self.queue_rst(&seg, now),
+            }
             return;
         };
         let Some(c) = self.conns.get_mut(&h) else {
             return;
         };
+        let mark = self.events.len();
         let Some(mut i) = c.subflows.iter().position(|sf| sf.id == id) else {
             return;
         };
@@ -767,7 +918,28 @@ impl<R: CryptoRng> Endpoint<R> {
         if fell_back {
             self.events.push_back((h, Event::FellBack));
         }
+        let mut free = false;
+        if c.half_open {
+            // Nothing about a half-open connection reaches the application (spec G10); its
+            // `Connected` becomes `Accepted`.
+            self.events.truncate(mark);
+            let sf = &mut c.subflows[0];
+            if r == Reaction::Established {
+                c.half_open = false;
+                release_pending(&mut self.listeners, sf);
+                let mptcp = c.hooks.active();
+                self.events.push_back((h, Event::Accepted { mptcp }));
+            } else if sf.tcb.state() == TcpState::Closed {
+                // A RST, or the peer's SYN in the window, returns a passive open to LISTEN
+                // (RFC 9293 L3580–3592, L3652–3658): freed now, unless a RST is still due.
+                release_pending(&mut self.listeners, sf);
+                free = !sf.tcb.reset_pending();
+            }
+        }
         Self::free_ended(&mut self.demux, h, c);
+        if free {
+            self.free(h);
+        }
     }
 
     /// Frees the ended subflows (TCB Closed, no RST left to send) other than `subflows[0]`,
@@ -1150,6 +1322,7 @@ impl<R: CryptoRng> Endpoint<R> {
         self.apply_aborts(now);
         self.aborted.expire(now);
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
+            let mark = self.events.len();
             c.update_recovery(now);
             for i in 0..c.subflows.len() {
                 let last = !others_open(&c.subflows, i);
@@ -1196,9 +1369,14 @@ impl<R: CryptoRng> Endpoint<R> {
                 }
                 Self::report(&mut self.events, h, c, i, r, last, now);
             }
+            // A half-open connection ends silently, at R2 (spec G10).
+            if c.half_open {
+                self.events.truncate(mark);
+            }
             Self::free_ended(&mut self.demux, h, c);
         }
         let (demux, events) = (&mut self.demux, &mut self.events);
+        let listeners = &mut self.listeners;
         self.conns.retain(|&h, c| {
             if c.hooks.retained() || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
                 return true;
@@ -1209,7 +1387,8 @@ impl<R: CryptoRng> Endpoint<R> {
             {
                 return true;
             }
-            for sf in &c.subflows {
+            for sf in &mut c.subflows {
+                release_pending(listeners, sf);
                 let key = (sf.local, sf.remote);
                 if demux.get(&key) == Some(&(h, sf.id)) {
                     demux.remove(&key);
@@ -1232,6 +1411,21 @@ fn down(subflow: SubflowId, reason: CloseReason, rst: Option<MpTcpRst>) -> Event
         reason,
         rst,
     }
+}
+
+/// Gives back the half-open slot `sf` holds on its listener, at most once; nothing if that
+/// listener was removed.
+fn release_pending(listeners: &mut BTreeMap<SocketAddr, Listener>, sf: &mut Subflow) {
+    if let Some(l) = sf.pending_via.take().and_then(|k| listeners.get_mut(&k)) {
+        l.half_open -= 1;
+    }
+}
+
+/// `send_buffer` and `recv_buffer` are within 1 and 2^30.
+fn buffers_ok(cfg: &ConnectConfig) -> bool {
+    [cfg.send_buffer, cfg.recv_buffer]
+        .iter()
+        .all(|b| (1..=1 << 30).contains(b))
 }
 
 /// IPv4 needs an MTU of at least 68, IPv6 at least 1280; `None` for mixed families.
@@ -1271,3 +1465,5 @@ fn closed(c: &Connection) -> bool {
 
 #[cfg(test)]
 mod mptcp_tests;
+#[cfg(test)]
+mod server_tests;

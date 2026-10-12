@@ -38,6 +38,9 @@ pub(crate) struct Subflow {
     pub remote: SocketAddr,
     pub state: SubflowState,
     pub mp: SubflowMp,
+    /// The key of the listener whose half-open count this passive subflow holds while it is
+    /// not yet up (`Endpoint::release_pending` gives it back once).
+    pub pending_via: Option<SocketAddr>,
 }
 
 impl Subflow {

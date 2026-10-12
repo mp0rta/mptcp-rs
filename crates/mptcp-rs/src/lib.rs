@@ -83,8 +83,8 @@ pub mod wire;
 
 pub use connection::{Connection, ReadError, WriteError};
 pub use endpoint::{
-    AddSubflowError, AddressError, ConnectError, ConnectionHandle, Endpoint, Event, MpTcpRst,
-    SubflowError,
+    AddSubflowError, AddressError, ConnectError, ConnectionHandle, Endpoint, Event, ListenConfig,
+    ListenError, MpTcpRst, SubflowError,
 };
 #[doc(hidden)]
 pub use mptcp::DebugStats;

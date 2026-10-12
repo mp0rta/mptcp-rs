@@ -234,6 +234,11 @@ pub(crate) fn is_signal(opt: &[u8]) -> bool {
         .is_some_and(|b| matches!(b >> 4, ST_ADD_ADDR | ST_REMOVE_ADDR | ST_PRIO | ST_TCPRST))
 }
 
+/// `opt` is an MP_JOIN, well-formed or not.
+pub(crate) fn is_join(opt: &[u8]) -> bool {
+    opt.get(2).is_some_and(|b| b >> 4 == ST_JOIN)
+}
+
 pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
     let (&kind, &len, &b2) = match opt {
         [k, l, b, ..] => (k, l, b),
