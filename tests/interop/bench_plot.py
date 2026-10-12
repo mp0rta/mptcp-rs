@@ -79,7 +79,8 @@ def bars(ax, groups, summary, scale=1.0, ceiling=True):
             m = s["median_mbps"] / scale
             ax.bar(x, m, w, color=CLIENTS[client], zorder=2)
             ax.errorbar(x, m, yerr=[[m - s["min_mbps"] / scale], [s["max_mbps"] / scale - m]], color=INK, lw=1, capsize=3, zorder=3)
-            ax.annotate(f"{m:.1f}", (x, s["max_mbps"] / scale), xytext=(0, 3),
+            top = max(s["max_mbps"], (s["ceiling_median_mbps"] or 0) if ceiling else 0) / scale  # clear of the ceiling tick
+            ax.annotate(f"{m:.1f}", (x, top), xytext=(0, 3),
                         textcoords="offset points", ha="center", va="bottom", fontsize=8, color=INK)
             if ceiling and s["ceiling_median_mbps"]:
                 c = s["ceiling_median_mbps"] / scale
@@ -110,9 +111,9 @@ def plot(summary, outdir):
     plt.rcParams.update({"font.size": 9, "svg.fonttype": "none", "figure.facecolor": SURFACE})
     note = "CUBIC; median of runs, bars min-max; one segment per packet at netem"
 
-    def shaped(scen, name, title):
+    def shaped(scen, name, title, ceiling=True):
         fig, ax = plt.subplots(figsize=(6.4, 4.2))
-        bars(ax, [(DIR_LABEL[d], scen, d) for d in ("c2s", "s2c")], summary)
+        bars(ax, [(DIR_LABEL[d], scen, d) for d in ("c2s", "s2c")], summary, ceiling=ceiling)
         style(ax, "goodput (Mbit/s)")
         ax.set_title(f"{title}\n{PROFILE}\n{note}", fontsize=9, color=INK, loc="left")
         fig.tight_layout()
@@ -120,7 +121,8 @@ def plot(summary, outdir):
         plt.close(fig)
 
     shaped("m2-goodput", "shaped-ab.svg", "mptcp-rs vs Linux kernel MPTCP client, paths A+B")
-    shaped("m2-lossy", "lossy.svg", "mptcp-rs vs Linux kernel MPTCP client, paths A+B, 1 % loss")
+    # The ~357 Mbit/s link ceiling would flatten loss-limited bars: it is named in the title instead.
+    shaped("m2-lossy", "lossy.svg", "mptcp-rs vs Linux kernel MPTCP client, paths A+B, 1 % loss (link ceiling ~357-360 Mbit/s)", ceiling=False)
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4.2), sharey=True)
     for ax, d in zip(axes, ("c2s", "s2c")):
