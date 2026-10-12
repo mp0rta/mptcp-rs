@@ -602,3 +602,23 @@ fn listener_rsts_join_syn_and_synack() {
     );
     assert!(n.events_b.is_empty());
 }
+
+/// In LISTEN a segment without SYN, ACK or RST is dropped (RFC 9293 L3340–3346).
+#[test]
+fn listener_drops_fin_only_and_flagless() {
+    let mut n = idle_net();
+    n.b.listen(sa(2, 80), ListenConfig::default()).unwrap();
+    let (src, dst) = (sa(1, 5000), sa(2, 80));
+    n.send(
+        Dir::AtoB,
+        pkt(src, dst, SeqNum(7), SeqNum(0), TcpFlags::FIN, &[], &[]),
+    );
+    n.send(
+        Dir::AtoB,
+        pkt(src, dst, SeqNum(7), SeqNum(0), TcpFlags(0), &[], b"data"),
+    );
+    n.run_until(t(5), |_| false);
+    assert_eq!(n.delivered.len(), 2);
+    assert!(n.taps.iter().all(|(d, _)| *d == Dir::AtoB), "no response");
+    assert!(n.events_b.is_empty());
+}

@@ -798,13 +798,17 @@ impl<R: CryptoRng> Endpoint<R> {
         self.apply_aborts(now);
         let Some(&(h, id)) = self.demux.get(&(seg.dst, seg.src)) else {
             let f = seg.flags;
-            let syn = f.contains(TcpFlags::SYN)
-                && !f.contains(TcpFlags::ACK)
-                && !f.contains(TcpFlags::RST);
+            let (syn, ack) = (f.contains(TcpFlags::SYN), f.contains(TcpFlags::ACK));
+            let ctl = syn || ack || f.contains(TcpFlags::RST);
             // An MP_JOIN SYN is refused until joins are answered (spec G4a).
             let join = walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(m)) if is_join(m)));
             match self.listener_for(seg.dst) {
-                Some(key) if syn && !join => self.accept(now, key, &seg),
+                // LISTEN (RFC 9293 §3.10.7.2): a RST is ignored and an ACK draws a RST
+                // (`queue_rst`); without SYN, ACK or RST the segment is dropped (L3340–3346).
+                Some(_) if !ctl => {}
+                Some(key) if syn && !ack && !f.contains(TcpFlags::RST) && !join => {
+                    self.accept(now, key, &seg)
+                }
                 _ => self.queue_rst(&seg, now),
             }
             return;
