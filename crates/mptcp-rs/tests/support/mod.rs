@@ -7,9 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use mptcp_rs::wire::packet::{Segment, TcpFlags, build, parse};
-use mptcp_rs::{ConnectConfig, Endpoint, Instant, SeqNum};
+use mptcp_rs::{ConnectConfig, ConnectionHandle, Endpoint, Event, Instant, SeqNum};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{Rng, SeedableRng};
+use rand_core::{CryptoRng, Rng, SeedableRng};
 
 pub const MTU: usize = 1500;
 pub const PEER_MSS: u16 = 1200;
@@ -490,15 +490,20 @@ impl Link {
     }
 
     pub fn send(&mut self, now: Instant, p: Vec<u8>) {
+        self.send_after(now, p, Duration::from_millis(10));
+    }
+
+    /// Like `send` with a caller-chosen base delay; loss and reorder still apply.
+    pub fn send_after(&mut self, now: Instant, p: Vec<u8>, delay: Duration) {
         if self.rng.next_u32() % 1000 < self.loss_permille {
             return;
         }
-        let mut delay = 10;
+        let mut delay = delay;
         if self.rng.next_u32() % 1000 < self.reorder_permille {
-            delay += 5 + u64::from(self.rng.next_u32() % 20);
+            delay += Duration::from_millis(5 + u64::from(self.rng.next_u32() % 20));
         }
         self.n += 1;
-        self.q.insert((ms(now, delay), self.n), p);
+        self.q.insert((now + delay, self.n), p);
     }
 
     pub fn recv(&mut self, now: Instant) -> Option<Vec<u8>> {
@@ -508,5 +513,183 @@ impl Link {
 
     pub fn next_due(&self) -> Option<Instant> {
         self.q.first_key_value().map(|(k, _)| k.0)
+    }
+}
+
+/// Direction through a `Net`: `AtoB` is sent by `a`, delivered to `b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    AtoB,
+    BtoA,
+}
+
+type DropFn = Box<dyn Fn(&Seg) -> bool>;
+type DelayFn = Box<dyn FnMut(&Seg) -> Option<Duration>>;
+type RewriteFn = Box<dyn FnMut(&mut Seg) -> bool>;
+
+/// Two endpoints joined by one `Link` per direction, on a single virtual clock.
+pub struct Net<R: CryptoRng> {
+    pub a: Endpoint<R>,
+    pub b: Endpoint<R>,
+    pub now: Instant,
+    pub events_a: Vec<(ConnectionHandle, Event)>,
+    pub events_b: Vec<(ConnectionHandle, Event)>,
+    /// Every packet sent, before rewrite, drop and loss.
+    pub taps: Vec<(Dir, Seg)>,
+    /// Every packet handed to an endpoint, with its delivery time.
+    pub delivered: Vec<(Dir, Instant, Seg)>,
+    ab: Link,
+    ba: Link,
+    drops: Vec<(Dir, DropFn)>,
+    delays: [Option<DelayFn>; 2],
+    rewrites: [Option<RewriteFn>; 2],
+}
+
+impl<R: CryptoRng> Net<R> {
+    pub fn new(a: Endpoint<R>, b: Endpoint<R>, link_ab: Link, link_ba: Link) -> Self {
+        Self {
+            a,
+            b,
+            now: Instant::from_nanos(0),
+            events_a: Vec::new(),
+            events_b: Vec::new(),
+            taps: Vec::new(),
+            delivered: Vec::new(),
+            ab: link_ab,
+            ba: link_ba,
+            drops: Vec::new(),
+            delays: [None, None],
+            rewrites: [None, None],
+        }
+    }
+
+    /// Drops the first packet in `dir` matching `pred`, once.
+    pub fn drop_next(&mut self, dir: Dir, pred: impl Fn(&Seg) -> bool + 'static) {
+        self.drops.push((dir, Box::new(pred)));
+    }
+
+    /// Per-packet delay override (`None` keeps the link default).
+    pub fn delay(&mut self, dir: Dir, f: impl FnMut(&Seg) -> Option<Duration> + 'static) {
+        self.delays[dir as usize] = Some(Box::new(f));
+    }
+
+    /// Rewrites packets in `dir`; the packet is re-serialised with fresh checksums.
+    /// Returning `false` drops it.
+    pub fn rewrite(&mut self, dir: Dir, f: impl FnMut(&mut Seg) -> bool + 'static) {
+        self.rewrites[dir as usize] = Some(Box::new(f));
+    }
+
+    /// Puts a raw packet on the wire in `dir` at the current time.
+    pub fn send(&mut self, dir: Dir, raw: Vec<u8>) {
+        let mut seg = parse_owned(&raw);
+        self.taps.push((dir, seg.clone()));
+        if let Some(i) = self.drops.iter().position(|(d, p)| *d == dir && p(&seg)) {
+            let _ = self.drops.remove(i);
+            return;
+        }
+        let mut raw = raw;
+        if let Some(f) = &mut self.rewrites[dir as usize] {
+            if !f(&mut seg) {
+                return;
+            }
+            let wire = Segment {
+                src: seg.src,
+                dst: seg.dst,
+                seq: seg.seq,
+                ack: seg.ack,
+                flags: seg.flags,
+                wnd: seg.wnd,
+                options: &seg.options,
+                payload: &seg.payload,
+            };
+            let mut buf = vec![0u8; MTU];
+            let n = build(&wire, 0, &mut buf).unwrap();
+            buf.truncate(n);
+            raw = buf;
+        }
+        let over = self.delays[dir as usize].as_mut().and_then(|f| f(&seg));
+        let link = match dir {
+            Dir::AtoB => &mut self.ab,
+            Dir::BtoA => &mut self.ba,
+        };
+        match over {
+            Some(d) => link.send_after(self.now, raw, d),
+            None => link.send(self.now, raw),
+        }
+    }
+
+    /// Moves everything the endpoints want to send onto the links and collects events.
+    fn pump(&mut self) {
+        let mut buf = [0u8; MTU];
+        while let Some(n) = self.a.poll_transmit(self.now, &mut buf) {
+            self.send(Dir::AtoB, buf[..n].to_vec());
+        }
+        while let Some(n) = self.b.poll_transmit(self.now, &mut buf) {
+            self.send(Dir::BtoA, buf[..n].to_vec());
+        }
+        while let Some(e) = self.a.poll_event() {
+            self.events_a.push(e);
+        }
+        while let Some(e) = self.b.poll_event() {
+            self.events_b.push(e);
+        }
+    }
+
+    fn next_event(&self) -> Option<Instant> {
+        [
+            self.ab.next_due(),
+            self.ba.next_due(),
+            self.a.poll_timeout(),
+            self.b.poll_timeout(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Advances to the earliest link delivery or timeout and handles it.
+    /// Returns `false` when nothing is pending.
+    pub fn step(&mut self) -> bool {
+        self.pump();
+        let Some(next) = self.next_event() else {
+            return false;
+        };
+        self.now = self.now.max(next);
+        let now = self.now;
+        while let Some(p) = self.ab.recv(now) {
+            self.delivered.push((Dir::AtoB, now, parse_owned(&p)));
+            self.b.handle_packet(now, &p);
+        }
+        while let Some(p) = self.ba.recv(now) {
+            self.delivered.push((Dir::BtoA, now, parse_owned(&p)));
+            self.a.handle_packet(now, &p);
+        }
+        if self.a.poll_timeout().is_some_and(|t| t <= now) {
+            self.a.handle_timeout(now);
+        }
+        if self.b.poll_timeout().is_some_and(|t| t <= now) {
+            self.b.handle_timeout(now);
+        }
+        self.pump();
+        true
+    }
+
+    /// Steps until `done` holds (returns `true`), the next event is past `deadline`, or
+    /// nothing is pending (both return `false`).
+    pub fn run_until(
+        &mut self,
+        deadline: Instant,
+        mut done: impl FnMut(&mut Self) -> bool,
+    ) -> bool {
+        loop {
+            if done(self) {
+                return true;
+            }
+            self.pump();
+            if self.next_event().is_none_or(|t| t > deadline) {
+                return false;
+            }
+            self.step();
+        }
     }
 }
