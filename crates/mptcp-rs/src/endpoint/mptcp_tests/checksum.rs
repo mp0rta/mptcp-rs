@@ -993,3 +993,30 @@ fn replay_full_app_buffer_drains_on_read() {
     assert_eq!(&out[..], &a[..]);
     assert_eq!(read_now(&mut c.ep, c.h), &b[..3000]);
 }
+
+/// Subflow 0 fills all 64 out-of-order ranges of the connection; subflow 1 holds 5 octets past
+/// them when the peer's infinite mapping arrives on it. The replayed run, a 65th range, is
+/// stored anyway: it is TCP-ACKed and the peer never resends it (spec G15).
+#[test]
+fn replay_past_range_cap_after_join() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+    let now = t(20_000_000);
+    for k in 0..64u32 {
+        let opt = csum_mapping(1 + k, dsn + 10 + 2 * u64::from(k), b"x", false);
+        feed(&mut ep, &peer_data(&syn, 5001 + k, &opt, b"x"), now);
+    }
+    let free = recv(&ep, h).free();
+    let data = pattern(10);
+    let opt = csum_mapping(1, dsn + 1000, &data, false);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[..5]), now);
+    assert_eq!(held(&ep, h), 5);
+    let inf = dss_mapping(false, 6, dsn + 1005, 0, Some(0));
+    feed(&mut ep, &peer_data(&jsyn, 5006, &inf, &[]), now);
+    assert_eq!(negotiation(&ep, h).state, State::FellBack);
+    assert_eq!(held(&ep, h), 0);
+    assert_eq!(
+        recv(&ep, h).free(),
+        free - 5,
+        "the 5 replayed octets are stored"
+    );
+}

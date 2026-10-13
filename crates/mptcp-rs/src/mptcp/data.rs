@@ -587,6 +587,17 @@ impl RecvAssembler {
         self.advance_fin();
         result
     }
+    /// Stores held octets on fallback (M4b spec G15): they are TCP-ACKed and never resent, so
+    /// neither the range cap nor the offered edge may refuse them. The hold cap bounded them
+    /// (`recv_buffer + 65,535` per subflow), and reads deliver them as they make room. Only
+    /// octets past a DATA_FIN are dropped: they belong to no stream.
+    pub fn replay(&mut self, dsn: u64, data: &[u8]) {
+        let (range_cap, edge) = (self.range_cap, self.right_edge);
+        self.range_cap = usize::MAX;
+        self.right_edge = super::later(Some(edge), dsn.wrapping_add(data.len() as u64)).unwrap();
+        self.accept(dsn, data);
+        (self.range_cap, self.right_edge) = (range_cap, edge);
+    }
     pub fn accept_tcp(&mut self, dsn: u64, data: &[u8]) -> usize {
         let before = self.next;
         let off = dsn.wrapping_sub(before) as i64;
@@ -861,6 +872,24 @@ mod credit_tests {
         let field = r.window_offer(0, 1460);
         r.window_sent(field, 0);
         assert_eq!((r.right_edge, r.base_edge), (14_096, None));
+    }
+
+    /// Replayed octets past the offered edge and the range cap are stored; the edge and the
+    /// cap stay as they were (M4b spec G15).
+    #[test]
+    fn replay_ignores_edge_and_range_cap() {
+        let mut r = RecvAssembler::new(0, 100, 1);
+        assert_eq!(r.accept(10, b"a"), (Outcome::Stored, 1));
+        r.replay(150, b"bc");
+        assert_eq!((r.right_edge, r.range_cap), (100, 1));
+        r.replay(0, &[0; 10]);
+        let mut out = [0; 200];
+        assert_eq!(r.read(&mut out), 11);
+        // Delivered `cap` at a time, as reads make room.
+        r.replay(11, &[0; 139]);
+        assert_eq!(r.read(&mut out), 100);
+        assert_eq!(r.read(&mut out), 41);
+        assert_eq!(&out[39..41], b"bc");
     }
 
     #[test]

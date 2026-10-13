@@ -1707,14 +1707,12 @@ impl DataState {
         let peer_idsn = m.peer_idsn.unwrap();
         let (ssn_r, dsn_r) =
             *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
-        // Held octets are TCP-ACKed and never resent: they go on as plain TCP (spec G15).
-        // `accept_tcp` takes what free memory allows; the remainder is carried by
-        // `RecvAssembler`'s promised-data overshoot (`accept` stores within `right_edge`,
-        // which every held octet is below) and delivered as reads make room.
+        // Held octets go on as plain TCP through the new translation (spec G15). What free
+        // memory cannot take is carried by `RecvAssembler`'s promised data above it, past the
+        // range cap and the offered edge if need be (`replay`), and delivered as reads make room.
         for (ssn, run) in sf.hold.drain() {
             let dsn = dsn_r.wrapping_add_signed(ssn.wrapping_sub(ssn_r) as i32 as i64);
-            let n = self.recv.accept_tcp(dsn, &run);
-            self.recv.accept(dsn.wrapping_add(n as u64), &run[n..]);
+            self.recv.replay(dsn, &run);
         }
         let una = self.send.una;
         let (ssn, dsn) = if joined_ever {
