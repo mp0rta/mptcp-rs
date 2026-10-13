@@ -1774,6 +1774,9 @@ impl SegmentHooks for SubflowHooks<'_> {
                     self.sf.reset = true;
                     return;
                 }
+                // An MP_CAPABLE mapping always has the handshake's offset (SSN 1, IDSN + 1).
+                let peer_idsn = m.peer_idsn.unwrap();
+                self.sf.other_offset |= len > 0 && !initial_offset_ok(peer_idsn, dsn, mapping.ssn);
                 // With checksums (the check above makes `checksum` present exactly then), a
                 // data mapping is held until it verifies and may earn completion credit; its
                 // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping
@@ -1903,8 +1906,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         tcp_ack: u32,
         bytes: &[u8],
     ) -> Vec<std::ops::Range<usize>> {
-        let m = self.conn.negotiation.as_ref().unwrap();
-        let (csum, peer_idsn) = (m.csum, m.peer_idsn.unwrap());
+        let csum = self.conn.negotiation.as_ref().unwrap().csum;
         let d = self.conn.data.as_mut().unwrap();
         // With checksums, mapped octets wait in the hold buffer until their mapping verifies
         // (spec G6, G7); without, they go to the connection level at once, as before (G9).
@@ -1975,37 +1977,25 @@ impl SegmentHooks for SubflowHooks<'_> {
         } else {
             Vec::new()
         };
-        // Every mapping this input completed counts as held for the offset check (G10).
-        let completed_ok = complete.iter().all(|c| match *c {
-            Complete::Verified { dsn, ssn, .. } | Complete::Failed { dsn, ssn } => {
-                initial_offset_ok(peer_idsn, dsn, ssn)
-            }
-        });
         for done in complete {
             match done {
-                Complete::Verified {
-                    dsn, len, data_fin, ..
-                } => {
+                Complete::Verified { dsn, len, data_fin } => {
                     let fin = dsn.wrapping_add(u64::from(len));
                     if data_fin && d.recv.finish(fin) {
                         self.sf.ack_now = true;
                     }
                 }
                 // With contiguity on both sides (`infinite_ok`, which no completed join leaves,
-                // so this is the one data-carrying subflow, and the handshake's offset in M and
-                // every held or just completed mapping), we wait for the peer's answer to
-                // MP_FAIL(M.dsn), keeping M's octets and all later ones: they are TCP-ACKed and
-                // come back as plain TCP on fallback. A later failure while waiting is kept the
+                // so this is the one data-carrying subflow, and the handshake's offset in every
+                // data mapping the subflow ever got, `other_offset`), we wait for the peer's
+                // answer to MP_FAIL(M.dsn), keeping M's octets and all later ones: they are
+                // TCP-ACKed and come back as plain TCP on fallback. A later failure while waiting is kept the
                 // same way (M4b spec G10, G11, G15).
                 Complete::Failed { .. }
                     if matches!(self.conn.mp_fail, MpFail::Waiting { .. })
                         || self.conn.mp_fail_step.is_some() => {}
                 Complete::Failed { dsn, .. }
-                    if self.conn.infinite_ok
-                        && !self.sf.joining()
-                        && completed_ok
-                        && (self.sf.hold.maps())
-                            .all(|h| initial_offset_ok(peer_idsn, h.dsn, h.ssn)) =>
+                    if self.conn.infinite_ok && !self.sf.joining() && !self.sf.other_offset =>
                 {
                     self.conn.mp_fail_step = Some(MpFailStep::Wait { dsn });
                 }

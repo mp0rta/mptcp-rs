@@ -28,12 +28,7 @@ pub(crate) struct HoldMap {
 pub(crate) enum Complete {
     /// Taken by the caller's `deliver`, every octet whatever was delivered already (coverage
     /// is not delivery, spec G7).
-    Verified {
-        dsn: u64,
-        ssn: u32,
-        len: u32,
-        data_fin: bool,
-    },
+    Verified { dsn: u64, len: u32, data_fin: bool },
     /// Reported once; its octets stay held (`drain`) until the caller drains them (M4b spec
     /// G11: kept for the replay of a single-subflow fallback, else discarded with the reset).
     Failed { dsn: u64, ssn: u32 },
@@ -183,6 +178,7 @@ impl Hold {
     }
 
     /// Every held mapping, failed ones included.
+    #[cfg(test)]
     pub fn maps(&self) -> impl Iterator<Item = &HoldMap> {
         self.entries.iter().map(|e| &e.map)
     }
@@ -300,7 +296,6 @@ impl Hold {
             self.pieces -= 1;
             out.push(Complete::Verified {
                 dsn: m.dsn,
-                ssn: m.ssn,
                 len: m.len,
                 data_fin: m.data_fin,
             });

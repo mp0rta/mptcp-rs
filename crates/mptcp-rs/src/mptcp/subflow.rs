@@ -100,6 +100,9 @@ pub(crate) struct SubflowMp {
     /// The highest DSN end of any mapping ever installed on this subflow (fallback data loss).
     pub dsn_end: Option<u64>,
     pub rx_infinite: Option<(u32, u64)>,
+    /// A data mapping installed here ever had a DSN−SSN offset other than the handshake's: the
+    /// peer's side of contiguity is gone for good (M4b spec G10).
+    pub other_offset: bool,
     /// Window scale this subflow's SYN/ACK negotiated; scales DATA_ACK windows it carries.
     pub peer_scale: u8,
     /// A scheduling step offered this subflow a nonzero budget and installed no mapping on
@@ -179,6 +182,7 @@ impl SubflowMp {
             infinite: None,
             dsn_end: None,
             rx_infinite: None,
+            other_offset: false,
             peer_scale: 0,
             offered_unused: false,
             join: None,

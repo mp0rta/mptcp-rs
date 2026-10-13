@@ -327,6 +327,24 @@ fn offset_of_mapping_completed_alongside_counts() {
     assert_eq!(state(&c), MpFail::Idle);
 }
 
+/// Valid N (another offset) verifies out of order and leaves the hold; corrupt M (the initial
+/// offset) fails later. N's offset still counts: the subflow is reset with MP_FAIL rather than
+/// waiting (spec G10, G11).
+#[test]
+fn offset_of_earlier_verified_mapping_counts() {
+    let mut c = client(true, false);
+    c.confirm();
+    let head = peer_head();
+    let (m, n) = (pattern(10), pattern(20)[10..].to_vec());
+    c.peer_at(5011, &csum_mapping(11, head + 1000, &n, false), &n);
+    assert_eq!(held(&c.ep, c.h), 0, "N verified");
+    let mut wire = m.clone();
+    wire[3] ^= 0xff;
+    let sent = c.peer_at(5001, &csum_mapping(1, head, &m, false), &wire);
+    assert_eq!(rst_reason(&sent), Some(mp_fail_rst(head)));
+    assert_eq!(state(&c), MpFail::Idle);
+}
+
 /// An MP_FAIL that would make us the echoer, with an infinite mapping in the same segment (in
 /// either order): the mapping is checked first, so one without its checksum resets with
 /// MP_TCPRST 0x01 and no fallback (spec G3); a valid one keeps its own anchor (here SSN 151 at
