@@ -1989,8 +1989,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                 // so this is the one data-carrying subflow, and the handshake's offset in every
                 // data mapping the subflow ever got, `other_offset`), we wait for the peer's
                 // answer to MP_FAIL(M.dsn), keeping M's octets and all later ones: they are
-                // TCP-ACKed and come back as plain TCP on fallback. A later failure while waiting is kept the
-                // same way (M4b spec G10, G11, G15).
+                // TCP-ACKed and come back as plain TCP on fallback. A later failure while
+                // waiting is kept the same way (M4b spec G10, G11, G15).
                 Complete::Failed { .. }
                     if matches!(self.conn.mp_fail, MpFail::Waiting { .. })
                         || self.conn.mp_fail_step.is_some() => {}
