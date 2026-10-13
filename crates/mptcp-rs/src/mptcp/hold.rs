@@ -123,6 +123,9 @@ pub(crate) struct Hold {
     frontier: Option<u32>,
     /// Entries `verified`: complete and verified, refused by `deliver` so far.
     refused: usize,
+    /// The last `insert` refused the octet at the frontier for the cap alone, its mapping not
+    /// exempt and no failed mapping held: nothing would ever take it (`blocked`).
+    blocked: bool,
 }
 
 impl Hold {
@@ -172,6 +175,12 @@ impl Hold {
         self.held
     }
 
+    /// The last `insert` refused the frontier octet at a full hold, its mapping not exempt and
+    /// no failed one held: the subflow can make no progress (M4b spec G7).
+    pub fn blocked(&self) -> bool {
+        self.blocked
+    }
+
     /// Verified mappings `deliver` refused, held until it takes them.
     pub fn refused(&self) -> usize {
         self.refused
@@ -205,6 +214,7 @@ impl Hold {
         // failed mapping is held (MP_FAIL waits, spec G11), and the assembler would take it
         // now. Otherwise each new frontier could add a complete mapping that stays held (G7).
         let failed = self.entries.iter().any(|e| e.failed);
+        self.blocked = false;
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -230,7 +240,9 @@ impl Hold {
             let mut k = (right_edge.wrapping_sub(dsn) as i64).clamp(0, n as i64) as usize;
             let exempt = !failed && covering(e, frontier) && would_take(e.map.dsn, e.map.len);
             if !exempt {
-                k = k.min(cap.saturating_sub(self.held));
+                let room = cap.saturating_sub(self.held);
+                self.blocked |= pos == frontier && !failed && k > 0 && room == 0;
+                k = k.min(room);
             }
             let may_split = self.pieces < PIECE_CAP || pos == frontier;
             if k > 0 {

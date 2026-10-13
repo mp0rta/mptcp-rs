@@ -1948,6 +1948,17 @@ impl SegmentHooks for SubflowHooks<'_> {
                         cap,
                         |dsn, len| d.recv.would_take(dsn, len),
                     );
+                    // The frontier octet, refused at a full hold for a mapping the assembler
+                    // would refuse too, could never be taken: reset with MP_TCPRST 0x02 "lack
+                    // of resources". The held octets are not DATA_ACKed, so the peer sends them
+                    // again on another subflow (RFC 8684 L2392–2394, M4b spec G7). Never while
+                    // MP_FAIL waits: a failed mapping held keeps `blocked` clear.
+                    if self.sf.hold.blocked() {
+                        self.sf.reset = true;
+                        self.sf.reset_option = Some(tcprst(0x02, false).to_vec());
+                        self.sf.hold.drain();
+                        return Vec::new();
+                    }
                     accepted.extend(taken.into_iter().map(|r| at + r.start..at + r.end));
                     at += len;
                     continue;

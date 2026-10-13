@@ -1389,6 +1389,49 @@ fn frontier_mapping_touching_a_range_stays_exempt() {
     assert_eq!(read_now(&mut ep, h), data);
 }
 
+/// Subflow 1 takes the 64 assembler ranges; on subflow 0, N and its duplicate N2 (DSN
+/// [H+200, H+65,735)) are refused and fill the hold, and so would N3's completion be: the
+/// retransmitted frontier octet of N3 resets subflow 0 with MP_TCPRST 0x02 and its hold is
+/// discarded. The stream then completes over subflow 1 (spec G7, the escape from a full hold).
+#[test]
+fn full_hold_with_refusable_frontier_resets() {
+    let (mut ep, h, a, b, dsn) = two_subflows_with(ConnectConfig {
+        recv_buffer: 1 << 16,
+        ..checksums_cfg(true)
+    });
+    let now = t(20_000_000);
+    let data = pattern(65_735);
+    for k in 0..64u32 {
+        let i = 10 + 2 * k as usize;
+        send_mapping(&mut ep, &b, 1 + k, dsn + i as u64, &data[i..i + 1]);
+    }
+    send_mapping(&mut ep, &a, 1, dsn + 200, &data[200..]);
+    send_mapping(&mut ep, &a, 65_536, dsn + 200, &data[200..]);
+    let opt = csum_mapping(131_071, dsn + 200, &data[200..], false);
+    feed(
+        &mut ep,
+        &peer_data(&a, 5000 + 131_071, &opt, &data[200..4200]),
+        now,
+    );
+    assert_eq!(held(&ep, h), 131_071, "one octet of N3 at the cap");
+    drain(&mut ep, now);
+    // The peer retransmits from our ACK, at N3's second octet: refused at the full hold.
+    feed(
+        &mut ep,
+        &peer_data(&a, 5000 + 131_072, &opt, &data[201..4200]),
+        now,
+    );
+    let sent: Vec<Segment> = (drain(&mut ep, now).into_iter())
+        .map(|p| packet::parse(p.leak()).unwrap())
+        .filter(|s| s.src == a.src)
+        .collect();
+    assert_eq!(rst_reason(&sent), Some(vec![30, 4, 0x80, 0x02]));
+    assert_eq!(held(&ep, h), 0);
+    send_mapping(&mut ep, &b, 65, dsn, &data[..65_535]);
+    send_mapping(&mut ep, &b, 65_600, dsn + 65_535, &data[65_535..]);
+    assert_eq!(read_now(&mut ep, h), data);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 
