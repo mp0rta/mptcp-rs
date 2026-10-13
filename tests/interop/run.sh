@@ -262,18 +262,21 @@ fi
 mib() { awk -v k="MPTcpExt$1" '$1 == k {print $2}' "$out/nstat.txt"; }
 # csum-fail*: pinned from the first runs (M4b spec section 7 item 2). Which end counts the
 # checksum error, and sends the reset or the infinite mapping, depends on whether Linux receives
-# the corrupted direction. MPFail* count MP_FAIL packets Linux processes before its fallback.
+# the corrupted direction. MPFail* count MP_FAIL packets Linux processes before its fallback,
+# which in csum-fail1 depends on timing (2 or 9 seen), so only the spec's >= 1 holds there.
 linux_rx=0
 if [ "$server:$dir" = kernel:c2s ] || [ "$client:$dir" = kernel:s2c ]; then linux_rx=1; fi
 case "$scenario:$linux_rx" in
-  csum-fail1:1) want="DataCsumErr=1 MPFailTx=2 MPFailRx=2 InfiniteMapTx=0 InfiniteMapRx=1 MPRstTx=0 MPRstRx=0";;
-  csum-fail1:0) want="DataCsumErr=0 MPFailTx=2 MPFailRx=2 InfiniteMapTx=1 InfiniteMapRx=0 MPRstTx=0 MPRstRx=0";;
+  csum-fail1:1) want="DataCsumErr=1 MPFailTx>=1 MPFailRx>=1 InfiniteMapTx=0 InfiniteMapRx=1 MPRstTx=0 MPRstRx=0";;
+  csum-fail1:0) want="DataCsumErr=0 MPFailTx>=1 MPFailRx>=1 InfiniteMapTx=1 InfiniteMapRx=0 MPRstTx=0 MPRstRx=0";;
   csum-fail2:1) want="DataCsumErr=1 MPFailTx=1 MPFailRx=0 InfiniteMapTx=0 InfiniteMapRx=0 MPRstTx=1 MPRstRx=0";;
   csum-fail2:0) want="DataCsumErr=0 MPFailTx=0 MPFailRx=1 InfiniteMapTx=0 InfiniteMapRx=0 MPRstTx=0 MPRstRx=1";;
   *) want="DataCsumErr=0";;
 esac
 for kv in $want; do
-  [ "$(mib "${kv%=*}")" = "${kv#*=}" ] || { echo "FAIL Linux MPTcpExt${kv%=*}=$(mib "${kv%=*}"), want ${kv#*=}"; exit 1; }
+  k=${kv%%[>=]*}; v=${kv##*=}; got=$(mib "$k")
+  if [[ "$kv" == *'>='* ]]; then [ "${got:-0}" -ge "$v" ]; else [ "$got" = "$v" ]; fi ||
+    { echo "FAIL Linux MPTcpExt$k=$got, want ${kv#"$k"}"; exit 1; }
 done
 if [ "$server" = mptcp-rs ]; then
   # Joins: the mptcp-rs server reports them; the kernel client counts its MP_JOIN SYN/ACKs.
