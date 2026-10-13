@@ -309,6 +309,36 @@ fn infinite_mapping_triggers_fallback_too() {
     }
 }
 
+/// An MP_FAIL that would make us the echoer, with an infinite mapping in the same segment (in
+/// either order): the mapping is checked first, so one without its checksum resets with
+/// MP_TCPRST 0x01 and no fallback (spec G3); a valid one keeps its own anchor (here SSN 151 at
+/// DSN `head + 100`, not the handshake offset), and later data is placed by it.
+#[test]
+fn mp_fail_with_infinite_mapping_checked_and_anchored() {
+    let head = peer_head();
+    let fail = mp_fail(head);
+    for ck in [None, Some(0)] {
+        let inf = dss_mapping(false, 151, head + 100, 0, ck);
+        for opts in [[&fail[..], &inf].concat(), [&inf[..], &fail].concat()] {
+            let mut c = client(true, false);
+            c.confirm();
+            let a = pattern(100);
+            c.peer_at(5001, &csum_mapping(1, head, &a, false), &a);
+            assert_eq!(read_now(&mut c.ep, c.h), a);
+            let sent = c.peer_at(5101, &opts, &[]);
+            if ck.is_none() {
+                assert_eq!(rst_reason(&sent), Some(vec![30, 4, 0x80, 0x01]));
+                assert_eq!(fell_back(&mut c.ep), 0);
+                continue;
+            }
+            assert_eq!(rst_reason(&sent), None);
+            assert_eq!(fell_back(&mut c.ep), 1);
+            c.peer_at(5151, &[], b"later");
+            assert_eq!(read_now(&mut c.ep, c.h), b"later", "{opts:?}");
+        }
+    }
+}
+
 /// Review Focus 1: the peer sends one request whose only mapping fails, then only ACKs. After
 /// its echo the request is readable with no peer data, and our response goes out as plain TCP
 /// (spec G15).

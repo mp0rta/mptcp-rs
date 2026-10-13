@@ -1613,6 +1613,14 @@ impl SegmentHooks for SubflowHooks<'_> {
         if d.fallback {
             return;
         }
+        // Every mapping carries a checksum exactly when checksums are used, or the subflow is
+        // reset with MP_TCPRST 0x01 (RFC 8684 L1331–1342, spec G3), whatever else the segment
+        // carries (MP_FAIL included).
+        if (dss.and_then(|v| v.mapping)).is_some_and(|mp| mp.checksum.is_some() != m.csum) {
+            self.sf.reset = true;
+            self.sf.reset_option = Some(tcprst(0x01, false).to_vec());
+            return;
+        }
         // MP_FAIL without RST, with or without checksums; ignored after fallback (above) and
         // while joining (M4b spec G18). Without contiguity the subflow is reset, the RST's
         // MP_FAIL carrying the received DSN (RFC 8684 L2419–2424, spec G13).
@@ -1627,6 +1635,17 @@ impl SegmentHooks for SubflowHooks<'_> {
             // once, the held octets replayed (spec G13, G15); the echo rides our segments.
             if !matches!(self.conn.mp_fail, MpFail::Waiting { .. }) {
                 self.conn.mp_fail_step = Some(MpFailStep::Echo);
+            }
+            // An infinite mapping on the same segment keeps its own anchor, as below.
+            let infinite = (dss.filter(|v| !v.data_fin))
+                .and_then(|v| v.mapping)
+                .filter(|mp| mp.data_len == 0);
+            if let Some(mp) = infinite {
+                let dsn = match mp.dsn {
+                    mptcp::Dsn::Dsn32(x) => promote32(x, d.recv.next),
+                    mptcp::Dsn::Dsn64(x) => x,
+                };
+                self.sf.rx_infinite = Some((mp.ssn, dsn));
             }
             d.fall_back(self.sf, m, self.conn.joined_ever);
             self.conn.fallback_event = true;
@@ -1691,13 +1710,6 @@ impl SegmentHooks for SubflowHooks<'_> {
         if let Some(v) = dss {
             m.peer_dss_seen = true;
             if let Some(mapping) = v.mapping {
-                // Every mapping carries a checksum exactly when checksums are used, or the
-                // subflow is reset with MP_TCPRST 0x01 (RFC 8684 L1331–1342, spec G3).
-                if mapping.checksum.is_some() != m.csum {
-                    self.sf.reset = true;
-                    self.sf.reset_option = Some(tcprst(0x01, false).to_vec());
-                    return;
-                }
                 let dsn = match mapping.dsn {
                     mptcp::Dsn::Dsn32(x) => promote32(x, d.recv.next),
                     mptcp::Dsn::Dsn64(x) => x,
