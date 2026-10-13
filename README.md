@@ -1,13 +1,13 @@
 # mptcp-rs
 
-A userspace, sans-I/O library for the client side of Multipath TCP v1 (RFC 8684), in Rust.
+A userspace, sans-I/O library for Multipath TCP v1 (RFC 8684), client and server, in Rust.
 
 mptcp-rs implements MPTCP itself, on its own TCP engine; it does not use the MPTCP in the
 Linux kernel. You give it incoming packets and the current time. It gives you back packets to
 send and data to read. So it can run over any packet I/O, such as a TUN device or a userspace
 network stack.
 
-Status: 0.2.0, client only.
+Status: the latest release, 0.2.0, is client only. The server role is on main and not released yet.
 
 ## Features
 
@@ -21,9 +21,16 @@ Status: 0.2.0, client only.
   when a link returns). Backup subflows, MP_PRIO, and ADD_ADDR and REMOVE_ADDR from the server.
 - IPv4, IPv6 and mixed-family paths.
 
-Not yet supported (planned): the server role, MPTCP checksums, MP_FAIL, and sending 32-bit
-DSNs. The client does not ask for checksums, and falls back to plain TCP if the server requires
-them.
+- Server role (on main, unreleased): `Endpoint::listen` and `unlisten`, passive MP_CAPABLE, and
+  MP_JOIN from clients. Each accepted connection is one `Event::Accepted`.
+
+Not yet supported (planned): MPTCP checksums, MP_FAIL, and sending 32-bit DSNs. The client does
+not ask for checksums, and falls back to plain TCP if the server requires them.
+
+Server limits: the server sends no ADD_ADDR; a client that requires checksums gets plain TCP;
+there are no SYN cookies, so SYNs beyond the `max_half_open` cap are dropped; and the timer and
+transmit paths scan every connection of the endpoint, so they are not meant for very many
+connections yet.
 
 ## Interoperability
 
@@ -62,6 +69,10 @@ Without netem the CPU is the limit, and the kernel is far ahead (same paths A+B,
 
 The kernel figures are one connection with one sending thread saturating a core. In s2c the kernel server sends in both cases, so those rows compare the clients as receivers. Host CPU per GB is all busy CPU time on the host over a 20 s window of the transfer, divided by the TCP payload the server's subflows moved in that window.
 
+The server role is tested against the Linux kernel MPTCP client (`INTEROP_CLIENT=kernel`) and
+against our own client, with `mptcp-rs-tun --listen` as the server: `INTEROP_SERVER=mptcp-rs
+tests/interop/run.sh <scenario>`, for the scenarios `run.sh` accepts in that mode.
+
 It has not been tested against other MPTCP implementations yet.
 
 ## Known limits
@@ -86,6 +97,9 @@ cargo build --release -p mptcp-rs-tun
 sudo target/release/mptcp-rs-tun --mode mptcp --tun mtun0 \
   --local 10.0.9.2 --remote 10.0.1.2:5201 --send 67108864 --expect 67108864
 ```
+
+With `--listen IP:PORT` instead of `--local` and `--remote`, it is a server: it serves the first
+accepted connection and aborts any other.
 
 Rust 1.85 or later is required.
 
@@ -124,7 +138,7 @@ Each run saves pcaps and logs under `artifacts/interop/`.
 
 ## Roadmap
 
-Next: the server role, checksums and MP_FAIL. TCP work continues alongside: RACK-TLP
+Next: checksums and MP_FAIL (M4b); the server role is released with them. TCP work continues alongside: RACK-TLP
 and timestamps. Async runtime integration, `no_std` and coupled congestion control are not
 planned yet.
 
