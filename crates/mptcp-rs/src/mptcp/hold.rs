@@ -26,12 +26,9 @@ pub(crate) struct HoldMap {
 /// A mapping whose octets have all arrived.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Complete {
-    /// Every octet, whatever was delivered already (coverage is not delivery, spec G7).
-    Verified {
-        dsn: u64,
-        bytes: Vec<u8>,
-        data_fin: bool,
-    },
+    /// Taken by the caller's `deliver`, every octet whatever was delivered already (coverage
+    /// is not delivery, spec G7).
+    Verified { dsn: u64, len: u32, data_fin: bool },
     /// Reported once; its octets stay held (`drain`) until the caller drains them (M4b spec
     /// G11: kept for the replay of a single-subflow fallback, else discarded with the reset).
     Failed { dsn: u64, ssn: u32 },
@@ -52,6 +49,8 @@ struct Entry {
     pieces: Vec<(u32, VecDeque<u8>)>,
     /// Complete with a checksum that failed (`Complete::Failed`, reported once).
     failed: bool,
+    /// Complete and verified, but `deliver` refused it: held until it takes it.
+    verified: bool,
 }
 
 impl Entry {
@@ -141,6 +140,7 @@ impl Hold {
                 {
                     if map.data_fin {
                         e.map = map;
+                        e.verified = false;
                     }
                     return true;
                 }
@@ -161,6 +161,7 @@ impl Hold {
             map,
             pieces: Vec::new(),
             failed: false,
+            verified: false,
         });
         true
     }
@@ -240,7 +241,7 @@ impl Hold {
         self.frontier = Some(frontier);
         let (held, pieces) = (&mut self.held, &mut self.pieces);
         self.entries.retain(|e| {
-            let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
+            let live = e.failed || e.verified || e.end().wrapping_sub(frontier) as i32 > 0;
             if !live {
                 *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
                 *pieces -= e.pieces.len();
@@ -249,23 +250,25 @@ impl Hold {
         });
     }
 
-    /// Takes every mapping whose octets have all arrived and verify; reports, once, each one
-    /// that fails and keeps it.
-    pub fn take_complete(&mut self) -> Vec<Complete> {
+    /// Hands every mapping whose octets have all arrived and verify to `deliver` (its DSN and
+    /// octets) and takes it once `deliver` does; one it refuses stays held, verified, and is
+    /// offered again on the next call (its octets are TCP-ACKed: spec G7, G15). Reports, once,
+    /// each mapping that fails and keeps it.
+    pub fn take_complete(&mut self, mut deliver: impl FnMut(u64, &[u8]) -> bool) -> Vec<Complete> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
             let e = &mut self.entries[i];
-            let Some(b) = (e.pieces.first())
-                .filter(|p| !e.failed && p.0 == 0 && p.1.len() == e.map.len as usize)
+            let m = e.map;
+            let Some(b) = (e.pieces.first_mut())
+                .filter(|p| !e.failed && p.0 == 0 && p.1.len() == m.len as usize)
             else {
                 i += 1;
                 continue;
             };
-            let m = e.map;
             let data_len = (m.len + u32::from(m.data_fin)) as u16;
             let (head, tail) = b.1.as_slices();
-            if !dss_checksum_ok(m.dsn, m.ssn, data_len, &[head, tail], m.checksum) {
+            if !e.verified && !dss_checksum_ok(m.dsn, m.ssn, data_len, &[head, tail], m.checksum) {
                 e.failed = true;
                 out.push(Complete::Failed {
                     dsn: m.dsn,
@@ -274,13 +277,17 @@ impl Hold {
                 i += 1;
                 continue;
             }
-            let e = self.entries.remove(i);
-            let bytes = Vec::from(e.pieces.into_iter().next().unwrap().1);
-            self.held -= bytes.len();
+            e.verified = true;
+            if !deliver(m.dsn, b.1.make_contiguous()) {
+                i += 1;
+                continue;
+            }
+            self.entries.remove(i);
+            self.held -= m.len as usize;
             self.pieces -= 1;
             out.push(Complete::Verified {
                 dsn: m.dsn,
-                bytes,
+                len: m.len,
                 data_fin: m.data_fin,
             });
         }
@@ -317,6 +324,39 @@ mod tests {
     /// An offered edge far past every DSN the tests use.
     const EDGE: u64 = 1 << 40;
 
+    /// `Complete` with the octets `take_complete` delivered.
+    #[derive(Debug, PartialEq)]
+    enum Done {
+        Verified {
+            dsn: u64,
+            bytes: Vec<u8>,
+            data_fin: bool,
+        },
+        Failed {
+            dsn: u64,
+            ssn: u32,
+        },
+    }
+
+    fn take(h: &mut Hold) -> Vec<Done> {
+        let mut got = Vec::new();
+        let out = h.take_complete(|_, b| {
+            got.push(b.to_vec());
+            true
+        });
+        let mut got = got.into_iter();
+        (out.into_iter())
+            .map(|c| match c {
+                Complete::Verified { dsn, data_fin, .. } => Done::Verified {
+                    dsn,
+                    bytes: got.next().unwrap(),
+                    data_fin,
+                },
+                Complete::Failed { dsn, ssn } => Done::Failed { dsn, ssn },
+            })
+            .collect()
+    }
+
     fn map(ssn: u32, dsn: u64, data: &[u8], data_fin: bool) -> HoldMap {
         let len = data.len() as u32;
         let data_len = (len + u32::from(data_fin)) as u16;
@@ -340,22 +380,22 @@ mod tests {
         assert!(h.install(map(1, 500, &data, false)));
         assert_eq!(h.insert(2001, &data[2000..], 1, EDGE, BIG), vec![0..1000]);
         assert_eq!(h.insert(1, &data[..1000], 1, EDGE, BIG), vec![0..1000]);
-        assert!(h.take_complete().is_empty());
+        assert!(take(&mut h).is_empty());
         assert_eq!(h.held(), 2000);
         assert_eq!(
             h.insert(1001, &data[1000..2000], 1001, EDGE, BIG),
             vec![0..1000]
         );
-        let done = h.take_complete();
+        let done = take(&mut h);
         assert_eq!(
             done,
-            [Complete::Verified {
+            [Done::Verified {
                 dsn: 500,
                 bytes: data,
                 data_fin: false
             }]
         );
-        assert!(h.take_complete().is_empty());
+        assert!(take(&mut h).is_empty());
         assert_eq!(h.held(), 0);
     }
 
@@ -367,10 +407,10 @@ mod tests {
         let mut bad = data.clone();
         bad[40] ^= 1;
         h.insert(7, &bad, 7, EDGE, BIG);
-        assert_eq!(h.take_complete(), [Complete::Failed { dsn: 900, ssn: 7 }]);
+        assert_eq!(take(&mut h), [Done::Failed { dsn: 900, ssn: 7 }]);
         // Kept, reported once, and not pruned below the frontier (spec G11, G15).
         assert_eq!(h.held(), 100);
-        assert!(h.take_complete().is_empty());
+        assert!(take(&mut h).is_empty());
         h.insert(107, b"", 107, EDGE, BIG);
         assert_eq!(h.drain(), [(7, bad)]);
         assert_eq!(h.held(), 0);
@@ -388,15 +428,15 @@ mod tests {
             sent[0] ^= u8::from(flip);
             h.insert(1, &sent, 1, EDGE, BIG);
             let want = if flip {
-                Complete::Failed { dsn: 10, ssn: 1 }
+                Done::Failed { dsn: 10, ssn: 1 }
             } else {
-                Complete::Verified {
+                Done::Verified {
                     dsn: 10,
                     bytes: data.clone(),
                     data_fin: true,
                 }
             };
-            assert_eq!(h.take_complete(), [want]);
+            assert_eq!(take(&mut h), [want]);
         }
     }
 
@@ -413,12 +453,12 @@ mod tests {
             h.insert(1, &data[..1436], 1, EDGE, BIG);
             assert!(h.install(order[1]));
             h.insert(1437, &data[1436..], 1437, EDGE, BIG);
-            let want = Complete::Verified {
+            let want = Done::Verified {
                 dsn: 10,
                 bytes: data.clone(),
                 data_fin: true,
             };
-            assert_eq!(h.take_complete(), [want]);
+            assert_eq!(take(&mut h), [want]);
         }
         for other in [
             HoldMap {
@@ -450,7 +490,7 @@ mod tests {
         h.install(map(1, 1000, &data, false));
         assert_eq!(h.insert(1, &data[..60], 1, 6000, BIG), vec![0..60]);
         assert_eq!(h.held(), 60);
-        assert!(h.take_complete().is_empty());
+        assert!(take(&mut h).is_empty());
     }
 
     #[test]
@@ -468,10 +508,10 @@ mod tests {
         assert_eq!(h.held(), 800);
         h.insert(801, &data[800..], 401, EDGE, BIG);
         assert_eq!(h.held(), 1000);
-        let done = h.take_complete();
+        let done = take(&mut h);
         assert_eq!(
             done,
-            [Complete::Verified {
+            [Done::Verified {
                 dsn: 0,
                 bytes: data,
                 data_fin: false
@@ -503,8 +543,8 @@ mod tests {
         let last = a + 65_534;
         assert_eq!(h.insert(last, &data[65_534..], last, EDGE, cap), vec![0..1]);
         assert_eq!(h.held(), cap + 1);
-        let done = h.take_complete();
-        assert!(matches!(&done[..], [Complete::Verified { dsn: 0, bytes, .. }] if *bytes == data));
+        let done = take(&mut h);
+        assert!(matches!(&done[..], [Done::Verified { dsn: 0, bytes, .. }] if *bytes == data));
         // B's held octets are all still there.
         assert_eq!(h.held(), cap - 65_534);
     }
@@ -587,8 +627,8 @@ mod tests {
             );
             assert_eq!(got, vec![0..1]);
         }
-        let done = h.take_complete();
-        assert!(matches!(&done[..], [Complete::Verified { bytes, .. }] if *bytes == data));
+        let done = take(&mut h);
+        assert!(matches!(&done[..], [Done::Verified { bytes, .. }] if *bytes == data));
         assert_eq!((h.held(), h.pieces), (0, 0));
     }
 
@@ -603,7 +643,7 @@ mod tests {
         // In order: B taken, then its last segment repeated behind the frontier.
         h.install(map(1, 0, &b, false));
         h.insert(1, &b, 1, EDGE, BIG);
-        assert_eq!(h.take_complete().len(), 1);
+        assert_eq!(take(&mut h).len(), 1);
         assert!(h.install(map(1, 0, &b, false)));
         h.insert(151, &b[150..], 201, EDGE, BIG);
         assert_eq!(h.held(), 0);
@@ -614,12 +654,12 @@ mod tests {
         h.install(map(1, 0, &a, false));
         h.install(map(101, 100, &b, false));
         h.insert(101, &b, 1, EDGE, BIG);
-        assert_eq!(h.take_complete().len(), 1);
+        assert_eq!(take(&mut h).len(), 1);
         assert!(h.install(map(101, 100, &b, false)));
         h.insert(251, &b[150..], 1, EDGE, BIG);
         assert_eq!(h.held(), 50);
         h.insert(1, &a, 1, EDGE, BIG);
-        assert_eq!(h.take_complete().len(), 1);
+        assert_eq!(take(&mut h).len(), 1);
         h.insert(301, &[], 301, EDGE, BIG);
         assert_eq!((h.held(), h.pieces), (0, 0));
     }

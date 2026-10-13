@@ -9,7 +9,7 @@ pub(crate) mod sched;
 pub(crate) mod signal;
 mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
-use data::{RecvAssembler, SendStore, TxMaps, promote32};
+use data::{Outcome, RecvAssembler, SendStore, TxMaps, promote32};
 use hold::{Complete, HoldMap};
 pub(crate) use join::{Join, JoinRole};
 pub(crate) use opp::Cand;
@@ -1925,21 +1925,19 @@ impl SegmentHooks for SubflowHooks<'_> {
                 at += len;
             }
         }
+        // The existing receive path clips what another subflow already delivered; what its
+        // range cap refuses stays held (spec G7, G15).
         let complete = if hold {
-            self.sf.hold.take_complete()
+            let recv = &mut d.recv;
+            (self.sf.hold)
+                .take_complete(|dsn, bytes| recv.accept(dsn, bytes).0 != Outcome::Discarded)
         } else {
             Vec::new()
         };
         for done in complete {
             match done {
-                // The existing receive path clips what another subflow already delivered.
-                Complete::Verified {
-                    dsn,
-                    bytes,
-                    data_fin,
-                } => {
-                    d.recv.accept(dsn, &bytes);
-                    let fin = dsn.wrapping_add(bytes.len() as u64);
+                Complete::Verified { dsn, len, data_fin } => {
+                    let fin = dsn.wrapping_add(u64::from(len));
                     if data_fin && d.recv.finish(fin) {
                         self.sf.ack_now = true;
                     }

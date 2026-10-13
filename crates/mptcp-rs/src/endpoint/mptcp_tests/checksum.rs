@@ -1199,6 +1199,28 @@ fn replay_past_range_cap_after_join() {
     );
 }
 
+/// As above, but subflow 1's mapping completes and verifies: the 65th range is refused by the
+/// assembler, so its octets, TCP-ACKed already, stay held, and the fallback replays them
+/// (spec G7, G15).
+#[test]
+fn verified_past_range_cap_stays_held() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+    let now = t(20_000_000);
+    for k in 0..64u32 {
+        let opt = csum_mapping(1 + k, dsn + 10 + 2 * u64::from(k), b"x", false);
+        feed(&mut ep, &peer_data(&syn, 5001 + k, &opt, b"x"), now);
+    }
+    let free = recv(&ep, h).free();
+    let data = pattern(10);
+    let opt = csum_mapping(1, dsn + 1000, &data, false);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data), now);
+    assert_eq!(held(&ep, h), 10, "refused by the range cap, kept");
+    let inf = dss_mapping(false, 11, dsn + 1010, 0, Some(0));
+    feed(&mut ep, &peer_data(&jsyn, 5011, &inf, &[]), now);
+    assert_eq!(negotiation(&ep, h).state, State::FellBack);
+    assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, free - 10));
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 
