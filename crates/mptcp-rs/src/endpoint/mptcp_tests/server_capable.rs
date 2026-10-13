@@ -317,6 +317,29 @@ fn server_later_capable_invalid_resets_subflow() {
     }
 }
 
+/// A later MP_CAPABLE the parser rejects (length 5) is an invalid one too: the listener's
+/// subflow is reset with the same RST as for an invalid well-formed one.
+#[test]
+fn server_later_capable_malformed_resets_subflow() {
+    let rst_of = |option: &[u8]| {
+        let mut s = started();
+        let out = s.send(65535, &ack_cap(CAP_H, None), &[]);
+        confirmed(&mut s, &out, 0);
+        let out = s.send(65535, option, &[]);
+        let rst = out.iter().find(|p| has_rst(std::slice::from_ref(p)));
+        rst.map(|p| mptcp_of(p))
+    };
+    let invalid = rst_of(&cap(
+        1,
+        CAP_B | CAP_H,
+        Some(CLIENT_KEY),
+        Some(SERVER_KEY),
+        None,
+    ));
+    assert!(invalid.is_some());
+    assert_eq!(rst_of(&[30, 5, 1, 1, 0]), invalid);
+}
+
 /// A valid MP_CAPABLE on a final ACK whose option list is rejected (a malformed DSS, a second
 /// DSS, a malformed TCP option): fallback, consistently: no MPTCP data state, the payload as
 /// plain TCP, no MPTCP option afterwards, and C not taken.

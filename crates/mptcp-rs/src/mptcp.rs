@@ -1213,6 +1213,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
         let (mut removed, mut added) = (Vec::new(), Vec::new());
+        let mut bad_capable = false;
         let options_ok = 'opts: {
             for opt in walk(seg.options).filter(|_| !seg.flags.contains(TcpFlags::SYN)) {
                 match opt {
@@ -1242,7 +1243,10 @@ impl SegmentHooks for SubflowHooks<'_> {
                             | MptcpOption::Capable(_)
                             | MptcpOption::FastClose { .. },
                         )
-                        | Err(_) => break 'opts false,
+                        | Err(_) => {
+                            bad_capable = mptcp::is_capable(raw);
+                            break 'opts false;
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -1273,6 +1277,12 @@ impl SegmentHooks for SubflowHooks<'_> {
             return;
         }
         if !options_ok {
+            // A malformed MP_CAPABLE is an invalid one: past the handshake, a listener resets
+            // (as below); an initiator ignores the segment's options.
+            let m = self.conn.negotiation.as_ref();
+            self.sf.reset |= bad_capable
+                && m.is_some_and(|m| m.passive && m.state == State::Confirmed)
+                && self.conn.active();
             return;
         }
         self.sf.valid_data_ack = if dss.is_some_and(|v| v.data_ack.is_some()) {
