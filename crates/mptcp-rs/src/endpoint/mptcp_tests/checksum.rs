@@ -1459,6 +1459,17 @@ fn closed_subflow_hold_is_discarded() {
     assert_eq!(read_now(&mut ep, h), &data[4096..]);
 }
 
+/// A mapping at the frontier whose DSN lies 2^63 − 1 past `recv.next`: nothing of it is in
+/// the window, and asking the assembler about it does not overflow.
+#[test]
+fn hostile_dsn_at_the_frontier() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head().wrapping_add(i64::MAX as u64);
+    c.peer_at(5001, &csum_mapping(1, dsn, b"x", false), b"x");
+    assert_eq!(held(&c.ep, c.h), 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 

@@ -583,7 +583,7 @@ impl RecvAssembler {
     /// G7). The first two stay true as `next` moves on.
     pub fn would_take(&self, dsn: u64, len: u32) -> bool {
         let lo = dsn.wrapping_sub(self.next) as i64;
-        let hi = lo + i64::from(len);
+        let hi = lo.saturating_add(i64::from(len));
         let start = |p: &Piece| p.dsn.wrapping_sub(self.next) as i64;
         lo <= 0
             || (self.pieces.iter()).any(|p| start(p) <= hi && lo <= start(p) + p.bytes.len() as i64)
