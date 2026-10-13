@@ -161,8 +161,9 @@ impl Hold {
     /// ranges accepted at the TCP level. `frontier` is the subflow's cumulative TCP receive
     /// point: octets below it arrived before. An octet at or past `right_edge` is refused, as
     /// `RecvAssembler::accept` refuses it; one below `recv.next` is kept for the checksum (spec
-    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further;
-    /// with `PIECE_CAP` runs held, only runs touching a held one or starting at `frontier`.
+    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further,
+    /// and none while a failed mapping is held; with `PIECE_CAP` runs held, only runs touching
+    /// a held one or starting at `frontier`.
     pub fn insert(
         &mut self,
         ssn: u32,
@@ -172,6 +173,9 @@ impl Hold {
         cap: usize,
     ) -> Vec<Range<usize>> {
         self.prune(frontier);
+        // A failed mapping is held only while MP_FAIL waits (spec G11): then no mapping is
+        // exempt, or the peer could map the same in-window DSNs at each new frontier (G7).
+        let exempt_ok = !self.entries.iter().any(|e| e.failed);
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -195,7 +199,7 @@ impl Hold {
             let n = rest.min((e.map.len - off) as usize);
             let dsn = e.map.dsn.wrapping_add(u64::from(off));
             let mut k = (right_edge.wrapping_sub(dsn) as i64).clamp(0, n as i64) as usize;
-            if !covering(e, frontier) {
+            if !(exempt_ok && covering(e, frontier)) {
                 k = k.min(cap.saturating_sub(self.held));
             }
             let may_split = self.pieces < PIECE_CAP || pos == frontier;

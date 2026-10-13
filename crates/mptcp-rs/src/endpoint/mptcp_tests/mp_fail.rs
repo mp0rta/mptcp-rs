@@ -221,8 +221,8 @@ struct Waiting {
     sent: Vec<Segment<'static>>,
 }
 
-fn waiting_with(sack: bool) -> Waiting {
-    let mut c = client_with(checksums_cfg(true), false, sack);
+fn waiting_with(cfg: ConnectConfig, sack: bool) -> Waiting {
+    let mut c = client_with(cfg, false, sack);
     c.confirm();
     let dsn = peer_head();
     let a = pattern(100);
@@ -241,7 +241,7 @@ fn waiting_with(sack: bool) -> Waiting {
 }
 
 fn waiting() -> Waiting {
-    waiting_with(false)
+    waiting_with(checksums_cfg(true), false)
 }
 
 /// Our ACK of a corrupt mapping M carries MP_FAIL(M.dsn) and a DATA_ACK at M. With the peer
@@ -366,6 +366,38 @@ fn waiting_times_out_at_120s() {
     assert_eq!(rst_options(&c.sent(end)), Some(vec![30, 4, 0x80, 0x06]));
     assert_eq!(held(&c.ep, c.h), 0);
     assert_eq!(state(&c), MpFail::Idle);
+}
+
+/// While `Waiting`, the peer keeps sending failing mappings of M's in-window DSNs at the next
+/// SSNs, each covering the frontier: the hold buffer stays within `recv_buffer + 2 × 65,535`
+/// (spec G7); past it new octets are refused at the TCP level, and the echo still falls back.
+#[test]
+fn waiting_further_failures_stay_bounded() {
+    let recv_buffer = 1 << 16;
+    let cfg = ConnectConfig {
+        recv_buffer,
+        ..checksums_cfg(true)
+    };
+    let Waiting { mut c, m, .. } = waiting_with(cfg, false);
+    let bound = recv_buffer as usize + 2 * 65_535;
+    let data = pattern(4000);
+    let (mut ssn, mut refused) = (111, false);
+    for _ in 0..200 {
+        let opt = bad_mapping(ssn, m, &data, false);
+        let sent = c.peer_at(5000 + ssn, &opt, &data);
+        assert!(held(&c.ep, c.h) <= bound, "{}", held(&c.ep, c.h));
+        let next = sent.last().expect("an ACK").ack.0 - 5000;
+        refused = next < ssn + data.len() as u32;
+        ssn = next;
+        if refused {
+            break;
+        }
+    }
+    assert!(refused, "past the cap, octets are refused");
+    assert!(matches!(state(&c), MpFail::Waiting { .. }));
+    c.peer_at(5000 + ssn, &mp_fail(m), &[]);
+    assert_eq!(fell_back(&mut c.ep), 1);
+    assert_eq!(held(&c.ep, c.h), 0);
 }
 
 /// The client's MP_JOIN SYN from `src` to `SERVER`, for the connection of `SERVER_KEY`; returns
@@ -555,7 +587,7 @@ fn echoer_replays_partial_reverse_mapping() {
 /// one SACK block; a data segment with the full 28-octet DSS and MP_FAIL has none.
 #[test]
 fn mp_fail_beats_sack() {
-    let Waiting { mut c, m, .. } = waiting_with(true);
+    let Waiting { mut c, m, .. } = waiting_with(checksums_cfg(true), true);
     // The second half of the next mapping, past a hole.
     let z = pattern(20);
     let opt = csum_mapping(111, peer_head() + 110, &z, false);
