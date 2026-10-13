@@ -94,11 +94,15 @@ impl Default for ConnectConfig {
     }
 }
 
-/// RFC 9293 connection states (a client never uses LISTEN or SYN-RECEIVED).
+/// RFC 9293 connection states. LISTEN belongs to the endpoint's listener, not to a TCB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TcpState {
     Closed,
     SynSent,
+    /// A passive open answered the peer's SYN. Simultaneous open (SYN-SENT → SYN-RECEIVED,
+    /// RFC 9293 §3.5) would also lead here; it is a later addition.
+    SynReceived,
     Established,
     FinWait1,
     FinWait2,
@@ -235,6 +239,8 @@ pub struct Tcb {
     cfg: ConnectConfig,
     v6: bool,
     state: TcpState,
+    /// Opened from a listener (RFC 9293 L3580–3592 treats a RST in SYN-RECEIVED by it).
+    passive: bool,
     nodelay: bool,
 
     // Send sequence space (RFC 9293 §3.3.1).
@@ -389,11 +395,35 @@ impl Tcb {
         now: Instant,
         seed: u64,
     ) -> Tcb {
-        let cc: Box<dyn CongestionControl> = match cfg.congestion_control {
-            CongestionControlKind::Cubic => Box::new(Cubic::new()),
-            CongestionControlKind::BbrV3 => Box::new(Bbr::new(seed)),
-        };
-        Self::with_cc(cfg, local, remote, isn, now, cc)
+        Self::with_cc(cfg, local, remote, isn, now, new_cc(cfg, seed))
+    }
+
+    /// SYN-RECEIVED from the peer's `syn` (a passive open): the SYN/ACK is due. `seed` as in
+    /// `new_active`.
+    pub fn new_passive(
+        cfg: &ConnectConfig,
+        local: SocketAddr,
+        syn: &Segment,
+        isn: SeqNum,
+        now: Instant,
+        seed: u64,
+    ) -> Tcb {
+        Self::passive_with_cc(cfg, local, syn, isn, now, new_cc(cfg, seed))
+    }
+
+    pub(crate) fn passive_with_cc(
+        cfg: &ConnectConfig,
+        local: SocketAddr,
+        syn: &Segment,
+        isn: SeqNum,
+        now: Instant,
+        cc: Box<dyn CongestionControl>,
+    ) -> Tcb {
+        let mut tcb = Self::with_cc(cfg, local, syn.src, isn, now, cc);
+        tcb.state = TcpState::SynReceived;
+        tcb.passive = true;
+        tcb.take_peer_syn(syn);
+        tcb
     }
 
     pub(crate) fn with_cc(
@@ -408,6 +438,7 @@ impl Tcb {
             cfg: cfg.clone(),
             v6: remote.is_ipv6(),
             state: TcpState::SynSent,
+            passive: false,
             nodelay: false,
             iss: isn,
             snd_una: isn,
@@ -527,6 +558,11 @@ impl Tcb {
         self.state
     }
 
+    /// Opened passively, from a listener (spec G11).
+    pub(crate) fn passive(&self) -> bool {
+        self.passive
+    }
+
     /// RFC 9293 §3.10.4 CLOSE; idempotent. ESTABLISHED → FIN-WAIT-1 and CLOSE-WAIT →
     /// LAST-ACK at once; the FIN follows the data queued at the next `poll_send`, and nothing
     /// queued after that is sent (the Connection rejects writes after `close` before they
@@ -535,6 +571,9 @@ impl Tcb {
     /// SYN-SENT: the TCB is deleted. `state()` is `Closed` at once and nothing more is sent or
     /// accepted; `poll_send_at` reports a deadline that is already due, and the next
     /// `on_timeout` returns `Closed(Normal)`, once, and sets `closed_at`.
+    ///
+    /// SYN-RECEIVED is left unchanged on purpose: FIN-WAIT-1 (RFC 9293 L3143–3148) would skip
+    /// an MP_JOIN responder's HMAC check of the third ACK.
     pub fn close(&mut self) {
         self.state = match self.state {
             TcpState::SynSent => TcpState::Closed,
@@ -577,6 +616,19 @@ impl Tcb {
                 }
                 r
             }
+            TcpState::SynReceived => {
+                let r = self.on_segment_syn_received(seg, now, h);
+                if r == Reaction::Established {
+                    h.on_valid_segment(seg);
+                    // Text and FIN on the final ACK, from RCV.NXT, once ESTABLISHED. A reset
+                    // the hooks request there (a join's bad HMAC) ends it before it is reported.
+                    let closed = self.on_text_and_fin(seg, now, h);
+                    if matches!(closed, Reaction::Closed(_)) {
+                        return closed;
+                    }
+                }
+                r
+            }
             _ => self.on_segment_sync(seg, now, h),
         }
     }
@@ -584,7 +636,7 @@ impl Tcb {
     /// Processes every timer expiry due at `now` (spec §3.1).
     pub fn on_timeout(&mut self, now: Instant, h: &mut impl Hooks) -> Reaction {
         match self.state {
-            TcpState::SynSent => self.on_timeout_syn_sent(now),
+            TcpState::SynSent | TcpState::SynReceived => self.on_timeout_syn_sent(now),
             // A `close` in SYN-SENT, reported once.
             TcpState::Closed if self.closed_at.is_none() => {
                 self.closed_at = Some(now);
@@ -1084,14 +1136,30 @@ impl Tcb {
             self.snd_max = self.snd_nxt;
             // RFC 7323 §2.2: the window field of a SYN is never scaled.
             let wnd = self.cfg.recv_buffer.min(65535) as u16;
-            let meta = out.start(self.iss, SeqNum(0), TcpFlags::SYN, wnd);
-            let n = h.options_for(TcpFlags::SYN, &mut out.options);
-            let n = n + tcp_options::write_mss(&mut out.options[n..], self.mss_option());
-            let n = n + tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
-            out.options_len = n + tcp_options::write_sack_permitted(&mut out.options[n..]);
+            let passive = self.passive();
+            let (flags, ack) = if passive {
+                (TcpFlags::SYN | TcpFlags::ACK, self.rcv_nxt)
+            } else {
+                (TcpFlags::SYN, SeqNum(0))
+            };
+            let meta = out.start(self.iss, ack, flags, wnd);
+            let mut n = h.options_for(flags, &mut out.options);
+            n += tcp_options::write_mss(&mut out.options[n..], self.mss_option());
+            // A SYN/ACK carries WS only if the SYN did (RFC 7323 §2.2), which left a shift
+            // here; with both shifts 0, leaving it out changes nothing.
+            if !passive || self.rcv_shift > 0 || self.snd_shift > 0 {
+                n += tcp_options::write_ws(&mut out.options[n..], self.rcv_shift);
+            }
+            if !passive || self.sack_permitted {
+                n += tcp_options::write_sack_permitted(&mut out.options[n..]);
+            }
+            out.options_len = n;
             return Some(meta);
         }
-        if !matches!(self.state, TcpState::SynSent | TcpState::TimeWait) {
+        if !matches!(
+            self.state,
+            TcpState::SynSent | TcpState::SynReceived | TcpState::TimeWait
+        ) {
             if std::mem::take(&mut self.keepalive_due) {
                 // The peer drops it unprocessed (below its window) and answers with an ACK, so
                 // it carries no options and answers nothing: a due ACK stays due.
@@ -1194,7 +1262,7 @@ impl Tcb {
         match self.state {
             // Due at once after a `close` in SYN-SENT.
             TcpState::Closed => Some(self.closed_at.unwrap_or(Instant::from_nanos(0))),
-            TcpState::SynSent => {
+            TcpState::SynSent | TcpState::SynReceived => {
                 let r2 = self.first_syn_at.map(|t| t + self.r2_syn());
                 [self.rto_at, r2].into_iter().flatten().min()
             }
@@ -1230,7 +1298,7 @@ impl Tcb {
     }
 
     /// RFC 9293 §3.10.7.3. A segment without ACK is dropped: a RST without ACK by the RFC's
-    /// rule, a bare SYN because this client does not support simultaneous open.
+    /// rule, a bare SYN because simultaneous open (to SYN-RECEIVED) is a later addition.
     fn on_segment_syn_sent(&mut self, seg: &Segment, now: Instant, h: &mut impl Hooks) -> Reaction {
         let rst = seg.flags.contains(TcpFlags::RST);
         if !seg.flags.contains(TcpFlags::ACK) {
@@ -1250,7 +1318,21 @@ impl Tcb {
         if !seg.flags.contains(TcpFlags::SYN) {
             return Reaction::None;
         }
+        self.take_peer_syn(seg);
+        self.snd_una = seg.ack;
+        self.snd_wnd = u32::from(seg.wnd);
+        self.max_snd_wnd = self.snd_wnd;
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
+        self.recovery.last_wnd = self.snd_wnd;
+        self.establish(now);
+        self.ack_due = true;
+        Reaction::Established
+    }
 
+    /// The peer's SYN, either role: its MSS, WS and SACK-Permitted, RCV.NXT and the first
+    /// receive edges.
+    fn take_peer_syn(&mut self, seg: &Segment) {
         let (mut mss, mut ws) = (None, None);
         for opt in tcp_options::walk(seg.options).map_while(Result::ok) {
             match opt {
@@ -1268,15 +1350,13 @@ impl Tcb {
         }
         self.rcv_nxt = seg.seq.wrapping_add(1);
         self.rcv_ssn = 1;
-        // The window field of our SYN (unscaled) is the first edge advertised.
+        // The window field of our SYN or SYN/ACK (unscaled) is the first edge advertised.
         self.rcv_right_edge = self.rcv_nxt.wrapping_add(self.cfg.recv_buffer.min(65535));
         self.rcv_sws_edge = self.rcv_right_edge;
-        self.snd_una = seg.ack;
-        self.snd_wnd = u32::from(seg.wnd);
-        self.max_snd_wnd = self.snd_wnd;
-        self.snd_wl1 = seg.seq;
-        self.snd_wl2 = seg.ack;
-        self.recovery.last_wnd = self.snd_wnd;
+    }
+
+    /// ESTABLISHED, either role, once the send-side variables are set from the segment.
+    fn establish(&mut self, now: Instant) {
         // RFC 6298 §5.7: the timer expired awaiting the SYN's ACK (only then is RTO above 1 s).
         let syn_lost = self.rtt.rto() > INITIAL_RTO;
         if syn_lost {
@@ -1295,8 +1375,55 @@ impl Tcb {
         // A SYN retransmission made due by an RTO that fired just before is now moot.
         self.syn_due = false;
         self.rto_at = None;
-        self.ack_due = true;
         self.state = TcpState::Established;
+    }
+
+    /// RFC 9293 §3.10.7.4 in SYN-RECEIVED (only reached by a passive open so far).
+    fn on_segment_syn_received(
+        &mut self,
+        seg: &Segment,
+        now: Instant,
+        h: &mut impl Hooks,
+    ) -> Reaction {
+        // Second step as in the synchronized states (RFC 5961 §3, L3551). A RST at RCV.NXT
+        // closes with `Reset`; the endpoint frees a passive TCB silently (L3580–3592).
+        if seg.flags.contains(TcpFlags::RST) {
+            return self.on_segment_sync(seg, now, h);
+        }
+        let syn = seg.flags.contains(TcpFlags::SYN);
+        // The peer's SYN again: our SYN/ACK was lost, so it is the answer due (the ACK
+        // L3527–3530 asks for, in this state).
+        if syn && seg.seq.wrapping_add(1) == self.rcv_nxt {
+            self.syn_due = true;
+            return Reaction::None;
+        }
+        // First step (L3491–3530).
+        if !self.acceptable(seg) {
+            self.ack_due = true;
+            return Reaction::None;
+        }
+        // Fourth step (L3652–3658): a passive open returns to LISTEN, which the endpoint does
+        // by freeing the TCB silently. Simultaneous open (later) takes the synchronized states'
+        // challenge ACK here instead.
+        if syn {
+            return self.terminate(CloseReason::Reset, now);
+        }
+        if !seg.flags.contains(TcpFlags::ACK) {
+            return Reaction::None;
+        }
+        // Fifth step (L3729–3746): SND.UNA < SEG.ACK =< SND.NXT, else <SEQ=SEG.ACK><CTL=RST>.
+        if !(self.snd_una.lt(seg.ack) && seg.ack.le(self.snd_nxt)) {
+            self.rst_due = Some((seg.ack, None));
+            return Reaction::None;
+        }
+        self.snd_una = seg.ack;
+        // Not a SYN: the window field is scaled (RFC 7323 §2.2).
+        self.snd_wnd = u32::from(seg.wnd) << self.snd_shift;
+        self.max_snd_wnd = self.snd_wnd;
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
+        self.recovery.last_wnd = self.snd_wnd;
+        self.establish(now);
         Reaction::Established
     }
 
@@ -2404,6 +2531,13 @@ fn pacing_quantum(rate: u64, seg: usize) -> usize {
 
 fn seq_len(m: &SentMeta) -> u32 {
     m.len + u32::from(m.flags.contains(TcpFlags::FIN))
+}
+
+fn new_cc(cfg: &ConnectConfig, seed: u64) -> Box<dyn CongestionControl> {
+    match cfg.congestion_control {
+        CongestionControlKind::Cubic => Box::new(Cubic::new()),
+        CongestionControlKind::BbrV3 => Box::new(Bbr::new(seed)),
+    }
 }
 
 /// Smallest shift `s` with `buffer >> s <= 65535`, at most 14 (RFC 7323 §2.3).

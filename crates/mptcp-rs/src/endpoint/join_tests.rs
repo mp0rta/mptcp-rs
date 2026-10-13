@@ -2161,7 +2161,8 @@ fn fallen_back_peer(
             let rel = s.seq.0.wrapping_sub(syn.seq.0);
             let dsn = match dss_map(&s) {
                 Some((ssn, dsn, 0)) => {
-                    assert!(inf.is_none(), "one infinite mapping");
+                    // One mapping, repeated on the data it maps until acknowledged.
+                    assert!(inf.is_none_or(|i| i == (ssn, dsn)), "one infinite mapping");
                     inf = Some((ssn, dsn));
                     dsn.wrapping_add(u64::from(rel.wrapping_sub(ssn)))
                 }
@@ -3211,8 +3212,8 @@ fn stale_then_stripped_single_subflow_falls_back() {
     assert_eq!(data.len(), 1);
     assert_eq!((data[0].seq, data[0].payload), (end(&sent), &b"second"[..]));
     assert!(
-        mpc(data[0].options).is_empty(),
-        "plain TCP after the switch"
+        infinite_mapping(data[0]),
+        "the data after the switch carries the infinite mapping until acknowledged"
     );
 }
 
@@ -4755,6 +4756,199 @@ fn fallback_keeps_bbr() {
     peer.run(&mut ep, h, now, now + Duration::from_secs(10));
     assert_eq!(una(&ep, h), head + n as u64, "plain TCP delivered it");
     assert_eq!(runs_bbr(&ep, h), [true]);
+}
+
+// M4a Task 6: the MP_JOIN responder on an accepted connection (`server_tests::Script`).
+
+/// RFC 8684 test keys and nonces (`crypto.rs` vectors): Key-A, Key-B, R-A, R-B.
+const KA: u64 = 0x0102030405060708;
+const KB: u64 = 0x1112131415161718;
+const RA: u32 = 0xa1a2a3a4;
+const RB: u32 = 0xb1b2b3b4;
+const JOIN_SRC: &str = "10.0.1.1:40000";
+
+/// A listener whose accepted connection is Confirmed, the client holding Key-A and the
+/// server Key-B.
+fn responder() -> super::super::server_tests::Script {
+    use super::super::server_tests::{Script, cap, syn_cap};
+    use crate::wire::mptcp::CAP_H;
+    let mut s = Script::new(true);
+    s.ep.keys.clear();
+    s.ep.keys.push_back(KB);
+    s.syn(&syn_cap(1, CAP_H));
+    s.send(65535, &cap(1, CAP_H, Some(KA), Some(KB), None), &[]);
+    assert_eq!(s.negotiation().state, State::Confirmed);
+    s.events();
+    s
+}
+
+/// The client's segment on the join 4-tuple; the server's ISS comes from its SYN/ACK.
+fn join_input(s: &mut super::super::server_tests::Script, seg: Segment) -> Vec<Segment<'static>> {
+    let seg = Segment {
+        src: JOIN_SRC.parse().unwrap(),
+        dst: super::super::server_tests::SERVER.parse().unwrap(),
+        ..seg
+    };
+    input_at(&mut s.ep, &seg, s.now);
+    s.output().into_iter().map(leak).collect()
+}
+
+/// The client's MP_JOIN SYN (nonce R-A, window scale 6); returns the server's answer.
+fn responder_syn(s: &mut super::super::server_tests::Script, backup: bool) -> Segment<'static> {
+    let mut opts = [0; 40];
+    let join = MpJoin::Syn {
+        backup,
+        addr_id: 3,
+        token: crate::crypto::key_token_idsn(KB).0,
+        nonce: RA,
+    };
+    let n = mptcp::encode(&MptcpOption::Join(join), &mut opts).unwrap();
+    let n = n + crate::wire::tcp_options::write_ws(&mut opts[n..], 6);
+    let seg = Segment {
+        src: JOIN_SRC.parse().unwrap(),
+        dst: JOIN_SRC.parse().unwrap(),
+        seq: SeqNum(7000),
+        ack: SeqNum(0),
+        flags: TcpFlags::SYN,
+        wnd: 65535,
+        options: &opts[..n],
+        payload: &[],
+    };
+    let mut out = join_input(s, seg);
+    assert_eq!(out.len(), 1);
+    out.pop().unwrap()
+}
+
+/// HMAC-B in the SYN/ACK is the RFC vector `HMAC(Key-B‖Key-A, R-B‖R-A)` truncated to 64 bits;
+/// HMAC-A in the third ACK, `HMAC(Key-A‖Key-B, R-A‖R-B)`, completes the join, and a
+/// retransmitted third ACK draws a plain ACK and no second `SubflowUp` (RFC 8684 L1155–1187).
+#[test]
+fn responder_synack_hmac_matches_rfc_vector() {
+    let mut s = responder();
+    s.ep.nonces.push_back(RB);
+    let synack = responder_syn(&mut s, false);
+    assert_eq!(synack.flags, TcpFlags::SYN | TcpFlags::ACK);
+    assert_eq!(synack.ack, SeqNum(7001));
+    let expected = MpJoin::SynAck {
+        backup: false,
+        addr_id: 0,
+        hmac64: 0x864b_4042_8762_fd06,
+        nonce: RB,
+    };
+    assert_eq!(mp_join(&synack), (expected, 16));
+    let hmac160: [u8; 20] = join_hmac(KA, KB, RA, RB)[..20].try_into().unwrap();
+    assert_eq!(hmac160[..4], [0x53, 0x03, 0x7f, 0x28]);
+    let mut opts = [0; 24];
+    let n = mptcp::encode(&MptcpOption::Join(MpJoin::Ack { hmac160 }), &mut opts).unwrap();
+    let third = Segment {
+        seq: SeqNum(7001),
+        ack: synack.seq.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        options: &opts[..n],
+        ..synack.clone()
+    };
+    for round in 0..2 {
+        let out = join_input(&mut s, third.clone());
+        assert!(
+            !out.is_empty(),
+            "round {round}: an ACK answers the third ACK"
+        );
+        for ack in &out {
+            assert_eq!(ack.flags, TcpFlags::ACK);
+            let join = |o: &&[u8]| matches!(mptcp::parse(o), Ok(MptcpOption::Join(_)));
+            assert!(!mpc(ack.options).iter().any(join));
+        }
+        let up = Event::SubflowUp {
+            subflow: SubflowId(1),
+        };
+        assert_eq!(s.events(), if round == 0 { vec![up] } else { vec![] });
+    }
+}
+
+/// Spec G3c: the SYN's B bit is the peer's backup request (RFC 8684 L1101–1109); its window
+/// scale is the subflow's. The SYN/ACK carries our own flag, which is clear.
+#[test]
+fn responder_takes_backup_from_syn() {
+    for backup in [false, true] {
+        let mut s = responder();
+        let synack = responder_syn(&mut s, backup);
+        let (MpJoin::SynAck { backup: ours, .. }, _) = mp_join(&synack) else {
+            panic!()
+        };
+        assert!(!ours);
+        let sf = &s.ep.conns[&ConnectionHandle(0)].subflows[1];
+        assert_eq!((sf.mp.peer_backup, sf.mp.peer_scale), (backup, 6));
+    }
+}
+
+/// The data level closes both ways while a join we answered waits for its lost third ACK:
+/// the join can carry nothing more, so it is reset with MP_TCPRST at once, its listener slot
+/// comes back, and the connection ends with subflow 0, not at the join's SYN timeout.
+#[test]
+fn responder_join_reset_when_data_closed() {
+    use super::super::server_tests::SERVER;
+    use crate::crypto::key_token_idsn;
+    use crate::wire::mptcp::{DataAck, Dsn, Dss, Mapping};
+    let mut s = responder();
+    responder_syn(&mut s, false);
+    let server: SocketAddr = SERVER.parse().unwrap();
+    assert_eq!(s.ep.listeners[&server].half_open, 1);
+    let dss = |data_ack: u64, fin: Option<u64>| {
+        let o = MptcpOption::Dss(Dss {
+            data_fin: fin.is_some(),
+            data_ack: Some(DataAck::Ack64(data_ack)),
+            mapping: fin.map(|dsn| Mapping {
+                dsn: Dsn::Dsn64(dsn),
+                ssn: 0,
+                data_len: 1,
+                checksum: None,
+            }),
+        });
+        let mut out = [0; 40];
+        let n = mptcp::encode(&o, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (client, server_idsn) = (key_token_idsn(KA).1, key_token_idsn(KB).1);
+    // The client's DATA_FIN, then ours, which the client DATA_ACKs with its subflow FIN.
+    s.send(65535, &dss(server_idsn + 1, Some(client + 1)), &[]);
+    s.conn().close();
+    assert!(!s.output().is_empty(), "our DATA_FIN");
+    let seq = s.seq;
+    s.input(
+        TcpFlags::ACK | TcpFlags::FIN,
+        seq,
+        65535,
+        &dss(server_idsn + 2, None),
+        &[],
+    );
+    s.seq += 1;
+    let out = s.output();
+    let rst: Vec<_> = (out.iter().map(|p| leak(p.clone())))
+        .filter(|p| p.flags.contains(TcpFlags::RST))
+        .collect();
+    assert_eq!(rst.len(), 1, "the join is reset");
+    assert_eq!(rst[0].dst, JOIN_SRC.parse().unwrap());
+    let tcprst = MptcpOption::TcpRst {
+        transient: false,
+        reason: 0,
+    };
+    assert_eq!(
+        mpc(rst[0].options)
+            .iter()
+            .map(|o| mptcp::parse(o).unwrap())
+            .collect::<Vec<_>>(),
+        [tcprst]
+    );
+    assert_eq!(s.ep.listeners[&server].half_open, 0);
+    // The client ACKs our subflow FIN: the connection ends and is freed.
+    s.iss += 1;
+    s.send(65535, &[], &[]);
+    s.ep.handle_timeout(s.now);
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert!(s.events().contains(&closed));
+    assert!(s.ep.conns.is_empty() && s.ep.demux.is_empty());
 }
 
 // M3 Task 4: path-management API groundwork, reusing the helpers above.

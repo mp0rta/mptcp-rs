@@ -7,9 +7,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use mptcp_rs::wire::packet::{Segment, TcpFlags, build, parse};
-use mptcp_rs::{ConnectConfig, Endpoint, Instant, SeqNum};
+use mptcp_rs::{
+    CloseReason, ConnectConfig, ConnectionHandle, Endpoint, Event, Instant, ReadError, SeqNum,
+};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{Rng, SeedableRng};
+use rand_core::{CryptoRng, Rng, SeedableRng};
 
 pub const MTU: usize = 1500;
 pub const PEER_MSS: u16 = 1200;
@@ -490,15 +492,20 @@ impl Link {
     }
 
     pub fn send(&mut self, now: Instant, p: Vec<u8>) {
+        self.send_after(now, p, Duration::from_millis(10));
+    }
+
+    /// Like `send` with a caller-chosen base delay; loss and reorder still apply.
+    pub fn send_after(&mut self, now: Instant, p: Vec<u8>, delay: Duration) {
         if self.rng.next_u32() % 1000 < self.loss_permille {
             return;
         }
-        let mut delay = 10;
+        let mut delay = delay;
         if self.rng.next_u32() % 1000 < self.reorder_permille {
-            delay += 5 + u64::from(self.rng.next_u32() % 20);
+            delay += Duration::from_millis(5 + u64::from(self.rng.next_u32() % 20));
         }
         self.n += 1;
-        self.q.insert((ms(now, delay), self.n), p);
+        self.q.insert((now + delay, self.n), p);
     }
 
     pub fn recv(&mut self, now: Instant) -> Option<Vec<u8>> {
@@ -509,4 +516,357 @@ impl Link {
     pub fn next_due(&self) -> Option<Instant> {
         self.q.first_key_value().map(|(k, _)| k.0)
     }
+}
+
+/// Direction through a `Net`: `AtoB` is sent by `a`, delivered to `b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    AtoB,
+    BtoA,
+}
+
+type DropFn = Box<dyn Fn(&Seg) -> bool>;
+type DelayFn = Box<dyn FnMut(&Seg) -> Option<Duration>>;
+type RewriteFn = Box<dyn FnMut(&mut Seg) -> bool>;
+
+/// Two endpoints joined by one `Link` per direction, on a single virtual clock.
+pub struct Net<R: CryptoRng> {
+    pub a: Endpoint<R>,
+    pub b: Endpoint<R>,
+    pub now: Instant,
+    pub events_a: Vec<(ConnectionHandle, Event)>,
+    pub events_b: Vec<(ConnectionHandle, Event)>,
+    /// Every packet sent, before rewrite, drop and loss.
+    pub taps: Vec<(Dir, Seg)>,
+    /// Every packet handed to an endpoint, with its delivery time.
+    pub delivered: Vec<(Dir, Instant, Seg)>,
+    ab: Link,
+    ba: Link,
+    drops: Vec<(Dir, DropFn)>,
+    delays: [Option<DelayFn>; 2],
+    rewrites: [Option<RewriteFn>; 2],
+}
+
+impl<R: CryptoRng> Net<R> {
+    pub fn new(a: Endpoint<R>, b: Endpoint<R>, link_ab: Link, link_ba: Link) -> Self {
+        Self {
+            a,
+            b,
+            now: Instant::from_nanos(0),
+            events_a: Vec::new(),
+            events_b: Vec::new(),
+            taps: Vec::new(),
+            delivered: Vec::new(),
+            ab: link_ab,
+            ba: link_ba,
+            drops: Vec::new(),
+            delays: [None, None],
+            rewrites: [None, None],
+        }
+    }
+
+    /// Drops the first packet in `dir` matching `pred`, once.
+    pub fn drop_next(&mut self, dir: Dir, pred: impl Fn(&Seg) -> bool + 'static) {
+        self.drops.push((dir, Box::new(pred)));
+    }
+
+    /// Per-packet delay override (`None` keeps the link default).
+    pub fn delay(&mut self, dir: Dir, f: impl FnMut(&Seg) -> Option<Duration> + 'static) {
+        self.delays[dir as usize] = Some(Box::new(f));
+    }
+
+    /// Rewrites packets in `dir`; the packet is re-serialised with fresh checksums.
+    /// Returning `false` drops it.
+    pub fn rewrite(&mut self, dir: Dir, f: impl FnMut(&mut Seg) -> bool + 'static) {
+        self.rewrites[dir as usize] = Some(Box::new(f));
+    }
+
+    /// Puts a raw packet on the wire in `dir` at the current time.
+    pub fn send(&mut self, dir: Dir, raw: Vec<u8>) {
+        let mut seg = parse_owned(&raw);
+        self.taps.push((dir, seg.clone()));
+        if let Some(i) = self.drops.iter().position(|(d, p)| *d == dir && p(&seg)) {
+            let _ = self.drops.remove(i);
+            return;
+        }
+        let mut raw = raw;
+        if let Some(f) = &mut self.rewrites[dir as usize] {
+            if !f(&mut seg) {
+                return;
+            }
+            let wire = Segment {
+                src: seg.src,
+                dst: seg.dst,
+                seq: seg.seq,
+                ack: seg.ack,
+                flags: seg.flags,
+                wnd: seg.wnd,
+                options: &seg.options,
+                payload: &seg.payload,
+            };
+            let mut buf = vec![0u8; MTU];
+            let n = build(&wire, 0, &mut buf).unwrap();
+            buf.truncate(n);
+            raw = buf;
+        }
+        let over = self.delays[dir as usize].as_mut().and_then(|f| f(&seg));
+        let link = match dir {
+            Dir::AtoB => &mut self.ab,
+            Dir::BtoA => &mut self.ba,
+        };
+        match over {
+            Some(d) => link.send_after(self.now, raw, d),
+            None => link.send(self.now, raw),
+        }
+    }
+
+    /// Moves everything the endpoints want to send onto the links and collects events.
+    fn pump(&mut self) {
+        let mut buf = [0u8; MTU];
+        while let Some(n) = self.a.poll_transmit(self.now, &mut buf) {
+            self.send(Dir::AtoB, buf[..n].to_vec());
+        }
+        while let Some(n) = self.b.poll_transmit(self.now, &mut buf) {
+            self.send(Dir::BtoA, buf[..n].to_vec());
+        }
+        while let Some(e) = self.a.poll_event() {
+            self.events_a.push(e);
+        }
+        while let Some(e) = self.b.poll_event() {
+            self.events_b.push(e);
+        }
+    }
+
+    fn next_event(&self) -> Option<Instant> {
+        [
+            self.ab.next_due(),
+            self.ba.next_due(),
+            self.a.poll_timeout(),
+            self.b.poll_timeout(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Handles exactly one event: the earliest link delivery or endpoint timeout (ties:
+    /// a->b delivery, b->a delivery, a's timeout, b's timeout). Returns `false` when
+    /// nothing is pending.
+    pub fn step(&mut self) -> bool {
+        self.pump();
+        let Some(next) = self.next_event() else {
+            return false;
+        };
+        self.now = self.now.max(next);
+        let now = self.now;
+        if let Some(p) = self.ab.recv(now) {
+            self.delivered.push((Dir::AtoB, now, parse_owned(&p)));
+            self.b.handle_packet(now, &p);
+        } else if let Some(p) = self.ba.recv(now) {
+            self.delivered.push((Dir::BtoA, now, parse_owned(&p)));
+            self.a.handle_packet(now, &p);
+        } else if self.a.poll_timeout().is_some_and(|t| t <= now) {
+            self.a.handle_timeout(now);
+        } else {
+            self.b.handle_timeout(now);
+        }
+        self.pump();
+        true
+    }
+
+    /// Steps until `done` holds (returns `true`), the next event is past `deadline`, or
+    /// nothing is pending (both return `false`).
+    pub fn run_until(
+        &mut self,
+        deadline: Instant,
+        mut done: impl FnMut(&mut Self) -> bool,
+    ) -> bool {
+        loop {
+            self.pump();
+            if done(self) {
+                return true;
+            }
+            if self.next_event().is_none_or(|t| t > deadline) {
+                return false;
+            }
+            self.step();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-endpoint sessions (M4a): addresses, segment predicates and `App`.
+
+pub fn sa(last: u8, port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), port)
+}
+
+pub fn idle_net() -> Net<ChaCha20Rng> {
+    Net::new(
+        endpoint(1),
+        endpoint(2),
+        Link::new(1, 0, 0),
+        Link::new(2, 0, 0),
+    )
+}
+
+pub fn is_synack(s: &Seg) -> bool {
+    s.flags == TcpFlags::SYN | TcpFlags::ACK
+}
+
+/// The pure ACK that completes a handshake (and any later pure ACK).
+pub fn is_pure_ack(s: &Seg) -> bool {
+    s.flags == TcpFlags::ACK && s.payload.is_empty()
+}
+
+/// One application: writes `out`, then closes; reads until EOF. A client (`h` set) starts
+/// once `Connected`, a server once it takes an unclaimed `Accepted` on its side.
+pub struct App {
+    pub on_b: bool,
+    pub h: Option<ConnectionHandle>,
+    pub out: Vec<u8>,
+    pub written: usize,
+    pub got: Vec<u8>,
+    pub eof: bool,
+    pub closing: bool,
+    /// Writes nothing until it has read some data.
+    pub hold: bool,
+}
+
+impl App {
+    pub fn new(on_b: bool, h: Option<ConnectionHandle>, len: usize, salt: usize) -> Self {
+        let out = pattern(len, salt);
+        let (written, got, eof, closing) = (0, Vec::new(), false, false);
+        App {
+            on_b,
+            h,
+            out,
+            written,
+            got,
+            eof,
+            closing,
+            hold: false,
+        }
+    }
+
+    pub fn events<'a>(&self, n: &'a Net<ChaCha20Rng>) -> &'a [(ConnectionHandle, Event)] {
+        if self.on_b { &n.events_b } else { &n.events_a }
+    }
+
+    pub fn up(&self, n: &Net<ChaCha20Rng>) -> bool {
+        let up = |(h, e): &(ConnectionHandle, Event)| {
+            Some(*h) == self.h && matches!(e, Event::Connected { .. } | Event::Accepted { .. })
+        };
+        self.events(n).iter().any(up)
+    }
+
+    pub fn closed(&self, n: &Net<ChaCha20Rng>) -> Vec<CloseReason> {
+        let closed = |(h, e): &(ConnectionHandle, Event)| match e {
+            Event::Closed { reason } if Some(*h) == self.h => Some(*reason),
+            _ => None,
+        };
+        self.events(n).iter().filter_map(closed).collect()
+    }
+
+    pub fn drive(&mut self, n: &mut Net<ChaCha20Rng>, claimed: &[ConnectionHandle]) {
+        if self.h.is_none() {
+            let free = accepted_any(self.events(n))
+                .into_iter()
+                .find(|h| !claimed.contains(h));
+            self.h = free;
+        }
+        let Some(h) = self.h.filter(|_| self.up(n)) else {
+            return;
+        };
+        let ep = if self.on_b { &mut n.b } else { &mut n.a };
+        // Freed after `Closed` (a close waits out TIME-WAIT on one side only).
+        let Some(c) = ep.connection(h) else {
+            return;
+        };
+        let held = self.hold && self.got.is_empty();
+        while self.written < self.out.len() && !held {
+            let w = c.write(&self.out[self.written..]).unwrap();
+            if w == 0 {
+                break;
+            }
+            self.written += w;
+        }
+        if self.written == self.out.len() && !self.closing && !held {
+            c.close();
+            self.closing = true;
+        }
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(k) => self.got.extend_from_slice(&buf[..k]),
+                Err(ReadError::WouldBlock) => break,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+}
+
+/// Sends what the applications' calls made due (driver contract of `poll_transmit`).
+pub fn flush(n: &mut Net<ChaCha20Rng>) {
+    let mut buf = [0u8; MTU];
+    while let Some(k) = n.a.poll_transmit(n.now, &mut buf) {
+        n.send(Dir::AtoB, buf[..k].to_vec());
+    }
+    while let Some(k) = n.b.poll_transmit(n.now, &mut buf) {
+        n.send(Dir::BtoA, buf[..k].to_vec());
+    }
+}
+
+/// Runs `apps` until each has read EOF and seen `Closed`; each pair (client, server) must
+/// have exchanged its bytes exactly, closed `Normal`, and no RST may have been sent.
+pub fn run_apps(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
+    run_apps_with_rst(n, apps, secs);
+    assert!(n.taps.iter().all(|t| !t.1.flags.contains(TcpFlags::RST)));
+}
+
+/// `run_apps` where RSTs may have been sent (a refused or reset subflow).
+pub fn run_apps_with_rst(n: &mut Net<ChaCha20Rng>, apps: &mut [App], secs: u64) {
+    let deadline = n.now + Duration::from_secs(secs);
+    let done = |n: &mut Net<ChaCha20Rng>, apps: &[App]| {
+        apps.iter().all(|a| a.eof && !a.closed(n).is_empty())
+    };
+    let ok = run_apps_until(n, apps, deadline, done);
+    assert!(ok, "transfer did not finish by {deadline:?}");
+    for pair in apps.chunks(2) {
+        assert!(pair[0].got == pair[1].out, "server to client bytes differ");
+        assert!(pair[1].got == pair[0].out, "client to server bytes differ");
+    }
+    for a in apps.iter() {
+        assert_eq!(a.closed(n), [CloseReason::Normal]);
+    }
+}
+
+/// Drives `apps` until `done` holds (`true`) or `deadline` passes (`false`).
+pub fn run_apps_until(
+    n: &mut Net<ChaCha20Rng>,
+    apps: &mut [App],
+    deadline: Instant,
+    mut done: impl FnMut(&mut Net<ChaCha20Rng>, &[App]) -> bool,
+) -> bool {
+    n.run_until(deadline, |n| {
+        for i in 0..apps.len() {
+            let side = apps[i].on_b;
+            let mine = |a: &App| a.h.filter(|_| a.on_b == side);
+            let claimed: Vec<_> = apps.iter().filter_map(mine).collect();
+            apps[i].drive(n, &claimed);
+        }
+        flush(n);
+        done(n, apps)
+    })
+}
+
+/// The handles of every `Accepted`, MPTCP or not.
+pub fn accepted_any(events: &[(ConnectionHandle, Event)]) -> Vec<ConnectionHandle> {
+    let acc =
+        |(h, e): &(ConnectionHandle, Event)| matches!(e, Event::Accepted { .. }).then_some(*h);
+    events.iter().filter_map(acc).collect()
 }

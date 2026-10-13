@@ -52,6 +52,8 @@ pub struct Connection {
     pub(crate) opp: Option<Episode>,
     /// Head repair and bounded lookahead (M3 spec §2.7).
     pub(crate) repair: Repair,
+    /// Accepted by a listener and not yet `Accepted`: hidden from the application (spec G10).
+    pub(crate) half_open: bool,
 }
 
 /// An `add_subflow` made before the connection was Confirmed.
@@ -69,6 +71,34 @@ pub(crate) struct QueuedJoin {
 }
 
 impl Connection {
+    /// A connection whose initial subflow is `sf`.
+    pub(crate) fn new(cfg: ConnectConfig, sf: Subflow) -> Self {
+        Connection {
+            local_addrs: LocalAddrs::new(sf.local.ip()),
+            subflows: vec![sf],
+            hooks: ConnectionHooks::new(&cfg),
+            closed_by_app: false,
+            aborting: false,
+            reset: false,
+            detached: false,
+            cfg,
+            nodelay: false,
+            queued_joins: Vec::new(),
+            next_subflow: 1,
+            peer_addrs: PeerAddrs::default(),
+            opp: None,
+            repair: Default::default(),
+            half_open: false,
+        }
+    }
+
+    /// Subflows counted against `SUBFLOW_CAP` (spec G3b): every one not ended, whether up,
+    /// joining (ours or one a listener answered) or in SYN-SENT, plus queued joins.
+    pub(crate) fn subflow_slots(&self) -> usize {
+        let open = self.subflows.iter().filter(|sf| !sf.ended()).count();
+        open + self.queued_joins.len()
+    }
+
     /// The initial subflow's local address (after a fallback: the surviving subflow's).
     pub fn local(&self) -> SocketAddr {
         self.subflows[0].local

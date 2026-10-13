@@ -4911,3 +4911,311 @@ fn bbr_bulk_transfer_scripted() {
     let rate = f.tcb.cc.pacing_rate().unwrap();
     assert!((9_000_000..=12_500_000).contains(&rate), "{rate}");
 }
+
+// ---- Passive open (M4a) ----
+
+const SYN_ACK: TcpFlags = TcpFlags(TcpFlags::SYN.0 | TcpFlags::ACK.0);
+
+/// MSS 1460, WS `ws` if any, then SACK-Permitted.
+fn syn_opts(ws: Option<u8>) -> Vec<u8> {
+    let mut v = opts(Some(1460), ws);
+    let mut b = [0u8; 4];
+    let n = tcp_options::write_sack_permitted(&mut b);
+    v.extend_from_slice(&b[..n]);
+    v
+}
+
+/// The peer's SYN at PEER_ISN, window 65535.
+fn peer_syn(addrs: (SocketAddr, SocketAddr), options: &[u8]) -> Segment<'_> {
+    Segment {
+        src: addrs.1,
+        dst: addrs.0,
+        seq: PEER_ISN,
+        ack: SeqNum(0),
+        flags: TcpFlags::SYN,
+        wnd: 65535,
+        options,
+        payload: &[],
+    }
+}
+
+impl Fixture {
+    /// SYN-RECEIVED at t(0) from a SYN carrying `syn_opts`, nothing sent yet; `cc::Unbounded`.
+    fn passive(syn_opts: &[u8]) -> Self {
+        let cfg = ConnectConfig::default();
+        let addrs = v4();
+        let syn = peer_syn(addrs, syn_opts);
+        Self {
+            tcb: Tcb::passive_with_cc(&cfg, addrs.0, &syn, ISN, t(0), Box::new(Unbounded)),
+            h: PlainHooks::new(&cfg),
+            out: SegmentWriter::default(),
+            addrs,
+        }
+    }
+    /// The final ACK of the handshake at `now`, acknowledging `ack`.
+    fn final_ack(&mut self, now: Instant, ack: SeqNum, wnd: u16) -> Reaction {
+        self.ack_seq(now, PEER_ISN.wrapping_add(1), ack, wnd)
+    }
+    fn rst_at(&mut self, seq: SeqNum) -> Reaction {
+        let seg = Segment {
+            src: self.addrs.1,
+            dst: self.addrs.0,
+            seq,
+            ack: ISN.wrapping_add(1),
+            flags: TcpFlags::RST | TcpFlags::ACK,
+            wnd: 0,
+            options: &[],
+            payload: &[],
+        };
+        self.tcb.on_segment(&seg, t(0), &mut self.h)
+    }
+}
+
+#[test]
+fn passive_synack_echoes_syn_options() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    assert_eq!(f.tcb.state(), TcpState::SynReceived);
+    assert!(f.tcb.passive());
+    let meta = f.send(t(0)).unwrap();
+    assert_eq!(meta.flags, SYN_ACK);
+    assert_eq!((f.out.seq, f.out.ack), (ISN, PEER_ISN.wrapping_add(1)));
+    // RFC 7323 §2.2: never scaled in a SYN.
+    assert_eq!(f.out.wnd, 65535);
+    assert_eq!(
+        parsed(f.out.options()),
+        vec![
+            TcpOpt::Mss(1460),
+            TcpOpt::WindowScale(9),
+            TcpOpt::SackPermitted
+        ]
+    );
+    assert_eq!((f.tcb.eff_mss, f.tcb.snd_shift), (1460, 7));
+    assert!(f.tcb.sack_permitted);
+    assert_eq!(f.send(t(0)), None);
+    assert_eq!(f.tcb.poll_send_at(), Some(t(1)));
+}
+
+#[test]
+fn passive_no_ws_in_syn_disables_scaling() {
+    let mut f = Fixture::passive(&syn_opts(None));
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        parsed(f.out.options()),
+        vec![TcpOpt::Mss(1460), TcpOpt::SackPermitted]
+    );
+    assert_eq!(
+        f.final_ack(t(0), ISN.wrapping_add(1), 5000),
+        Reaction::Established
+    );
+    assert_eq!((f.tcb.snd_shift, f.tcb.rcv_shift), (0, 0));
+    assert_eq!(f.tcb.snd_wnd, 5000);
+    f.tcb.request_ack();
+    f.send(t(0)).unwrap();
+    // 16 MiB free, unscaled: capped at 65535.
+    assert_eq!(f.out.wnd, 65535);
+}
+
+#[test]
+fn passive_final_ack_establishes() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        f.final_ack(t(0), ISN.wrapping_add(1), 100),
+        Reaction::Established
+    );
+    assert_eq!(f.tcb.state(), TcpState::Established);
+    assert_eq!(f.tcb.snd_una, ISN.wrapping_add(1));
+    // The SYN/ACK offered 65535 unscaled: one window update announces the scaled window
+    // (16 MiB >> 9), then nothing is due or outstanding.
+    assert_eq!(f.acks(t(0)), vec![(pdata(0), 32768)]);
+    assert_eq!(f.tcb.poll_send_at(), None);
+}
+
+#[test]
+fn passive_final_ack_with_data_delivers_it() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    let p = pattern(100);
+    let r = f.seg_ack(t(0), 0, ISN.wrapping_add(1), TcpFlags::ACK, &p);
+    assert_eq!(r, Reaction::Established);
+    assert_eq!(f.read_all(), p);
+    assert_eq!(f.tcb.rcv_nxt, pdata(100));
+}
+
+#[test]
+fn passive_out_of_window_final_ack_dropped() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    // Our SYN/ACK offered 65535 octets from PEER_ISN + 1.
+    let r = f.seg_ack(t(0), 65535, ISN.wrapping_add(1), TcpFlags::ACK, &[1; 100]);
+    assert_eq!(r, Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::SynReceived);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(0)]);
+    assert!(f.read_all().is_empty());
+}
+
+#[test]
+fn passive_final_ack_window_is_scaled() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    assert_eq!(
+        f.final_ack(t(0), ISN.wrapping_add(1), 100),
+        Reaction::Established
+    );
+    assert_eq!(f.tcb.snd_wnd, 100 << 7);
+    assert_eq!(f.tcb.max_snd_wnd, 100 << 7);
+}
+
+#[test]
+fn passive_bad_ack_draws_rst() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    for ack in [ISN.wrapping_add(2), ISN] {
+        assert_eq!(f.final_ack(t(0), ack, 100), Reaction::None);
+        let meta = f.send(t(0)).unwrap();
+        assert_eq!((meta.flags, meta.seq), (TcpFlags::RST, ack));
+        assert_eq!(f.send(t(0)), None);
+        assert_eq!(f.tcb.state(), TcpState::SynReceived);
+    }
+}
+
+#[test]
+fn passive_rst_exact_rcv_nxt_closes_reset() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    assert_eq!(f.rst_at(pdata(0)), Reaction::Closed(CloseReason::Reset));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    // Once.
+    assert_eq!(f.rst_at(pdata(0)), Reaction::None);
+    assert_eq!(f.timeout(t(500)), Reaction::None);
+    assert_eq!(f.send(t(500)), None);
+}
+
+#[test]
+fn passive_rst_in_window_not_exact_challenges() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    assert_eq!(f.rst_at(pdata(1)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::SynReceived);
+    assert_eq!(f.ack_nos(t(0)), vec![pdata(0)]);
+}
+
+#[test]
+fn passive_rst_out_of_window_ignored() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    assert_eq!(f.rst_at(pdata(70_000)), Reaction::None);
+    assert_eq!(f.tcb.state(), TcpState::SynReceived);
+    assert_eq!(f.send(t(0)), None);
+}
+
+#[test]
+fn passive_duplicate_syn_resends_synack() {
+    let o = syn_opts(Some(7));
+    let mut f = Fixture::passive(&o);
+    f.send(t(0)).unwrap();
+    let syn = peer_syn(f.addrs, &o);
+    assert_eq!(f.tcb.on_segment(&syn, t(0), &mut f.h), Reaction::None);
+    let meta = f.send(t(0)).unwrap();
+    assert_eq!((meta.flags, meta.seq), (SYN_ACK, ISN));
+    assert_eq!(f.out.ack, pdata(0));
+    assert_eq!(f.send(t(0)), None);
+    assert_eq!(f.tcb.state(), TcpState::SynReceived);
+}
+
+#[test]
+fn passive_synack_retransmits_with_backoff_then_times_out() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    let (sends, closed) = f.run_until_closed();
+    let secs: Vec<u64> = sends.iter().map(|&s| (s - t(0)).as_secs()).collect();
+    // RTO 1, 2, 4, ... 32, then capped at 60 s; R2 (180 s) counts from the first SYN/ACK.
+    assert_eq!(secs, vec![1, 3, 7, 15, 31, 63, 123]);
+    assert_eq!((f.out.flags, f.out.seq), (SYN_ACK, ISN));
+    assert_eq!(closed, t(180));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+}
+
+#[test]
+fn passive_syn_lost_rtt_rule() {
+    let mut f = Fixture::passive(&syn_opts(Some(0)));
+    f.send(t(0)).unwrap();
+    assert_eq!(f.timeout(t(1)), Reaction::None);
+    assert_eq!(f.send(t(1)).unwrap().flags, SYN_ACK);
+    assert_eq!(
+        f.final_ack(t(1), ISN.wrapping_add(1), 10 * MSS),
+        Reaction::Established
+    );
+    f.write(&[1; 100]);
+    let segs = f.drain(t(1));
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].0.len, 100);
+    // RFC 6298 §5.7: RTO 3 s, not the backed-off 2 s.
+    assert_eq!(f.tcb.poll_send_at(), Some(t(4)));
+}
+
+#[test]
+fn passive_in_window_syn_returns_to_listen() {
+    let mut f = Fixture::passive(&syn_opts(Some(7)));
+    f.send(t(0)).unwrap();
+    // Not the peer's SYN again: a new one inside our window (RFC 9293 L3652–3658).
+    let mut syn = peer_syn(f.addrs, &[]);
+    syn.seq = pdata(5);
+    let r = f.tcb.on_segment(&syn, t(0), &mut f.h);
+    assert_eq!(r, Reaction::Closed(CloseReason::Reset));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    // Freed silently: no RST, no ACK.
+    assert_eq!(f.send(t(0)), None);
+}
+
+/// Requests a reset once a segment is valid, as a join rejecting a bad HMAC does.
+struct ResetOnValid(PlainHooks, bool);
+
+impl SendBuf for ResetOnValid {
+    fn peek_with<R>(&self, rel_ssn: u32, max: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.0.peek_with(rel_ssn, max, f)
+    }
+    fn assigned_end(&self) -> u32 {
+        self.0.assigned_end()
+    }
+    fn mark_acked(&mut self, rel_ssn_una: u32) {
+        self.0.mark_acked(rel_ssn_una)
+    }
+}
+
+impl SegmentHooks for ResetOnValid {
+    fn on_valid_segment(&mut self, _seg: &Segment<'_>) {
+        self.1 = true;
+    }
+    fn reset_requested(&self) -> bool {
+        self.1
+    }
+    fn accept_payload(&mut self, rel_ssn: u32, data: &[u8]) {
+        self.0.accept_payload(rel_ssn, data)
+    }
+    fn recv_window(&self) -> u32 {
+        self.0.recv_window()
+    }
+}
+
+#[test]
+fn passive_final_ack_reset_by_hooks_is_not_established() {
+    let cfg = ConnectConfig::default();
+    let addrs = v4();
+    let o = syn_opts(Some(7));
+    let syn = peer_syn(addrs, &o);
+    let mut f = Fixture {
+        tcb: Tcb::passive_with_cc(&cfg, addrs.0, &syn, ISN, t(0), Box::new(Unbounded)),
+        h: ResetOnValid(PlainHooks::new(&cfg), false),
+        out: SegmentWriter::default(),
+        addrs,
+    };
+    f.send(t(0)).unwrap();
+    let r = f.seg_ack(t(0), 0, ISN.wrapping_add(1), TcpFlags::ACK, &pattern(100));
+    assert_eq!(r, Reaction::Closed(CloseReason::Reset));
+    assert_eq!(f.tcb.state(), TcpState::Closed);
+    // The payload is not delivered; a RST <SEQ=SND.MAX> goes out.
+    assert!(!f.h.0.has_unread());
+    let meta = f.send(t(0)).unwrap();
+    assert_eq!((meta.flags, meta.seq), (TcpFlags::RST, ISN.wrapping_add(1)));
+}

@@ -38,6 +38,9 @@ pub(crate) struct Subflow {
     pub remote: SocketAddr,
     pub state: SubflowState,
     pub mp: SubflowMp,
+    /// The key of the listener whose half-open count this passive subflow holds while it is
+    /// not yet up (`Endpoint::release_pending` gives it back once).
+    pub pending_via: Option<SocketAddr>,
 }
 
 impl Subflow {
@@ -64,7 +67,8 @@ impl Subflow {
 
 /// MPTCP state tied to one subflow's TCP sequence space, options or window scale. The creator
 /// must set `local_isn`, `tcp_acked_dsn` and (from its SYN/ACK) `peer_scale`: the MP_CAPABLE
-/// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`.
+/// path does it in `on_valid_segment`, a join in `Endpoint::start_join` and `join_segment`, an
+/// answered join in `Endpoint::answer_join` (from the SYN).
 pub(crate) struct SubflowMp {
     pub tx: TxMaps,
     pub rx: RxMaps,
@@ -81,10 +85,14 @@ pub(crate) struct SubflowMp {
     pub valid_data_ack: Option<bool>,
     pub ack_now: bool,
     pub capable_ack_due: bool,
-    /// Our infinite mapping, due until a segment carries it.
+    /// Our infinite mapping, due on an ACK-only segment until any segment carries it.
     pub final_mapping: Option<mptcp::Mapping>,
     /// SSN where our infinite mapping starts; data below it keeps its finite mapping.
     pub infinite_from: Option<u32>,
+    /// Our infinite mapping and the SSN of the first data sent after it: every data segment
+    /// not below the mapping, retransmissions included, carries it until the peer's TCP ACK
+    /// passes that SSN, so no octet it maps can arrive without it (RFC 8684 L2406–2407).
+    pub infinite: Option<(mptcp::Mapping, u32)>,
     /// The highest DSN end of any mapping ever installed on this subflow (fallback data loss).
     pub dsn_end: Option<u64>,
     pub rx_infinite: Option<(u32, u64)>,
@@ -121,7 +129,8 @@ pub(crate) struct SubflowMp {
     pub join_failed: Option<Option<crate::MpTcpRst>>,
     /// Our own transmit policy (`Endpoint::set_local_backup`).
     pub local_backup: bool,
-    /// The peer's MP_JOIN SYN/ACK B bit, then its latest MP_PRIO (RFC 8684 L1849–1852).
+    /// The peer's MP_JOIN SYN/ACK B bit, or its SYN's on a join we answered (RFC 8684
+    /// L1101–1109), then its latest MP_PRIO (L1849–1852).
     pub peer_backup: bool,
     /// An MP_PRIO arrived with this B bit: `Event::PeerPriority` is due.
     pub peer_prio: Option<bool>,
@@ -162,6 +171,7 @@ impl SubflowMp {
             capable_ack_due: false,
             final_mapping: None,
             infinite_from: None,
+            infinite: None,
             dsn_end: None,
             rx_infinite: None,
             peer_scale: 0,
