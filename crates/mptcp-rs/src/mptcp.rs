@@ -1775,8 +1775,9 @@ impl SegmentHooks for SubflowHooks<'_> {
                     return;
                 }
                 // An MP_CAPABLE mapping always has the handshake's offset (SSN 1, IDSN + 1).
-                let peer_idsn = m.peer_idsn.unwrap();
-                self.sf.other_offset |= len > 0 && !initial_offset_ok(peer_idsn, dsn, mapping.ssn);
+                // Only checksums use it (G9, A1).
+                self.sf.other_offset |=
+                    m.csum && len > 0 && !initial_offset_ok(m.peer_idsn.unwrap(), dsn, mapping.ssn);
                 // With checksums (the check above makes `checksum` present exactly then), a
                 // data mapping is held until it verifies and may earn completion credit; its
                 // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping
@@ -1896,8 +1897,11 @@ impl SegmentHooks for SubflowHooks<'_> {
                 *base = ssn;
             }
             self.sf.rx.ack(ssn);
-            // Complete mappings were taken in `receive_data`, before the receipt advanced.
-            self.sf.hold.prune(ssn);
+            // Complete mappings were taken in `receive_data`, before the receipt advanced. Only
+            // checksums hold anything (G9, A1).
+            if self.conn.negotiation.as_ref().is_some_and(|m| m.csum) {
+                self.sf.hold.prune(ssn);
+            }
         }
     }
     fn receive_data(
