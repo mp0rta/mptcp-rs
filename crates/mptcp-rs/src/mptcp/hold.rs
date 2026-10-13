@@ -126,6 +126,8 @@ pub(crate) struct Hold {
     pieces: usize,
     /// The frontier of the last `prune`: TCP took every octet below it.
     frontier: Option<u32>,
+    /// Entries `verified`: complete and verified, refused by `deliver` so far.
+    refused: usize,
 }
 
 impl Hold {
@@ -145,7 +147,7 @@ impl Hold {
                 {
                     if map.data_fin {
                         e.map = map;
-                        e.verified = false;
+                        self.refused -= usize::from(std::mem::take(&mut e.verified));
                     }
                     return true;
                 }
@@ -173,6 +175,11 @@ impl Hold {
 
     pub fn held(&self) -> usize {
         self.held
+    }
+
+    /// Verified mappings `deliver` refused, held until it takes them.
+    pub fn refused(&self) -> usize {
+        self.refused
     }
 
     /// Every held mapping, failed ones included.
@@ -282,11 +289,12 @@ impl Hold {
                 i += 1;
                 continue;
             }
-            e.verified = true;
             if !deliver(m.dsn, b.1.make_contiguous()) {
+                self.refused += usize::from(!std::mem::replace(&mut e.verified, true));
                 i += 1;
                 continue;
             }
+            self.refused -= usize::from(e.verified);
             self.entries.remove(i);
             self.held -= m.len as usize;
             self.pieces -= 1;
@@ -304,6 +312,7 @@ impl Hold {
     pub fn drain(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.held = 0;
         self.pieces = 0;
+        self.refused = 0;
         let mut runs: Vec<(u32, Vec<u8>)> = (self.entries.drain(..))
             .flat_map(|e| {
                 let ssn = e.map.ssn;

@@ -1221,6 +1221,31 @@ fn verified_past_range_cap_stays_held() {
     assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, free - 10));
 }
 
+/// As above, but subflow 0 then fills every gap up to the refused mapping: with no further
+/// octet on subflow 1, the refused mapping is offered again and taken (spec G7).
+#[test]
+fn refused_verified_retried_after_other_subflow_input() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+    let now = t(20_000_000);
+    let data = pattern(1010);
+    for k in 0..64u32 {
+        let i = 10 + 2 * k as usize;
+        let opt = csum_mapping(1 + k, dsn + i as u64, &data[i..i + 1], false);
+        feed(
+            &mut ep,
+            &peer_data(&syn, 5001 + k, &opt, &data[i..i + 1]),
+            now,
+        );
+    }
+    let opt = csum_mapping(1, dsn + 1000, &data[1000..], false);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[1000..]), now);
+    assert_eq!(held(&ep, h), 10);
+    let opt = csum_mapping(65, dsn, &data[..1000], false);
+    feed(&mut ep, &peer_data(&syn, 5065, &opt, &data[..1000]), now);
+    assert_eq!((held(&ep, h), recv(&ep, h).next), (0, dsn + 1010));
+    assert_eq!(read_now(&mut ep, h), data);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 

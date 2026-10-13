@@ -396,6 +396,47 @@ impl Connection {
     /// allows, or timed out): contiguity no longer matters, so joins may come again within the
     /// no-subflow wait. Its held octets are discarded: they are not DATA_ACKed, so the peer
     /// resends them elsewhere (RFC 8684 L2392–2394, M4b spec G12, G17).
+    /// Offers the verified mappings the assembler's range cap refused to it again, on every
+    /// subflow until none is taken: input on any subflow, or a read, may have made room. They
+    /// are TCP-ACKed, so nothing else would bring them (spec G7, G15). With no such mapping,
+    /// or no checksums, it does nothing.
+    pub(crate) fn retry_refused(&mut self) {
+        let csum = (self.hooks.negotiation.as_ref()).is_some_and(|m| m.csum);
+        let Some(d) = self.hooks.data.as_mut().filter(|_| csum) else {
+            return;
+        };
+        let mut any = false;
+        loop {
+            let mut taken = false;
+            for sf in (self.subflows.iter_mut()).filter(|sf| sf.mp.hold.refused() > 0) {
+                let recv = &mut d.recv;
+                let done = (sf.mp.hold)
+                    .take_complete(|dsn, bytes| recv.accept(dsn, bytes).0 != Outcome::Discarded);
+                for c in done {
+                    let Complete::Verified {
+                        dsn, len, data_fin, ..
+                    } = c
+                    else {
+                        continue;
+                    };
+                    taken = true;
+                    sf.mp.ack_now = true;
+                    if data_fin {
+                        d.recv.finish(dsn.wrapping_add(u64::from(len)));
+                    }
+                }
+            }
+            if !taken {
+                break;
+            }
+            any = true;
+        }
+        if any {
+            d.recv
+                .set_held(self.subflows.iter().map(|s| s.mp.hold.held()).sum());
+        }
+    }
+
     pub(crate) fn end_orphaned_wait(&mut self) {
         let MpFail::Waiting { subflow, .. } = self.hooks.mp_fail else {
             return;
