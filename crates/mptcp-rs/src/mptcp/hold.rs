@@ -187,9 +187,10 @@ impl Hold {
     /// ranges accepted at the TCP level. `frontier` is the subflow's cumulative TCP receive
     /// point: octets below it arrived before. An octet at or past `right_edge` is refused, as
     /// `RecvAssembler::accept` refuses it; one below `recv.next` is kept for the checksum (spec
-    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further,
-    /// and none while a failed or a refused verified mapping is held; with `PIECE_CAP` runs
-    /// held, only runs touching a held one or starting at `frontier`.
+    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further:
+    /// none while a failed mapping is held, and while a refused verified one is, only one
+    /// starting at or before `next` (`recv.next`); with `PIECE_CAP` runs held, only runs
+    /// touching a held one or starting at `frontier`.
     pub fn insert(
         &mut self,
         ssn: u32,
@@ -197,12 +198,16 @@ impl Hold {
         frontier: u32,
         right_edge: u64,
         cap: usize,
+        next: u64,
     ) -> Vec<Range<usize>> {
         self.prune(frontier);
         // While a complete mapping stays held (failed, as MP_FAIL waits, spec G11, or verified
-        // and refused by `deliver`) no mapping is exempt, or the peer could map the same
-        // in-window DSNs at each new frontier (G7).
-        let exempt_ok = self.refused == 0 && !self.entries.iter().any(|e| e.failed);
+        // and refused by `deliver`) the exemption could let the peer map the same in-window
+        // DSNs at each new frontier (G7). A frontier mapping starting at or before `recv.next`
+        // stays exempt past a refused one: its completion is taken, or a duplicate, never
+        // refused by the range cap, so it leaves the hold and cannot pile up; without it, it
+        // could never complete (liveness).
+        let failed = self.entries.iter().any(|e| e.failed);
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -226,7 +231,10 @@ impl Hold {
             let n = rest.min((e.map.len - off) as usize);
             let dsn = e.map.dsn.wrapping_add(u64::from(off));
             let mut k = (right_edge.wrapping_sub(dsn) as i64).clamp(0, n as i64) as usize;
-            if !(exempt_ok && covering(e, frontier)) {
+            let exempt = !failed
+                && covering(e, frontier)
+                && (self.refused == 0 || e.map.dsn.wrapping_sub(next) as i64 <= 0);
+            if !exempt {
                 k = k.min(cap.saturating_sub(self.held));
             }
             let may_split = self.pieces < PIECE_CAP || pos == frontier;
@@ -389,12 +397,15 @@ mod tests {
         let data = pattern(3000);
         let mut h = Hold::default();
         assert!(h.install(map(1, 500, &data, false)));
-        assert_eq!(h.insert(2001, &data[2000..], 1, EDGE, BIG), vec![0..1000]);
-        assert_eq!(h.insert(1, &data[..1000], 1, EDGE, BIG), vec![0..1000]);
+        assert_eq!(
+            h.insert(2001, &data[2000..], 1, EDGE, BIG, 0),
+            vec![0..1000]
+        );
+        assert_eq!(h.insert(1, &data[..1000], 1, EDGE, BIG, 0), vec![0..1000]);
         assert!(take(&mut h).is_empty());
         assert_eq!(h.held(), 2000);
         assert_eq!(
-            h.insert(1001, &data[1000..2000], 1001, EDGE, BIG),
+            h.insert(1001, &data[1000..2000], 1001, EDGE, BIG, 0),
             vec![0..1000]
         );
         let done = take(&mut h);
@@ -417,12 +428,12 @@ mod tests {
         h.install(map(7, 900, &data, false));
         let mut bad = data.clone();
         bad[40] ^= 1;
-        h.insert(7, &bad, 7, EDGE, BIG);
+        h.insert(7, &bad, 7, EDGE, BIG, 0);
         assert_eq!(take(&mut h), [Done::Failed { dsn: 900, ssn: 7 }]);
         // Kept, reported once, and not pruned below the frontier (spec G11, G15).
         assert_eq!(h.held(), 100);
         assert!(take(&mut h).is_empty());
-        h.insert(107, b"", 107, EDGE, BIG);
+        h.insert(107, b"", 107, EDGE, BIG, 0);
         assert_eq!(h.drain(), [(7, bad)]);
         assert_eq!(h.held(), 0);
     }
@@ -437,7 +448,7 @@ mod tests {
             h.install(m);
             let mut sent = data.clone();
             sent[0] ^= u8::from(flip);
-            h.insert(1, &sent, 1, EDGE, BIG);
+            h.insert(1, &sent, 1, EDGE, BIG, 0);
             let want = if flip {
                 Done::Failed { dsn: 10, ssn: 1 }
             } else {
@@ -461,9 +472,9 @@ mod tests {
         for order in [[plain, folded], [folded, plain]] {
             let mut h = Hold::default();
             assert!(h.install(order[0]));
-            h.insert(1, &data[..1436], 1, EDGE, BIG);
+            h.insert(1, &data[..1436], 1, EDGE, BIG, 0);
             assert!(h.install(order[1]));
-            h.insert(1437, &data[1436..], 1437, EDGE, BIG);
+            h.insert(1437, &data[1436..], 1437, EDGE, BIG, 0);
             let want = Done::Verified {
                 dsn: 10,
                 bytes: data.clone(),
@@ -494,12 +505,12 @@ mod tests {
         let mut h = Hold::default();
         h.install(map(1, 1000, &data, false));
         // DSNs [1000, 1050) are inside the edge; [1050, 1100) are not.
-        assert_eq!(h.insert(1, &data, 1, 1050, BIG), vec![0..50]);
+        assert_eq!(h.insert(1, &data, 1, 1050, BIG, 0), vec![0..50]);
         assert_eq!(h.held(), 50);
         // A mapping wholly below `recv.next` (say 5000, edge 6000) is still held in full.
         let mut h = Hold::default();
         h.install(map(1, 1000, &data, false));
-        assert_eq!(h.insert(1, &data[..60], 1, 6000, BIG), vec![0..60]);
+        assert_eq!(h.insert(1, &data[..60], 1, 6000, BIG, 0), vec![0..60]);
         assert_eq!(h.held(), 60);
         assert!(take(&mut h).is_empty());
     }
@@ -510,14 +521,17 @@ mod tests {
         let mut h = Hold::default();
         h.install(map(1, 0, &data, false));
         assert!(h.install(map(1, 0, &data, false)), "an equal repeat");
-        h.insert(1, &data[..400], 1, EDGE, BIG);
-        h.insert(601, &data[600..800], 401, EDGE, BIG);
+        h.insert(1, &data[..400], 1, EDGE, BIG, 0);
+        h.insert(601, &data[600..800], 401, EDGE, BIG, 0);
         // A repeat of held octets, then one overlapping both held runs.
-        assert_eq!(h.insert(601, &data[600..800], 401, EDGE, BIG), vec![0..200]);
+        assert_eq!(
+            h.insert(601, &data[600..800], 401, EDGE, BIG, 0),
+            vec![0..200]
+        );
         assert_eq!(h.held(), 600);
-        h.insert(301, &data[300..700], 401, EDGE, BIG);
+        h.insert(301, &data[300..700], 401, EDGE, BIG, 0);
         assert_eq!(h.held(), 800);
-        h.insert(801, &data[800..], 401, EDGE, BIG);
+        h.insert(801, &data[800..], 401, EDGE, BIG, 0);
         assert_eq!(h.held(), 1000);
         let done = take(&mut h);
         assert_eq!(
@@ -540,19 +554,32 @@ mod tests {
         let (a, b) = (1u32, 1 + 65_535);
         h.install(map(a, 0, &data, false));
         h.install(map(b, 0, &data, false));
-        assert_eq!(h.insert(a, &data[..65_534], a, EDGE, cap), vec![0..65_534]);
+        assert_eq!(
+            h.insert(a, &data[..65_534], a, EDGE, cap, 0),
+            vec![0..65_534]
+        );
         // The frontier is A's last octet: B is not exempt past the cap.
         let mut accepted = 0;
         for chunk in (0..65_535).step_by(1460) {
             let end = (chunk + 1460).min(65_535);
-            let got = h.insert(b + chunk as u32, &data[chunk..end], a + 65_534, EDGE, cap);
+            let got = h.insert(
+                b + chunk as u32,
+                &data[chunk..end],
+                a + 65_534,
+                EDGE,
+                cap,
+                0,
+            );
             accepted += got.iter().map(Range::len).sum::<usize>();
         }
         assert_eq!(accepted, cap - 65_534);
         assert_eq!(h.held(), cap);
         // A's last octet is the frontier mapping's: accepted, and A completes.
         let last = a + 65_534;
-        assert_eq!(h.insert(last, &data[65_534..], last, EDGE, cap), vec![0..1]);
+        assert_eq!(
+            h.insert(last, &data[65_534..], last, EDGE, cap, 0),
+            vec![0..1]
+        );
         assert_eq!(h.held(), cap + 1);
         let done = take(&mut h);
         assert!(matches!(&done[..], [Done::Verified { dsn: 0, bytes, .. }] if *bytes == data));
@@ -574,7 +601,7 @@ mod tests {
         for &s in ssns.iter().rev() {
             for chunk in (0..65_534).step_by(1460) {
                 let end = (chunk + 1460).min(65_534);
-                h.insert(s + chunk as u32, &data[chunk..end], 1, EDGE, cap);
+                h.insert(s + chunk as u32, &data[chunk..end], 1, EDGE, cap, 0);
                 assert!(h.held() <= 4096 + 2 * 65_535, "{}", h.held());
             }
         }
@@ -587,9 +614,9 @@ mod tests {
         let mut h = Hold::default();
         h.install(map(u32::MAX - 99, 0, &data[..200], false));
         h.install(map(101, 200, &data[200..], false));
-        h.insert(101, &data[200..250], 0, EDGE, BIG);
-        h.insert(u32::MAX - 99, &data[..50], u32::MAX - 99, EDGE, BIG);
-        h.insert(u32::MAX - 9, &data[90..120], u32::MAX - 99, EDGE, BIG);
+        h.insert(101, &data[200..250], 0, EDGE, BIG, 0);
+        h.insert(u32::MAX - 99, &data[..50], u32::MAX - 99, EDGE, BIG, 0);
+        h.insert(u32::MAX - 9, &data[90..120], u32::MAX - 99, EDGE, BIG, 0);
         let runs = h.drain();
         assert_eq!(
             runs,
@@ -612,7 +639,7 @@ mod tests {
         // One octet at every other offset from 2: disjoint runs.
         let mut taken = 0;
         for off in (2..400).step_by(2) {
-            let got = h.insert(1 + off as u32, &data[off..off + 1], 1, EDGE, BIG);
+            let got = h.insert(1 + off as u32, &data[off..off + 1], 1, EDGE, BIG, 0);
             taken += got.len();
         }
         assert_eq!(
@@ -620,14 +647,17 @@ mod tests {
             (PIECE_CAP, PIECE_CAP, PIECE_CAP)
         );
         // Past the cap: a new disjoint run is refused; one touching a held run is taken.
-        assert!(h.insert(1 + 500, &data[500..501], 1, EDGE, BIG).is_empty());
-        assert_eq!(h.insert(1 + 3, &data[3..4], 1, EDGE, BIG), vec![0..1]);
+        assert!(
+            h.insert(1 + 500, &data[500..501], 1, EDGE, BIG, 0)
+                .is_empty()
+        );
+        assert_eq!(h.insert(1 + 3, &data[3..4], 1, EDGE, BIG, 0), vec![0..1]);
         assert_eq!(h.pieces, PIECE_CAP - 1, "offsets 2..5 merged");
         // The run at the frontier is exempt.
-        assert_eq!(h.insert(1, &data[..1], 1, EDGE, BIG), vec![0..1]);
+        assert_eq!(h.insert(1, &data[..1], 1, EDGE, BIG, 0), vec![0..1]);
         // Past the cap, a run far ahead is still refused; filling on from the frontier, each
         // run touching the last, completes the mapping.
-        assert!(h.insert(1 + 999, &data[999..], 2, EDGE, BIG).is_empty());
+        assert!(h.insert(1 + 999, &data[999..], 2, EDGE, BIG, 0).is_empty());
         for off in 1..1000 {
             let got = h.insert(
                 1 + off as u32,
@@ -635,6 +665,7 @@ mod tests {
                 1 + off as u32,
                 EDGE,
                 BIG,
+                0,
             );
             assert_eq!(got, vec![0..1]);
         }
@@ -653,10 +684,10 @@ mod tests {
         let mut h = Hold::default();
         // In order: B taken, then its last segment repeated behind the frontier.
         h.install(map(1, 0, &b, false));
-        h.insert(1, &b, 1, EDGE, BIG);
+        h.insert(1, &b, 1, EDGE, BIG, 0);
         assert_eq!(take(&mut h).len(), 1);
         assert!(h.install(map(1, 0, &b, false)));
-        h.insert(151, &b[150..], 201, EDGE, BIG);
+        h.insert(151, &b[150..], 201, EDGE, BIG, 0);
         assert_eq!(h.held(), 0);
         assert!(h.entries.is_empty());
         // Out of order: B (SSN 101) taken above a hole at A (SSN 1), then B's last segment
@@ -664,14 +695,14 @@ mod tests {
         let mut h = Hold::default();
         h.install(map(1, 0, &a, false));
         h.install(map(101, 100, &b, false));
-        h.insert(101, &b, 1, EDGE, BIG);
+        h.insert(101, &b, 1, EDGE, BIG, 0);
         assert_eq!(take(&mut h).len(), 1);
         assert!(h.install(map(101, 100, &b, false)));
-        h.insert(251, &b[150..], 1, EDGE, BIG);
+        h.insert(251, &b[150..], 1, EDGE, BIG, 0);
         assert_eq!(h.held(), 50);
-        h.insert(1, &a, 1, EDGE, BIG);
+        h.insert(1, &a, 1, EDGE, BIG, 0);
         assert_eq!(take(&mut h).len(), 1);
-        h.insert(301, &[], 301, EDGE, BIG);
+        h.insert(301, &[], 301, EDGE, BIG, 0);
         assert_eq!((h.held(), h.pieces), (0, 0));
     }
 }

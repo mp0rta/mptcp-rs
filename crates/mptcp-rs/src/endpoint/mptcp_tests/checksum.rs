@@ -739,10 +739,22 @@ pub(super) fn two_subflows() -> (
     Segment<'static>,
     u64,
 ) {
-    let cfg = ConnectConfig {
+    two_subflows_with(ConnectConfig {
         recv_buffer: 1 << 20,
         ..checksums_cfg(true)
-    };
+    })
+}
+
+/// `two_subflows` with the whole `ConnectConfig`.
+fn two_subflows_with(
+    cfg: ConnectConfig,
+) -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    Segment<'static>,
+    u64,
+) {
     let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
     open_window(&mut ep, &syn, h);
     assert!(negotiation(&ep, h).csum);
@@ -1024,7 +1036,7 @@ fn rx_csum_off_no_hold_accounting() {
         checksum: 0,
     };
     assert!(hold.install(map));
-    hold.insert(1, &[0; 100], 1, 1 << 40, usize::MAX);
+    hold.insert(1, &[0; 100], 1, 1 << 40, usize::MAX, 0);
     assert_eq!(hold.held(), 100);
     c.peer(&[], &[]);
     assert_eq!(recv(&c.ep, c.h).free(), free);
@@ -1282,6 +1294,41 @@ fn refused_verified_ends_frontier_exemption() {
         ssn += data.len() as u32;
     }
     unreachable!("past the cap, octets are refused");
+}
+
+/// As above, but then the frontier mapping X starts at `recv.next`: its completion can never
+/// be refused by the range cap, so it stays exempt from the hold cap and completes, though two
+/// refused verified mappings fill that cap (spec G7, liveness).
+#[test]
+fn frontier_mapping_at_recv_next_stays_exempt() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows_with(ConnectConfig {
+        recv_buffer: 1 << 16,
+        ..checksums_cfg(true)
+    });
+    let now = t(20_000_000);
+    let data = pattern(66_535);
+    for k in 0..64u32 {
+        let i = 10 + 2 * k as usize;
+        let opt = csum_mapping(1 + k, dsn + i as u64, &data[i..i + 1], false);
+        feed(
+            &mut ep,
+            &peer_data(&jsyn, 5001 + k, &opt, &data[i..i + 1]),
+            now,
+        );
+    }
+    // On subflow 0: N and its duplicate N2 (DSN [H+1000, H+66,535)), each refused, then X.
+    let maps = [(1, 1000), (65_536, 1000), (131_071, 0)];
+    for (ssn, at) in maps {
+        let part = &data[at..at + 65_535];
+        let opt = csum_mapping(ssn, dsn + at as u64, part, false);
+        for off in (0..part.len()).step_by(4000) {
+            let end = (off + 4000).min(part.len());
+            let seq = 5000 + ssn + off as u32;
+            feed(&mut ep, &peer_data(&syn, seq, &opt, &part[off..end]), now);
+        }
+    }
+    assert_eq!(held(&ep, h), 0);
+    assert_eq!(read_now(&mut ep, h), data);
 }
 
 // ---------------------------------------------------------------------------------------------
