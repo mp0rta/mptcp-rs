@@ -578,6 +578,17 @@ impl RecvAssembler {
         }
         self.next != before
     }
+    /// Whether `accept` would take `[dsn, dsn + len)` now rather than refuse it for the range
+    /// cap: it starts at or before `next`, touches a stored range, or a range is free (M4b spec
+    /// G7). The first two stay true as `next` moves on.
+    pub fn would_take(&self, dsn: u64, len: u32) -> bool {
+        let lo = dsn.wrapping_sub(self.next) as i64;
+        let hi = lo + i64::from(len);
+        let start = |p: &Piece| p.dsn.wrapping_sub(self.next) as i64;
+        lo <= 0
+            || (self.pieces.iter()).any(|p| start(p) <= hi && lo <= start(p) + p.bytes.len() as i64)
+            || (self.pieces.iter()).filter(|p| start(p) != 0).count() < self.range_cap
+    }
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
         let len = self.fin.map_or(data.len(), |fin| {

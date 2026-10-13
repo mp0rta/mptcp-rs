@@ -1946,7 +1946,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                         tcp_ack,
                         d.recv.right_edge,
                         cap,
-                        d.recv.next,
+                        |dsn, len| d.recv.would_take(dsn, len),
                     );
                     accepted.extend(taken.into_iter().map(|r| at + r.start..at + r.end));
                     at += len;

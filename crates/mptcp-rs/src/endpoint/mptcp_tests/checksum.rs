@@ -1036,7 +1036,7 @@ fn rx_csum_off_no_hold_accounting() {
         checksum: 0,
     };
     assert!(hold.install(map));
-    hold.insert(1, &[0; 100], 1, 1 << 40, usize::MAX, 0);
+    hold.insert(1, &[0; 100], 1, 1 << 40, usize::MAX, |_, _| true);
     assert_eq!(hold.held(), 100);
     c.peer(&[], &[]);
     assert_eq!(recv(&c.ep, c.h).free(), free);
@@ -1333,6 +1333,59 @@ fn frontier_mapping_at_recv_next_stays_exempt() {
         }
     }
     assert_eq!(held(&ep, h), 0);
+    assert_eq!(read_now(&mut ep, h), data);
+}
+
+/// Sends mapping `(ssn, dsn)` of `data` whole on `sf`, in segments of up to 4,000 octets.
+fn send_mapping(ep: &mut Endpoint<ChaCha20Rng>, sf: &Segment, ssn: u32, dsn: u64, data: &[u8]) {
+    let opt = csum_mapping(ssn, dsn, data, false);
+    for off in (0..data.len()).step_by(4000) {
+        let end = (off + 4000).min(data.len());
+        let seq = 5000 + ssn + off as u32;
+        feed(
+            ep,
+            &peer_data(sf, seq, &opt, &data[off..end]),
+            t(20_000_000),
+        );
+    }
+}
+
+/// Codex's three subflows with a redundant sender (RFC 8684 L1369–1381): C takes the 64
+/// assembler ranges and loses H; A and B each hold most of X = [H+1, H+259) and a refused N =
+/// [H+200, H+65,734), so each hold is full. X's last octet is exempt on both, as X touches an
+/// assembler range, so its completion is taken now; X and the retried N go in, and the stream
+/// completes once A resends H (spec G7, liveness).
+#[test]
+fn frontier_mapping_touching_a_range_stays_exempt() {
+    let (mut ep, h, a, b, dsn) = two_subflows_with(ConnectConfig {
+        recv_buffer: 256,
+        ..checksums_cfg(true)
+    });
+    let (_, c) = joined(&mut ep, h, t(15_000_000), "10.0.2.1", 1500, 7);
+    let data = pattern(65_734);
+    for k in 0..64u32 {
+        let i = 10 + 2 * k as usize;
+        send_mapping(&mut ep, &c, 1 + k, dsn + i as u64, &data[i..i + 1]);
+    }
+    for sf in [&a, &b] {
+        let opt = csum_mapping(1, dsn + 1, &data[1..259], false);
+        feed(
+            &mut ep,
+            &peer_data(sf, 5001, &opt, &data[1..258]),
+            t(20_000_000),
+        );
+        send_mapping(&mut ep, sf, 259, dsn + 200, &data[200..]);
+    }
+    assert_eq!(held(&ep, h), 2 * 65_791, "both holds full");
+    for sf in [&a, &b] {
+        feed(
+            &mut ep,
+            &peer_data(sf, 5258, &[], &data[258..259]),
+            t(20_000_000),
+        );
+    }
+    assert_eq!(held(&ep, h), 0);
+    send_mapping(&mut ep, &a, 65_793, dsn, &data[..1]);
     assert_eq!(read_now(&mut ep, h), data);
 }
 
