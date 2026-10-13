@@ -9,7 +9,7 @@ pub(crate) mod sched;
 pub(crate) mod signal;
 mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
-use data::{RecvAssembler, SendStore, TxMaps, promote32};
+use data::{Outcome, RecvAssembler, SendStore, TxMaps, promote32};
 use hold::{Complete, HoldMap};
 pub(crate) use join::{Join, JoinRole};
 pub(crate) use opp::Cand;
@@ -176,6 +176,9 @@ pub(crate) struct DataState {
     /// Fallback happened in the current input and `Connection::on_fallback` has not run yet:
     /// no release until it has checked the other subflows' data.
     settling: bool,
+    /// The end of the verified octets the range cap dropped, as without checksums (not
+    /// DATA_ACKed; M4b spec G7): while above `recv.next`, a fallback would leave a hole.
+    dropped_end: Option<u64>,
 }
 
 impl ConnectionHooks {
@@ -1234,8 +1237,7 @@ impl SendBuf for SubflowHooks<'_> {
                             }
                             Some(false) => {
                                 let m = self.conn.negotiation.as_mut().unwrap();
-                                d.fall_back(self.sf, m, false);
-                                self.conn.fallback_event = true;
+                                self.conn.fallback_event |= d.fall_back(self.sf, m, false);
                             }
                             None => {}
                         }
@@ -1607,6 +1609,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 reinject: ReinjectQueue::new(m.local_idsn.wrapping_add(1)),
                 fallback: false,
                 settling: false,
+                dropped_end: None,
             });
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
             // Our ISS: the SYN/ACK's ACK (initiator) or the final ACK's (listener) is ISS + 1.
@@ -1641,9 +1644,7 @@ impl SegmentHooks for SubflowHooks<'_> {
             // While `Waiting` it answers ours (the echo, or the peer's own report crossing
             // ours); otherwise we echo it (RFC 8684 L2414–2418). Either way we fall back at
             // once, the held octets replayed (spec G13, G15); the echo rides our segments.
-            if !matches!(self.conn.mp_fail, MpFail::Waiting { .. }) {
-                self.conn.mp_fail_step = Some(MpFailStep::Echo);
-            }
+            let echo = !matches!(self.conn.mp_fail, MpFail::Waiting { .. });
             // An infinite mapping on the same segment keeps its own anchor, as below.
             let infinite = (dss.filter(|v| !v.data_fin))
                 .and_then(|v| v.mapping)
@@ -1655,8 +1656,12 @@ impl SegmentHooks for SubflowHooks<'_> {
                 };
                 self.sf.rx_infinite = Some((mp.ssn, dsn));
             }
-            d.fall_back(self.sf, m, self.conn.joined_ever);
-            self.conn.fallback_event = true;
+            if d.fall_back(self.sf, m, self.conn.joined_ever) {
+                self.conn.fallback_event = true;
+                if echo {
+                    self.conn.mp_fail_step = Some(MpFailStep::Echo);
+                }
+            }
             return;
         }
         // MP_PRIO: the peer's preference for the subflow it arrived on (M3 spec §3.3).
@@ -1732,8 +1737,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 if mapping.data_len == 0 {
                     // A received infinite mapping keeps its own anchor (`fall_back` keeps it).
                     self.sf.rx_infinite = Some((mapping.ssn, dsn));
-                    d.fall_back(self.sf, m, self.conn.joined_ever);
-                    self.conn.fallback_event = true;
+                    self.conn.fallback_event |= d.fall_back(self.sf, m, self.conn.joined_ever);
                     return;
                 }
                 let len = u32::from(mapping.data_len).saturating_sub(u32::from(v.data_fin));
@@ -1821,8 +1825,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 self.sf.reset_option = Some(tcprst(0x06, false).to_vec());
                 return;
             }
-            d.fall_back(self.sf, m, false);
-            self.conn.fallback_event = true;
+            self.conn.fallback_event |= d.fall_back(self.sf, m, false);
         }
     }
 
@@ -1913,7 +1916,6 @@ impl SegmentHooks for SubflowHooks<'_> {
                         tcp_ack,
                         d.recv.right_edge,
                         cap,
-                        |dsn, len| d.recv.would_take(dsn, len),
                     );
                     accepted.extend(taken.into_iter().map(|r| at + r.start..at + r.end));
                     at += len;
@@ -1940,17 +1942,25 @@ impl SegmentHooks for SubflowHooks<'_> {
                 at += len;
             }
         }
-        // A verified mapping always enters the assembler, which clips what another subflow
-        // already delivered (spec G7). Admission made sure it would be taken; if another
-        // subflow's completion took the free range since, it is stored past the range cap, as
-        // `replay` stores, for its octets are TCP-ACKed. Such extra ranges are at most the
-        // mappings held: `ENTRY_CAP` per subflow, `SUBFLOW_CAP` subflows.
+        // A verified mapping takes the receive path octets take without checksums, which clips
+        // what another subflow already delivered (spec G7). What its range cap refuses is
+        // dropped, as there: not DATA_ACKed, the peer's reinjection or a redundant copy brings
+        // it again. No MP_FAIL wait follows, and no fallback while it is missing (`fall_back`).
+        let mut dropped = None;
         let complete = if hold {
             let recv = &mut d.recv;
-            (self.sf.hold).take_complete(|dsn, bytes| recv.replay(dsn, bytes))
+            (self.sf.hold).take_complete(|dsn, bytes| {
+                if recv.accept(dsn, bytes).0 == Outcome::Discarded {
+                    dropped = later(dropped, dsn.wrapping_add(bytes.len() as u64));
+                }
+            })
         } else {
             Vec::new()
         };
+        if let Some(end) = dropped {
+            d.dropped_end = later(d.dropped_end, end);
+            self.sf.other_offset = true;
+        }
         for done in complete {
             match done {
                 Complete::Verified { dsn, len, data_fin } => {
@@ -2018,7 +2028,16 @@ impl DataState {
     /// `assigned_end`, `send.next)`: later data follows it linearly, and `sf`'s earlier finite
     /// mappings keep covering its earlier SSNs (RFC 8684 L1496–1500). Anchors sit at the
     /// current position, as translation takes SSN distances as `i32` (M4b spec G10a).
-    fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation, joined_ever: bool) {
+    ///
+    /// Unless verified octets above `recv.next` were dropped (`dropped_end`): plain TCP would
+    /// never bring them again, so `sf` is reset instead (MP_TCPRST 0x01, M4b spec G7, G15).
+    /// Returns whether it fell back.
+    fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation, joined_ever: bool) -> bool {
+        if (self.dropped_end).is_some_and(|e| e.wrapping_sub(self.recv.next) as i64 > 0) {
+            sf.reset = true;
+            sf.reset_option = Some(tcprst(0x01, false).to_vec());
+            return false;
+        }
         self.fallback = true;
         self.settling = true;
         self.close = close::Close::default();
@@ -2053,6 +2072,7 @@ impl DataState {
         };
         sf.final_mapping = Some(mapping);
         sf.infinite = Some((mapping, sf.tx.assigned_end()));
+        true
     }
 }
 
@@ -2385,6 +2405,7 @@ mod tests {
             reinject: ReinjectQueue::new(local_una),
             fallback: false,
             settling: false,
+            dropped_end: None,
         };
         let mut sf = SubflowMp::new();
         d.fall_back(&mut sf, &mut m, false);

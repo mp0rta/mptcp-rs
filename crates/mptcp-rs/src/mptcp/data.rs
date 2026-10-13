@@ -578,17 +578,6 @@ impl RecvAssembler {
         }
         self.next != before
     }
-    /// Whether `accept` would take `[dsn, dsn + len)` now rather than refuse it for the range
-    /// cap: it starts at or before `next`, touches a stored range, or a range is free (M4b spec
-    /// G7). The first two stay true as `next` moves on.
-    pub fn would_take(&self, dsn: u64, len: u32) -> bool {
-        let lo = dsn.wrapping_sub(self.next) as i64;
-        let hi = lo.saturating_add(i64::from(len));
-        let start = |p: &Piece| p.dsn.wrapping_sub(self.next) as i64;
-        lo <= 0
-            || (self.pieces.iter()).any(|p| start(p) <= hi && lo <= start(p) + p.bytes.len() as i64)
-            || (self.pieces.iter()).filter(|p| start(p) != 0).count() < self.range_cap
-    }
     /// Returns the outcome and TCP-acknowledgeable prefix, including a duplicate prefix.
     pub fn accept(&mut self, dsn: u64, data: &[u8]) -> (Outcome, usize) {
         let len = self.fin.map_or(data.len(), |fin| {
@@ -598,11 +587,10 @@ impl RecvAssembler {
         self.advance_fin();
         result
     }
-    /// Stores octets that are TCP-ACKed and never resent: held octets on fallback and verified
-    /// mappings (M4b spec G7, G15), so neither the range cap nor the offered edge may refuse
-    /// them. The hold cap bounded them (`recv_buffer + 65,535` per subflow), and reads deliver
-    /// them as they make room. Only octets past a DATA_FIN are dropped: they belong to no
-    /// stream.
+    /// Stores held octets on fallback (M4b spec G15): they are TCP-ACKed and never resent, so
+    /// neither the range cap nor the offered edge may refuse them. The hold cap bounded them
+    /// (`recv_buffer + 65,535` per subflow), and reads deliver them as they make room. Only
+    /// octets past a DATA_FIN are dropped: they belong to no stream.
     pub fn replay(&mut self, dsn: u64, data: &[u8]) {
         let (range_cap, edge) = (self.range_cap, self.right_edge);
         self.range_cap = usize::MAX;
