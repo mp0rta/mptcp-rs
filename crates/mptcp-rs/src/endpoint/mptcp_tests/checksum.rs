@@ -1007,6 +1007,29 @@ fn rx_csum_off_delivers_per_segment() {
     assert_eq!(read_now(&mut c.ep, c.h), &data[1460..]);
 }
 
+/// Checksums off on both ends: input never sums the hold buffers (spec G9, A1). Octets planted
+/// in one by hand stay out of `free`.
+#[test]
+fn rx_csum_off_no_hold_accounting() {
+    use crate::mptcp::hold::HoldMap;
+    let mut c = client(false, false);
+    c.confirm();
+    let free = recv(&c.ep, c.h).free();
+    let hold = &mut c.ep.conns.get_mut(&c.h).unwrap().subflows[0].mp.hold;
+    let map = HoldMap {
+        ssn: 1,
+        dsn: 0,
+        len: 100,
+        data_fin: false,
+        checksum: 0,
+    };
+    assert!(hold.install(map));
+    hold.insert(1, &[0; 100], 1, 1 << 40, usize::MAX);
+    assert_eq!(hold.held(), 100);
+    c.peer(&[], &[]);
+    assert_eq!(recv(&c.ep, c.h).free(), free);
+}
+
 /// Each in-order octet arrives unmapped with a DSS mapping of the octet before it: the stale
 /// mappings are pruned as the receipt passes them, so their metadata stays bounded (spec G7).
 #[test]
