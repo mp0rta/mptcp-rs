@@ -46,9 +46,11 @@ fn mptcp_net(cc: CongestionControlKind) -> (Net<ChaCha20Rng>, ConnectionHandle) 
     let mut n = idle_net();
     let mut l = ListenConfig::default();
     l.connection.congestion_control = cc;
+    l.connection.checksums = false; // these tests read the A=0 layout
     n.b.listen(sa(2, 80), l).unwrap();
     let mut cfg = ConnectConfig::default();
     cfg.congestion_control = cc;
+    cfg.checksums = false;
     let h = (n.a).connect_mptcp(n.now, sa(1, 0).ip(), sa(2, 80), cfg);
     (n, h.unwrap())
 }

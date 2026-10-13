@@ -24,13 +24,13 @@ Status: the latest release, 0.2.0, is client only. The server role is on main an
 - Server role (on main, unreleased): `Endpoint::listen` and `unlisten`, passive MP_CAPABLE, and
   MP_JOIN from clients. Each accepted connection is one `Event::Accepted`.
 
-Not yet supported (planned): MPTCP checksums, MP_FAIL, and sending 32-bit DSNs. The client does
-not ask for checksums, and falls back to plain TCP if the server requires them.
+DSS checksums are on by default (A=1, `ConnectConfig::checksums`) in both roles, with MP_FAIL.
+A peer that requires them is honoured even when ours is off. Not yet supported (planned):
+sending 32-bit DSNs.
 
-Server limits: the server sends no ADD_ADDR; a client that requires checksums gets plain TCP;
-there are no SYN cookies, so SYNs beyond the `max_half_open` cap are dropped; and the timer and
-transmit paths scan every connection of the endpoint, so they are not meant for very many
-connections yet.
+Server limits: the server sends no ADD_ADDR; there are no SYN cookies, so SYNs beyond the
+`max_half_open` cap are dropped; and the timer and transmit paths scan every connection of
+the endpoint, so they are not meant for very many connections yet.
 
 ## Interoperability
 
@@ -56,7 +56,7 @@ transfer in one direction, and both clients open the first subflow on A and join
 
 ![Goodput of mptcp-rs and the Linux kernel MPTCP client over two netem paths](docs/images/kernel-compare.svg)
 
-Paths A (10 ms one-way, 300 Mbit/s) and B (30 ms, 80 Mbit/s) are netem on veth on one host; CUBIC, median of 5 runs, one segment per packet at netem; the dashed line is each client's ceiling after header overhead.
+Paths A (10 ms one-way, 300 Mbit/s) and B (30 ms, 80 Mbit/s) are netem on veth on one host; CUBIC, median of 5 runs, one segment per packet at netem; the dashed line is each client's ceiling after header overhead. Measured with checksums off (A=0).
 
 Without netem the CPU is the limit, and the kernel is far ahead (same paths A+B, offloads at their defaults, median of 5 runs):
 
@@ -138,7 +138,7 @@ Each run saves pcaps and logs under `artifacts/interop/`.
 
 ## Roadmap
 
-Next: checksums and MP_FAIL; the server role is released with them. TCP work continues
+Next: the server role is released with checksums and MP_FAIL. TCP work continues
 alongside: RACK-TLP and timestamps. Async runtime integration, `no_std` and coupled
 congestion control are not planned yet.
 

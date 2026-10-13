@@ -10,7 +10,7 @@ fn open(ep: &mut Endpoint<ChaCha20Rng>) -> ConnectionHandle {
         Instant::from_nanos(0),
         "10.0.0.1".parse().unwrap(),
         "10.0.0.2:80".parse().unwrap(),
-        ConnectConfig::default(),
+        checksums_cfg(false),
     )
     .unwrap()
 }
@@ -664,7 +664,7 @@ fn connected_with_capacity_cc(
             "10.0.0.2:80".parse().unwrap(),
             ConnectConfig {
                 recv_buffer: cap,
-                ..ConnectConfig::default()
+                ..checksums_cfg(false)
             },
         )
         .unwrap();
@@ -2644,7 +2644,7 @@ fn connected_between(
 ) -> Connected {
     let cfg = ConnectConfig {
         recv_buffer: cap,
-        ..ConnectConfig::default()
+        ..checksums_cfg(false)
     };
     connected_cfg(local, remote, cfg, cc, sack)
 }
@@ -3613,7 +3613,7 @@ fn app_limited_marked_before_write() {
             Instant::from_nanos(0),
             "10.0.0.1".parse().unwrap(),
             "10.0.0.2:80".parse().unwrap(),
-            ConnectConfig::default(),
+            checksums_cfg(false),
         )
         .unwrap();
     let bytes = transmit(&mut ep, Instant::from_nanos(0));
@@ -3749,6 +3749,7 @@ mod server_capable;
 
 /// DSS checksums: negotiation, sent mappings, presence check (M4b Task 2).
 mod checksum;
+use checksum::checksums_cfg;
 
 /// MP_FAIL: the reset carrying it, `infinite_ok`, ignored MP_FAILs (M4b Task 5).
 mod mp_fail;

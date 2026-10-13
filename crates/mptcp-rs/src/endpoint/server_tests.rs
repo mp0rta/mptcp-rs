@@ -35,7 +35,10 @@ fn half_open_hidden_until_established() {
         now,
         "10.0.0.1".parse().unwrap(),
         remote,
-        ConnectConfig::default(),
+        ConnectConfig {
+            checksums: false,
+            ..ConnectConfig::default()
+        },
     )
     .unwrap();
     assert_eq!(shuttle(&mut a, &mut b, now), 1, "the SYN");
@@ -59,12 +62,23 @@ fn half_open_hidden_until_established() {
     assert_eq!(b.listeners[&key].half_open, 0);
 }
 
+/// The A=0 wire layout: these tests script the peer without a checksum.
+fn no_checksums() -> ConnectConfig {
+    ConnectConfig {
+        checksums: false,
+        ..ConnectConfig::default()
+    }
+}
+
 fn open_mptcp(ep: &mut Endpoint<ChaCha20Rng>, now: Instant) -> ConnectionHandle {
     ep.connect_mptcp(
         now,
         "10.0.0.1".parse().unwrap(),
         "10.0.0.2:80".parse().unwrap(),
-        ConnectConfig::default(),
+        ConnectConfig {
+            checksums: false,
+            ..ConnectConfig::default()
+        },
     )
     .unwrap()
 }
@@ -199,6 +213,7 @@ impl Script {
         let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(9));
         let cfg = ListenConfig {
             mptcp,
+            connection: no_checksums(),
             ..Default::default()
         };
         ep.listen(SERVER.parse().unwrap(), cfg).unwrap();
@@ -296,8 +311,14 @@ impl Script {
 #[test]
 fn token_collision_server_server() {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
-    ep.listen(SERVER.parse().unwrap(), ListenConfig::default())
-        .unwrap();
+    ep.listen(
+        SERVER.parse().unwrap(),
+        ListenConfig {
+            connection: no_checksums(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     ep.keys.extend([7, 7, 8]);
     for port in [40000, 40001] {
         let seg = Segment {
@@ -332,15 +353,24 @@ fn token_collision_server_server() {
 fn token_collision_client_server() {
     let now = Instant::from_nanos(0);
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
-    ep.listen(SERVER.parse().unwrap(), ListenConfig::default())
-        .unwrap();
+    ep.listen(
+        SERVER.parse().unwrap(),
+        ListenConfig {
+            connection: no_checksums(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     ep.keys.extend([7, 7, 8]);
     let client = ep
         .connect_mptcp(
             now,
             "10.0.0.2".parse().unwrap(),
             "10.0.0.3:80".parse().unwrap(),
-            ConnectConfig::default(),
+            ConnectConfig {
+                checksums: false,
+                ..ConnectConfig::default()
+            },
         )
         .unwrap();
     let seg = Segment {
@@ -391,6 +421,7 @@ fn half_open_failed_final_ack_freed() {
     let now = Instant::from_nanos(0);
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
     let cfg = ListenConfig {
+        connection: no_checksums(),
         max_half_open: 1,
         ..Default::default()
     };

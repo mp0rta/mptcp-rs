@@ -541,7 +541,7 @@ fn add_subflow_errors() {
             ms(0),
             ip("10.0.0.1"),
             "10.0.0.2:80".parse().unwrap(),
-            ConnectConfig::default(),
+            checksums_cfg(false),
         )
         .unwrap();
     assert_eq!(
@@ -4685,7 +4685,7 @@ fn bbr_connected() -> Connected {
     let cfg = ConnectConfig {
         recv_buffer: 1 << 20,
         congestion_control: crate::tcp::CongestionControlKind::BbrV3,
-        ..ConnectConfig::default()
+        ..checksums_cfg(false)
     };
     let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
     open_window(&mut ep, &syn, h);

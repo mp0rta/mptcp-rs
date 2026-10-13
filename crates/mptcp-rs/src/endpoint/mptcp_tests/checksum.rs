@@ -1089,3 +1089,35 @@ fn replay_past_range_cap_after_join() {
         "the 5 replayed octets are stored"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The default (M4b G1, G23).
+
+/// `ConnectConfig::default()` requires checksums, and the client's SYN says so.
+#[test]
+fn default_requires_checksums_client() {
+    assert!(ConnectConfig::default().checksums);
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
+    ep.connect_mptcp(
+        t(0),
+        "10.0.0.1".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        ConnectConfig::default(),
+    )
+    .unwrap();
+    let syn = packet::parse(transmit(&mut ep, t(0)).leak()).unwrap();
+    assert_eq!(mpc(syn.options)[0][3], CAP_H | CAP_A);
+}
+
+/// A listener on the default config answers an A=0 SYN with A=1 (RFC 8684 L958–967).
+#[test]
+fn default_requires_checksums_server() {
+    assert!(ListenConfig::default().connection.checksums);
+    let mut s = Script::new(true);
+    s.ep.listeners
+        .get_mut(&SERVER.parse().unwrap())
+        .unwrap()
+        .cfg = ListenConfig::default();
+    let synack = s.syn(&syn_cap(1, CAP_H));
+    assert_eq!(mptcp_of(&synack)[0][3], CAP_H | CAP_A);
+}
