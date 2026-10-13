@@ -910,6 +910,7 @@ impl SubflowHooks<'_> {
     }
     /// Installs a validated plan's mapping; DATA_FIN rides on the final data mapping.
     fn install(&mut self, payload: Payload) -> bool {
+        let csum = self.conn.negotiation.as_ref().unwrap().csum;
         let d = self.conn.data.as_mut().unwrap();
         let (dsn, len) = match payload {
             Payload::Reinject { dsn, len } | Payload::Opportunistic { dsn, len } => (dsn, len),
@@ -918,7 +919,7 @@ impl SubflowHooks<'_> {
         match payload {
             Payload::Reinject { dsn, len } | Payload::Opportunistic { dsn, len } => {
                 let len = len as usize;
-                if !d.send.assign(&mut self.sf.tx, dsn, len) {
+                if !d.send.assign(&mut self.sf.tx, dsn, len, csum) {
                     return false;
                 }
                 d.reinject.remove(dsn, len as u64);
@@ -929,7 +930,7 @@ impl SubflowHooks<'_> {
             }
             Payload::New { bytes } => {
                 let len = bytes as usize;
-                if !d.send.assign(&mut self.sf.tx, d.send.next, len) {
+                if !d.send.assign(&mut self.sf.tx, d.send.next, len, csum) {
                     return false;
                 }
                 if d.close.local == Some(d.send.next)
@@ -1088,11 +1089,12 @@ impl SegmentHooks for SubflowHooks<'_> {
         let option = if m.state == State::PreConfirmed && mapping.ssn == 1 {
             MptcpOption::Capable(MpCapable {
                 version: 1,
-                flags: CAP_H,
+                flags: m.flags(),
                 sender_key: Some(m.local_key),
                 receiver_key: m.peer_key,
                 data_len: Some(mapping.data_len),
-                checksum: None,
+                // The first mapping's stored checksum (spec G5).
+                checksum: mapping.checksum,
             })
         } else {
             // After fallback, data below the infinite mapping keeps its finite mapping, which
@@ -1163,11 +1165,14 @@ impl SegmentHooks for SubflowHooks<'_> {
                     &MptcpOption::Dss(mptcp::Dss {
                         data_fin: true,
                         data_ack: Some(mptcp::DataAck::Ack64(d.recv.next)),
+                        // The checksum covers the pseudo-header only (RFC 8684 L1584–1589).
                         mapping: Some(mptcp::Mapping {
                             dsn: mptcp::Dsn::Dsn64(d.close.local.unwrap()),
                             ssn: 0,
                             data_len: 1,
-                            checksum: None,
+                            checksum: m
+                                .csum
+                                .then(|| mptcp::dss_checksum(d.close.local.unwrap(), 0, 1, &[])),
                         }),
                     }),
                     out,
@@ -1377,8 +1382,8 @@ impl SegmentHooks for SubflowHooks<'_> {
         // sends none after the SYN/ACK).
         if let Some((c, raw_len)) = capable {
             let payload = !seg.payload.is_empty();
-            let valid =
-                capable_ack_ok(&c, raw_len, payload, m.local_key) && c.sender_key == m.peer_key;
+            let valid = capable_ack_ok(&c, raw_len, payload, m.local_key, m.csum)
+                && c.sender_key == m.peer_key;
             if !valid && (c.data_len.is_some() || m.passive) {
                 self.sf.reset = true;
                 return;
@@ -1397,6 +1402,13 @@ impl SegmentHooks for SubflowHooks<'_> {
         if let Some(v) = dss {
             m.peer_dss_seen = true;
             if let Some(mapping) = v.mapping {
+                // Every mapping carries a checksum exactly when checksums are used, or the
+                // subflow is reset with MP_TCPRST 0x01 (RFC 8684 L1331–1342, spec G3).
+                if mapping.checksum.is_some() != m.csum {
+                    self.sf.reset = true;
+                    self.sf.reset_option = Some(tcprst(0x01, false));
+                    return;
+                }
                 let dsn = match mapping.dsn {
                     mptcp::Dsn::Dsn32(x) => promote32(x, d.recv.next),
                     mptcp::Dsn::Dsn64(x) => x,
@@ -1613,7 +1625,8 @@ impl DataState {
             dsn: mptcp::Dsn::Dsn64(dsn),
             ssn,
             data_len: 0,
-            checksum: None,
+            // Checksum 0, the field present when checksums are used (RFC 8684 L1496–1500).
+            checksum: m.csum.then_some(0),
         };
         sf.final_mapping = Some(mapping);
         sf.infinite = Some((mapping, sf.tx.assigned_end()));
@@ -1637,15 +1650,17 @@ pub(crate) enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SynCapable {
     Plain,
-    /// `peer_c`: the client set C=1 (RFC 8684 L924–932).
+    /// `peer_c`: the client set C=1 (RFC 8684 L924–932); `peer_a`: it requires DSS checksums
+    /// (L958–967).
     V1 {
         peer_c: bool,
+        peer_a: bool,
     },
 }
 
 /// Exactly one MP_CAPABLE, of length 4, version 1 or higher (we answer with 1, RFC 8684
-/// L716–722), A=0 (no checksums until M4b, L958–970), B=0 (L906–922) and H=1, whatever D–G
-/// say: only HMAC-SHA256 is supported (L942–944, L972–982). Anything else is plain TCP.
+/// L716–722), B=0 (L906–922) and H=1, whatever D–G say: only HMAC-SHA256 is supported
+/// (L942–944, L972–982). A is free (L958–967). Anything else is plain TCP.
 pub(crate) fn syn_capable(seg: &Segment<'_>) -> SynCapable {
     let mut found = None;
     for opt in walk(seg.options) {
@@ -1663,10 +1678,11 @@ pub(crate) fn syn_capable(seg: &Segment<'_>) -> SynCapable {
     };
     match mptcp::parse(raw) {
         Ok(MptcpOption::Capable(c))
-            if c.version >= 1 && c.flags & (CAP_A | CAP_B) == 0 && c.flags & CAP_H != 0 =>
+            if c.version >= 1 && c.flags & CAP_B == 0 && c.flags & CAP_H != 0 =>
         {
             SynCapable::V1 {
                 peer_c: c.flags & CAP_C != 0,
+                peer_a: c.flags & CAP_A != 0,
             }
         }
         _ => SynCapable::Plain,
@@ -1686,22 +1702,26 @@ pub(crate) fn syn_scale(seg: &Segment<'_>) -> u8 {
 }
 
 /// The one acceptance test for an MP_CAPABLE after our SYN/ACK, of `raw_len` octets on a
-/// segment with or without payload: version 1, flags exactly H with C free (C=1 is allowed,
-/// L924–932), the sender's key, our key echoed, and the length for the form: 20 without data,
-/// 22 with a Data-Level Length and data (L751–758; 24 means checksums, not supported).
+/// segment with or without payload: version 1, flags exactly H, and A = `csum` (the decision,
+/// L958–967), with C free (C=1 is allowed, L924–932), the sender's key, our key echoed, and the
+/// length for the form: 20 without data; with a Data-Level Length and data, 22, or 24 (the
+/// checksum present) when `csum` (L751–758).
 pub(crate) fn capable_ack_ok(
     c: &MpCapable,
     raw_len: usize,
     has_payload: bool,
     local_key: u64,
+    csum: bool,
 ) -> bool {
+    let a = if csum { CAP_A } else { 0 };
     c.version == 1
-        && c.flags & !CAP_C == CAP_H
+        && c.flags & !CAP_C == CAP_H | a
         && c.sender_key.is_some()
         && c.receiver_key == Some(local_key)
         && match raw_len {
             20 => !has_payload,
-            22 => c.data_len.is_some() && has_payload,
+            22 => c.data_len.is_some() && has_payload && !csum,
+            24 => c.checksum.is_some() && has_payload && csum,
             _ => false,
         }
 }
@@ -1723,12 +1743,15 @@ pub(crate) struct Negotiation {
     pub peer_dss_seen: bool,
     /// The listener's negotiation (`new_passive`).
     pub passive: bool,
+    /// DSS checksums are used: we or the peer require them (RFC 8684 L958–967). Final once
+    /// the handshake confirms.
+    pub csum: bool,
     syns_sent: u8,
     connected_pending: bool,
 }
 
 impl Negotiation {
-    pub fn new(local_key: u64) -> Self {
+    pub fn new(local_key: u64, checksums: bool) -> Self {
         let (token, local_idsn) = key_token_idsn(local_key);
         Self {
             state: State::SynSent,
@@ -1739,6 +1762,7 @@ impl Negotiation {
             send_right_edge: None,
             peer_dss_seen: false,
             passive: false,
+            csum: checksums,
             peer_idsn: None,
             peer_key: None,
             syns_sent: 0,
@@ -1747,11 +1771,11 @@ impl Negotiation {
     }
 
     /// A listener's negotiation, created with the SYN: `AwaitingKey`.
-    pub fn new_passive(local_key: u64) -> Self {
+    pub fn new_passive(local_key: u64, checksums: bool) -> Self {
         Self {
             state: State::AwaitingKey,
             passive: true,
-            ..Self::new(local_key)
+            ..Self::new(local_key, checksums)
         }
     }
 
@@ -1768,8 +1792,9 @@ impl Negotiation {
         peer_scale: u8,
     ) -> bool {
         let has_payload = !seg.payload.is_empty();
-        let ok =
-            |(c, len): &(MpCapable, usize)| capable_ack_ok(c, *len, has_payload, self.local_key);
+        let ok = |(c, len): &(MpCapable, usize)| {
+            capable_ack_ok(c, *len, has_payload, self.local_key, self.csum)
+        };
         let Some(key) = capable.filter(ok).and_then(|(c, _)| c.sender_key) else {
             self.state = State::FellBack;
             return false;
@@ -1826,11 +1851,13 @@ impl Negotiation {
                     Ok(MptcpOption::Capable(c))
                         if raw.len() == 12
                             && c.version == 1
-                            && c.flags & !CAP_C == CAP_H
+                            && c.flags & !(CAP_C | CAP_A) == CAP_H
                             && peer_key.is_none() =>
                     {
                         peer_key = c.sender_key;
                         self.peer_c = c.flags & CAP_C != 0;
+                        // A server that requires checksums is honoured (RFC 8684 L958–967).
+                        self.csum |= c.flags & CAP_A != 0;
                     }
                     _ => {
                         peer_key = None;
@@ -1861,8 +1888,8 @@ impl Negotiation {
             State::PreConfirmed if flags.contains(TcpFlags::ACK) => {
                 (Some(self.local_key), self.peer_key)
             }
-            // The SYN/ACK, also each repeat of it: our key, flags exactly H (RFC 8684 L753,
-            // L972–982), our C=0.
+            // The SYN/ACK, also each repeat of it: our key, flags H and A = `csum` (RFC 8684
+            // L753, L958–982), our C=0.
             State::AwaitingKey if flags.contains(TcpFlags::SYN) => (Some(self.local_key), None),
             State::Confirmed if flags.contains(TcpFlags::ACK) => {
                 return mptcp::encode(
@@ -1882,7 +1909,7 @@ impl Negotiation {
         mptcp::encode(
             &MptcpOption::Capable(MpCapable {
                 version: 1,
-                flags: CAP_H,
+                flags: self.flags(),
                 sender_key: keys.0,
                 receiver_key: keys.1,
                 data_len: None,
@@ -1891,6 +1918,11 @@ impl Negotiation {
             out,
         )
         .expect("MP_CAPABLE has a fixed layout fitting TCP options")
+    }
+
+    /// Our MP_CAPABLE flags: H, and A while we use checksums (RFC 8684 L958–967).
+    pub fn flags(&self) -> u8 {
+        if self.csum { CAP_H | CAP_A } else { CAP_H }
     }
 
     pub fn on_transmitted(&mut self, flags: TcpFlags) -> Option<bool> {

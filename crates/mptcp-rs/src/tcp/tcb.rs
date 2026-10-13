@@ -60,6 +60,9 @@ pub struct ConnectConfig {
     pub r2_syn: Duration,
     /// The congestion controller of every subflow of the connection.
     pub congestion_control: CongestionControlKind,
+    /// Require DSS checksums (A=1). A peer that requires them is honoured either way. Plain
+    /// TCP ignores it.
+    pub checksums: bool,
 }
 
 /// A congestion controller to run (`ConnectConfig::congestion_control`). MPTCP subflows are
@@ -90,6 +93,7 @@ impl Default for ConnectConfig {
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),
             congestion_control: CongestionControlKind::Cubic,
+            checksums: false,
         }
     }
 }

@@ -65,8 +65,9 @@ fn server_syn_listener_without_mptcp_plain() {
     fell_back(&mut s, &out, &[]);
 }
 
-/// More than one MP_CAPABLE, length ≠ 4, version 0, A=1, B=1 or H=0 whatever D–G say:
-/// plain TCP, no MP_CAPABLE in the SYN/ACK (RFC 8684 L942–944, L958–970, L972–982).
+/// More than one MP_CAPABLE, length ≠ 4, version 0, B=1 or H=0 whatever D–G say: plain TCP,
+/// no MP_CAPABLE in the SYN/ACK (RFC 8684 L906–922, L942–944, L972–982). A=1 is answered
+/// (`checksum::server_csum_from_syn_a`).
 #[test]
 fn server_syn_invalid_capable_plain() {
     let good = syn_cap(1, CAP_H);
@@ -76,7 +77,6 @@ fn server_syn_invalid_capable_plain() {
         cap(1, CAP_H, Some(CLIENT_KEY), None, None),
         vec![30, 5, 0x01, CAP_H, 0],
         syn_cap(0, CAP_H),
-        syn_cap(1, CAP_A | CAP_H),
         syn_cap(1, CAP_B | CAP_H),
         syn_cap(1, 0),
         syn_cap(1, CAP_C),
@@ -199,7 +199,7 @@ fn server_final_ack_c1_accepted() {
 }
 
 /// Every way `capable_ack_ok` fails, each on its own, on both forms: fall back (RFC 8684
-/// L877–883, L958–970).
+/// L877–883, L958–970). Without checksums, A=1 and length 24 mismatch the decision.
 #[test]
 fn server_final_ack_invalid_capable_falls_back() {
     let keys = (Some(CLIENT_KEY), Some(SERVER_KEY));
@@ -223,7 +223,7 @@ fn server_final_ack_invalid_capable_falls_back() {
         let wrong = Some(SERVER_KEY ^ 1);
         cases.push((cap(1, CAP_H, keys.0, wrong, form), payload));
     }
-    // The length for the form: 20 with payload, 22 without, 24 (checksum).
+    // The length for the form: 20 with payload, 22 without, 24 (checksum, not decided).
     cases.push((ack_cap(CAP_H, None), b"hello"));
     cases.push((ack_cap(CAP_H, Some(5)), b""));
     let c = MpCapable {

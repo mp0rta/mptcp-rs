@@ -139,7 +139,8 @@ fn invalid_synack_option_falls_back_permanently() {
     for version in [0, 2, 15] {
         cases.push(capable(version, CAP_H));
     }
-    for flags in [0, 0x81, 0x41, 0x02, 0x03, 0x05, 0x09, 0x11] {
+    // A=1 (0x81) is valid since M4b: the server requires checksums.
+    for flags in [0, 0x41, 0x02, 0x03, 0x05, 0x09, 0x11] {
         cases.push(capable(1, flags));
     }
     for options in cases {
@@ -516,7 +517,8 @@ fn all_synack_flags_and_option_lengths_are_checked() {
         let syn = packet::parse(&bytes).unwrap();
         reply(&mut ep, &syn, &capable(1, flags), syn.seq.wrapping_add(1));
         let bytes = transmit(&mut ep, Instant::from_nanos(1));
-        let valid = flags == CAP_H || flags == CAP_H | mptcp::CAP_C;
+        // C and A are free (A: the server requires checksums, M4b).
+        let valid = flags & !(mptcp::CAP_C | mptcp::CAP_A) == CAP_H;
         assert_eq!(
             mpc(packet::parse(&bytes).unwrap().options).len(),
             usize::from(valid)
@@ -829,7 +831,10 @@ fn ack32_promotion_releases_connection_store_only_with_tcp_ack() {
     // Install a wrapped send origin before any application data.
     d.send = crate::mptcp::data::SendStore::new(u64::MAX - 1, 4);
     assert_eq!(d.send.write(b"abcd"), 4);
-    assert!(d.send.assign(&mut c.subflows[0].mp.tx, u64::MAX - 1, 4));
+    assert!(
+        d.send
+            .assign(&mut c.subflows[0].mp.tx, u64::MAX - 1, 4, false)
+    );
     let bytes = transmit(&mut ep, Instant::from_nanos(2));
     assert_eq!(packet::parse(&bytes).unwrap().payload, b"abcd");
     let mut opts = [0; 40];
@@ -3741,3 +3746,6 @@ fn confirmed_pure_ack_carries_three_sack_blocks() {
 
 /// Server MP_CAPABLE, one test per negotiation-table row (M4a Task 5).
 mod server_capable;
+
+/// DSS checksums: negotiation, sent mappings, presence check (M4b Task 2).
+mod checksum;

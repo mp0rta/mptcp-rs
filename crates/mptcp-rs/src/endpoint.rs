@@ -308,14 +308,15 @@ impl<R: CryptoRng> Endpoint<R> {
     pub(crate) fn new_negotiation(
         &mut self,
         h: ConnectionHandle,
-        make: fn(u64) -> Negotiation,
+        make: fn(u64, bool) -> Negotiation,
     ) -> Negotiation {
+        let checksums = self.conns[&h].cfg.checksums;
         loop {
             #[cfg(test)]
             let key = self.keys.pop_front().unwrap_or_else(|| self.rng.next_u64());
             #[cfg(not(test))]
             let key = self.rng.next_u64();
-            let n = make(key);
+            let n = make(key, checksums);
             if let std::collections::btree_map::Entry::Vacant(e) = self.tokens.entry(n.token) {
                 e.insert(h);
                 return n;
@@ -467,9 +468,11 @@ impl<R: CryptoRng> Endpoint<R> {
         let (local, remote) = (syn.dst, syn.src);
         let (tcb, _) = self.passive_tcb(&cfg, syn, now);
         let h = self.insert(cfg, tcb, local, remote, Some(key));
-        if let (true, SynCapable::V1 { peer_c }) = (mptcp, syn_capable(syn)) {
+        if let (true, SynCapable::V1 { peer_c, peer_a }) = (mptcp, syn_capable(syn)) {
             let mut n = self.new_negotiation(h, Negotiation::new_passive);
             n.peer_c = peer_c;
+            // A client that requires checksums is honoured (RFC 8684 L958–967).
+            n.csum |= peer_a;
             let c = self.conns.get_mut(&h).unwrap();
             c.hooks.negotiation = Some(n);
             c.subflows[0].mp.peer_scale = syn_scale(syn);

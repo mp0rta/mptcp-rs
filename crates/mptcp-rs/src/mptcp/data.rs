@@ -16,12 +16,12 @@ mod tests {
             let mut s = SendStore::new(u64::MAX - 1, 4);
             let mut m = TxMaps::new(u32::MAX - 1, 4);
             assert_eq!(s.write(b"abcd"), 4);
-            assert!(s.assign(&mut m, u64::MAX - 1, 4));
+            assert!(s.assign(&mut m, u64::MAX - 1, 4, false));
             assert_eq!(
                 m.peek_with(u32::MAX, 9, |b| b.to_vec()),
                 Some(b"bcd".to_vec())
             );
-            assert!(s.assign(&mut m, u64::MAX - 1, 4)); // reinjection, fresh SSNs
+            assert!(s.assign(&mut m, u64::MAX - 1, 4, false)); // reinjection, fresh SSNs
             if data_first {
                 assert!(s.ack(2));
             } else {
@@ -158,8 +158,9 @@ impl SendStore {
         let len = self.end.wrapping_sub(self.una);
         if off < len { (len - off) as usize } else { 0 }
     }
-    /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
-    pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
+    /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection. With
+    /// `csum` the mapping carries its DSS checksum (RFC 8684 L1402–1430).
+    pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize, csum: bool) -> bool {
         if len == 0 || len > u16::MAX as usize || maps.is_full() {
             return false;
         }
@@ -191,7 +192,7 @@ impl SendStore {
                 break;
             }
         }
-        maps.maps.push_back(TxMap {
+        let mut map = TxMap {
             ssn: maps.end,
             mapping: crate::wire::mptcp::Mapping {
                 dsn: crate::wire::mptcp::Dsn::Dsn64(dsn),
@@ -204,7 +205,11 @@ impl SendStore {
             dsn,
             len,
             pieces,
-        });
+        };
+        if csum {
+            map.mapping.checksum = Some(map.checksum());
+        }
+        maps.maps.push_back(map);
         maps.end = maps.end.wrapping_add(len as u32);
         if dsn == self.next {
             self.next = self.next.wrapping_add(len as u64);
@@ -243,6 +248,14 @@ struct TxMap {
     pieces: VecDeque<Chunk>,
 }
 impl TxMap {
+    /// The checksum of the whole mapping, before any of it is acknowledged (spec G5).
+    fn checksum(&self) -> u16 {
+        let data: Vec<&[u8]> = (self.pieces.iter())
+            .map(|c| &c.bytes[c.start..c.end])
+            .collect();
+        let m = &self.mapping;
+        crate::wire::mptcp::dss_checksum(self.dsn, m.ssn, m.data_len, &data)
+    }
     fn covers(&self, ssn: u32) -> bool {
         (ssn.wrapping_sub(self.ssn) as usize) < self.len
     }
@@ -303,6 +316,11 @@ impl TxMaps {
         if let Some(m) = self.maps.back_mut() {
             m.data_fin = true;
             m.mapping.data_len += 1;
+            // The Data-Level Length counts the DATA_FIN (RFC 8684 L1402–1430); `install` attaches
+            // it right after `assign`, before the mapping is sent or acknowledged.
+            if m.mapping.checksum.is_some() {
+                m.mapping.checksum = Some(m.checksum());
+            }
         }
     }
     pub fn data_fin(&self, ssn: u32) -> bool {
@@ -758,12 +776,12 @@ mod bounds_tests {
         let mut s = SendStore::new(100, 70000);
         s.write(&vec![0; 70000]);
         let mut maps = TxMaps::new(1, 1);
-        assert!(!s.assign(&mut maps, 100, 65536));
-        assert!(!s.assign(&mut maps, 101, 1));
-        assert!(s.assign(&mut maps, 100, 10));
-        assert!(!s.assign(&mut maps, 110, 1));
+        assert!(!s.assign(&mut maps, 100, 65536, false));
+        assert!(!s.assign(&mut maps, 101, 1, false));
+        assert!(s.assign(&mut maps, 100, 10, false));
+        assert!(!s.assign(&mut maps, 110, 1, false));
         maps.mark_acked(11);
-        assert!(s.assign(&mut maps, 105, 5));
+        assert!(s.assign(&mut maps, 105, 5, false));
     }
 }
 
