@@ -5,7 +5,9 @@
 //! Memory: a subflow holds at most `cap` octets (`recv_buffer + 65,535`) plus those of the
 //! frontier mapping (at most 65,535), so `recv_buffer + 2 × 65,535` per subflow and
 //! `SUBFLOW_CAP` times that per connection. Past `cap` other mappings' octets are refused at
-//! the TCP level (the peer retransmits them); held octets are never evicted.
+//! the TCP level (the peer retransmits them); held octets are never evicted. Held runs are
+//! bounded too (`PIECE_CAP`).
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::wire::mptcp::dss_checksum_ok;
@@ -35,48 +37,74 @@ pub(crate) enum Complete {
     Failed { dsn: u64, ssn: u32 },
 }
 
+/// Held runs per subflow, as the TCB's out-of-order ranges (`MAX_OOO_RANGES`) and
+/// `RecvAssembler`'s `range_cap` bound theirs: past it, a run that would start a new disjoint
+/// run is refused at the TCP level unless it starts at the frontier.
+const PIECE_CAP: usize = 64;
+
 struct Entry {
     map: HoldMap,
     /// Held runs by offset in the mapping: sorted, disjoint, never adjacent.
-    pieces: Vec<(u32, Vec<u8>)>,
+    pieces: Vec<(u32, VecDeque<u8>)>,
 }
 
 impl Entry {
     fn end(&self) -> u32 {
         self.map.ssn.wrapping_add(self.map.len)
     }
-    /// Stores the octets of `data` (at mapping offset `off`) not held yet; returns how many.
-    fn put(&mut self, off: u32, data: &[u8]) -> usize {
+    /// Stores the octets of `data` (at mapping offset `off`) not held yet: returns how many,
+    /// and the change in the number of runs. A run touching no held one is refused (`None`)
+    /// unless `may_split`.
+    fn put(&mut self, off: u32, data: &[u8], may_split: bool) -> Option<(usize, isize)> {
         let (lo, hi) = (off as usize, off as usize + data.len());
-        let mut gaps = Vec::new();
-        let mut at = lo;
-        for (s, b) in &self.pieces {
-            let (s, e) = (*s as usize, *s as usize + b.len());
-            if s >= hi {
-                break;
+        let span = |p: &(u32, VecDeque<u8>)| (p.0 as usize, p.0 as usize + p.1.len());
+        // The runs that overlap or touch [lo, hi].
+        let i = self.pieces.partition_point(|p| span(p).1 < lo);
+        let j = self.pieces.partition_point(|p| span(p).0 <= hi);
+        if i == j {
+            if !may_split {
+                return None;
             }
-            if s > at {
-                gaps.push(at..s);
+            self.pieces.insert(i, (off, data.iter().copied().collect()));
+            return Some((data.len(), 1));
+        }
+        // Merge into the largest touched run, copying only what lies outside it.
+        let b = (i..j).max_by_key(|&k| self.pieces[k].1.len()).unwrap();
+        let (s_b, e_b) = span(&self.pieces[b]);
+        let start = lo.min(span(&self.pieces[i]).0);
+        let stop = hi.max(span(&self.pieces[j - 1]).1);
+        // Between touched runs, [at, to) lies inside [lo, hi].
+        let gap = |at: usize, to: usize| {
+            if at < to {
+                &data[at - lo..to - lo]
+            } else {
+                &[][..]
             }
-            at = at.max(e);
+        };
+        let mut left = Vec::with_capacity(s_b - start);
+        let mut at = start;
+        for p in &self.pieces[i..b] {
+            left.extend_from_slice(gap(at, p.0 as usize));
+            left.extend(p.1.iter());
+            at = span(p).1;
         }
-        if at < hi {
-            gaps.push(at..hi);
+        left.extend_from_slice(gap(at, s_b));
+        let mut right = Vec::with_capacity(stop - e_b);
+        at = e_b;
+        for p in &self.pieces[b + 1..j] {
+            right.extend_from_slice(gap(at, p.0 as usize));
+            right.extend(p.1.iter());
+            at = span(p).1;
         }
-        let added = gaps.iter().map(Range::len).sum();
-        for g in gaps {
-            (self.pieces).push((g.start as u32, data[g.start - lo..g.end - lo].to_vec()));
+        right.extend_from_slice(gap(at, stop));
+        let had: usize = self.pieces[i..j].iter().map(|p| p.1.len()).sum();
+        let mut run = std::mem::take(&mut self.pieces[b].1);
+        for &x in left.iter().rev() {
+            run.push_front(x);
         }
-        self.pieces.sort_by_key(|p| p.0);
-        let mut merged: Vec<(u32, Vec<u8>)> = Vec::with_capacity(self.pieces.len());
-        for (s, b) in self.pieces.drain(..) {
-            match merged.last_mut() {
-                Some((ps, pb)) if *ps as usize + pb.len() == s as usize => pb.extend_from_slice(&b),
-                _ => merged.push((s, b)),
-            }
-        }
-        self.pieces = merged;
-        added
+        run.extend(right);
+        self.pieces.splice(i..j, [(start as u32, run)]);
+        Some((stop - start - had, 1 - (j - i) as isize))
     }
 }
 
@@ -84,6 +112,8 @@ impl Entry {
 pub(crate) struct Hold {
     entries: Vec<Entry>,
     held: usize,
+    /// Held runs, over all entries (at most `PIECE_CAP` plus those at the frontier).
+    pieces: usize,
 }
 
 impl Hold {
@@ -111,7 +141,8 @@ impl Hold {
     /// ranges accepted at the TCP level. `frontier` is the subflow's cumulative TCP receive
     /// point: octets below it arrived before. An octet at or past `right_edge` is refused, as
     /// `RecvAssembler::accept` refuses it; one below `recv.next` is kept for the checksum (spec
-    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further.
+    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further;
+    /// with `PIECE_CAP` runs held, only runs touching a held one or starting at `frontier`.
     pub fn insert(
         &mut self,
         ssn: u32,
@@ -120,13 +151,15 @@ impl Hold {
         right_edge: u64,
         cap: usize,
     ) -> Vec<Range<usize>> {
-        // A mapping wholly below the frontier and not complete lost octets that TCP already
-        // took (unmapped, or a repeat of a mapping taken before): it can never complete.
-        let held = &mut self.held;
+        // The only exception to "held octets are never dropped" (G7): a mapping wholly below
+        // the frontier and not complete can never complete, as TCP already took the octets it
+        // lacks (unmapped, or it is a repeat of a mapping taken before).
+        let (held, pieces) = (&mut self.held, &mut self.pieces);
         self.entries.retain(|e| {
             let live = e.end().wrapping_sub(frontier) as i32 > 0;
             if !live {
                 *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
+                *pieces -= e.pieces.len();
             }
             live
         });
@@ -156,9 +189,13 @@ impl Hold {
             if !covering(e, frontier) {
                 k = k.min(cap.saturating_sub(self.held));
             }
+            let may_split = self.pieces < PIECE_CAP || pos == frontier;
             if k > 0 {
-                self.held += e.put(off, &bytes[at..at + k]);
-                accepted.push(at..at + k);
+                if let Some((added, runs)) = e.put(off, &bytes[at..at + k], may_split) {
+                    self.held += added;
+                    self.pieces = self.pieces.wrapping_add_signed(runs);
+                    accepted.push(at..at + k);
+                }
             }
             at += n;
         }
@@ -176,8 +213,9 @@ impl Hold {
                 continue;
             }
             let e = self.entries.remove(i);
-            let (m, bytes) = (e.map, e.pieces.into_iter().next().unwrap().1);
+            let (m, bytes) = (e.map, Vec::from(e.pieces.into_iter().next().unwrap().1));
             self.held -= bytes.len();
+            self.pieces -= 1;
             let data_len = (m.len + u32::from(m.data_fin)) as u16;
             out.push(
                 if dss_checksum_ok(m.dsn, m.ssn, data_len, &[&bytes], m.checksum) {
@@ -202,10 +240,11 @@ impl Hold {
     #[allow(dead_code)]
     pub fn drain(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.held = 0;
+        self.pieces = 0;
         let mut runs: Vec<(u32, Vec<u8>)> = (self.entries.drain(..))
             .flat_map(|e| {
                 let ssn = e.map.ssn;
-                (e.pieces.into_iter()).map(move |(off, b)| (ssn.wrapping_add(off), b))
+                (e.pieces.into_iter()).map(move |(off, b)| (ssn.wrapping_add(off), Vec::from(b)))
             })
             .collect();
         let first = runs.first().map_or(0, |r| r.0);
@@ -418,5 +457,78 @@ mod tests {
             ]
         );
         assert_eq!(h.held(), 0);
+    }
+
+    /// Runs past `PIECE_CAP` that would start a new disjoint run are refused; a run touching a
+    /// held one, or starting at the frontier, is still taken.
+    #[test]
+    fn hold_piece_cap_refuses_new_runs() {
+        let data = pattern(1000);
+        let mut h = Hold::default();
+        h.install(map(1, 0, &data, false));
+        // One octet at every other offset from 2: disjoint runs.
+        let mut taken = 0;
+        for off in (2..400).step_by(2) {
+            let got = h.insert(1 + off as u32, &data[off..off + 1], 1, EDGE, BIG);
+            taken += got.len();
+        }
+        assert_eq!(
+            (taken, h.held(), h.pieces),
+            (PIECE_CAP, PIECE_CAP, PIECE_CAP)
+        );
+        // Past the cap: a new disjoint run is refused; one touching a held run is taken.
+        assert!(h.insert(1 + 500, &data[500..501], 1, EDGE, BIG).is_empty());
+        assert_eq!(h.insert(1 + 3, &data[3..4], 1, EDGE, BIG), vec![0..1]);
+        assert_eq!(h.pieces, PIECE_CAP - 1, "offsets 2..5 merged");
+        // The run at the frontier is exempt.
+        assert_eq!(h.insert(1, &data[..1], 1, EDGE, BIG), vec![0..1]);
+        // Past the cap, a run far ahead is still refused; filling on from the frontier, each
+        // run touching the last, completes the mapping.
+        assert!(h.insert(1 + 999, &data[999..], 2, EDGE, BIG).is_empty());
+        for off in 1..1000 {
+            let got = h.insert(
+                1 + off as u32,
+                &data[off..off + 1],
+                1 + off as u32,
+                EDGE,
+                BIG,
+            );
+            assert_eq!(got, vec![0..1]);
+        }
+        let done = h.take_complete();
+        assert!(matches!(&done[..], [Complete::Verified { bytes, .. }] if *bytes == data));
+        assert_eq!((h.held(), h.pieces), (0, 0));
+    }
+
+    /// A mapping taken, then repeated with its DSS option (a stale re-install): nothing stays
+    /// held once the frontier passes it, whether its octets were behind the frontier or held
+    /// out of order above it.
+    #[test]
+    fn hold_stale_reinstall_is_pruned() {
+        let a = pattern(100);
+        let b = pattern(200);
+        let mut h = Hold::default();
+        // In order: B taken, then its last segment repeated behind the frontier.
+        h.install(map(1, 0, &b, false));
+        h.insert(1, &b, 1, EDGE, BIG);
+        assert_eq!(h.take_complete().len(), 1);
+        assert!(h.install(map(1, 0, &b, false)));
+        h.insert(151, &b[150..], 201, EDGE, BIG);
+        assert_eq!(h.held(), 0);
+        assert!(h.entries.is_empty());
+        // Out of order: B (SSN 101) taken above a hole at A (SSN 1), then B's last segment
+        // repeated with its option: held again until the frontier passes B.
+        let mut h = Hold::default();
+        h.install(map(1, 0, &a, false));
+        h.install(map(101, 100, &b, false));
+        h.insert(101, &b, 1, EDGE, BIG);
+        assert_eq!(h.take_complete().len(), 1);
+        assert!(h.install(map(101, 100, &b, false)));
+        h.insert(251, &b[150..], 1, EDGE, BIG);
+        assert_eq!(h.held(), 50);
+        h.insert(1, &a, 1, EDGE, BIG);
+        assert_eq!(h.take_complete().len(), 1);
+        h.insert(301, &[], 301, EDGE, BIG);
+        assert_eq!((h.held(), h.pieces), (0, 0));
     }
 }
