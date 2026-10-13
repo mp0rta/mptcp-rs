@@ -381,3 +381,64 @@ fn server_mptcp_send_edge_scaled() {
     s.send(300, &dss_ack(una), &[]);
     assert_eq!(edge(&s), Some(una + (300 << 7)));
 }
+
+/// A final ACK that confirms MPTCP (taking the client's key) and then fails, its data_len 0
+/// mapping refused, resets the half-open connection. It is freed with its token and demux
+/// entry once the RST is out, not kept for the no-subflow wait: repeated, these would bypass
+/// `max_half_open` (spec G9) with nothing the application can abort (spec G10).
+#[test]
+fn half_open_failed_final_ack_freed() {
+    let now = Instant::from_nanos(0);
+    let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
+    let cfg = ListenConfig {
+        max_half_open: 1,
+        ..Default::default()
+    };
+    let server: SocketAddr = SERVER.parse().unwrap();
+    ep.listen(server, cfg).unwrap();
+    let input = |ep: &mut Endpoint<ChaCha20Rng>, seg: Segment| {
+        let mut out = [0; 1500];
+        let n = packet::build(&seg, 0, &mut out).unwrap();
+        ep.handle_packet(now, &out[..n]);
+        let mut sent = Vec::new();
+        while let Some(n) = ep.poll_transmit(now, &mut out) {
+            sent.push(out[..n].to_vec());
+        }
+        sent
+    };
+    for round in 0..3u16 {
+        let key = SERVER_KEY + u64::from(round);
+        ep.keys.push_back(key);
+        let syn = Segment {
+            src: SocketAddr::new("10.0.0.1".parse().unwrap(), 40000 + round),
+            dst: server,
+            seq: SeqNum(C_ISN),
+            ack: SeqNum(0),
+            flags: TcpFlags::SYN,
+            wnd: 65535,
+            options: &syn_cap(1, CAP_H),
+            payload: &[],
+        };
+        let out = input(&mut ep, syn.clone());
+        assert_eq!(out.len(), 1, "round {round}: the SYN/ACK; the slot is free");
+        let synack = packet::parse(&out[0]).unwrap();
+        assert_eq!(synack.flags, TcpFlags::SYN | TcpFlags::ACK);
+        let option = cap(1, CAP_H, Some(CLIENT_KEY), Some(key), Some(0));
+        let ack = Segment {
+            seq: SeqNum(C_ISN + 1),
+            ack: synack.seq.wrapping_add(1),
+            flags: TcpFlags::ACK,
+            options: &option,
+            payload: b"x",
+            ..syn
+        };
+        let out = input(&mut ep, ack);
+        let rst = |p: &Vec<u8>| packet::parse(p).unwrap().flags.contains(TcpFlags::RST);
+        assert!(out.iter().any(rst), "round {round}: the final ACK is reset");
+        ep.handle_timeout(now);
+        assert_eq!(ep.poll_event(), None);
+        assert_eq!(ep.listeners[&server].half_open, 0);
+        let counts = (ep.conns.len(), ep.tokens.len(), ep.demux.len());
+        assert_eq!(counts, (0, 0, 0), "round {round}: freed");
+    }
+}

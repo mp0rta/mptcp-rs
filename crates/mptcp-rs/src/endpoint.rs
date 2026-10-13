@@ -1556,7 +1556,10 @@ impl<R: CryptoRng> Endpoint<R> {
         let (demux, events) = (&mut self.demux, &mut self.events);
         let (listeners, tokens) = (&mut self.listeners, &mut self.tokens);
         self.conns.retain(|&h, c| {
-            if c.hooks.retained() || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
+            // A half-open connection is never retained nor detached: no application holds it
+            // (spec G10), and keeping it would bypass `max_half_open` (spec G9).
+            let retained = !c.half_open && c.hooks.retained();
+            if retained || c.subflows.iter().any(|sf| sf.tcb.reset_pending()) {
                 return true;
             }
             if c.subflows
@@ -1576,7 +1579,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 events.push_back((h, down(q.id, CloseReason::Reset, None)));
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
-            c.detached = !c.reset && c.hooks.has_unread();
+            c.detached = !c.reset && !c.half_open && c.hooks.has_unread();
             if !c.detached
                 && let Some(n) = &c.hooks.negotiation
             {
