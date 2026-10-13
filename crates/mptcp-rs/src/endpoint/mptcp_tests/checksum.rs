@@ -17,14 +17,17 @@ pub(super) fn t(n: u64) -> Instant {
     Instant::from_nanos(n)
 }
 
-fn checksums_cfg(checksums: bool) -> ConnectConfig {
+pub(super) fn checksums_cfg(checksums: bool) -> ConnectConfig {
     ConnectConfig {
         checksums,
         ..ConnectConfig::default()
     }
 }
 
-fn negotiation(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> &crate::mptcp::Negotiation {
+pub(super) fn negotiation(
+    ep: &Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+) -> &crate::mptcp::Negotiation {
     ep.conns[&h].hooks.negotiation.as_ref().unwrap()
 }
 
@@ -42,7 +45,13 @@ pub(super) fn encode(o: &MptcpOption) -> Vec<u8> {
     out[..n].to_vec()
 }
 
-fn dss_mapping(data_fin: bool, ssn: u32, dsn: u64, len: u16, checksum: Option<u16>) -> Vec<u8> {
+pub(super) fn dss_mapping(
+    data_fin: bool,
+    ssn: u32,
+    dsn: u64,
+    len: u16,
+    checksum: Option<u16>,
+) -> Vec<u8> {
     encode(&MptcpOption::Dss(Dss {
         data_fin,
         data_ack: None,
@@ -76,6 +85,11 @@ pub(super) fn client(checksums: bool, peer_a: bool) -> Client {
 
 /// `client` with the whole `ConnectConfig`.
 fn client_cfg(cfg: ConnectConfig, peer_a: bool) -> Client {
+    client_with(cfg, peer_a, false)
+}
+
+/// `client_cfg`, with SACK-Permitted in the SYN/ACK if `sack`.
+pub(super) fn client_with(cfg: ConnectConfig, peer_a: bool, sack: bool) -> Client {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(41));
     ep.cc = Some(reno);
     let h = ep
@@ -94,6 +108,10 @@ fn client_cfg(cfg: ConnectConfig, peer_a: bool) -> Client {
     opts.extend_from_slice(&o[..n]);
     let n = crate::wire::tcp_options::write_ws(&mut o, 7);
     opts.extend_from_slice(&o[..n]);
+    if sack {
+        let n = crate::wire::tcp_options::write_sack_permitted(&mut o);
+        opts.extend_from_slice(&o[..n]);
+    }
     reply(&mut ep, &syn, &opts, syn.seq.wrapping_add(1));
     let ack = transmit(&mut ep, t(1));
     let third = mpc(packet::parse(&ack).unwrap().options)[0].to_vec();
@@ -108,7 +126,7 @@ fn client_cfg(cfg: ConnectConfig, peer_a: bool) -> Client {
 
 impl Client {
     /// Our IDSN + 1, from the key our third ACK carries.
-    fn head(&self) -> u64 {
+    pub(super) fn head(&self) -> u64 {
         let MptcpOption::Capable(c) = mptcp::parse(&self.third).unwrap() else {
             panic!()
         };
@@ -153,12 +171,12 @@ impl Client {
 }
 
 /// The mapping of the DSS a segment carries.
-fn seg_mapping(seg: &Segment) -> Option<(Mapping, bool)> {
+pub(super) fn seg_mapping(seg: &Segment) -> Option<(Mapping, bool)> {
     let d = mpc(seg.options).into_iter().find_map(dss)?;
     d.mapping.map(|m| (m, d.data_fin))
 }
 
-fn dsn64(m: &Mapping) -> u64 {
+pub(super) fn dsn64(m: &Mapping) -> u64 {
     let mptcp::Dsn::Dsn64(dsn) = m.dsn else {
         panic!("64-bit DSNs only")
     };
@@ -482,7 +500,7 @@ pub(super) fn mp_fail_rst(dsn: u64) -> Vec<u8> {
 }
 
 /// The MPTCP options of an RST among `sent`, if any.
-fn rst_reason(sent: &[Segment]) -> Option<Vec<u8>> {
+pub(super) fn rst_reason(sent: &[Segment]) -> Option<Vec<u8>> {
     let rst = sent.iter().find(|s| s.flags.contains(TcpFlags::RST))?;
     Some(mpc(rst.options).concat())
 }
@@ -530,7 +548,7 @@ fn rx_checksum_presence_mismatch_resets() {
 // Server role, against a scripted client (`Script`).
 
 /// A listener on `SERVER` with `checksums`.
-fn server(checksums: bool) -> Script {
+pub(super) fn server(checksums: bool) -> Script {
     let mut s = Script::new(true);
     let l = s.ep.listeners.get_mut(&SERVER.parse().unwrap()).unwrap();
     l.cfg.connection.checksums = checksums;
@@ -682,7 +700,7 @@ pub(super) fn held(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> usize {
 }
 
 /// The DATA_ACK a segment carries.
-fn data_ack_of(seg: &Segment) -> Option<u64> {
+pub(super) fn data_ack_of(seg: &Segment) -> Option<u64> {
     match mpc(seg.options).into_iter().find_map(dss)?.data_ack? {
         mptcp::DataAck::Ack64(a) => Some(a),
         mptcp::DataAck::Ack32(_) => None,
@@ -700,7 +718,7 @@ fn our_scale(syn: &Segment) -> u8 {
 }
 
 /// Every octet readable now.
-fn read_now(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<u8> {
+pub(super) fn read_now(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<u8> {
     let mut all = Vec::new();
     let mut buf = [0; 8192];
     while let Ok(n) = ep.connection(h).unwrap().read(&mut buf) {
@@ -769,15 +787,50 @@ fn rx_mapping_prefix_delivered_elsewhere_verifies() {
     assert_eq!(held(&ep, h), 0);
 }
 
-/// A mapping that fails its checksum resets the subflow with MP_FAIL and MP_TCPRST 0x06 and
-/// delivers nothing (interim: Task 6 moves this to the single-subflow path).
+/// On the one subflow, with no join completed and no connection-level retransmission sent, a
+/// mapping that fails its checksum delivers nothing and draws no RST: we wait, with MP_FAIL on
+/// our ACK (M4b spec G11, first bullet).
 #[test]
-fn rx_bad_checksum_resets_subflow_interim() {
+fn rx_bad_checksum_single_subflow_waits() {
     let mut c = client(true, false);
     c.confirm();
     let dsn = peer_head();
     let sent = c.peer(&bad_mapping(1, dsn, b"hello", false), b"hello");
-    assert_eq!(rst_reason(&sent), Some(mp_fail_rst(dsn)));
+    assert_eq!(rst_reason(&sent), None);
+    let fail = encode(&MptcpOption::Fail { dsn });
+    assert!(mpc(sent.last().unwrap().options).contains(&&fail[..]));
+    assert_eq!(recv(&c.ep, c.h).next, dsn);
+    assert!(matches!(
+        c.ep.conns[&c.h].hooks.mp_fail,
+        crate::mptcp::MpFail::Waiting { .. }
+    ));
+}
+
+/// Once we have sent a reinjection, the same failure resets the subflow with MP_FAIL and
+/// MP_TCPRST 0x06 and delivers nothing (spec G10, G11 second bullet).
+#[test]
+fn rx_bad_checksum_after_reinjection_resets() {
+    let mut c = client(true, false);
+    c.confirm();
+    c.ep.connection(c.h).unwrap().write(b"lost").unwrap();
+    let sent = c.sent(t(2));
+    let first = sent.iter().find(|s| s.payload == b"lost").unwrap();
+    let syn = c.syn.clone();
+    let head = una(&c.ep, c.h);
+    let opts = data_ack(head);
+    let mut ack = peer_data(&syn, 5001, &opts, &[]);
+    ack.ack = first.seq.wrapping_add(4);
+    feed(&mut c.ep, &ack, t(2));
+    let deadline = c.ep.poll_timeout().expect("connection recovery timer");
+    c.ep.handle_timeout(deadline);
+    let retry = c.sent(deadline);
+    assert!(retry.iter().any(|s| s.payload == b"lost"));
+    assert!(!c.ep.conns[&c.h].hooks.infinite_ok);
+    let dsn = peer_head();
+    let opts = bad_mapping(1, dsn, b"hello", false);
+    let seg = peer_data(&syn, 5001, &opts, b"hello");
+    feed(&mut c.ep, &seg, deadline);
+    assert_eq!(rst_reason(&c.sent(deadline)), Some(mp_fail_rst(dsn)));
     assert_eq!(recv(&c.ep, c.h).next, dsn);
 }
 
@@ -927,7 +980,7 @@ fn rx_csum_off_delivers_per_segment() {
 // Replay of held octets on fallback (spec G15).
 
 /// The peer's infinite mapping, retroactive to its first octet (checksum field present, 0).
-fn peer_infinite() -> Vec<u8> {
+pub(super) fn peer_infinite() -> Vec<u8> {
     dss_mapping(false, 1, peer_head(), 0, Some(0))
 }
 

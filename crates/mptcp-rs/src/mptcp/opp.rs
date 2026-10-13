@@ -113,13 +113,17 @@ fn clock(sf: &Subflow) -> Duration {
 impl Connection {
     /// §2.2 conditions 1, 3 and 4: data is outstanding, no New data is assignable, and the
     /// store is full (allocation accounting) or the connection window is exhausted while data
-    /// waits beyond it.
+    /// waits beyond it. Never while `Waiting` (M4b spec G12).
     fn blocked(&self) -> bool {
         let (Some(d), Some(m)) = (&self.hooks.data, &self.hooks.negotiation) else {
             return false;
         };
         let send = &d.send;
-        if d.fallback || send.una == send.next || self.hooks.unassigned_len() > 0 {
+        if d.fallback
+            || self.hooks.frozen()
+            || send.una == send.next
+            || self.hooks.unassigned_len() > 0
+        {
             return false;
         }
         let window_full = send.end != send.next

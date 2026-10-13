@@ -54,6 +54,10 @@ pub(crate) struct ConnectionHooks {
     /// completed and we have sent no connection-level retransmission (M4b spec G10). Unlike
     /// `joined_ever`, a failed join leaves it set. Cleared for good.
     pub infinite_ok: bool,
+    /// The MP_FAIL exchange (M4b spec G11–G18).
+    pub mp_fail: MpFail,
+    /// The MP_FAIL step of the current input, timed by `Connection::mp_fail_input`.
+    mp_fail_step: Option<MpFailStep>,
     /// The highest `SubflowMp::dsn_end` of the subflows already freed.
     pub freed_dsn_end: Option<u64>,
     /// MinRTT; tests inject others (spec §4: crate-internal, one implementation).
@@ -84,6 +88,45 @@ pub(crate) struct ConnectionHooks {
     sws_mss: u16,
 }
 
+/// How long we wait for an answer to our MP_FAIL, and re-send our echo: Linux's
+/// `TCP_RTO_MAX` (M4b spec G13, G16).
+const MP_FAIL_WAIT: Duration = Duration::from_secs(120);
+
+/// The MP_FAIL exchange of a connection (M4b spec G11–G18). Each retry interval starts at the
+/// subflow's RTO and doubles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MpFail {
+    Idle,
+    /// Mapping `dsn` failed its checksum on `subflow`, the one that carries data: MP_FAIL(`dsn`)
+    /// rides its every ACK, a pure ACK with it is forced at `retry_at`, and nothing may break
+    /// contiguity (G11, G12), until an MP_FAIL or an infinite mapping arrives (fallback) or
+    /// 120 s after `since` (RST, G16).
+    Waiting {
+        subflow: SubflowId,
+        dsn: u64,
+        since: Instant,
+        retry_at: Instant,
+        interval: Duration,
+    },
+    /// We echoed the peer's MP_FAIL and fell back: the echo rides every segment while our
+    /// infinite mapping is due, and a pure ACK with it is forced at `retry_at` until then or
+    /// 120 s after `since` (G13).
+    Echo {
+        since: Instant,
+        retry_at: Instant,
+        interval: Duration,
+    },
+}
+
+/// An MP_FAIL step found during an input, before its time is known.
+#[derive(Debug, Clone, Copy)]
+enum MpFailStep {
+    /// Enter `Waiting` on mapping `dsn`.
+    Wait { dsn: u64 },
+    /// We echoed and fell back.
+    Echo,
+}
+
 /// MP_TCPRST option bytes for our RSTs (M3 spec §3.4).
 pub(crate) fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
     let mut out = [0; 4];
@@ -94,7 +137,6 @@ pub(crate) fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
 
 /// The peer's side of contiguity: mapping `(dsn, ssn)` keeps the handshake's offset, relative
 /// SSN 1 at `peer_idsn + 1`, compared on the low 32 bits (M4b spec G10).
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn initial_offset_ok(peer_idsn: u64, dsn: u64, ssn: u32) -> bool {
     dsn.wrapping_sub(peer_idsn) as u32 == ssn
 }
@@ -148,6 +190,8 @@ impl ConnectionHooks {
             fast_closed: false,
             joined_ever: false,
             infinite_ok: true,
+            mp_fail: MpFail::Idle,
+            mp_fail_step: None,
             freed_dsn_end: None,
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
@@ -162,6 +206,11 @@ impl ConnectionHooks {
             opp_live: false,
             sws_mss: 0,
         }
+    }
+    /// `Waiting` for the answer to our MP_FAIL: no join, reinjection, opportunistic
+    /// retransmission or recovery timer may break contiguity (M4b spec G12).
+    pub fn frozen(&self) -> bool {
+        matches!(self.mp_fail, MpFail::Waiting { .. })
     }
     fn sws_mss(&self, own: u16) -> u16 {
         if self.sws_mss == 0 { own } else { self.sws_mss }
@@ -302,6 +351,105 @@ pub(crate) fn accept_plan(
 }
 
 impl Connection {
+    /// The next MP_FAIL retry, or the end of the 120 s wait (M4b spec G13, G16). An echo's
+    /// retries end once our infinite mapping is no longer due or at 120 s.
+    pub(crate) fn mp_fail_deadline(&self) -> Option<Instant> {
+        match self.hooks.mp_fail {
+            MpFail::Idle => None,
+            MpFail::Waiting {
+                since, retry_at, ..
+            } => Some(retry_at.min(since + MP_FAIL_WAIT)),
+            MpFail::Echo {
+                since, retry_at, ..
+            } => (self.subflows[0].mp.infinite.is_some() && retry_at < since + MP_FAIL_WAIT)
+                .then_some(retry_at),
+        }
+    }
+
+    /// Times the MP_FAIL step of the input that subflow `i` just took, at `now`; the first
+    /// MP_FAIL goes on the ACK this input makes due. Returns whether it entered `Waiting`.
+    pub(crate) fn mp_fail_input(&mut self, i: usize, now: Instant) -> bool {
+        let Some(step) = self.hooks.mp_fail_step.take() else {
+            return false;
+        };
+        let sf = &self.subflows[i];
+        let interval = sf.tcb.retransmission_timeout();
+        let (since, retry_at) = (now, now + interval);
+        self.hooks.mp_fail = match step {
+            MpFailStep::Wait { dsn } => MpFail::Waiting {
+                subflow: sf.id,
+                dsn,
+                since,
+                retry_at,
+                interval,
+            },
+            MpFailStep::Echo => MpFail::Echo {
+                since,
+                retry_at,
+                interval,
+            },
+        };
+        matches!(step, MpFailStep::Wait { .. })
+    }
+
+    /// Resets every join not yet complete as `Waiting` begins (M4b spec G12); one in SYN-SENT
+    /// sends nothing (RFC 9293 §3.10.5). Returns the joins we started, for `SubflowDown`.
+    pub(crate) fn cancel_joins(&mut self, now: Instant) -> Vec<SubflowId> {
+        let mut ours = Vec::new();
+        for sf in &mut self.subflows {
+            if !sf.mp.joining() || sf.tcb.state() == TcpState::Closed {
+                continue;
+            }
+            if sf.tcb.state() == TcpState::SynSent {
+                sf.tcb.delete(now);
+            } else {
+                let rst = Some(tcprst(0x01, false).to_vec());
+                sf.tcb.abort_with(crate::tcp::CloseReason::Reset, rst, now);
+            }
+            if (sf.mp.join.as_ref()).is_some_and(|j| j.role == JoinRole::Initiator) {
+                ours.push(sf.id);
+            }
+        }
+        ours
+    }
+
+    /// The MP_FAIL timers at `now`: a due retry forces a pure ACK and doubles the interval;
+    /// 120 s in `Waiting` returns the subflow to reset (M4b spec G13, G16).
+    pub(crate) fn mp_fail_timeout(&mut self, now: Instant) -> Option<SubflowId> {
+        if !self.mp_fail_deadline().is_some_and(|at| at <= now) {
+            return None;
+        }
+        let (subflow, since, retry_at, interval) = match &mut self.hooks.mp_fail {
+            MpFail::Idle => return None,
+            MpFail::Waiting {
+                subflow,
+                since,
+                retry_at,
+                interval,
+                ..
+            } => (Some(*subflow), *since, retry_at, interval),
+            MpFail::Echo {
+                since,
+                retry_at,
+                interval,
+            } => (None, *since, retry_at, interval),
+        };
+        if subflow.is_some() && now >= since + MP_FAIL_WAIT {
+            self.hooks.mp_fail = MpFail::Idle;
+            return subflow;
+        }
+        *interval *= 2;
+        *retry_at = now + *interval;
+        let sf = match subflow {
+            Some(id) => self.subflows.iter_mut().find(|sf| sf.id == id),
+            None => self.subflows.first_mut(),
+        };
+        if let Some(sf) = sf {
+            sf.tcb.request_ack();
+        }
+        None
+    }
+
     /// Connection-scoped roles, set before every `poll_transmit` step 1 (spec §3, §4 rule 2,
     /// §5.4): the window update a read makes due goes on the lowest-RTT Active subflow that
     /// can still receive data, and a standalone DATA_FIN on the lowest-RTT Active subflow;
@@ -318,6 +466,7 @@ impl Connection {
             let demand = opp.is_some_and(|c| self.opp_target(t, c.dsn, c.blocking, !c.repair));
             self.subflows[k].mp.opp_demand = demand;
         }
+        let frozen = self.hooks.frozen();
         let (Some(d), Some(m)) = (&self.hooks.data, &self.hooks.negotiation) else {
             return;
         };
@@ -330,7 +479,7 @@ impl Connection {
         };
         let window = role(&|sf| !sf.tcb.fin_received());
         let fin = role(&|_| true);
-        let waiting = d.send.next != d.send.end || !d.reinject.is_empty();
+        let waiting = d.send.next != d.send.end || (!d.reinject.is_empty() && !frozen);
         let closed = !d.fallback
             && m.send_right_edge
                 .is_some_and(|edge| edge.wrapping_sub(d.send.next) as i64 <= 0);
@@ -378,6 +527,7 @@ impl Connection {
     pub(crate) fn update_recovery(&mut self, now: Instant) {
         self.update_episode(now);
         self.update_repair(now);
+        let frozen = self.hooks.frozen();
         let Some(d) = &mut self.hooks.data else {
             return;
         };
@@ -427,7 +577,9 @@ impl Connection {
         let maps = active_maps(&self.subflows);
         // A queued head is the timer's job already done: disarm, or an expiry nothing
         // consumes keeps `poll_timeout` in the past while no subflow can take the reinjection.
+        // While `Waiting` the timer is suspended (M4b spec G12).
         if head.is_none()
+            || frozen
             || d.reinject.first().map(|(start, _)| start) == head
             || maps.clone().any(|m| m.covering_end(d.send.una).is_some())
         {
@@ -521,6 +673,10 @@ impl Connection {
             .any(|end| end.wrapping_sub(una) as i64 > 0);
         d.reinject.clear();
         d.settling = false;
+        // The answer to our MP_FAIL (M4b spec G13, G14); an echo of ours stays.
+        if matches!(self.hooks.mp_fail, MpFail::Waiting { .. }) {
+            self.hooks.mp_fail = MpFail::Idle;
+        }
         // Signals end with MPTCP (M3 spec §3.3 rev3 S4); published events stand.
         self.peer_addrs.0.clear();
         self.hooks.signals.clear_echoes();
@@ -654,7 +810,11 @@ impl Connection {
     }
 
     /// The head reinjection candidate `(dsn, len)` (Hot-path rules); trims covered head parts.
+    /// Nothing while `Waiting`: queued reinjections wait (M4b spec G12).
     pub(crate) fn reinject_head(&mut self) -> Option<(u64, u32)> {
+        if self.hooks.frozen() {
+            return None;
+        }
         let d = self
             .hooks
             .data
@@ -924,8 +1084,9 @@ impl SubflowHooks<'_> {
         }
         tcb.set_probe_demand(self.sf.probe);
         // An opportunistic candidate this subflow may take is demand like a reinjection.
-        let reinject =
-            self.sf.opp_demand || (self.conn.data.as_ref()).is_some_and(|d| !d.reinject.is_empty());
+        let frozen = self.conn.frozen();
+        let reinject = self.sf.opp_demand
+            || (self.conn.data.as_ref()).is_some_and(|d| !d.reinject.is_empty() && !frozen);
         tcb.pending_send(
             now,
             self.unassigned_len(),
@@ -1083,24 +1244,34 @@ impl SubflowHooks<'_> {
     }
 }
 
-impl SegmentHooks for SubflowHooks<'_> {
-    fn data_option_len(&self) -> usize {
-        if self.conn.data.as_ref().is_some_and(|d| !d.fallback) {
-            28
-        } else if self.conn.data.is_some() && self.sf.infinite.is_some() {
-            20
-        } else {
-            0
+impl SubflowHooks<'_> {
+    /// The DSN of the MP_FAIL this subflow's segments carry now (M4b spec G11, G13): ours on
+    /// the subflow we wait on, or our echo, `recv.next`, while our infinite mapping is due.
+    fn fail_due(&self) -> Option<u64> {
+        let d = self.conn.data.as_ref()?;
+        match self.conn.mp_fail {
+            MpFail::Waiting { subflow, dsn, .. } => {
+                (self.sf.signal_clock).and_then(|(id, ..)| (id == subflow).then_some(dsn))
+            }
+            MpFail::Echo { .. } => self.sf.infinite.map(|_| d.recv.next),
+            MpFail::Idle => None,
         }
     }
-    fn data_options_for(&mut self, ssn: u32, out: &mut [u8]) -> usize {
+    /// Writes the due MP_FAIL, if any, into `out`; returns its length.
+    fn fail_option(&self, out: &mut [u8]) -> usize {
+        self.fail_due().map_or(0, |dsn| {
+            mptcp::encode(&MptcpOption::Fail { dsn }, out).expect("MP_FAIL fits next to the DSS")
+        })
+    }
+    /// `data_options_for` without MP_FAIL.
+    fn data_protocol_options(&mut self, ssn: u32, out: &mut [u8]) -> usize {
         let (Some(m), Some(d)) = (&self.conn.negotiation, &self.conn.data) else {
-            return self.options_for(TcpFlags::ACK, out);
+            return self.protocol_options(TcpFlags::ACK, out);
         };
         let below_infinite = |from: u32| (ssn.wrapping_sub(from) as i32) < 0;
         if d.fallback && !self.sf.infinite_from.is_some_and(below_infinite) {
             let Some((mapping, _)) = self.sf.infinite else {
-                return self.options_for(TcpFlags::ACK, out);
+                return self.protocol_options(TcpFlags::ACK, out);
             };
             let dss = mptcp::Dss {
                 data_fin: false,
@@ -1138,31 +1309,8 @@ impl SegmentHooks for SubflowHooks<'_> {
         out[n..padded].fill(1);
         padded
     }
-    fn window_offer(&self, scale: u8, mss: u16) -> Option<u16> {
-        let mss = self.conn.sws_mss(mss);
-        self.conn
-            .data
-            .as_ref()
-            .map(|d| d.recv.window_offer(scale, mss))
-    }
-    /// A joining subflow's ACK carries no DATA_ACK, so the peer cannot take its window at
-    /// connection level (RFC 8684 §3.3.2): it is not the connection's advertisement.
-    fn window_sent(&mut self, field: u16, scale: u8) {
-        if let Some(d) = self.conn.data.as_mut().filter(|_| !self.sf.joining()) {
-            d.recv.window_sent(field, scale);
-        }
-    }
-    /// Only the subflow chosen to announce a read's window (`window_owner`) sends it.
-    fn window_update_due(&self, scale: u8, mss: u16) -> bool {
-        let mss = self.conn.sws_mss(mss);
-        self.sf.window_owner
-            && (self.conn.data.as_ref()).is_some_and(|d| d.recv.window_update_due(scale, mss))
-    }
-    fn duplicate_ack_allowed(&self, seg: &Segment<'_>) -> bool {
-        self.conn.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
-    }
-
-    fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
+    /// `options_for` without MP_FAIL.
+    fn protocol_options(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
         if let Some(n) = self.join_options(flags, out) {
             return n;
         }
@@ -1226,6 +1374,58 @@ impl SegmentHooks for SubflowHooks<'_> {
             .negotiation
             .as_mut()
             .map_or(0, |m| m.options_for(flags, out))
+    }
+}
+
+impl SegmentHooks for SubflowHooks<'_> {
+    fn data_option_len(&self) -> usize {
+        let fail = if self.fail_due().is_some() { 12 } else { 0 };
+        if self.conn.data.as_ref().is_some_and(|d| !d.fallback) {
+            28 + fail
+        } else if self.conn.data.is_some() && self.sf.infinite.is_some() {
+            20 + fail
+        } else {
+            0
+        }
+    }
+    /// The protocol options of a data segment, MP_FAIL after the DSS (M4b spec G21).
+    fn data_options_for(&mut self, ssn: u32, out: &mut [u8]) -> usize {
+        let n = self.data_protocol_options(ssn, out);
+        n + self.fail_option(&mut out[n..])
+    }
+    fn window_offer(&self, scale: u8, mss: u16) -> Option<u16> {
+        let mss = self.conn.sws_mss(mss);
+        self.conn
+            .data
+            .as_ref()
+            .map(|d| d.recv.window_offer(scale, mss))
+    }
+    /// A joining subflow's ACK carries no DATA_ACK, so the peer cannot take its window at
+    /// connection level (RFC 8684 §3.3.2): it is not the connection's advertisement.
+    fn window_sent(&mut self, field: u16, scale: u8) {
+        if let Some(d) = self.conn.data.as_mut().filter(|_| !self.sf.joining()) {
+            d.recv.window_sent(field, scale);
+        }
+    }
+    /// Only the subflow chosen to announce a read's window (`window_owner`) sends it.
+    fn window_update_due(&self, scale: u8, mss: u16) -> bool {
+        let mss = self.conn.sws_mss(mss);
+        self.sf.window_owner
+            && (self.conn.data.as_ref()).is_some_and(|d| d.recv.window_update_due(scale, mss))
+    }
+    fn duplicate_ack_allowed(&self, seg: &Segment<'_>) -> bool {
+        self.conn.data.is_none() || !walk(seg.options).any(|o| matches!(o, Ok(TcpOpt::Mptcp(raw)) if !matches!(mptcp::parse(raw), Ok(MptcpOption::Dss(_)))))
+    }
+
+    /// Protocol options, then MP_FAIL on an ACK while one is due (M4b spec G21: before any
+    /// SACK block, which gets what is left).
+    fn options_for(&mut self, flags: TcpFlags, out: &mut [u8]) -> usize {
+        let n = self.protocol_options(flags, out);
+        if flags.contains(TcpFlags::ACK) && !flags.contains(TcpFlags::SYN) {
+            n + self.fail_option(&mut out[n..])
+        } else {
+            n
+        }
     }
     fn ack_signals(&mut self, purpose: AckPurpose, room: usize, out: &mut [u8]) -> usize {
         self.sf.signal_take = None;
@@ -1331,6 +1531,8 @@ impl SegmentHooks for SubflowHooks<'_> {
         } else {
             Some(false)
         };
+        // An MP_FAIL on the segment that completes a join counts as one on a joining subflow.
+        let joining = self.sf.joining();
         // A join's SYN/ACK is its own (the handshake state and SYN window are the initial
         // subflow's); later segments find the connection Confirmed and go on as usual.
         if self.sf.join.is_some() {
@@ -1391,12 +1593,21 @@ impl SegmentHooks for SubflowHooks<'_> {
         // MP_FAIL without RST, with or without checksums; ignored after fallback (above) and
         // while joining (M4b spec G18). Without contiguity the subflow is reset, the RST's
         // MP_FAIL carrying the received DSN (RFC 8684 L2419–2424, spec G13).
-        if let Some(dsn) = fail.filter(|_| !self.sf.joining()) {
+        if let Some(dsn) = fail.filter(|_| !joining) {
             if !self.conn.infinite_ok {
                 self.sf.reset = true;
                 self.sf.reset_option = Some(fail_rst(dsn));
                 return;
             }
+            // While `Waiting` it answers ours (the echo, or the peer's own report crossing
+            // ours); otherwise we echo it (RFC 8684 L2414–2418). Either way we fall back at
+            // once, the held octets replayed (spec G13, G15); the echo rides our segments.
+            if !matches!(self.conn.mp_fail, MpFail::Waiting { .. }) {
+                self.conn.mp_fail_step = Some(MpFailStep::Echo);
+            }
+            d.fall_back(self.sf, m, self.conn.joined_ever);
+            self.conn.fallback_event = true;
+            return;
         }
         // MP_PRIO: the peer's preference for the subflow it arrived on (M3 spec §3.3).
         if let Some(backup) = prio.filter(|_| m.state == State::Confirmed) {
@@ -1614,7 +1825,8 @@ impl SegmentHooks for SubflowHooks<'_> {
         tcp_ack: u32,
         bytes: &[u8],
     ) -> Vec<std::ops::Range<usize>> {
-        let csum = self.conn.negotiation.as_ref().unwrap().csum;
+        let m = self.conn.negotiation.as_ref().unwrap();
+        let (csum, peer_idsn) = (m.csum, m.peer_idsn.unwrap());
         let d = self.conn.data.as_mut().unwrap();
         // With checksums, mapped octets wait in the hold buffer until their mapping verifies
         // (spec G6, G7); without, they go to the connection level at once, as before (G9).
@@ -1695,9 +1907,27 @@ impl SegmentHooks for SubflowHooks<'_> {
                         self.sf.ack_now = true;
                     }
                 }
-                // The subflow is reset with MP_FAIL and its held octets are discarded: they are
-                // not DATA_ACKed, so the peer sends them again elsewhere (RFC 8684 L2369–2394,
-                // M4b spec G11).
+                // With contiguity on both sides (`infinite_ok`, which no completed join leaves,
+                // so this is the one data-carrying subflow, and the handshake's offset in M and
+                // every held mapping), we wait for the peer's answer to MP_FAIL(M.dsn), keeping
+                // M's octets and all later ones: they are TCP-ACKed and come back as plain TCP
+                // on fallback. A later failure while waiting is kept the same way (M4b spec
+                // G10, G11, G15).
+                Complete::Failed { .. }
+                    if matches!(self.conn.mp_fail, MpFail::Waiting { .. })
+                        || self.conn.mp_fail_step.is_some() => {}
+                Complete::Failed { dsn, ssn }
+                    if self.conn.infinite_ok
+                        && !self.sf.joining()
+                        && initial_offset_ok(peer_idsn, dsn, ssn)
+                        && (self.sf.hold.maps())
+                            .all(|h| initial_offset_ok(peer_idsn, h.dsn, h.ssn)) =>
+                {
+                    self.conn.mp_fail_step = Some(MpFailStep::Wait { dsn });
+                }
+                // Otherwise the subflow is reset with MP_FAIL and its held octets are
+                // discarded: they are not DATA_ACKed, so the peer sends them again elsewhere
+                // (RFC 8684 L2369–2394, M4b spec G11).
                 Complete::Failed { dsn, .. } => {
                     self.sf.reset = true;
                     self.sf.reset_option = Some(fail_rst(dsn));

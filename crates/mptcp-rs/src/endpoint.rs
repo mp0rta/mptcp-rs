@@ -513,11 +513,12 @@ impl<R: CryptoRng> Endpoint<R> {
         });
         let l = &self.listeners[&key];
         let listener_ok = l.cfg.mptcp && l.half_open < l.cfg.max_half_open;
+        // Not while `Waiting` for an MP_FAIL answer (M4b spec G12).
         let confirmed = |c: &&Connection| {
             let m = c.hooks.negotiation.as_ref();
             !c.half_open
                 && m.is_some_and(|m| m.state == State::Confirmed)
-                && !(c.reset || c.detached || closed(c))
+                && !(c.reset || c.detached || closed(c) || c.hooks.frozen())
         };
         let found = parsed.filter(|_| listener_ok).and_then(|(.., token, _)| {
             let h = *self.tokens.get(&token)?;
@@ -671,7 +672,7 @@ impl<R: CryptoRng> Endpoint<R> {
             backup,
             local_backup: false,
         };
-        if m.state == State::Confirmed && m.peer_dss_seen {
+        if m.state == State::Confirmed && m.peer_dss_seen && !c.hooks.frozen() {
             self.start_join(now, h, join)?;
         } else {
             c.queued_joins.push(join);
@@ -892,8 +893,9 @@ impl<R: CryptoRng> Endpoint<R> {
             let m = c.hooks.negotiation.as_ref().unwrap();
             let open = !c.reset && !c.detached && !closed(c);
             let (state, peer_c, initial) = (m.state, m.peer_c, c.subflows[0].remote);
-            // Our joins wait for a DSS from the peer (RFC 8684 L884–887).
-            let ready = state == State::Confirmed && m.peer_dss_seen;
+            // Our joins wait for a DSS from the peer (RFC 8684 L884–887), and while we are
+            // `Waiting` for an MP_FAIL answer (M4b spec G12).
+            let ready = state == State::Confirmed && m.peer_dss_seen && !c.hooks.frozen();
             let waiting = open && !ready && state != State::FellBack;
             let mut kept = Vec::new();
             for q in std::mem::take(&mut c.queued_joins) {
@@ -1001,6 +1003,12 @@ impl<R: CryptoRng> Endpoint<R> {
         if let Some(d) = c.hooks.data.as_mut() {
             d.recv
                 .set_held(c.subflows.iter().map(|s| s.mp.hold.held()).sum());
+        }
+        // Waiting for an MP_FAIL answer: joins not yet complete are reset (M4b spec G12).
+        if c.mp_fail_input(i, now) {
+            for subflow in c.cancel_joins(now) {
+                (self.events).push_back((h, down(subflow, CloseReason::Reset, None)));
+            }
         }
         c.note_join_failure(i);
         // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
@@ -1485,6 +1493,7 @@ impl<R: CryptoRng> Endpoint<R> {
                         tcb.chain(unlisten)
                     })
                     .chain(c.hooks.recovery_deadline())
+                    .chain(c.mp_fail_deadline())
                     .chain(c.opp_deadline())
                     .chain(c.hooks.signals.next_wake())
                     .chain(c.aborting.then_some(Instant::from_nanos(0)))
@@ -1503,6 +1512,7 @@ impl<R: CryptoRng> Endpoint<R> {
         for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
             let mark = self.events.len();
             c.update_recovery(now);
+            let mp_fail_expired = c.mp_fail_timeout(now);
             for i in 0..c.subflows.len() {
                 let last = !others_open(&c.subflows, i);
                 let sf = &mut c.subflows[i];
@@ -1512,7 +1522,12 @@ impl<R: CryptoRng> Endpoint<R> {
                 };
                 let mut r = Reaction::None;
                 let syn_sent = sf.tcb.state() == TcpState::SynSent;
-                if sf.tcb.state() == TcpState::SynReceived && hk.sf.reset {
+                if Some(sf.id) == mp_fail_expired && sf.tcb.state() != TcpState::Closed {
+                    // No answer to our MP_FAIL in 120 s (M4b spec G16); held octets go too.
+                    hk.sf.hold.drain();
+                    let rst = Some(tcprst(0x06, false).to_vec());
+                    r = sf.tcb.abort_with(CloseReason::Reset, rst, now);
+                } else if sf.tcb.state() == TcpState::SynReceived && hk.sf.reset {
                     // A join whose listener was removed (`unlisten`): RFC 9293 §3.10.5 ABORT.
                     r = sf
                         .tcb
@@ -1558,6 +1573,10 @@ impl<R: CryptoRng> Endpoint<R> {
                         .abort_with(CloseReason::Timeout, Some(tcprst(0x00, true).to_vec()), now);
                 }
                 Self::report(&mut self.events, h, c, i, r, last, now);
+            }
+            if let Some(d) = c.hooks.data.as_mut().filter(|_| mp_fail_expired.is_some()) {
+                d.recv
+                    .set_held(c.subflows.iter().map(|s| s.mp.hold.held()).sum());
             }
             // A half-open connection ends silently, at R2 (spec G10).
             if c.half_open {

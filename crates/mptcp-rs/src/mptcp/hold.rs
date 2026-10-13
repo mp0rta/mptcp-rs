@@ -32,8 +32,8 @@ pub(crate) enum Complete {
         bytes: Vec<u8>,
         data_fin: bool,
     },
-    // Task 5 (MP_FAIL) reads the fields.
-    #[allow(dead_code)]
+    /// Reported once; its octets stay held (`drain`) until the caller drains them (M4b spec
+    /// G11: kept for the replay of a single-subflow fallback, else discarded with the reset).
     Failed { dsn: u64, ssn: u32 },
 }
 
@@ -46,6 +46,8 @@ struct Entry {
     map: HoldMap,
     /// Held runs by offset in the mapping: sorted, disjoint, never adjacent.
     pieces: Vec<(u32, VecDeque<u8>)>,
+    /// Complete with a checksum that failed (`Complete::Failed`, reported once).
+    failed: bool,
 }
 
 impl Entry {
@@ -129,12 +131,18 @@ impl Hold {
         self.entries.push(Entry {
             map,
             pieces: Vec::new(),
+            failed: false,
         });
         true
     }
 
     pub fn held(&self) -> usize {
         self.held
+    }
+
+    /// Every held mapping, failed ones included.
+    pub fn maps(&self) -> impl Iterator<Item = &HoldMap> {
+        self.entries.iter().map(|e| &e.map)
     }
 
     /// Takes the octets of `bytes` (from SSN `ssn`) that known mappings cover and returns the
@@ -156,7 +164,7 @@ impl Hold {
         // lacks (unmapped, or it is a repeat of a mapping taken before).
         let (held, pieces) = (&mut self.held, &mut self.pieces);
         self.entries.retain(|e| {
-            let live = e.end().wrapping_sub(frontier) as i32 > 0;
+            let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
             if !live {
                 *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
                 *pieces -= e.pieces.len();
@@ -202,35 +210,40 @@ impl Hold {
         accepted
     }
 
-    /// Removes every mapping whose octets have all arrived, verified or failed.
+    /// Takes every mapping whose octets have all arrived and verify; reports, once, each one
+    /// that fails and keeps it.
     pub fn take_complete(&mut self) -> Vec<Complete> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
-            let e = &self.entries[i];
-            if !matches!(e.pieces.as_slice(), [(0, b)] if b.len() == e.map.len as usize) {
+            let e = &mut self.entries[i];
+            let Some(b) = (e.pieces.first())
+                .filter(|p| !e.failed && p.0 == 0 && p.1.len() == e.map.len as usize)
+            else {
+                i += 1;
+                continue;
+            };
+            let m = e.map;
+            let data_len = (m.len + u32::from(m.data_fin)) as u16;
+            let (head, tail) = b.1.as_slices();
+            if !dss_checksum_ok(m.dsn, m.ssn, data_len, &[head, tail], m.checksum) {
+                e.failed = true;
+                out.push(Complete::Failed {
+                    dsn: m.dsn,
+                    ssn: m.ssn,
+                });
                 i += 1;
                 continue;
             }
             let e = self.entries.remove(i);
-            let (m, bytes) = (e.map, Vec::from(e.pieces.into_iter().next().unwrap().1));
+            let bytes = Vec::from(e.pieces.into_iter().next().unwrap().1);
             self.held -= bytes.len();
             self.pieces -= 1;
-            let data_len = (m.len + u32::from(m.data_fin)) as u16;
-            out.push(
-                if dss_checksum_ok(m.dsn, m.ssn, data_len, &[&bytes], m.checksum) {
-                    Complete::Verified {
-                        dsn: m.dsn,
-                        bytes,
-                        data_fin: m.data_fin,
-                    }
-                } else {
-                    Complete::Failed {
-                        dsn: m.dsn,
-                        ssn: m.ssn,
-                    }
-                },
-            );
+            out.push(Complete::Verified {
+                dsn: m.dsn,
+                bytes,
+                data_fin: m.data_fin,
+            });
         }
         out
     }
@@ -316,6 +329,11 @@ mod tests {
         bad[40] ^= 1;
         h.insert(7, &bad, 7, EDGE, BIG);
         assert_eq!(h.take_complete(), [Complete::Failed { dsn: 900, ssn: 7 }]);
+        // Kept, reported once, and not pruned below the frontier (spec G11, G15).
+        assert_eq!(h.held(), 100);
+        assert!(h.take_complete().is_empty());
+        h.insert(107, b"", 107, EDGE, BIG);
+        assert_eq!(h.drain(), [(7, bad)]);
         assert_eq!(h.held(), 0);
     }
 
