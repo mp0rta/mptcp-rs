@@ -309,6 +309,24 @@ fn infinite_mapping_triggers_fallback_too() {
     }
 }
 
+/// Corrupt M (the initial offset) and valid N (another offset) complete in one payload: N is
+/// taken in the same input, but its offset still counts, so the subflow is reset with MP_FAIL
+/// rather than waiting (spec G10, G11).
+#[test]
+fn offset_of_mapping_completed_alongside_counts() {
+    let mut c = client(true, false);
+    c.confirm();
+    let head = peer_head();
+    let (m, n) = (pattern(10), pattern(20)[10..].to_vec());
+    c.peer_at(5001, &csum_mapping(1, head, &m, false), &[]);
+    c.peer_at(5001, &csum_mapping(11, head + 1000, &n, false), &[]);
+    let mut wire = [m, n].concat();
+    wire[3] ^= 0xff;
+    let sent = c.peer_at(5001, &[], &wire);
+    assert_eq!(rst_reason(&sent), Some(mp_fail_rst(head)));
+    assert_eq!(state(&c), MpFail::Idle);
+}
+
 /// An MP_FAIL that would make us the echoer, with an infinite mapping in the same segment (in
 /// either order): the mapping is checked first, so one without its checksum resets with
 /// MP_TCPRST 0x01 and no fallback (spec G3); a valid one keeps its own anchor (here SSN 151 at

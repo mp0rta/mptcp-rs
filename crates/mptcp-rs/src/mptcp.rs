@@ -1934,9 +1934,17 @@ impl SegmentHooks for SubflowHooks<'_> {
         } else {
             Vec::new()
         };
+        // Every mapping this input completed counts as held for the offset check (G10).
+        let completed_ok = complete.iter().all(|c| match *c {
+            Complete::Verified { dsn, ssn, .. } | Complete::Failed { dsn, ssn } => {
+                initial_offset_ok(peer_idsn, dsn, ssn)
+            }
+        });
         for done in complete {
             match done {
-                Complete::Verified { dsn, len, data_fin } => {
+                Complete::Verified {
+                    dsn, len, data_fin, ..
+                } => {
                     let fin = dsn.wrapping_add(u64::from(len));
                     if data_fin && d.recv.finish(fin) {
                         self.sf.ack_now = true;
@@ -1944,17 +1952,17 @@ impl SegmentHooks for SubflowHooks<'_> {
                 }
                 // With contiguity on both sides (`infinite_ok`, which no completed join leaves,
                 // so this is the one data-carrying subflow, and the handshake's offset in M and
-                // every held mapping), we wait for the peer's answer to MP_FAIL(M.dsn), keeping
-                // M's octets and all later ones: they are TCP-ACKed and come back as plain TCP
-                // on fallback. A later failure while waiting is kept the same way (M4b spec
-                // G10, G11, G15).
+                // every held or just completed mapping), we wait for the peer's answer to
+                // MP_FAIL(M.dsn), keeping M's octets and all later ones: they are TCP-ACKed and
+                // come back as plain TCP on fallback. A later failure while waiting is kept the
+                // same way (M4b spec G10, G11, G15).
                 Complete::Failed { .. }
                     if matches!(self.conn.mp_fail, MpFail::Waiting { .. })
                         || self.conn.mp_fail_step.is_some() => {}
-                Complete::Failed { dsn, ssn }
+                Complete::Failed { dsn, .. }
                     if self.conn.infinite_ok
                         && !self.sf.joining()
-                        && initial_offset_ok(peer_idsn, dsn, ssn)
+                        && completed_ok
                         && (self.sf.hold.maps())
                             .all(|h| initial_offset_ok(peer_idsn, h.dsn, h.ssn)) =>
                 {
