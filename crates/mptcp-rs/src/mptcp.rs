@@ -677,6 +677,13 @@ impl Connection {
         if sf.tcb.state() == TcpState::Closed {
             self.reinject_ranges(i);
             self.subflows[i].mp.tx.clear();
+            // Its held octets can never complete here, nor are they DATA_ACKed: the peer sends
+            // them again elsewhere (RFC 8684 L2392–2394). Kept, they would hold `free` down for
+            // good, the initial subflow being retained (M4b spec G7).
+            if !self.subflows[i].mp.hold.drain().is_empty() {
+                let held = self.subflows.iter().map(|s| s.mp.hold.held()).sum();
+                self.hooks.data.as_mut().unwrap().recv.set_held(held);
+            }
             return None;
         }
         if sf.tcb.fin_received()

@@ -1432,6 +1432,33 @@ fn full_hold_with_refusable_frontier_resets() {
     assert_eq!(read_now(&mut ep, h), data);
 }
 
+/// The initial subflow holds all but the last octet of a 4,096-octet mapping when it is reset;
+/// the joined subflow sends the mapping again and the application reads it. The reset
+/// subflow's hold is discarded with it, so the window reopens and the transfer goes on (G7).
+#[test]
+fn closed_subflow_hold_is_discarded() {
+    let (mut ep, h, a, b, dsn) = two_subflows_with(ConnectConfig {
+        recv_buffer: 4096,
+        ..checksums_cfg(true)
+    });
+    let now = t(20_000_000);
+    let data = pattern(5096);
+    let opt = csum_mapping(1, dsn, &data[..4096], false);
+    feed(&mut ep, &peer_data(&a, 5001, &opt, &data[..4095]), now);
+    assert_eq!(held(&ep, h), 4095);
+    let rst = Segment {
+        flags: TcpFlags::RST,
+        ..peer_data(&a, 5001 + 4095, &[], &[])
+    };
+    feed(&mut ep, &rst, now);
+    send_mapping(&mut ep, &b, 1, dsn, &data[..4096]);
+    assert_eq!(read_now(&mut ep, h), &data[..4096]);
+    assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, 4096));
+    drain(&mut ep, now);
+    send_mapping(&mut ep, &b, 4097, dsn + 4096, &data[4096..]);
+    assert_eq!(read_now(&mut ep, h), &data[4096..]);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 
