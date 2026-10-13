@@ -906,3 +906,90 @@ fn rx_csum_off_delivers_per_segment() {
     assert_eq!(held(&c.ep, c.h), 0);
     assert_eq!(read_now(&mut c.ep, c.h), &data[1460..]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Replay of held octets on fallback (spec G15).
+
+/// The peer's infinite mapping, retroactive to its first octet (checksum field present, 0).
+fn peer_infinite() -> Vec<u8> {
+    dss_mapping(false, 1, peer_head(), 0, Some(0))
+}
+
+/// With `csum`, the first 1460 octets of a 3000-octet mapping are held when the peer's infinite
+/// mapping arrives with the plain octets after them: all 4000 are readable, in order.
+#[test]
+fn replay_partial_reverse_mapping_on_peer_infinite_mapping() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let data = pattern(4000);
+    c.peer_at(
+        5001,
+        &csum_mapping(1, dsn, &data[..3000], false),
+        &data[..1460],
+    );
+    assert_eq!(held(&c.ep, c.h), 1460);
+    c.peer_at(5001 + 1460, &peer_infinite(), &data[1460..]);
+    assert_eq!(negotiation(&c.ep, c.h).state, State::FellBack);
+    assert_eq!(read_now(&mut c.ep, c.h), data);
+    assert_eq!(held(&c.ep, c.h), 0);
+}
+
+/// With `csum`, 1460 octets of a mapping are held when the DATA_ACK-stripping fallback fires:
+/// they are readable at once, and the rest follows as plain TCP.
+#[test]
+fn replay_on_stripping_fallback() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let data = pattern(3000);
+    c.peer_at(5001, &csum_mapping(1, dsn, &data, false), &data[..1460]);
+    assert_eq!(held(&c.ep, c.h), 1460);
+    c.ep.connection(c.h).unwrap().write(b"first").unwrap();
+    let sent = c.sent(t(2));
+    let first = sent.iter().find(|s| s.payload == b"first").unwrap();
+    // The peer ACKs it without any MPTCP option.
+    let syn = c.syn.clone();
+    let mut ack = peer_data(&syn, 5001 + 1460, &[], &[]);
+    ack.ack = first.seq.wrapping_add(5);
+    feed(&mut c.ep, &ack, t(2));
+    assert_eq!(negotiation(&c.ep, c.h).state, State::FellBack);
+    assert_eq!(read_now(&mut c.ep, c.h), &data[..1460]);
+    c.peer_at(5001 + 1460, &[], &data[1460..]);
+    assert_eq!(read_now(&mut c.ep, c.h), &data[1460..]);
+}
+
+/// A 4096-octet receive buffer full of unread octets when the fallback replays 3000 held ones:
+/// they stay owned by the connection, and one read makes them readable with no further packet.
+/// (4095 unread: a mapping is held only if it starts below the offered edge, spec G7.)
+#[test]
+fn replay_full_app_buffer_drains_on_read() {
+    let cfg = ConnectConfig {
+        recv_buffer: 4096,
+        ..checksums_cfg(true)
+    };
+    let mut c = client_cfg(cfg, false);
+    c.confirm();
+    let dsn = peer_head();
+    let a = pattern(4095);
+    let opt = csum_mapping(1, dsn, &a, false);
+    for at in (0..a.len()).step_by(1460) {
+        let end = (at + 1460).min(a.len());
+        c.peer_at(5001 + at as u32, &opt, &a[at..end]);
+    }
+    assert_eq!(recv(&c.ep, c.h).free(), 1);
+    // Mapping B starts below the edge, so completion credit opens the edge to its end.
+    let b = pattern(3001);
+    let opt = csum_mapping(4096, dsn + 4095, &b, false);
+    for (from, to) in [(0, 1), (1, 1461), (1461, 3000)] {
+        c.peer_at(5001 + 4095 + from as u32, &opt, &b[from..to]);
+    }
+    assert_eq!(held(&c.ep, c.h), 3000);
+    c.peer_at(5001 + 7095, &peer_infinite(), &[]);
+    assert_eq!(negotiation(&c.ep, c.h).state, State::FellBack);
+    assert_eq!(held(&c.ep, c.h), 0);
+    let mut out = [0; 4095];
+    assert_eq!(c.ep.connection(c.h).unwrap().read(&mut out), Ok(4095));
+    assert_eq!(&out[..], &a[..]);
+    assert_eq!(read_now(&mut c.ep, c.h), &b[..3000]);
+}

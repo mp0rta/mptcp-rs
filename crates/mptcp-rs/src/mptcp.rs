@@ -1438,8 +1438,9 @@ impl SegmentHooks for SubflowHooks<'_> {
                     return;
                 }
                 if mapping.data_len == 0 {
-                    d.fall_back(self.sf, m, self.conn.joined_ever);
+                    // A received infinite mapping keeps its own anchor (`fall_back` keeps it).
                     self.sf.rx_infinite = Some((mapping.ssn, dsn));
+                    d.fall_back(self.sf, m, self.conn.joined_ever);
                     self.conn.fallback_event = true;
                     return;
                 }
@@ -1688,21 +1689,38 @@ impl DataState {
         released
     }
     /// Falls back on subflow `sf` (`Connection::on_fallback` finishes it) and makes our
-    /// infinite mapping due. Before any join it starts at the send origin `(SSN 1,
-    /// local_idsn + 1)`; once a join was started it is survivor-relative, `(sf`'s
+    /// infinite mapping due. Before any join it is `(SSN of send.una, send.una)`, retroactive
+    /// to the end of the data known delivered (RFC 8684 L2405–2411; `(1, local_idsn + 1)`
+    /// before any DATA_ACK); once a join was started it is survivor-relative, `(sf`'s
     /// `assigned_end`, `send.next)`: later data follows it linearly, and `sf`'s earlier finite
-    /// mappings keep covering its earlier SSNs (RFC 8684 L1496–1500).
+    /// mappings keep covering its earlier SSNs (RFC 8684 L1496–1500). Anchors sit at the
+    /// current position, as translation takes SSN distances as `i32` (M4b spec G10a).
     fn fall_back(&mut self, sf: &mut SubflowMp, m: &mut Negotiation, joined_ever: bool) {
         self.fallback = true;
         self.settling = true;
         self.close = close::Close::default();
         m.state = State::FellBack;
         self.recovery_at = None;
-        sf.rx_infinite = Some((1, m.peer_idsn.unwrap().wrapping_add(1)));
+        // The receive translation, unless a received infinite mapping set it: `recv.next` at
+        // the handshake's constant DSN−SSN offset.
+        let next = self.recv.next;
+        let peer_idsn = m.peer_idsn.unwrap();
+        let (ssn_r, dsn_r) =
+            *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
+        // Held octets are TCP-ACKed and never resent: they go on as plain TCP (spec G15).
+        // `accept_tcp` takes what free memory allows; the remainder is carried by
+        // `RecvAssembler`'s promised-data overshoot (`accept` stores within `right_edge`,
+        // which every held octet is below) and delivered as reads make room.
+        for (ssn, run) in sf.hold.drain() {
+            let dsn = dsn_r.wrapping_add_signed(ssn.wrapping_sub(ssn_r) as i32 as i64);
+            let n = self.recv.accept_tcp(dsn, &run);
+            self.recv.accept(dsn.wrapping_add(n as u64), &run[n..]);
+        }
+        let una = self.send.una;
         let (ssn, dsn) = if joined_ever {
             (sf.tx.assigned_end(), self.send.next)
         } else {
-            (1, m.local_idsn.wrapping_add(1))
+            (una.wrapping_sub(m.local_idsn) as u32, una)
         };
         sf.infinite_from = Some(ssn);
         let mapping = mptcp::Mapping {
@@ -2018,5 +2036,64 @@ impl Negotiation {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review Focus 3 (spec G10a): a connection that has moved `past` octets each way past its
+    /// IDSNs falls back with no join. Plain data at the matching SSN lands at `recv.next`, and
+    /// our infinite mapping is `(SSN of send.una, send.una)`.
+    fn fallback_anchor_after(past: u64) {
+        let mut conn = ConnectionHooks::new(&ConnectConfig::default());
+        let mut m = Negotiation::new(7, false);
+        m.state = State::Confirmed;
+        m.peer_idsn = Some(0xfff0_0000_0000_0010);
+        let peer_head = m.peer_idsn.unwrap().wrapping_add(1 + past);
+        let local_una = m.local_idsn.wrapping_add(1 + past);
+        let mut d = DataState {
+            recv: RecvAssembler::new(peer_head, 65_536, 64),
+            send: SendStore::new(local_una, 65_536),
+            close: close::Close::default(),
+            sanity_failures: 0,
+            recovery_head: None,
+            recovery_at: None,
+            recovery_interval: Duration::from_secs(1),
+            reinject: ReinjectQueue::new(local_una),
+            fallback: false,
+            settling: false,
+        };
+        let mut sf = SubflowMp::new();
+        d.fall_back(&mut sf, &mut m, false);
+        let ssn = (1 + past) as u32;
+        let (mapping, _) = sf.infinite.unwrap();
+        assert_eq!(
+            (mapping.ssn, mapping.dsn),
+            (ssn, mptcp::Dsn::Dsn64(local_una))
+        );
+        conn.negotiation = Some(m);
+        conn.data = Some(d);
+        let mut hk = SubflowHooks {
+            conn: &mut conn,
+            sf: &mut sf,
+        };
+        assert_eq!(hk.receive_data(ssn, ssn, b"later"), vec![0..5]);
+        let recv = &mut conn.data.as_mut().unwrap().recv;
+        assert_eq!(recv.next, peer_head + 5);
+        let mut out = [0; 8];
+        assert_eq!(recv.read(&mut out), 5);
+        assert_eq!(&out[..5], b"later");
+    }
+
+    #[test]
+    fn fallback_anchor_after_2pow31() {
+        fallback_anchor_after((1 << 31) + 5);
+    }
+
+    #[test]
+    fn fallback_anchor_after_2pow32() {
+        fallback_anchor_after((1 << 32) + 5);
     }
 }

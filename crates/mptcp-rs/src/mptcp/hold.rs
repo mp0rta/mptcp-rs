@@ -236,8 +236,6 @@ impl Hold {
     }
 
     /// Empties the buffer: every held run with its SSN, in SSN order.
-    // Task 4 replays these on fallback.
-    #[allow(dead_code)]
     pub fn drain(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.held = 0;
         self.pieces = 0;
