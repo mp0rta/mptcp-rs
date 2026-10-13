@@ -10,11 +10,12 @@
 //!
 //! # Scope
 //!
-//! Client role (released in 0.2.0) and server role (on main, not yet released). Implemented: MP_CAPABLE, DSS and DATA_ACK, MP_JOIN with multiple
-//! subflows over IPv4 and IPv6 (including mixed families), a MinRTT scheduler with
-//! reinjection, opportunistic retransmission and penalization, stale-subflow detection,
-//! fallback to TCP (including the infinite mapping); CUBIC with HyStart++ and pacing, and
-//! SACK-based loss recovery; plain TCP connections.
+//! Client role (released in 0.2.0) and server role (on main, not yet released).
+//! Implemented: MP_CAPABLE, DSS and DATA_ACK, MP_JOIN with multiple subflows over IPv4 and
+//! IPv6 (including mixed families), a MinRTT scheduler with reinjection, opportunistic
+//! retransmission and penalization, stale-subflow detection, fallback to TCP (including the
+//! infinite mapping); CUBIC with HyStart++ and pacing, and SACK-based loss recovery; plain
+//! TCP connections.
 //!
 //! Congestion control is chosen per connection with [`ConnectConfig::congestion_control`]:
 //! [`CongestionControlKind::Cubic`] (the default) or [`CongestionControlKind::BbrV3`], BBRv3
@@ -37,7 +38,7 @@
 //! [`ListenConfig`] carries the per-connection [`ConnectConfig`], whether to offer MPTCP, and
 //! `max_half_open`. A completed handshake is one [`Event::Accepted`] on the new connection's
 //! handle; before it the connection has no handle. MP_CAPABLE and MP_JOIN are answered, and a
-//! client's MP_JOIN, MP_PRIO and REMOVE_ADDR work as on the client side. M4a limits: no SYN
+//! client's MP_JOIN, MP_PRIO and REMOVE_ADDR work as on the client side. Server limits: no SYN
 //! cookies, so SYNs beyond `max_half_open` half-open connections are dropped silently; the
 //! server sends no ADD_ADDR; no checksums, so a client that requires them (A=1) gets plain
 //! TCP; and, as on the client side, the timer and transmit paths scan every connection of the

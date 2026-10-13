@@ -138,9 +138,9 @@ Each run saves pcaps and logs under `artifacts/interop/`.
 
 ## Roadmap
 
-Next: checksums and MP_FAIL (M4b); the server role is released with them. TCP work continues alongside: RACK-TLP
-and timestamps. Async runtime integration, `no_std` and coupled congestion control are not
-planned yet.
+Next: checksums and MP_FAIL; the server role is released with them. TCP work continues
+alongside: RACK-TLP and timestamps. Async runtime integration, `no_std` and coupled
+congestion control are not planned yet.
 
 ## License
 
