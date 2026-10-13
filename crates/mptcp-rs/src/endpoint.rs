@@ -997,6 +997,11 @@ impl<R: CryptoRng> Endpoint<R> {
             let subflow = sf.id;
             (self.events).push_back((h, Event::PeerPriority { subflow, backup }));
         }
+        // New offers leave out the octets every hold buffer keeps (M4b spec G7, memory).
+        if let Some(d) = c.hooks.data.as_mut() {
+            d.recv
+                .set_held(c.subflows.iter().map(|s| s.mp.hold.held()).sum());
+        }
         c.note_join_failure(i);
         // MP_FASTCLOSE tears down every subflow (RFC 8684 L2168–2172).
         if c.hooks.fast_closed {

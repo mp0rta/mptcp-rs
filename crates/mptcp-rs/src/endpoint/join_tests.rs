@@ -6,7 +6,7 @@ use crate::endpoint::AddSubflowError;
 use crate::mptcp::State;
 use crate::wire::mptcp::MpJoin;
 
-const JOIN_IP: &str = "10.0.1.1";
+pub(super) const JOIN_IP: &str = "10.0.1.1";
 const PEER_NONCE: u32 = 0xb1b2_b3b4;
 
 /// The initial subflow's remote (`open`).
@@ -159,7 +159,7 @@ fn assert_third_ack(
     );
 }
 /// Opens a subflow from `ip` and completes the four-way join (peer scale `ws`).
-fn joined(
+pub(super) fn joined(
     ep: &mut Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     now: Instant,

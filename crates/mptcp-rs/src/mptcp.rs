@@ -2,6 +2,7 @@
 pub(crate) mod addr;
 mod close;
 pub(crate) mod data;
+pub(crate) mod hold;
 mod join;
 mod opp;
 pub(crate) mod sched;
@@ -9,6 +10,7 @@ pub(crate) mod signal;
 mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
 use data::{RecvAssembler, SendStore, TxMaps, promote32};
+use hold::{Complete, HoldMap};
 pub(crate) use join::{Join, JoinRole};
 pub(crate) use opp::Cand;
 pub use opp::DebugStats;
@@ -31,7 +33,7 @@ use crate::tcp::{
 use crate::time::Instant;
 use crate::wire::packet::{Segment, TcpFlags};
 use crate::wire::{
-    mptcp::{self, CAP_A, CAP_B, CAP_C, CAP_H, MpCapable, MptcpOption},
+    mptcp::{self, CAP_A, CAP_B, CAP_C, CAP_H, MpCapable, MptcpOption, dss_checksum_ok},
     tcp_options::{TcpOpt, walk},
 };
 use std::net::SocketAddr;
@@ -1395,6 +1397,21 @@ impl SegmentHooks for SubflowHooks<'_> {
                     self.sf.reset = true;
                     return;
                 }
+                // `capable_ack_ok` requires the checksum exactly when `csum` (spec G2).
+                if let Some(checksum) = c.checksum {
+                    let map = HoldMap {
+                        ssn: 1,
+                        dsn,
+                        len: u32::from(len),
+                        data_fin: false,
+                        checksum,
+                    };
+                    if !self.sf.hold.install(map) {
+                        self.sf.reset = true;
+                        return;
+                    }
+                    d.recv.credit(dsn, dsn.wrapping_add(u64::from(len)));
+                }
                 m.peer_dss_seen = true;
                 self.sf.unmapped = 0;
             }
@@ -1431,7 +1448,31 @@ impl SegmentHooks for SubflowHooks<'_> {
                     self.sf.reset = true;
                     return;
                 }
-                if v.data_fin && d.recv.finish(dsn.wrapping_add(u64::from(len))) {
+                // With checksums (the check above makes `checksum` present exactly then), a
+                // data mapping is held until it verifies and may earn completion credit; its
+                // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping
+                // only if its checksum does (spec G6–G8, RFC 8684 L1402–1430).
+                let fin = if let Some(checksum) = mapping.checksum {
+                    if len > 0 {
+                        let map = HoldMap {
+                            ssn: mapping.ssn,
+                            dsn,
+                            len,
+                            data_fin: v.data_fin,
+                            checksum,
+                        };
+                        if !self.sf.hold.install(map) {
+                            self.sf.reset = true;
+                            return;
+                        }
+                        let end = dsn.wrapping_add(u64::from(mapping.data_len));
+                        d.recv.credit(dsn, end);
+                    }
+                    v.data_fin && len == 0 && dss_checksum_ok(dsn, mapping.ssn, 1, &[], checksum)
+                } else {
+                    v.data_fin
+                };
+                if fin && d.recv.finish(dsn.wrapping_add(u64::from(len))) {
                     self.sf.ack_now = true;
                 }
                 self.sf.unmapped = 0;
@@ -1531,7 +1572,12 @@ impl SegmentHooks for SubflowHooks<'_> {
         tcp_ack: u32,
         bytes: &[u8],
     ) -> Vec<std::ops::Range<usize>> {
+        let csum = self.conn.negotiation.as_ref().unwrap().csum;
         let d = self.conn.data.as_mut().unwrap();
+        // With checksums, mapped octets wait in the hold buffer until their mapping verifies
+        // (spec G6, G7); without, they go to the connection level at once, as before (G9).
+        let hold = csum && !d.fallback;
+        let cap = self.conn.recv_cap + 65_535;
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -1555,6 +1601,18 @@ impl SegmentHooks for SubflowHooks<'_> {
                 {
                     d.sanity_failures = d.sanity_failures.saturating_add(1);
                 }
+                if hold {
+                    let taken = self.sf.hold.insert(
+                        pos,
+                        &bytes[at..at + len],
+                        tcp_ack,
+                        d.recv.right_edge,
+                        cap,
+                    );
+                    accepted.extend(taken.into_iter().map(|r| at + r.start..at + r.end));
+                    at += len;
+                    continue;
+                }
                 let n = if d.fallback {
                     d.recv.accept_tcp(dsn, &bytes[at..at + len])
                 } else {
@@ -1574,6 +1632,32 @@ impl SegmentHooks for SubflowHooks<'_> {
                 }
                 accepted.push(at..at + len);
                 at += len;
+            }
+        }
+        let complete = if hold {
+            self.sf.hold.take_complete()
+        } else {
+            Vec::new()
+        };
+        for done in complete {
+            match done {
+                // The existing receive path clips what another subflow already delivered.
+                Complete::Verified {
+                    dsn,
+                    bytes,
+                    data_fin,
+                } => {
+                    d.recv.accept(dsn, &bytes);
+                    let fin = dsn.wrapping_add(bytes.len() as u64);
+                    if data_fin && d.recv.finish(fin) {
+                        self.sf.ack_now = true;
+                    }
+                }
+                // Interim: Tasks 5 and 6 answer a failed checksum with MP_FAIL.
+                Complete::Failed { .. } => {
+                    self.sf.reset = true;
+                    self.sf.reset_option = Some(tcprst(0x06, false));
+                }
             }
         }
         accepted

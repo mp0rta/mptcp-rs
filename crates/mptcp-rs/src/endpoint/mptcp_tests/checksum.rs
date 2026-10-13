@@ -1,6 +1,8 @@
-//! DSS checksums (M4b spec G1–G5): the A-bit negotiation in both roles, the checksum on every
-//! mapping we send, and the presence check on every mapping we receive.
+//! DSS checksums (M4b spec G1–G9): the A-bit negotiation in both roles, the checksum on every
+//! mapping we send, the presence check on every mapping we receive, and the hold buffer that
+//! keeps a mapping's octets until its checksum verifies.
 use super::super::server_tests::*;
+use super::join_tests::{JOIN_IP, joined};
 use super::*;
 use crate::crypto::key_token_idsn;
 use crate::wire::mptcp::{CAP_A, Dss, Mapping, dss_checksum, dss_checksum_ok};
@@ -69,6 +71,11 @@ struct Client {
 /// A client with `checksums` (Reno, no pacing) against a SYN/ACK whose MP_CAPABLE has
 /// A=`peer_a`, MSS 1460 and WS 7. The third ACK is sent.
 fn client(checksums: bool, peer_a: bool) -> Client {
+    client_cfg(checksums_cfg(checksums), peer_a)
+}
+
+/// `client` with the whole `ConnectConfig`.
+fn client_cfg(cfg: ConnectConfig, peer_a: bool) -> Client {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(41));
     ep.cc = Some(reno);
     let h = ep
@@ -76,7 +83,7 @@ fn client(checksums: bool, peer_a: bool) -> Client {
             t(0),
             "10.0.0.1".parse().unwrap(),
             "10.0.0.2:80".parse().unwrap(),
-            checksums_cfg(checksums),
+            cfg,
         )
         .unwrap();
     let syn = packet::parse(transmit(&mut ep, t(0)).leak()).unwrap();
@@ -130,8 +137,12 @@ impl Client {
     }
     /// The peer's segment at its next sequence number with `options` and `payload`.
     fn peer(&mut self, options: &[u8], payload: &[u8]) -> Vec<Segment<'static>> {
+        self.peer_at(5001, options, payload)
+    }
+    /// The peer's segment at `seq`, and what we send in answer.
+    fn peer_at(&mut self, seq: u32, options: &[u8], payload: &[u8]) -> Vec<Segment<'static>> {
         let syn = self.syn.clone();
-        input(&mut self.ep, &peer_data(&syn, 5001, options, payload));
+        feed(&mut self.ep, &peer_data(&syn, seq, options, payload), t(2));
         self.sent(t(2))
     }
 }
@@ -610,4 +621,288 @@ fn server_third_ack_a_mismatch_falls_back() {
             s.assert_plain_after();
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Receiving: hold, verify, completion credit (spec G6–G9).
+
+/// Feeds `seg` at `now` (payloads up to 4 KiB).
+fn feed(ep: &mut Endpoint<ChaCha20Rng>, seg: &Segment, now: Instant) {
+    let mut wire = [0; 4200];
+    let n = packet::build(seg, 0, &mut wire).unwrap();
+    ep.handle_packet(now, &wire[..n]);
+}
+
+/// The peer's first DSN.
+fn peer_head() -> u64 {
+    key_token_idsn(PEER_KEY).1.wrapping_add(1)
+}
+
+/// A DSS mapping of `data` (plus a DATA_FIN if `fin`) with its checksum.
+fn csum_mapping(ssn: u32, dsn: u64, data: &[u8], fin: bool) -> Vec<u8> {
+    let len = (data.len() + usize::from(fin)) as u16;
+    dss_mapping(
+        fin,
+        ssn,
+        dsn,
+        len,
+        Some(dss_checksum(dsn, ssn, len, &[data])),
+    )
+}
+
+/// The same mapping with a checksum that does not verify.
+fn bad_mapping(ssn: u32, dsn: u64, data: &[u8], fin: bool) -> Vec<u8> {
+    let len = (data.len() + usize::from(fin)) as u16;
+    let ck = dss_checksum(dsn, ssn, len, &[data]) ^ 1;
+    dss_mapping(fin, ssn, dsn, len, Some(ck))
+}
+
+fn recv(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> &crate::mptcp::data::RecvAssembler {
+    &ep.conns[&h].hooks.data.as_ref().unwrap().recv
+}
+
+fn held(ep: &Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> usize {
+    ep.conns[&h].subflows.iter().map(|s| s.mp.hold.held()).sum()
+}
+
+/// The DATA_ACK a segment carries.
+fn data_ack_of(seg: &Segment) -> Option<u64> {
+    match mpc(seg.options).into_iter().find_map(dss)?.data_ack? {
+        mptcp::DataAck::Ack64(a) => Some(a),
+        mptcp::DataAck::Ack32(_) => None,
+    }
+}
+
+/// Our window scale, from our SYN.
+fn our_scale(syn: &Segment) -> u8 {
+    walk(syn.options)
+        .find_map(|o| match o {
+            Ok(TcpOpt::WindowScale(s)) => Some(s),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Every octet readable now.
+fn read_now(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut buf = [0; 8192];
+    while let Ok(n) = ep.connection(h).unwrap().read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+    }
+    all
+}
+
+/// A confirmed client with checksums (1 MiB buffer) and a second subflow joined: (endpoint,
+/// handle, initial SYN, join SYN, the peer's first DSN). The peer's ISN is 5000 on both.
+fn two_subflows() -> (
+    Endpoint<ChaCha20Rng>,
+    ConnectionHandle,
+    Segment<'static>,
+    Segment<'static>,
+    u64,
+) {
+    let cfg = ConnectConfig {
+        recv_buffer: 1 << 20,
+        ..checksums_cfg(true)
+    };
+    let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
+    open_window(&mut ep, &syn, h);
+    assert!(negotiation(&ep, h).csum);
+    let (_, jsyn) = joined(&mut ep, h, t(10_000_000), JOIN_IP, 1500, 7);
+    (ep, h, syn, jsyn, dsn)
+}
+
+/// With `csum`, octets of a mapping are neither readable nor DATA_ACKed until the whole
+/// mapping verifies; held octets are TCP-ACKed (spec G6, A3).
+#[test]
+fn rx_no_read_no_data_ack_before_verify() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let data = pattern(3000);
+    let opt = csum_mapping(1, dsn, &data, false);
+    let sent = c.peer_at(5001, &opt, &data[..1460]);
+    let ack = sent.last().expect("an ACK");
+    assert_eq!(ack.ack, SeqNum(5001 + 1460), "held octets are TCP-ACKed");
+    assert_eq!(data_ack_of(ack), Some(dsn));
+    assert_eq!(read_now(&mut c.ep, c.h), b"");
+    let sent = c.peer_at(5001 + 1460, &opt, &data[1460..]);
+    assert_eq!(data_ack_of(sent.last().unwrap()), Some(dsn + 3000));
+    assert_eq!(read_now(&mut c.ep, c.h), data);
+    assert_eq!(held(&c.ep, c.h), 0);
+}
+
+/// Subflow 0 delivers DSN [0, 200); subflow 1 then sends a mapping [100, 300). It verifies
+/// over all its octets and adds only [200, 300) (spec G7: coverage is not delivery).
+#[test]
+fn rx_mapping_prefix_delivered_elsewhere_verifies() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+    let now = t(20_000_000);
+    let data = pattern(300);
+    let opt = csum_mapping(1, dsn, &data[..200], false);
+    feed(&mut ep, &peer_data(&syn, 5001, &opt, &data[..200]), now);
+    assert_eq!(recv(&ep, h).next, dsn + 200);
+    let opt = csum_mapping(1, dsn + 100, &data[100..], false);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[100..]), now);
+    assert_eq!(recv(&ep, h).next, dsn + 300);
+    assert_eq!(read_now(&mut ep, h), data);
+    assert_eq!(held(&ep, h), 0);
+}
+
+/// A mapping that fails its checksum resets the subflow with MP_TCPRST 0x06 and delivers
+/// nothing (interim: Task 6 moves this to MP_FAIL and the single-subflow path).
+#[test]
+fn rx_bad_checksum_resets_subflow_interim() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let sent = c.peer(&bad_mapping(1, dsn, b"hello", false), b"hello");
+    assert_eq!(rst_reason(&sent), Some(vec![30, 4, 0x80, 0x06]));
+    assert_eq!(recv(&c.ep, c.h).next, dsn);
+}
+
+/// Subflow 1 holds the first half of a mapping while subflow 0 delivers past its middle; the
+/// held mapping still verifies once complete and adds only its new suffix.
+#[test]
+fn rx_recv_next_passes_partly_held_mapping() {
+    let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+    let now = t(20_000_000);
+    let data = pattern(2000);
+    let whole = csum_mapping(1, dsn, &data, false);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &whole, &data[..1000]), now);
+    assert_eq!((recv(&ep, h).next, held(&ep, h)), (dsn, 1000));
+    let opt = csum_mapping(1, dsn, &data[..1500], false);
+    feed(&mut ep, &peer_data(&syn, 5001, &opt, &data[..1500]), now);
+    assert_eq!(recv(&ep, h).next, dsn + 1500);
+    feed(&mut ep, &peer_data(&jsyn, 6001, &whole, &data[1000..]), now);
+    assert_eq!(recv(&ep, h).next, dsn + 2000);
+    assert_eq!(read_now(&mut ep, h), data);
+    assert_eq!(held(&ep, h), 0);
+}
+
+/// Subflow 0 delivers through DSN N; subflow 1 sends a duplicate mapping ending at N with a
+/// folded DATA_FIN. With a wrong checksum the DATA_FIN is not applied (the failure path
+/// runs); with a correct one it is.
+#[test]
+fn rx_corrupt_folded_fin_after_other_subflow_delivered() {
+    for good in [false, true] {
+        let (mut ep, h, syn, jsyn, dsn) = two_subflows();
+        let now = t(20_000_000);
+        let data = pattern(500);
+        let opt = csum_mapping(1, dsn, &data, false);
+        feed(&mut ep, &peer_data(&syn, 5001, &opt, &data), now);
+        assert_eq!(recv(&ep, h).next, dsn + 500);
+        let opt = if good {
+            csum_mapping(1, dsn, &data, true)
+        } else {
+            bad_mapping(1, dsn, &data, true)
+        };
+        feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data), now);
+        assert_eq!(recv(&ep, h).has_fin(), good);
+        let out: Vec<_> = drain(&mut ep, now)
+            .into_iter()
+            .map(|p| packet::parse(p.leak()).unwrap())
+            .filter(|s| s.src == jsyn.src)
+            .collect();
+        let want = (!good).then(|| vec![30, 4, 0x80, 0x06]);
+        assert_eq!(rst_reason(&out), want);
+    }
+}
+
+/// While 3000 octets are held, new offers count `recv_buffer − 3000` free (spec G7, memory).
+#[test]
+fn rx_free_subtracts_held() {
+    let cfg = ConnectConfig {
+        recv_buffer: 8000,
+        ..checksums_cfg(true)
+    };
+    let mut c = client_cfg(cfg, false);
+    c.confirm();
+    let scale = our_scale(&c.syn);
+    let dsn = peer_head();
+    // Mapping A, 4000 octets, delivered and read: the edge offered is still dsn + 8000.
+    let a = pattern(4000);
+    c.peer_at(5001, &csum_mapping(1, dsn, &a, false), &a);
+    assert_eq!(read_now(&mut c.ep, c.h), a);
+    // Mapping B, 4000 octets: 3000 of them held.
+    let b = pattern(4000);
+    let opt = csum_mapping(4001, dsn + 4000, &b, false);
+    let sent = c.peer_at(9001, &opt, &b[..3000]);
+    assert_eq!(held(&c.ep, c.h), 3000);
+    assert_eq!(recv(&c.ep, c.h).free(), 8000 - 3000);
+    // 5000 free and 4000 still offered from DATA_ACK dsn + 4000: below the SWS threshold, so
+    // the edge stays (not dsn + 12000, as 8000 free would give).
+    let ack = sent.last().unwrap();
+    let edge = data_ack_of(ack).unwrap() + (u64::from(ack.wnd) << scale);
+    assert_eq!(edge, dsn + 8000);
+}
+
+/// A DATA_FIN-only mapping whose checksum fails changes nothing (no RST either); a correct
+/// one sets the DATA_FIN (spec G8).
+#[test]
+fn rx_data_fin_only_bad_checksum_ignored() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let ck = dss_checksum(dsn, 0, 1, &[]);
+    let sent = c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck ^ 1)), &[]);
+    assert!(!recv(&c.ep, c.h).has_fin());
+    assert_eq!(rst_reason(&sent), None);
+    c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck)), &[]);
+    assert!(recv(&c.ep, c.h).has_fin());
+}
+
+/// Review Focus 2: a 4 KiB receive buffer against one 65,535-octet mapping sent within the
+/// edge we offer. Completion credit opens the edge to the mapping's end; every octet arrives
+/// and verifies, without a stall (spec G7).
+#[test]
+fn rx_small_buffer_large_mapping_completes() {
+    let cfg = ConnectConfig {
+        recv_buffer: 4096,
+        ..checksums_cfg(true)
+    };
+    let mut c = client_cfg(cfg, false);
+    c.confirm();
+    let scale = our_scale(&c.syn);
+    let dsn = peer_head();
+    let data = pattern(65_535);
+    let opt = csum_mapping(1, dsn, &data, false);
+    let mut edge = dsn + 4096;
+    let mut at = 0;
+    while at < data.len() {
+        let n = (data.len() - at).min(1460);
+        assert!(dsn + (at + n) as u64 <= edge, "within the offered edge");
+        let sent = c.peer_at(5001 + at as u32, &opt, &data[at..at + n]);
+        for s in &sent {
+            let offered = data_ack_of(s).unwrap() + (u64::from(s.wnd) << scale);
+            edge = edge.max(offered);
+        }
+        if at == 0 {
+            assert_eq!(edge, dsn + 65_535, "credit to the mapping's end");
+        }
+        at += n;
+    }
+    assert_eq!(read_now(&mut c.ep, c.h), data);
+}
+
+/// Review Focus 5: checksums off on both ends: the first segment of a two-segment mapping is
+/// readable at once; nothing is ever held (spec G9).
+#[test]
+fn rx_csum_off_delivers_per_segment() {
+    let mut c = client(false, false);
+    c.confirm();
+    assert!(!negotiation(&c.ep, c.h).csum);
+    let dsn = peer_head();
+    let data = pattern(3000);
+    let opt = dss_mapping(false, 1, dsn, 3000, None);
+    c.peer_at(5001, &opt, &data[..1460]);
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(read_now(&mut c.ep, c.h), &data[..1460]);
+    c.peer_at(5001 + 1460, &opt, &data[1460..]);
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(read_now(&mut c.ep, c.h), &data[1460..]);
 }

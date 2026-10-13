@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use super::ConnectionHooks;
 use super::data::{RxMaps, TxMaps};
+use super::hold::Hold;
 use super::join::Join;
 use crate::SeqNum;
 use crate::tcp::Tcb;
@@ -72,6 +73,8 @@ impl Subflow {
 pub(crate) struct SubflowMp {
     pub tx: TxMaps,
     pub rx: RxMaps,
+    /// With checksums, the octets of mappings not yet verified (M4b spec G7).
+    pub hold: Hold,
     pub unmapped: usize,
     pub reset: bool,
     /// The MP_TCPRST the RST that `reset` makes due carries (M3 spec §3.4).
@@ -159,6 +162,7 @@ impl SubflowMp {
         Self {
             tx: TxMaps::new(1, 1024),
             rx: RxMaps::new(1024),
+            hold: Hold::default(),
             unmapped: 0,
             reset: false,
             reset_option: None,

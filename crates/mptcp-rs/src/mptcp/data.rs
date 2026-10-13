@@ -419,9 +419,18 @@ struct Piece {
 /// reading and full segments of L octets the overshoot is about `cap · (−L mod 2^scale) / L`
 /// (L 1436: −1436 mod 2^scale is 100 at scale 7 and 9, so about 7 %, 1.1 MiB at the 16 MiB /
 /// scale 9 default); approaching the worst case needs segments shorter than 2^scale.
+///
+/// With checksums (M4b spec G7), completion credit may raise `right_edge` past the base edge,
+/// at most 65,535 octets plus the scale rounding, and `free` also counts the octets the hold
+/// buffers keep.
 pub(crate) struct RecvAssembler {
     pub next: u64,
+    /// The offered edge, completion credit included.
     pub right_edge: u64,
+    /// The base edge while credit has raised `right_edge` past it; `None`: it is `right_edge`.
+    base_edge: Option<u64>,
+    /// Octets the connection's hold buffers keep (`set_held`).
+    held: usize,
     ready: VecDeque<u8>,
     pieces: Vec<Piece>,
     cap: usize,
@@ -435,6 +444,8 @@ impl RecvAssembler {
         Self {
             next: head,
             right_edge: head.wrapping_add(cap as u64),
+            base_edge: None,
+            held: 0,
             ready: VecDeque::new(),
             pieces: Vec::new(),
             cap,
@@ -487,9 +498,40 @@ impl RecvAssembler {
     pub fn window_sent(&mut self, field: u16, scale: u8) {
         self.read_advanced = false;
         let edge = self.next.wrapping_add(u64::from(field) << scale);
+        if let Some(base) = self.base_edge {
+            // The part of the field the base offer covers: free memory or the base edge
+            // itself, rounded (the SWS gate of `window_offer` aside). Credit rounding stays out.
+            let kept = (base.wrapping_sub(self.next) as i64).max(0) as u64;
+            let units = (self.free() as u64 >> scale).max(kept.div_ceil(1 << scale));
+            let b = (self.next).wrapping_add(units.min(u64::from(field)) << scale);
+            if b.wrapping_sub(base) as i64 > 0 {
+                self.base_edge = Some(b);
+            }
+        }
         if edge.wrapping_sub(self.right_edge) as i64 > 0 {
             self.right_edge = edge;
         }
+        if (self.base_edge).is_some_and(|b| b.wrapping_sub(self.right_edge) as i64 >= 0) {
+            self.base_edge = None;
+        }
+    }
+    /// Completion credit (M4b spec G7): a mapping `[start, end)` that starts below the base
+    /// edge and ends past it raises the offered edge to its end, at most base edge + 65,535 (the
+    /// largest Data-Level Length). Anchored to the base edge only, credit never seeds credit;
+    /// raising the edge is allowed, shrinking it is not (RFC 8684 L1639–1641).
+    pub fn credit(&mut self, start: u64, end: u64) {
+        let base = self.base_edge.unwrap_or(self.right_edge);
+        if (start.wrapping_sub(base) as i64) < 0 && (end.wrapping_sub(base) as i64) > 0 {
+            let edge = base.wrapping_add(end.wrapping_sub(base).min(65_535));
+            if edge.wrapping_sub(self.right_edge) as i64 > 0 {
+                self.right_edge = edge;
+                self.base_edge = Some(base);
+            }
+        }
+    }
+    /// The octets all hold buffers of the connection keep: `free` subtracts them.
+    pub fn set_held(&mut self, n: usize) {
+        self.held = n;
     }
     pub fn window_update_due(&self, scale: u8, mss: u16) -> bool {
         let remaining = self.right_edge.wrapping_sub(self.next) as i64;
@@ -501,7 +543,7 @@ impl RecvAssembler {
     }
     pub fn free(&self) -> usize {
         self.cap.saturating_sub(
-            self.ready.len() + self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>(),
+            self.ready.len() + self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>() + self.held,
         )
     }
     pub fn has_unread(&self) -> bool {
@@ -765,6 +807,67 @@ mod pressure_tests {
         r.accept(10, b"uvwxyz");
         assert_eq!(r.accept(0, b"abcdefg"), (Outcome::Stored, 7));
         assert_eq!(r.next, 7);
+    }
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::*;
+
+    #[test]
+    fn credit_raises_edge_once() {
+        let mut r = RecvAssembler::new(1000, 4096, 64);
+        let base = r.right_edge;
+        r.credit(base - 100, base + 10_000);
+        assert_eq!(r.right_edge, base + 10_000);
+        // A second mapping from inside the credit starts past the base edge: no more credit.
+        r.credit(base + 9_999, base + 30_000);
+        assert_eq!(r.right_edge, base + 10_000);
+        // Nor does one wholly below the base edge, or one far past it reach beyond 65,535.
+        r.credit(base - 500, base);
+        assert_eq!(r.right_edge, base + 10_000);
+        r.credit(base - 1, base + 100_000);
+        assert_eq!(r.right_edge, base + 65_535);
+    }
+
+    #[test]
+    fn credit_never_chains() {
+        for scale in [0u8, 3, 7] {
+            let mut r = RecvAssembler::new(0, 4096, 64);
+            let base = r.right_edge;
+            let bound = base + 65_535 + (1 << scale);
+            r.credit(0, 65_535);
+            for _ in 0..20 {
+                // A 65,535-octet mapping starting at the credited edge.
+                let start = r.right_edge;
+                r.credit(start, start + 65_535);
+                let field = r.window_offer(scale, 1460);
+                r.window_sent(field, scale);
+                assert!(r.right_edge <= bound, "scale {scale}: {}", r.right_edge);
+            }
+            assert!(r.right_edge >= 65_535);
+        }
+    }
+
+    #[test]
+    fn credit_ends_once_the_base_edge_passes() {
+        let mut r = RecvAssembler::new(0, 4096, 64);
+        r.credit(4000, 10_000);
+        assert_eq!(r.right_edge, 10_000);
+        assert_eq!(r.accept(0, &[0; 10_000]), (Outcome::Stored, 10_000));
+        let mut out = vec![0; 10_000];
+        while r.read(&mut out) > 0 {}
+        assert_eq!(r.next, 10_000);
+        let field = r.window_offer(0, 1460);
+        r.window_sent(field, 0);
+        assert_eq!((r.right_edge, r.base_edge), (14_096, None));
+    }
+
+    #[test]
+    fn held_octets_reduce_free() {
+        let mut r = RecvAssembler::new(0, 8000, 64);
+        r.set_held(3000);
+        assert_eq!(r.free(), 5000);
     }
 }
 
