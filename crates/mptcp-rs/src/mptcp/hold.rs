@@ -2,11 +2,13 @@
 //! octets wait here, by SSN, until the whole mapping has arrived and its DSS checksum verifies;
 //! only then do they reach the connection level (`RecvAssembler`).
 //!
-//! Memory: a subflow holds at most `cap` octets (`recv_buffer + 65,535`) plus those of the
-//! frontier mapping (at most 65,535), so `recv_buffer + 2 × 65,535` per subflow and
-//! `SUBFLOW_CAP` times that per connection. Past `cap` other mappings' octets are refused at
-//! the TCP level (the peer retransmits them); held octets are never evicted. Held runs are
-//! bounded too (`PIECE_CAP`).
+//! Memory: a subflow holds at most `cap` octets (`recv_buffer + 65,535`) plus those of two
+//! exempt frontier mappings (at most 65,535 each), so `recv_buffer + 3 × 65,535` per subflow
+//! and `SUBFLOW_CAP` times that per connection. Two, as an exemption granted on a free range
+//! slot can be overtaken by another subflow, leaving that mapping held, refused, while the next
+//! frontier mapping is exempt. Past `cap` other mappings' octets are refused at the TCP level
+//! (the peer retransmits them); held octets are never evicted, short of the reset of a subflow
+//! whose frontier can never be taken. Held runs are bounded too (`PIECE_CAP`).
 use std::collections::VecDeque;
 use std::ops::Range;
 
