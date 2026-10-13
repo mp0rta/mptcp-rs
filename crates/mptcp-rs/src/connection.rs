@@ -137,7 +137,6 @@ impl Connection {
         if self.reset || self.aborting {
             return Err(ReadError::Reset);
         }
-        self.retry_refused();
         let eof = self.hooks.eof(self.subflows[0].tcb.fin_received());
         match self.hooks.read(buf) {
             0 if eof => Ok(0),

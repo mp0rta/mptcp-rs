@@ -1002,7 +1002,6 @@ impl<R: CryptoRng> Endpoint<R> {
         // New offers leave out the octets every hold buffer keeps (M4b spec G7, memory); with
         // no checksums nothing is ever held, so nothing is summed (G9, A1).
         let csum = c.hooks.negotiation.as_ref().is_some_and(|m| m.csum);
-        c.retry_refused();
         if let Some(d) = c.hooks.data.as_mut().filter(|_| csum) {
             d.recv
                 .set_held(c.subflows.iter().map(|s| s.mp.hold.held()).sum());

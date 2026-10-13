@@ -598,10 +598,11 @@ impl RecvAssembler {
         self.advance_fin();
         result
     }
-    /// Stores held octets on fallback (M4b spec G15): they are TCP-ACKed and never resent, so
-    /// neither the range cap nor the offered edge may refuse them. The hold cap bounded them
-    /// (`recv_buffer + 65,535` per subflow), and reads deliver them as they make room. Only
-    /// octets past a DATA_FIN are dropped: they belong to no stream.
+    /// Stores octets that are TCP-ACKed and never resent: held octets on fallback and verified
+    /// mappings (M4b spec G7, G15), so neither the range cap nor the offered edge may refuse
+    /// them. The hold cap bounded them (`recv_buffer + 65,535` per subflow), and reads deliver
+    /// them as they make room. Only octets past a DATA_FIN are dropped: they belong to no
+    /// stream.
     pub fn replay(&mut self, dsn: u64, data: &[u8]) {
         let (range_cap, edge) = (self.range_cap, self.right_edge);
         self.range_cap = usize::MAX;

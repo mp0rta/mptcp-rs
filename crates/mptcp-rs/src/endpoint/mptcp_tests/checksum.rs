@@ -1189,85 +1189,91 @@ fn replay_full_app_buffer_drains_on_read() {
     assert_eq!(read_now(&mut c.ep, c.h), &b[..3000]);
 }
 
-/// Subflow 0 fills all 64 out-of-order ranges of the connection; subflow 1 holds 5 octets past
-/// them when the peer's infinite mapping arrives on it. The replayed run, a 65th range, is
-/// stored anyway: it is TCP-ACKed and the peer never resends it (spec G15).
+/// Subflow 0 takes 63 of the 64 assembler ranges; subflow 1 is admitted to hold 5 octets past
+/// them, then subflow 0 takes the 64th range. The peer's infinite mapping arrives on subflow
+/// 1: the replayed run, a 65th range, is stored anyway, as it is TCP-ACKed and the peer never
+/// resends it (spec G15): the octets move from the hold to the assembler, `free` unchanged.
 #[test]
 fn replay_past_range_cap_after_join() {
     let (mut ep, h, syn, jsyn, dsn) = two_subflows();
     let now = t(20_000_000);
-    for k in 0..64u32 {
+    let island = |ep: &mut Endpoint<ChaCha20Rng>, k: u32| {
         let opt = csum_mapping(1 + k, dsn + 10 + 2 * u64::from(k), b"x", false);
-        feed(&mut ep, &peer_data(&syn, 5001 + k, &opt, b"x"), now);
+        feed(ep, &peer_data(&syn, 5001 + k, &opt, b"x"), now);
+    };
+    for k in 0..63 {
+        island(&mut ep, k);
     }
-    let free = recv(&ep, h).free();
     let data = pattern(10);
     let opt = csum_mapping(1, dsn + 1000, &data, false);
     feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[..5]), now);
     assert_eq!(held(&ep, h), 5);
+    island(&mut ep, 63);
+    let free = recv(&ep, h).free();
     let inf = dss_mapping(false, 6, dsn + 1005, 0, Some(0));
     feed(&mut ep, &peer_data(&jsyn, 5006, &inf, &[]), now);
     assert_eq!(negotiation(&ep, h).state, State::FellBack);
-    assert_eq!(held(&ep, h), 0);
-    assert_eq!(
-        recv(&ep, h).free(),
-        free - 5,
-        "the 5 replayed octets are stored"
-    );
+    assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, free));
 }
 
-/// As above, but subflow 1's mapping completes and verifies: the 65th range is refused by the
-/// assembler, so its octets, TCP-ACKed already, stay held, and the fallback replays them
-/// (spec G7, G15).
+/// As above, but subflow 1's mapping then completes and verifies after subflow 0 took the 64th
+/// range: admitted when a range was free, it enters the assembler past the range cap, and the
+/// stream is whole once subflow 0 fills the gaps (spec G7, design v2: a race).
 #[test]
-fn verified_past_range_cap_stays_held() {
+fn verified_completion_stored_past_range_cap() {
     let (mut ep, h, syn, jsyn, dsn) = two_subflows();
     let now = t(20_000_000);
-    for k in 0..64u32 {
-        let opt = csum_mapping(1 + k, dsn + 10 + 2 * u64::from(k), b"x", false);
-        feed(&mut ep, &peer_data(&syn, 5001 + k, &opt, b"x"), now);
+    let data = pattern(1010);
+    for k in 0..63u32 {
+        let i = 10 + 2 * k as usize;
+        send_mapping(&mut ep, &syn, 1 + k, dsn + i as u64, &data[i..i + 1]);
     }
+    let opt = csum_mapping(1, dsn + 1000, &data[1000..], false);
+    feed(
+        &mut ep,
+        &peer_data(&jsyn, 5001, &opt, &data[1000..1005]),
+        now,
+    );
+    assert_eq!(held(&ep, h), 5, "admitted");
+    send_mapping(&mut ep, &syn, 64, dsn + 136, &data[136..137]);
     let free = recv(&ep, h).free();
-    let data = pattern(10);
-    let opt = csum_mapping(1, dsn + 1000, &data, false);
-    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data), now);
-    assert_eq!(held(&ep, h), 10, "refused by the range cap, kept");
-    let inf = dss_mapping(false, 11, dsn + 1010, 0, Some(0));
-    feed(&mut ep, &peer_data(&jsyn, 5011, &inf, &[]), now);
-    assert_eq!(negotiation(&ep, h).state, State::FellBack);
-    assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, free - 10));
+    feed(&mut ep, &peer_data(&jsyn, 5006, &opt, &data[1005..]), now);
+    assert_eq!((held(&ep, h), recv(&ep, h).free()), (0, free - 5));
+    send_mapping(&mut ep, &syn, 65, dsn, &data[..1000]);
+    assert_eq!(read_now(&mut ep, h), data);
 }
 
-/// As above, but subflow 0 then fills every gap up to the refused mapping: with no further
-/// octet on subflow 1, the refused mapping is offered again and taken (spec G7).
+/// Subflow 0 takes the 64 assembler ranges; subflow 1's mapping past them would be a 65th, so
+/// it is not admitted: nothing held, nothing TCP-ACKed. Once subflow 0 fills every gap up to
+/// it, its retransmission goes in (spec G7, design v2: admission).
 #[test]
-fn refused_verified_retried_after_other_subflow_input() {
+fn range_capped_mapping_admitted_after_other_subflow_fills() {
     let (mut ep, h, syn, jsyn, dsn) = two_subflows();
     let now = t(20_000_000);
     let data = pattern(1010);
     for k in 0..64u32 {
         let i = 10 + 2 * k as usize;
-        let opt = csum_mapping(1 + k, dsn + i as u64, &data[i..i + 1], false);
-        feed(
-            &mut ep,
-            &peer_data(&syn, 5001 + k, &opt, &data[i..i + 1]),
-            now,
-        );
+        send_mapping(&mut ep, &syn, 1 + k, dsn + i as u64, &data[i..i + 1]);
     }
     let opt = csum_mapping(1, dsn + 1000, &data[1000..], false);
     feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[1000..]), now);
-    assert_eq!(held(&ep, h), 10);
-    let opt = csum_mapping(65, dsn, &data[..1000], false);
-    feed(&mut ep, &peer_data(&syn, 5065, &opt, &data[..1000]), now);
-    assert_eq!((held(&ep, h), recv(&ep, h).next), (0, dsn + 1010));
+    let ours = sent_on(&mut ep, &jsyn, now);
+    assert_eq!(held(&ep, h), 0);
+    assert_eq!(
+        ours.last().map(|s| s.ack),
+        Some(SeqNum(5001)),
+        "not TCP-ACKed"
+    );
+    send_mapping(&mut ep, &syn, 65, dsn, &data[..1000]);
+    feed(&mut ep, &peer_data(&jsyn, 5001, &opt, &data[1000..]), now);
     assert_eq!(read_now(&mut ep, h), data);
 }
 
 /// With the assembler's 64 ranges taken, valid 65,535-octet mappings of one DSN range arrive at
-/// successive frontiers: each verifies and is refused. While one is held so, no mapping is
-/// exempt from the hold cap, and the subflow stays within `recv_buffer + 2 × 65,535` (G7).
+/// successive frontiers: none would be taken, so none is admitted, and the subflow stays within
+/// `recv_buffer + 2 × 65,535` (G7; it held refused verified mappings before design v2).
 #[test]
-fn refused_verified_ends_frontier_exemption() {
+fn range_capped_frontier_mappings_not_admitted() {
     let recv_buffer = 1 << 16;
     let cfg = ConnectConfig {
         recv_buffer,
@@ -1301,38 +1307,27 @@ fn refused_verified_ends_frontier_exemption() {
     unreachable!("past the cap, octets are refused");
 }
 
-/// As above, but then the frontier mapping X starts at `recv.next`: its completion can never
-/// be refused by the range cap, so it stays exempt from the hold cap and completes, though two
-/// refused verified mappings fill that cap (spec G7, liveness).
+/// Subflow 1 takes the 64 assembler ranges; on subflow 0, N and its duplicate N2 (DSN
+/// [H+1000, H+66,535)) are not admitted, but X at `recv.next` is, and completes within the
+/// byte cap, nothing refused filling it. N's retransmission then goes in, and the stream is
+/// whole (spec G7, liveness; round 4 had refused verified mappings fill the cap first).
 #[test]
-fn frontier_mapping_at_recv_next_stays_exempt() {
+fn frontier_mapping_at_recv_next_completes() {
     let (mut ep, h, syn, jsyn, dsn) = two_subflows_with(ConnectConfig {
         recv_buffer: 1 << 16,
         ..checksums_cfg(true)
     });
-    let now = t(20_000_000);
     let data = pattern(66_535);
     for k in 0..64u32 {
         let i = 10 + 2 * k as usize;
-        let opt = csum_mapping(1 + k, dsn + i as u64, &data[i..i + 1], false);
-        feed(
-            &mut ep,
-            &peer_data(&jsyn, 5001 + k, &opt, &data[i..i + 1]),
-            now,
-        );
+        send_mapping(&mut ep, &jsyn, 1 + k, dsn + i as u64, &data[i..i + 1]);
     }
-    // On subflow 0: N and its duplicate N2 (DSN [H+1000, H+66,535)), each refused, then X.
-    let maps = [(1, 1000), (65_536, 1000), (131_071, 0)];
-    for (ssn, at) in maps {
-        let part = &data[at..at + 65_535];
-        let opt = csum_mapping(ssn, dsn + at as u64, part, false);
-        for off in (0..part.len()).step_by(4000) {
-            let end = (off + 4000).min(part.len());
-            let seq = 5000 + ssn + off as u32;
-            feed(&mut ep, &peer_data(&syn, seq, &opt, &part[off..end]), now);
-        }
-    }
+    send_mapping(&mut ep, &syn, 1, dsn + 1000, &data[1000..]);
+    send_mapping(&mut ep, &syn, 65_536, dsn + 1000, &data[1000..]);
+    assert_eq!(held(&ep, h), 0, "N and N2 not admitted");
+    send_mapping(&mut ep, &syn, 131_071, dsn, &data[..65_535]);
     assert_eq!(held(&ep, h), 0);
+    send_mapping(&mut ep, &syn, 1, dsn + 1000, &data[1000..]);
     assert_eq!(read_now(&mut ep, h), data);
 }
 
@@ -1351,50 +1346,44 @@ fn send_mapping(ep: &mut Endpoint<ChaCha20Rng>, sf: &Segment, ssn: u32, dsn: u64
 }
 
 /// Codex's three subflows with a redundant sender (RFC 8684 L1369–1381): C takes the 64
-/// assembler ranges and loses H; A and B each hold most of X = [H+1, H+259) and a refused N =
-/// [H+200, H+65,734), so each hold is full. X's last octet is exempt on both, as X touches an
-/// assembler range, so its completion is taken now; X and the retried N go in, and the stream
+/// assembler ranges and loses H; A and B each hold most of X = [H+1, H+259), which touches
+/// C's ranges and so is admitted, while N = [H+200, H+65,734) would be a 65th range and is
+/// not. X's last octet completes it on both; N's retransmission then goes in, and the stream
 /// completes once A resends H (spec G7, liveness).
 #[test]
-fn frontier_mapping_touching_a_range_stays_exempt() {
+fn frontier_mapping_touching_a_range_completes() {
     let (mut ep, h, a, b, dsn) = two_subflows_with(ConnectConfig {
         recv_buffer: 256,
         ..checksums_cfg(true)
     });
     let (_, c) = joined(&mut ep, h, t(15_000_000), "10.0.2.1", 1500, 7);
+    let now = t(20_000_000);
     let data = pattern(65_734);
     for k in 0..64u32 {
         let i = 10 + 2 * k as usize;
         send_mapping(&mut ep, &c, 1 + k, dsn + i as u64, &data[i..i + 1]);
     }
+    let x = csum_mapping(1, dsn + 1, &data[1..259], false);
     for sf in [&a, &b] {
-        let opt = csum_mapping(1, dsn + 1, &data[1..259], false);
-        feed(
-            &mut ep,
-            &peer_data(sf, 5001, &opt, &data[1..258]),
-            t(20_000_000),
-        );
+        feed(&mut ep, &peer_data(sf, 5001, &x, &data[1..258]), now);
         send_mapping(&mut ep, sf, 259, dsn + 200, &data[200..]);
     }
-    assert_eq!(held(&ep, h), 2 * 65_791, "both holds full");
+    assert_eq!(held(&ep, h), 2 * 257, "X held, N not admitted");
     for sf in [&a, &b] {
-        feed(
-            &mut ep,
-            &peer_data(sf, 5258, &[], &data[258..259]),
-            t(20_000_000),
-        );
+        feed(&mut ep, &peer_data(sf, 5258, &[], &data[258..259]), now);
     }
     assert_eq!(held(&ep, h), 0);
+    send_mapping(&mut ep, &a, 259, dsn + 200, &data[200..]);
     send_mapping(&mut ep, &a, 65_793, dsn, &data[..1]);
     assert_eq!(read_now(&mut ep, h), data);
 }
 
-/// Subflow 1 takes the 64 assembler ranges; on subflow 0, N and its duplicate N2 (DSN
-/// [H+200, H+65,735)) are refused and fill the hold, and so would N3's completion be: the
-/// retransmitted frontier octet of N3 resets subflow 0 with MP_TCPRST 0x02 and its hold is
-/// discarded. The stream then completes over subflow 1 (spec G7, the escape from a full hold).
+/// Subflow 1 takes the 64 assembler ranges; on subflow 0, mappings of [H+200, H+65,735) at
+/// successive frontiers would be a 65th range: none is admitted, nothing is held, and subflow
+/// 0 is not reset (the full-hold escape of round 5 has no state left to escape). The stream
+/// completes over subflow 1 (spec G7, design v2).
 #[test]
-fn full_hold_with_refusable_frontier_resets() {
+fn range_capped_frontier_refused_without_reset() {
     let (mut ep, h, a, b, dsn) = two_subflows_with(ConnectConfig {
         recv_buffer: 1 << 16,
         ..checksums_cfg(true)
@@ -1407,25 +1396,7 @@ fn full_hold_with_refusable_frontier_resets() {
     }
     send_mapping(&mut ep, &a, 1, dsn + 200, &data[200..]);
     send_mapping(&mut ep, &a, 65_536, dsn + 200, &data[200..]);
-    let opt = csum_mapping(131_071, dsn + 200, &data[200..], false);
-    feed(
-        &mut ep,
-        &peer_data(&a, 5000 + 131_071, &opt, &data[200..4200]),
-        now,
-    );
-    assert_eq!(held(&ep, h), 131_071, "one octet of N3 at the cap");
-    drain(&mut ep, now);
-    // The peer retransmits from our ACK, at N3's second octet: refused at the full hold.
-    feed(
-        &mut ep,
-        &peer_data(&a, 5000 + 131_072, &opt, &data[201..4200]),
-        now,
-    );
-    let sent: Vec<Segment> = (drain(&mut ep, now).into_iter())
-        .map(|p| packet::parse(p.leak()).unwrap())
-        .filter(|s| s.src == a.src)
-        .collect();
-    assert_eq!(rst_reason(&sent), Some(vec![30, 4, 0x80, 0x02]));
+    assert_eq!(rst_reason(&sent_on(&mut ep, &a, now)), None);
     assert_eq!(held(&ep, h), 0);
     send_mapping(&mut ep, &b, 65, dsn, &data[..65_535]);
     send_mapping(&mut ep, &b, 65_600, dsn + 65_535, &data[65_535..]);
@@ -1468,6 +1439,67 @@ fn hostile_dsn_at_the_frontier() {
     let dsn = peer_head().wrapping_add(i64::MAX as u64);
     c.peer_at(5001, &csum_mapping(1, dsn, b"x", false), b"x");
     assert_eq!(held(&c.ep, c.h), 0);
+}
+
+/// Our segments from `sf`'s subflow among those due at `now`.
+fn sent_on(ep: &mut Endpoint<ChaCha20Rng>, sf: &Segment, now: Instant) -> Vec<Segment<'static>> {
+    (drain(ep, now).into_iter())
+        .map(|p| packet::parse(p.leak()).unwrap())
+        .filter(|s| s.src == sf.src)
+        .collect()
+}
+
+/// The peer's FIN on `sf` at `seq`, ACKing our FIN among `ours` if there is one.
+fn peer_fin(sf: &Segment, seq: u32, ours: &[Segment]) -> Segment<'static> {
+    let ours = ours.iter().find(|g| g.flags.contains(TcpFlags::FIN));
+    Segment {
+        flags: TcpFlags::ACK | TcpFlags::FIN,
+        ack: ours.map_or(sf.seq.wrapping_add(1), |f| f.seq.wrapping_add(1)),
+        ..peer_data(sf, seq, &[], &[])
+    }
+}
+
+/// Codex r7 P1: subflow 1 takes the 64 assembler ranges; subflow 0's mapping [H+200, H+300)
+/// would be the 65th, so it is not taken at the TCP level, and neither is the FIN behind it.
+/// Once subflow 1 fills [H, H+200), the peer's retransmission on subflow 0 goes in with its
+/// FIN, and the whole stream is readable (spec G7, design v2: admission).
+#[test]
+fn range_capped_mapping_waits_for_admission_across_close() {
+    let (mut ep, h, a, b, dsn) = two_subflows();
+    let now = t(20_000_000);
+    let data = pattern(300);
+    for k in 0..64u32 {
+        let i = 10 + 2 * k as usize;
+        send_mapping(&mut ep, &b, 1 + k, dsn + i as u64, &data[i..i + 1]);
+    }
+    let opt = csum_mapping(1, dsn + 200, &data[200..], false);
+    feed(&mut ep, &peer_data(&a, 5001, &opt, &data[200..]), now);
+    let ours = sent_on(&mut ep, &a, now);
+    assert_eq!(ours.last().map(|s| s.ack), Some(SeqNum(5001)), "refused");
+    feed(&mut ep, &peer_fin(&a, 5101, &ours), now);
+    let ours = sent_on(&mut ep, &a, now);
+    send_mapping(&mut ep, &b, 65, dsn, &data[..200]);
+    feed(&mut ep, &peer_data(&a, 5001, &opt, &data[200..]), now);
+    feed(&mut ep, &peer_fin(&a, 5101, &ours), now);
+    assert_eq!(read_now(&mut ep, h), data);
+}
+
+/// Codex r7 P2: a subflow that holds part of a mapping and is retired to TIME-WAIT drops its
+/// hold, so ended subflows never keep memory past the connection bound (spec G7).
+#[test]
+fn time_wait_subflow_hold_is_discarded() {
+    let (mut ep, h, _, b, dsn) = two_subflows();
+    let now = t(20_000_000);
+    let data = pattern(100);
+    let opt = csum_mapping(1, dsn, &data, false);
+    feed(&mut ep, &peer_data(&b, 5001, &opt, &data[..50]), now);
+    assert_eq!(held(&ep, h), 50);
+    let s = ep.conns[&h].subflows[1].id;
+    assert_eq!(ep.close_subflow(now, h, s), Ok(()));
+    let ours = sent_on(&mut ep, &b, now);
+    feed(&mut ep, &peer_fin(&b, 5051, &ours), now);
+    assert_eq!(ep.conns[&h].subflows[1].tcb.state(), TcpState::TimeWait);
+    assert_eq!(held(&ep, h), 0);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -2,13 +2,16 @@
 //! octets wait here, by SSN, until the whole mapping has arrived and its DSS checksum verifies;
 //! only then do they reach the connection level (`RecvAssembler`).
 //!
-//! Memory: a subflow holds at most `cap` octets (`recv_buffer + 65,535`) plus those of two
-//! exempt frontier mappings (at most 65,535 each), so `recv_buffer + 3 × 65,535` per subflow
-//! and `SUBFLOW_CAP` times that per connection. Two, as an exemption granted on a free range
-//! slot can be overtaken by another subflow, leaving that mapping held, refused, while the next
-//! frontier mapping is exempt. Past `cap` other mappings' octets are refused at the TCP level
-//! (the peer retransmits them); held octets are never evicted, short of the reset of a subflow
-//! whose frontier can never be taken. Held runs are bounded too (`PIECE_CAP`).
+//! Admission: a mapping's octets come in only if the assembler would take its completion
+//! (`RecvAssembler::would_take`, the range-cap decision), else they are refused at the TCP
+//! level and the peer retransmits them. A verified mapping always leaves for the assembler.
+//!
+//! Memory: a subflow holds at most `cap` octets (`recv_buffer + 65,535`) plus those of the
+//! frontier mapping (at most 65,535), so `recv_buffer + 2 × 65,535` per subflow and
+//! `SUBFLOW_CAP` times that per connection: a complete mapping never stays held but a failed
+//! one, and a failed one ends the frontier exemption. Past `cap` other mappings' octets are
+//! refused at the TCP level; held octets are never evicted while the subflow lives. Held runs
+//! are bounded too (`PIECE_CAP`).
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -51,8 +54,6 @@ struct Entry {
     pieces: Vec<(u32, VecDeque<u8>)>,
     /// Complete with a checksum that failed (`Complete::Failed`, reported once).
     failed: bool,
-    /// Complete and verified, but `deliver` refused it: held until it takes it.
-    verified: bool,
 }
 
 impl Entry {
@@ -123,11 +124,6 @@ pub(crate) struct Hold {
     pieces: usize,
     /// The frontier of the last `prune`: TCP took every octet below it.
     frontier: Option<u32>,
-    /// Entries `verified`: complete and verified, refused by `deliver` so far.
-    refused: usize,
-    /// The last `insert` refused the octet at the frontier for the cap alone, its mapping not
-    /// exempt and no failed mapping held: nothing would ever take it (`blocked`).
-    blocked: bool,
 }
 
 impl Hold {
@@ -147,7 +143,6 @@ impl Hold {
                 {
                     if map.data_fin {
                         e.map = map;
-                        self.refused -= usize::from(std::mem::take(&mut e.verified));
                     }
                     return true;
                 }
@@ -168,24 +163,12 @@ impl Hold {
             map,
             pieces: Vec::new(),
             failed: false,
-            verified: false,
         });
         true
     }
 
     pub fn held(&self) -> usize {
         self.held
-    }
-
-    /// The last `insert` refused the frontier octet at a full hold, its mapping not exempt and
-    /// no failed one held: the subflow can make no progress (M4b spec G7).
-    pub fn blocked(&self) -> bool {
-        self.blocked
-    }
-
-    /// Verified mappings `deliver` refused, held until it takes them.
-    pub fn refused(&self) -> usize {
-        self.refused
     }
 
     /// Every held mapping, failed ones included.
@@ -198,10 +181,11 @@ impl Hold {
     /// ranges accepted at the TCP level. `frontier` is the subflow's cumulative TCP receive
     /// point: octets below it arrived before. An octet at or past `right_edge` is refused, as
     /// `RecvAssembler::accept` refuses it; one below `recv.next` is kept for the checksum (spec
-    /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further,
-    /// and only if `would_take` (`RecvAssembler::would_take`) says its completion would be
-    /// taken now, and no failed mapping is held; with `PIECE_CAP` runs held, only runs touching
-    /// a held one or starting at `frontier`.
+    /// G7). A mapping holding nothing yet is admitted only if `would_take`
+    /// (`RecvAssembler::would_take`) says the assembler would take its completion now. With
+    /// `cap` octets held, only the mapping covering `frontier` is accepted further, and none
+    /// while a failed mapping is held; with `PIECE_CAP` runs held, only runs touching a held one
+    /// or starting at `frontier`.
     pub fn insert(
         &mut self,
         ssn: u32,
@@ -212,11 +196,9 @@ impl Hold {
         would_take: impl Fn(u64, u32) -> bool,
     ) -> Vec<Range<usize>> {
         self.prune(frontier);
-        // The frontier mapping is exempt only if its completion would leave the hold: no
-        // failed mapping is held (MP_FAIL waits, spec G11), and the assembler would take it
-        // now. Otherwise each new frontier could add a complete mapping that stays held (G7).
+        // A failed mapping is held only while MP_FAIL waits (spec G11): then no mapping is
+        // exempt, or the peer could map the same in-window DSNs at each new frontier (G7).
         let failed = self.entries.iter().any(|e| e.failed);
-        self.blocked = false;
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -240,11 +222,12 @@ impl Hold {
             let n = rest.min((e.map.len - off) as usize);
             let dsn = e.map.dsn.wrapping_add(u64::from(off));
             let mut k = (right_edge.wrapping_sub(dsn) as i64).clamp(0, n as i64) as usize;
-            let exempt = !failed && covering(e, frontier) && would_take(e.map.dsn, e.map.len);
-            if !exempt {
-                let room = cap.saturating_sub(self.held);
-                self.blocked |= pos == frontier && !failed && k > 0 && room == 0;
-                k = k.min(room);
+            // Admitted once, a mapping stays admitted, so it can always complete; its
+            // completion then enters the assembler even past the range cap (`take_complete`).
+            if e.pieces.is_empty() && !would_take(e.map.dsn, e.map.len) {
+                k = 0;
+            } else if failed || !covering(e, frontier) {
+                k = k.min(cap.saturating_sub(self.held));
             }
             let may_split = self.pieces < PIECE_CAP || pos == frontier;
             if k > 0 {
@@ -267,7 +250,7 @@ impl Hold {
         self.frontier = Some(frontier);
         let (held, pieces) = (&mut self.held, &mut self.pieces);
         self.entries.retain(|e| {
-            let live = e.failed || e.verified || e.end().wrapping_sub(frontier) as i32 > 0;
+            let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
             if !live {
                 *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
                 *pieces -= e.pieces.len();
@@ -277,10 +260,8 @@ impl Hold {
     }
 
     /// Hands every mapping whose octets have all arrived and verify to `deliver` (its DSN and
-    /// octets) and takes it once `deliver` does; one it refuses stays held, verified, and is
-    /// offered again on the next call (its octets are TCP-ACKed: spec G7, G15). Reports, once,
-    /// each mapping that fails and keeps it.
-    pub fn take_complete(&mut self, mut deliver: impl FnMut(u64, &[u8]) -> bool) -> Vec<Complete> {
+    /// octets) and takes it; reports, once, each one that fails and keeps it.
+    pub fn take_complete(&mut self, mut deliver: impl FnMut(u64, &[u8])) -> Vec<Complete> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
@@ -294,7 +275,7 @@ impl Hold {
             };
             let data_len = (m.len + u32::from(m.data_fin)) as u16;
             let (head, tail) = b.1.as_slices();
-            if !e.verified && !dss_checksum_ok(m.dsn, m.ssn, data_len, &[head, tail], m.checksum) {
+            if !dss_checksum_ok(m.dsn, m.ssn, data_len, &[head, tail], m.checksum) {
                 e.failed = true;
                 out.push(Complete::Failed {
                     dsn: m.dsn,
@@ -303,12 +284,7 @@ impl Hold {
                 i += 1;
                 continue;
             }
-            if !deliver(m.dsn, b.1.make_contiguous()) {
-                self.refused += usize::from(!std::mem::replace(&mut e.verified, true));
-                i += 1;
-                continue;
-            }
-            self.refused -= usize::from(e.verified);
+            deliver(m.dsn, b.1.make_contiguous());
             self.entries.remove(i);
             self.held -= m.len as usize;
             self.pieces -= 1;
@@ -325,7 +301,6 @@ impl Hold {
     pub fn drain(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.held = 0;
         self.pieces = 0;
-        self.refused = 0;
         let mut runs: Vec<(u32, Vec<u8>)> = (self.entries.drain(..))
             .flat_map(|e| {
                 let ssn = e.map.ssn;
@@ -373,10 +348,7 @@ mod tests {
 
     fn take(h: &mut Hold) -> Vec<Done> {
         let mut got = Vec::new();
-        let out = h.take_complete(|_, b| {
-            got.push(b.to_vec());
-            true
-        });
+        let out = h.take_complete(|_, b| got.push(b.to_vec()));
         let mut got = got.into_iter();
         (out.into_iter())
             .map(|c| match c {

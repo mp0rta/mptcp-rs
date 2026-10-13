@@ -9,7 +9,7 @@ pub(crate) mod sched;
 pub(crate) mod signal;
 mod subflow;
 use crate::crypto::{add_addr_hmac, key_token_idsn};
-use data::{Outcome, RecvAssembler, SendStore, TxMaps, promote32};
+use data::{RecvAssembler, SendStore, TxMaps, promote32};
 use hold::{Complete, HoldMap};
 pub(crate) use join::{Join, JoinRole};
 pub(crate) use opp::Cand;
@@ -396,47 +396,6 @@ impl Connection {
     /// allows, or timed out): contiguity no longer matters, so joins may come again within the
     /// no-subflow wait. Its held octets are discarded: they are not DATA_ACKed, so the peer
     /// resends them elsewhere (RFC 8684 L2392–2394, M4b spec G12, G17).
-    /// Offers the verified mappings the assembler's range cap refused to it again, on every
-    /// subflow until none is taken: input on any subflow, or a read, may have made room. They
-    /// are TCP-ACKed, so nothing else would bring them (spec G7, G15). With no such mapping,
-    /// or no checksums, it does nothing.
-    pub(crate) fn retry_refused(&mut self) {
-        let csum = (self.hooks.negotiation.as_ref()).is_some_and(|m| m.csum);
-        let Some(d) = self.hooks.data.as_mut().filter(|_| csum) else {
-            return;
-        };
-        let mut any = false;
-        loop {
-            let mut taken = false;
-            for sf in (self.subflows.iter_mut()).filter(|sf| sf.mp.hold.refused() > 0) {
-                let recv = &mut d.recv;
-                let done = (sf.mp.hold)
-                    .take_complete(|dsn, bytes| recv.accept(dsn, bytes).0 != Outcome::Discarded);
-                for c in done {
-                    let Complete::Verified {
-                        dsn, len, data_fin, ..
-                    } = c
-                    else {
-                        continue;
-                    };
-                    taken = true;
-                    sf.mp.ack_now = true;
-                    if data_fin {
-                        d.recv.finish(dsn.wrapping_add(u64::from(len)));
-                    }
-                }
-            }
-            if !taken {
-                break;
-            }
-            any = true;
-        }
-        if any {
-            d.recv
-                .set_held(self.subflows.iter().map(|s| s.mp.hold.held()).sum());
-        }
-    }
-
     pub(crate) fn end_orphaned_wait(&mut self) {
         let MpFail::Waiting { subflow, .. } = self.hooks.mp_fail else {
             return;
@@ -671,19 +630,20 @@ impl Connection {
     /// them); Keep on `Progress` moves a Stale one back to Active. Nothing after fallback, nor
     /// once our FIN on the subflow is ACKed.
     pub(crate) fn update_health(&mut self, i: usize) -> Option<Event> {
-        let d = self.hooks.data.as_ref().filter(|d| !d.fallback)?;
+        let d = self.hooks.data.as_mut().filter(|d| !d.fallback)?;
+        // An ended subflow (TIME-WAIT or closed) receives no more: its held mappings, partial
+        // or failed, can never complete, nor are they DATA_ACKed, so the peer sends them again
+        // elsewhere (RFC 8684 L2392–2394). Kept, they would hold `free` down, for good on the
+        // retained initial subflow, and escape the connection's bound (M4b spec G7).
+        if self.subflows[i].ended() && !self.subflows[i].mp.hold.drain().is_empty() {
+            let held = self.subflows.iter().map(|s| s.mp.hold.held()).sum();
+            d.recv.set_held(held);
+        }
         let sf = &mut self.subflows[i];
         let subflow = sf.id;
         if sf.tcb.state() == TcpState::Closed {
             self.reinject_ranges(i);
             self.subflows[i].mp.tx.clear();
-            // Its held octets can never complete here, nor are they DATA_ACKed: the peer sends
-            // them again elsewhere (RFC 8684 L2392–2394). Kept, they would hold `free` down for
-            // good, the initial subflow being retained (M4b spec G7).
-            if !self.subflows[i].mp.hold.drain().is_empty() {
-                let held = self.subflows.iter().map(|s| s.mp.hold.held()).sum();
-                self.hooks.data.as_mut().unwrap().recv.set_held(held);
-            }
             return None;
         }
         if sf.tcb.fin_received()
@@ -1955,17 +1915,6 @@ impl SegmentHooks for SubflowHooks<'_> {
                         cap,
                         |dsn, len| d.recv.would_take(dsn, len),
                     );
-                    // The frontier octet, refused at a full hold for a mapping the assembler
-                    // would refuse too, could never be taken: reset with MP_TCPRST 0x02 "lack
-                    // of resources". The held octets are not DATA_ACKed, so the peer sends them
-                    // again on another subflow (RFC 8684 L2392–2394, M4b spec G7). Never while
-                    // MP_FAIL waits: a failed mapping held keeps `blocked` clear.
-                    if self.sf.hold.blocked() {
-                        self.sf.reset = true;
-                        self.sf.reset_option = Some(tcprst(0x02, false).to_vec());
-                        self.sf.hold.drain();
-                        return Vec::new();
-                    }
                     accepted.extend(taken.into_iter().map(|r| at + r.start..at + r.end));
                     at += len;
                     continue;
@@ -1991,12 +1940,14 @@ impl SegmentHooks for SubflowHooks<'_> {
                 at += len;
             }
         }
-        // The existing receive path clips what another subflow already delivered; what its
-        // range cap refuses stays held (spec G7, G15).
+        // A verified mapping always enters the assembler, which clips what another subflow
+        // already delivered (spec G7). Admission made sure it would be taken; if another
+        // subflow's completion took the free range since, it is stored past the range cap, as
+        // `replay` stores, for its octets are TCP-ACKed. Such extra ranges are at most the
+        // mappings held: `ENTRY_CAP` per subflow, `SUBFLOW_CAP` subflows.
         let complete = if hold {
             let recv = &mut d.recv;
-            (self.sf.hold)
-                .take_complete(|dsn, bytes| recv.accept(dsn, bytes).0 != Outcome::Discarded)
+            (self.sf.hold).take_complete(|dsn, bytes| recv.replay(dsn, bytes))
         } else {
             Vec::new()
         };
