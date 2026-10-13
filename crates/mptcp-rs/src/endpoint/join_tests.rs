@@ -4881,6 +4881,76 @@ fn responder_takes_backup_from_syn() {
     }
 }
 
+/// The data level closes both ways while a join we answered waits for its lost third ACK:
+/// the join can carry nothing more, so it is reset with MP_TCPRST at once, its listener slot
+/// comes back, and the connection ends with subflow 0, not at the join's SYN timeout.
+#[test]
+fn responder_join_reset_when_data_closed() {
+    use super::super::server_tests::SERVER;
+    use crate::crypto::key_token_idsn;
+    use crate::wire::mptcp::{DataAck, Dsn, Dss, Mapping};
+    let mut s = responder();
+    responder_syn(&mut s, false);
+    let server: SocketAddr = SERVER.parse().unwrap();
+    assert_eq!(s.ep.listeners[&server].half_open, 1);
+    let dss = |data_ack: u64, fin: Option<u64>| {
+        let o = MptcpOption::Dss(Dss {
+            data_fin: fin.is_some(),
+            data_ack: Some(DataAck::Ack64(data_ack)),
+            mapping: fin.map(|dsn| Mapping {
+                dsn: Dsn::Dsn64(dsn),
+                ssn: 0,
+                data_len: 1,
+                checksum: None,
+            }),
+        });
+        let mut out = [0; 40];
+        let n = mptcp::encode(&o, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (client, server_idsn) = (key_token_idsn(KA).1, key_token_idsn(KB).1);
+    // The client's DATA_FIN, then ours, which the client DATA_ACKs with its subflow FIN.
+    s.send(65535, &dss(server_idsn + 1, Some(client + 1)), &[]);
+    s.conn().close();
+    assert!(!s.output().is_empty(), "our DATA_FIN");
+    let seq = s.seq;
+    s.input(
+        TcpFlags::ACK | TcpFlags::FIN,
+        seq,
+        65535,
+        &dss(server_idsn + 2, None),
+        &[],
+    );
+    s.seq += 1;
+    let out = s.output();
+    let rst: Vec<_> = (out.iter().map(|p| leak(p.clone())))
+        .filter(|p| p.flags.contains(TcpFlags::RST))
+        .collect();
+    assert_eq!(rst.len(), 1, "the join is reset");
+    assert_eq!(rst[0].dst, JOIN_SRC.parse().unwrap());
+    let tcprst = MptcpOption::TcpRst {
+        transient: false,
+        reason: 0,
+    };
+    assert_eq!(
+        mpc(rst[0].options)
+            .iter()
+            .map(|o| mptcp::parse(o).unwrap())
+            .collect::<Vec<_>>(),
+        [tcprst]
+    );
+    assert_eq!(s.ep.listeners[&server].half_open, 0);
+    // The client ACKs our subflow FIN: the connection ends and is freed.
+    s.iss += 1;
+    s.send(65535, &[], &[]);
+    s.ep.handle_timeout(s.now);
+    let closed = Event::Closed {
+        reason: CloseReason::Normal,
+    };
+    assert!(s.events().contains(&closed));
+    assert!(s.ep.conns.is_empty() && s.ep.demux.is_empty());
+}
+
 // M3 Task 4: path-management API groundwork, reusing the helpers above.
 #[path = "pm_tests.rs"]
 mod pm_tests;

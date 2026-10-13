@@ -571,6 +571,9 @@ impl Tcb {
     /// SYN-SENT: the TCB is deleted. `state()` is `Closed` at once and nothing more is sent or
     /// accepted; `poll_send_at` reports a deadline that is already due, and the next
     /// `on_timeout` returns `Closed(Normal)`, once, and sets `closed_at`.
+    ///
+    /// SYN-RECEIVED is left unchanged on purpose: FIN-WAIT-1 (RFC 9293 L3143–3148) would skip
+    /// an MP_JOIN responder's HMAC check of the third ACK.
     pub fn close(&mut self) {
         self.state = match self.state {
             TcpState::SynSent => TcpState::Closed,

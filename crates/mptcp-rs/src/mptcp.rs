@@ -847,8 +847,14 @@ impl SubflowHooks<'_> {
             tcb.send_keepalive_probe();
         }
         if self.sf.joining() {
-            // No data, probes or DATA_FIN while joining; it still closes with the rest.
-            if self.conn.data.as_ref().is_some_and(|d| d.close.acked) {
+            // No data, probes or DATA_FIN while joining; it still closes with the rest. CLOSE
+            // leaves a join we answered in SYN-RECEIVED (`Tcb::close`): once the data level has
+            // closed both ways it can carry nothing, so it is reset and its slot comes back.
+            let answered = (self.sf.join.as_ref()).is_some_and(|j| j.role == JoinRole::Responder);
+            if answered && tcb.state() == TcpState::SynReceived && self.conn.data_closed() {
+                let rst = Some(tcprst(0x00, false));
+                tcb.abort_with(crate::tcp::CloseReason::Reset, rst, now);
+            } else if self.conn.data.as_ref().is_some_and(|d| d.close.acked) {
                 tcb.close();
             }
             return;
