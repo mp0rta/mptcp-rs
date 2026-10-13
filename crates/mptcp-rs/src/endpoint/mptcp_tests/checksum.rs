@@ -1052,6 +1052,39 @@ fn rx_stale_mappings_stay_bounded() {
     );
 }
 
+/// Pure ACKs declaring one-octet subranges of a verified mapping. Below the frontier they are
+/// not kept at all. Above it (the mapping verified over a hole) they count against the hold's
+/// mapping cap, past which the subflow is reset, as for `RxMaps` (spec G7).
+#[test]
+fn rx_stale_mappings_on_pure_acks_stay_bounded() {
+    let dsn = peer_head();
+    let data = pattern(2000);
+    let count = |c: &Client| c.ep.conns[&c.h].subflows[0].mp.hold.maps().count();
+    // In order: the frontier is past the mapping.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer_at(5001, &csum_mapping(1, dsn, &data, false), &data);
+    for k in 0..data.len() {
+        let opt = csum_mapping(1 + k as u32, dsn + k as u64, &data[k..k + 1], false);
+        c.peer_at(7001, &opt, &[]);
+    }
+    assert_eq!(count(&c), 0);
+    assert!(!c.ep.conns[&c.h].subflows[0].mp.reset);
+    // Out of order, over a hole at SSN 1..11.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer_at(5011, &csum_mapping(11, dsn + 10, &data, false), &data);
+    assert_eq!(count(&c), 0, "verified");
+    let mut rst = None;
+    for k in 0..1100 {
+        let opt = csum_mapping(11 + k as u32, dsn + 10 + k as u64, &data[k..k + 1], false);
+        let sent = c.peer_at(5001, &opt, &[]);
+        rst = rst.or(rst_reason(&sent));
+        assert!(count(&c) <= 1024, "{}", count(&c));
+    }
+    assert!(rst.is_some(), "the subflow is reset past the cap");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Replay of held octets on fallback (spec G15).
 

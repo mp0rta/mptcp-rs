@@ -42,6 +42,10 @@ pub(crate) enum Complete {
 /// run is refused at the TCP level unless it starts at the frontier.
 const PIECE_CAP: usize = 64;
 
+/// Held mappings per subflow, as `RxMaps` bounds its own: one more is invalid and resets the
+/// subflow. Only a peer re-declaring parts of a mapping it already sent reaches it.
+const ENTRY_CAP: usize = 1024;
+
 struct Entry {
     map: HoldMap,
     /// Held runs by offset in the mapping: sorted, disjoint, never adjacent.
@@ -116,11 +120,14 @@ pub(crate) struct Hold {
     held: usize,
     /// Held runs, over all entries (at most `PIECE_CAP` plus those at the frontier).
     pieces: usize,
+    /// The frontier of the last `prune`: TCP took every octet below it.
+    frontier: Option<u32>,
 }
 
 impl Hold {
     /// Registers a mapping. An equal repeat is a no-op; another mapping over the same SSNs is
-    /// invalid (false), as a conflicting one is for `RxMaps::install`.
+    /// invalid (false), as a conflicting one is for `RxMaps::install`, and so is one past
+    /// `ENTRY_CAP`. One wholly below the frontier is not kept: it could never complete.
     pub fn install(&mut self, map: HoldMap) -> bool {
         for e in &mut self.entries {
             let off = map.ssn.wrapping_sub(e.map.ssn) as i32 as i64;
@@ -139,6 +146,16 @@ impl Hold {
                 }
                 return e.map == map;
             }
+        }
+        let end = map.ssn.wrapping_add(map.len);
+        if self
+            .frontier
+            .is_some_and(|f| end.wrapping_sub(f) as i32 <= 0)
+        {
+            return true;
+        }
+        if self.entries.len() == ENTRY_CAP {
+            return false;
         }
         self.entries.push(Entry {
             map,
@@ -220,6 +237,7 @@ impl Hold {
     /// exception to "held octets are never dropped": such a mapping can never complete, as
     /// TCP already took the octets it lacks (unmapped, or it is a repeat of one taken before).
     pub fn prune(&mut self, frontier: u32) {
+        self.frontier = Some(frontier);
         let (held, pieces) = (&mut self.held, &mut self.pieces);
         self.entries.retain(|e| {
             let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
