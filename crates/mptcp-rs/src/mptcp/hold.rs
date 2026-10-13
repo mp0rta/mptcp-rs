@@ -122,9 +122,21 @@ impl Hold {
     /// Registers a mapping. An equal repeat is a no-op; another mapping over the same SSNs is
     /// invalid (false), as a conflicting one is for `RxMaps::install`.
     pub fn install(&mut self, map: HoldMap) -> bool {
-        for e in &self.entries {
+        for e in &mut self.entries {
             let off = map.ssn.wrapping_sub(e.map.ssn) as i32 as i64;
             if off < i64::from(e.map.len) && off + i64::from(map.len) > 0 {
+                // Linux folds a late DATA_FIN into the final mapping it already declared
+                // (`mptcp_write_data_fin`), though a sender MUST NOT change a declared mapping
+                // (RFC 8684 L1369–1371). As Linux's receiver (`get_mapping_status`), we take it
+                // as the same mapping; its DATA_FIN, with the checksum covering it, is kept.
+                if (e.map.ssn, e.map.dsn, e.map.len) == (map.ssn, map.dsn, map.len)
+                    && e.map.data_fin != map.data_fin
+                {
+                    if map.data_fin {
+                        e.map = map;
+                    }
+                    return true;
+                }
                 return e.map == map;
             }
         }
@@ -358,6 +370,43 @@ mod tests {
                 }
             };
             assert_eq!(h.take_complete(), [want]);
+        }
+    }
+
+    /// A repeat of a held mapping with the same SSN, DSN and length that folds in a DATA_FIN
+    /// (Linux's `mptcp_write_data_fin` on a declared mapping) is the same mapping, in either
+    /// order: it verifies with the DATA_FIN. Any other change is a conflict.
+    #[test]
+    fn hold_late_data_fin_fold_is_the_same_mapping() {
+        let data = pattern(1783);
+        let (plain, folded) = (map(1, 10, &data, false), map(1, 10, &data, true));
+        for order in [[plain, folded], [folded, plain]] {
+            let mut h = Hold::default();
+            assert!(h.install(order[0]));
+            h.insert(1, &data[..1436], 1, EDGE, BIG);
+            assert!(h.install(order[1]));
+            h.insert(1437, &data[1436..], 1437, EDGE, BIG);
+            let want = Complete::Verified {
+                dsn: 10,
+                bytes: data.clone(),
+                data_fin: true,
+            };
+            assert_eq!(h.take_complete(), [want]);
+        }
+        for other in [
+            HoldMap {
+                len: 1782,
+                ..folded
+            },
+            HoldMap { dsn: 11, ..plain },
+            HoldMap {
+                checksum: plain.checksum ^ 1,
+                ..plain
+            },
+        ] {
+            let mut h = Hold::default();
+            assert!(h.install(plain));
+            assert!(!h.install(other), "{other:?}");
         }
     }
 

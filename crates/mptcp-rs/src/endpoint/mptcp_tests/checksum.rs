@@ -925,6 +925,37 @@ fn rx_data_fin_only_bad_checksum_ignored() {
     assert!(recv(&c.ep, c.h).has_fin());
 }
 
+/// Linux folds a late DATA_FIN into the final mapping it already declared
+/// (`mptcp_write_data_fin`): the mapping's first segment says DLL n, a DATA_FIN-only DSS
+/// follows, and the rest comes with the same DSN and SSN but DLL n + 1, the DATA_FIN flag and
+/// a checksum over n + 1. Linux's receiver takes it as the same mapping
+/// (`get_mapping_status`); so do we: it verifies, the stream ends, no reset. A retransmitted
+/// first segment, with the mapping as first declared, changes nothing. (Linux interop,
+/// csum-fail2 c2s: the reset killed the only subflow left.)
+#[test]
+fn rx_late_data_fin_folded_into_declared_mapping() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let data = pattern(1783);
+    let first = c.peer_at(5001, &csum_mapping(1, dsn, &data, false), &data[..1436]);
+    let ck = dss_checksum(dsn + 1783, 0, 1, &[]);
+    let fin = dss_mapping(true, 0, dsn + 1783, 1, Some(ck));
+    let fin_only = c.peer_at(5001 + 1436, &fin, &[]);
+    let rest = c.peer_at(
+        5001 + 1436,
+        &csum_mapping(1, dsn, &data, true),
+        &data[1436..],
+    );
+    let again = c.peer_at(5001, &csum_mapping(1, dsn, &data, false), &data[..1436]);
+    for sent in [&first, &fin_only, &rest, &again] {
+        assert_eq!(rst_reason(sent), None);
+    }
+    assert_eq!(data_ack_of(rest.last().unwrap()), Some(dsn + 1784));
+    assert_eq!(read_now(&mut c.ep, c.h), data);
+    assert!(recv(&c.ep, c.h).has_fin());
+}
+
 /// Review Focus 2: a 4 KiB receive buffer against one 65,535-octet mapping sent within the
 /// edge we offer. Completion credit opens the edge to the mapping's end; every octet arrives
 /// and verifies, without a stall (spec G7).
