@@ -1840,6 +1840,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                 *base = ssn;
             }
             self.sf.rx.ack(ssn);
+            // Complete mappings were taken in `receive_data`, before the receipt advanced.
+            self.sf.hold.prune(ssn);
         }
     }
     fn receive_data(

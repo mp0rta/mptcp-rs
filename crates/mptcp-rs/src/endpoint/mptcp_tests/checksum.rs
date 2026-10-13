@@ -1007,6 +1007,28 @@ fn rx_csum_off_delivers_per_segment() {
     assert_eq!(read_now(&mut c.ep, c.h), &data[1460..]);
 }
 
+/// Each in-order octet arrives unmapped with a DSS mapping of the octet before it: the stale
+/// mappings are pruned as the receipt passes them, so their metadata stays bounded (spec G7).
+#[test]
+fn rx_stale_mappings_stay_bounded() {
+    let mut c = client(true, false);
+    c.confirm();
+    let dsn = peer_head();
+    let data = pattern(500);
+    c.peer_at(5001, &csum_mapping(1, dsn, &data[..1], false), &data[..1]);
+    for k in 1..data.len() {
+        let opt = csum_mapping(k as u32, dsn + k as u64 - 1, &data[k - 1..k], false);
+        c.peer_at(5001 + k as u32, &opt, &data[k..k + 1]);
+    }
+    let sf = &c.ep.conns[&c.h].subflows[0];
+    assert!(!sf.mp.reset);
+    assert!(
+        sf.mp.hold.maps().count() <= 1,
+        "{}",
+        sf.mp.hold.maps().count()
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Replay of held octets on fallback (spec G15).
 

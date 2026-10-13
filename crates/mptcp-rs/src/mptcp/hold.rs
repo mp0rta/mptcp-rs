@@ -171,18 +171,7 @@ impl Hold {
         right_edge: u64,
         cap: usize,
     ) -> Vec<Range<usize>> {
-        // The only exception to "held octets are never dropped" (G7): a mapping wholly below
-        // the frontier and not complete can never complete, as TCP already took the octets it
-        // lacks (unmapped, or it is a repeat of a mapping taken before).
-        let (held, pieces) = (&mut self.held, &mut self.pieces);
-        self.entries.retain(|e| {
-            let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
-            if !live {
-                *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
-                *pieces -= e.pieces.len();
-            }
-            live
-        });
+        self.prune(frontier);
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
@@ -220,6 +209,22 @@ impl Hold {
             at += n;
         }
         accepted
+    }
+
+    /// Drops every mapping wholly below `frontier` that is not failed, also as the receipt
+    /// advances with no mapped octet, so stale mappings never pile up (spec G7). The only
+    /// exception to "held octets are never dropped": such a mapping can never complete, as
+    /// TCP already took the octets it lacks (unmapped, or it is a repeat of one taken before).
+    pub fn prune(&mut self, frontier: u32) {
+        let (held, pieces) = (&mut self.held, &mut self.pieces);
+        self.entries.retain(|e| {
+            let live = e.failed || e.end().wrapping_sub(frontier) as i32 > 0;
+            if !live {
+                *held -= e.pieces.iter().map(|p| p.1.len()).sum::<usize>();
+                *pieces -= e.pieces.len();
+            }
+            live
+        });
     }
 
     /// Takes every mapping whose octets have all arrived and verify; reports, once, each one
