@@ -1522,9 +1522,11 @@ impl<R: CryptoRng> Endpoint<R> {
                 };
                 let mut r = Reaction::None;
                 let syn_sent = sf.tcb.state() == TcpState::SynSent;
-                if Some(sf.id) == mp_fail_expired && sf.tcb.state() != TcpState::Closed {
+                if Some(sf.id) == mp_fail_expired {
                     // No answer to our MP_FAIL in 120 s (M4b spec G16); held octets go too.
                     hk.sf.hold.drain();
+                }
+                if Some(sf.id) == mp_fail_expired && sf.tcb.state() != TcpState::Closed {
                     let rst = Some(tcprst(0x06, false).to_vec());
                     r = sf.tcb.abort_with(CloseReason::Reset, rst, now);
                 } else if sf.tcb.state() == TcpState::SynReceived && hk.sf.reset {
@@ -1578,6 +1580,8 @@ impl<R: CryptoRng> Endpoint<R> {
                 d.recv
                     .set_held(c.subflows.iter().map(|s| s.mp.hold.held()).sum());
             }
+            // A subflow this timeout ended may have been the one `Waiting` was on.
+            c.end_orphaned_wait();
             // A half-open connection ends silently, at R2 (spec G10).
             if c.half_open {
                 self.events.truncate(mark);

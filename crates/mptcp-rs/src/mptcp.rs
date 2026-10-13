@@ -392,6 +392,28 @@ impl Connection {
         matches!(step, MpFailStep::Wait { .. })
     }
 
+    /// `Waiting` ends without a fallback once its subflow is gone (reset by the peer, as G17
+    /// allows, or timed out): contiguity no longer matters, so joins may come again within the
+    /// no-subflow wait. Its held octets are discarded: they are not DATA_ACKed, so the peer
+    /// resends them elsewhere (RFC 8684 L2392–2394, M4b spec G12, G17).
+    pub(crate) fn end_orphaned_wait(&mut self) {
+        let MpFail::Waiting { subflow, .. } = self.hooks.mp_fail else {
+            return;
+        };
+        let sf = self.subflows.iter_mut().find(|sf| sf.id == subflow);
+        if sf.as_ref().is_some_and(|sf| !sf.ended()) {
+            return;
+        }
+        self.hooks.mp_fail = MpFail::Idle;
+        if let Some(sf) = sf {
+            sf.mp.hold.drain();
+        }
+        if let Some(d) = self.hooks.data.as_mut() {
+            d.recv
+                .set_held(self.subflows.iter().map(|s| s.mp.hold.held()).sum());
+        }
+    }
+
     /// Resets every join not yet complete as `Waiting` begins (M4b spec G12); one in SYN-SENT
     /// sends nothing (RFC 9293 §3.10.5). Returns the joins we started, for `SubflowDown`.
     pub(crate) fn cancel_joins(&mut self, now: Instant) -> Vec<SubflowId> {
@@ -525,6 +547,7 @@ impl Connection {
     /// Active subflows with an RTT sample, `INITIAL_RTO` when none has one: a backed-off RTO
     /// of a lossy subflow must not stretch recovery of what the healthy one carried.
     pub(crate) fn update_recovery(&mut self, now: Instant) {
+        self.end_orphaned_wait();
         self.update_episode(now);
         self.update_repair(now);
         let frozen = self.hooks.frozen();

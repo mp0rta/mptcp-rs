@@ -672,3 +672,35 @@ fn mp_fail_on_join_completing_ack_ignored() {
     assert_eq!(ep.poll_event(), Some((h, Event::SubflowUp { subflow: id })));
     assert!(!infinite_ok(&ep, h));
 }
+
+/// The peer resets the subflow we wait on (RST + MP_FAIL, as a peer without contiguity does,
+/// spec G13, G17): `Waiting` ends, its held octets are discarded, and a join queued while
+/// waiting starts at once, within the no-subflow wait (spec G12).
+#[test]
+fn waiting_ends_when_its_subflow_is_reset() {
+    let Waiting { mut c, m, .. } = waiting();
+    let remote = "10.0.0.2:80".parse().unwrap();
+    let ip = JOIN_IP.parse().unwrap();
+    c.ep.add_subflow(t(2), c.h, ip, remote, 1500, false)
+        .unwrap();
+    assert!(
+        c.sent(t(2)).iter().all(|s| s.flags != TcpFlags::SYN),
+        "queued"
+    );
+    let syn = c.syn.clone();
+    let rst = mp_fail_rst(m);
+    let seg = Segment {
+        flags: TcpFlags::RST,
+        ..peer_data(&syn, 5111, &rst, &[])
+    };
+    feed(&mut c.ep, &seg, t(2));
+    assert_eq!(state(&c), MpFail::Idle);
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(deadline(&c), None);
+    let out = c.sent(t(2));
+    let join = out
+        .iter()
+        .find(|s| s.flags == TcpFlags::SYN)
+        .expect("the join SYN");
+    assert_eq!(join.src.ip(), ip);
+}
