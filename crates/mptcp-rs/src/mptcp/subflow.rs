@@ -77,8 +77,9 @@ pub(crate) struct SubflowMp {
     pub hold: Hold,
     pub unmapped: usize,
     pub reset: bool,
-    /// The MP_TCPRST the RST that `reset` makes due carries (M3 spec §3.4).
-    pub reset_option: Option<[u8; 4]>,
+    /// The options the RST that `reset` makes due carries: MP_TCPRST (M3 spec §3.4), after
+    /// MP_FAIL for a checksum failure (M4b spec G11, G20).
+    pub reset_option: Option<Vec<u8>>,
     pub dss_confirmed: bool,
     pub tcp_acked_dsn: u64,
     pub tcp_acked_ssn: Option<u32>,

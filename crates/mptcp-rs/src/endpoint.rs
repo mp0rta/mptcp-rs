@@ -428,7 +428,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 if sf.mp.join.is_some() && sf.pending_via == Some(key) {
                     sf.pending_via = None;
                     sf.mp.reset = true;
-                    sf.mp.reset_option = Some(tcprst(0x01, false));
+                    sf.mp.reset_option = Some(tcprst(0x01, false).to_vec());
                 }
             }
         }
@@ -827,7 +827,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 tcb.delete(now);
                 Reaction::Closed(CloseReason::Reset)
             } else {
-                tcb.abort_with(CloseReason::Reset, Some(tcprst(0x00, false)), now)
+                tcb.abort_with(CloseReason::Reset, Some(tcprst(0x00, false).to_vec()), now)
             };
             Self::report(&mut self.events, h, c, i, r, last, now);
         }
@@ -1516,19 +1516,23 @@ impl<R: CryptoRng> Endpoint<R> {
                     // A join whose listener was removed (`unlisten`): RFC 9293 §3.10.5 ABORT.
                     r = sf
                         .tcb
-                        .abort_with(CloseReason::Reset, hk.sf.reset_option, now);
+                        .abort_with(CloseReason::Reset, hk.sf.reset_option.clone(), now);
                 } else if hk.sf.strand_at.is_some_and(|t| t <= now)
                     && sf.tcb.state() != TcpState::Closed
                 {
                     // Like a FIN exchange's end, a joined subflow reports `SubflowDown`.
-                    r = sf
-                        .tcb
-                        .abort_with(CloseReason::Reset, Some(tcprst(0x04, true)), now);
+                    r = sf.tcb.abort_with(
+                        CloseReason::Reset,
+                        Some(tcprst(0x04, true).to_vec()),
+                        now,
+                    );
                 } else if sf.tcb.state() != TcpState::Closed && hk.sf.keepalive_failed(now) {
                     // The REMOVE_ADDR keepalive went unanswered (M3 spec §3.3, §3.4).
-                    r = sf
-                        .tcb
-                        .abort_with(CloseReason::Reset, Some(tcprst(0x00, false)), now);
+                    r = sf.tcb.abort_with(
+                        CloseReason::Reset,
+                        Some(tcprst(0x00, false).to_vec()),
+                        now,
+                    );
                 } else if sf.tcb.poll_send_at().is_some_and(|t| t <= now) {
                     r = sf.tcb.on_timeout(now, &mut hk);
                 }
@@ -1551,7 +1555,7 @@ impl<R: CryptoRng> Endpoint<R> {
                     && !sf.tcb.reset_pending()
                 {
                     sf.tcb
-                        .abort_with(CloseReason::Timeout, Some(tcprst(0x00, true)), now);
+                        .abort_with(CloseReason::Timeout, Some(tcprst(0x00, true).to_vec()), now);
                 }
                 Self::report(&mut self.events, h, c, i, r, last, now);
             }

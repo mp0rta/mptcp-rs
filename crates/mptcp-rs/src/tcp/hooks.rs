@@ -71,8 +71,9 @@ pub trait SegmentHooks {
     fn reset_requested(&self) -> bool {
         false
     }
-    /// The option carried by the RST that `reset_requested` makes due (4 octets, aligned).
-    fn reset_option(&self) -> Option<[u8; 4]> {
+    /// The options carried by the RST that `reset_requested` makes due (a multiple of 4
+    /// octets, at most 16).
+    fn reset_option(&self) -> Option<Vec<u8>> {
         None
     }
     /// An acceptable RST, SYN-SENT included, before the TCB is torn down.

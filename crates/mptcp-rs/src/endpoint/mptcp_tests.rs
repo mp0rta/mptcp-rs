@@ -3749,3 +3749,6 @@ mod server_capable;
 
 /// DSS checksums: negotiation, sent mappings, presence check (M4b Task 2).
 mod checksum;
+
+/// MP_FAIL: the reset carrying it, `infinite_ok`, ignored MP_FAILs (M4b Task 5).
+mod mp_fail;

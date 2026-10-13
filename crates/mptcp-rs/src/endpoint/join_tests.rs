@@ -67,7 +67,7 @@ fn confirmed() -> Connected {
 }
 
 /// `add_subflow` from `ip` and the MP_JOIN SYN it sends.
-fn join_syn(
+pub(super) fn join_syn(
     ep: &mut Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     now: Instant,
@@ -83,7 +83,7 @@ fn join_syn(
 
 /// The peer's SYN/ACK options: MP_JOIN with the right HMAC-B (unless `hmac` overrides it),
 /// MSS 1460 and window scale `ws`.
-fn synack_opts(
+pub(super) fn synack_opts(
     ep: &Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     jsyn: &Segment,
@@ -122,7 +122,7 @@ fn synack_opts_mss(
     out[..n].to_vec()
 }
 /// The peer's SYN/ACK on the join 4-tuple (ISN 5000, like the initial subflow's peer).
-fn synack(ep: &mut Endpoint<ChaCha20Rng>, jsyn: &Segment, opts: &[u8], now: Instant) {
+pub(super) fn synack(ep: &mut Endpoint<ChaCha20Rng>, jsyn: &Segment, opts: &[u8], now: Instant) {
     let seg = Segment {
         flags: TcpFlags::SYN | TcpFlags::ACK,
         seq: SeqNum(5000),

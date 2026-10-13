@@ -50,6 +50,10 @@ pub(crate) struct ConnectionHooks {
     /// An MP_JOIN SYN has been sent on this connection (a history, not a subflow count): from
     /// then on stripping resets its subflow and never falls back (RFC 8684 L2321–2328).
     pub joined_ever: bool,
+    /// All unacknowledged data in flight is contiguous (RFC 8684 L2396–2401): no join has
+    /// completed and we have sent no connection-level retransmission (M4b spec G10). Unlike
+    /// `joined_ever`, a failed join leaves it set. Cleared for good.
+    pub infinite_ok: bool,
     /// The highest `SubflowMp::dsn_end` of the subflows already freed.
     pub freed_dsn_end: Option<u64>,
     /// MinRTT; tests inject others (spec §4: crate-internal, one implementation).
@@ -85,6 +89,22 @@ pub(crate) fn tcprst(reason: u8, transient: bool) -> [u8; 4] {
     let mut out = [0; 4];
     let option = MptcpOption::TcpRst { transient, reason };
     mptcp::encode(&option, &mut out).expect("MP_TCPRST is 4 octets");
+    out
+}
+
+/// The peer's side of contiguity: mapping `(dsn, ssn)` keeps the handshake's offset, relative
+/// SSN 1 at `peer_idsn + 1`, compared on the low 32 bits (M4b spec G10).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn initial_offset_ok(peer_idsn: u64, dsn: u64, ssn: u32) -> bool {
+    dsn.wrapping_sub(peer_idsn) as u32 == ssn
+}
+
+/// RST options for a checksum failure at `dsn`: MP_FAIL, then MP_TCPRST 0x06 "middlebox
+/// interference", T=0 (RFC 8684 L2369–2378, M4b spec G11).
+pub(crate) fn fail_rst(dsn: u64) -> Vec<u8> {
+    let mut out = vec![0; 12];
+    mptcp::encode(&MptcpOption::Fail { dsn }, &mut out).expect("MP_FAIL is 12 octets");
+    out.extend(tcprst(0x06, false));
     out
 }
 
@@ -127,6 +147,7 @@ impl ConnectionHooks {
             fallback_event: false,
             fast_closed: false,
             joined_ever: false,
+            infinite_ok: true,
             freed_dsn_end: None,
             scheduler: Box::new(MinRtt),
             snapshots: Vec::with_capacity(SUBFLOW_CAP),
@@ -515,7 +536,11 @@ impl Connection {
         {
             sf.state = SubflowState::Active;
         }
-        self.abort_all(now, (!lost).then_some(i), Some(tcprst(0x01, false)));
+        self.abort_all(
+            now,
+            (!lost).then_some(i),
+            Some(tcprst(0x01, false).to_vec()),
+        );
         for (_, sf) in (self.subflows.iter_mut().enumerate()).filter(|&(j, _)| j != i) {
             sf.mp.tx.clear();
         }
@@ -529,7 +554,7 @@ impl Connection {
         &mut self,
         now: Instant,
         except: Option<usize>,
-        rst_option: Option<[u8; 4]>,
+        rst_option: Option<Vec<u8>>,
     ) {
         for (j, sf) in self.subflows.iter_mut().enumerate() {
             if Some(j) == except || sf.tcb.state() == TcpState::Closed {
@@ -540,7 +565,7 @@ impl Connection {
                 sf.tcb.delete(now);
             } else {
                 sf.tcb
-                    .abort_with(crate::tcp::CloseReason::Reset, rst_option, now);
+                    .abort_with(crate::tcp::CloseReason::Reset, rst_option.clone(), now);
             }
         }
     }
@@ -854,7 +879,7 @@ impl SubflowHooks<'_> {
             // closed both ways it can carry nothing, so it is reset and its slot comes back.
             let answered = (self.sf.join.as_ref()).is_some_and(|j| j.role == JoinRole::Responder);
             if answered && tcb.state() == TcpState::SynReceived && self.conn.data_closed() {
-                let rst = Some(tcprst(0x00, false));
+                let rst = Some(tcprst(0x00, false).to_vec());
                 tcb.abort_with(crate::tcp::CloseReason::Reset, rst, now);
             } else if self.conn.data.as_ref().is_some_and(|d| d.close.acked) {
                 tcb.close();
@@ -925,6 +950,7 @@ impl SubflowHooks<'_> {
                     return false;
                 }
                 d.reinject.remove(dsn, len as u64);
+                self.conn.infinite_ok = false;
                 if d.close.local == Some(dsn.wrapping_add(len as u64)) {
                     self.sf.tx.attach_fin();
                     d.close.attached = true;
@@ -1012,7 +1038,7 @@ impl SendBuf for SubflowHooks<'_> {
                             // spec §5.2).
                             Some(false) if self.sf.join.is_some() || self.conn.joined_ever => {
                                 self.sf.reset = true;
-                                self.sf.reset_option = Some(tcprst(0x06, false));
+                                self.sf.reset_option = Some(tcprst(0x06, false).to_vec());
                             }
                             Some(false) => {
                                 let m = self.conn.negotiation.as_mut().unwrap();
@@ -1225,6 +1251,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         }
         // Validate the whole option list before mutating mapping or DATA_ACK state.
         let (mut dss, mut capable, mut fastclose, mut prio) = (None, None, None, None);
+        let mut fail = None;
         let (mut removed, mut added) = (Vec::new(), Vec::new());
         let mut bad_capable = false;
         let options_ok = 'opts: {
@@ -1240,6 +1267,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                             fastclose = Some(receiver_key)
                         }
                         Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
+                        Ok(MptcpOption::Fail { dsn }) => fail = Some(dsn),
                         Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
                         // E=1 echoes our ADD_ADDR, and we send none.
                         Ok(MptcpOption::AddAddr {
@@ -1360,6 +1388,16 @@ impl SegmentHooks for SubflowHooks<'_> {
         if d.fallback {
             return;
         }
+        // MP_FAIL without RST, with or without checksums; ignored after fallback (above) and
+        // while joining (M4b spec G18). Without contiguity the subflow is reset, the RST's
+        // MP_FAIL carrying the received DSN (RFC 8684 L2419–2424, spec G13).
+        if let Some(dsn) = fail.filter(|_| !self.sf.joining()) {
+            if !self.conn.infinite_ok {
+                self.sf.reset = true;
+                self.sf.reset_option = Some(fail_rst(dsn));
+                return;
+            }
+        }
         // MP_PRIO: the peer's preference for the subflow it arrived on (M3 spec §3.3).
         if let Some(backup) = prio.filter(|_| m.state == State::Confirmed) {
             self.sf.peer_backup = backup;
@@ -1423,7 +1461,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 // subflow is reset with MP_TCPRST 0x01 (RFC 8684 L1331–1342, spec G3).
                 if mapping.checksum.is_some() != m.csum {
                     self.sf.reset = true;
-                    self.sf.reset_option = Some(tcprst(0x01, false));
+                    self.sf.reset_option = Some(tcprst(0x01, false).to_vec());
                     return;
                 }
                 let dsn = match mapping.dsn {
@@ -1522,7 +1560,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         {
             if self.sf.join.is_some() || self.conn.joined_ever {
                 self.sf.reset = true;
-                self.sf.reset_option = Some(tcprst(0x06, false));
+                self.sf.reset_option = Some(tcprst(0x06, false).to_vec());
                 return;
             }
             d.fall_back(self.sf, m, false);
@@ -1540,8 +1578,11 @@ impl SegmentHooks for SubflowHooks<'_> {
     fn reset_requested(&self) -> bool {
         self.conn.fast_closed || (self.conn.data.is_some() && self.sf.reset)
     }
-    fn reset_option(&self) -> Option<[u8; 4]> {
-        self.sf.reset_option.filter(|_| !self.conn.fast_closed)
+    fn reset_option(&self) -> Option<Vec<u8>> {
+        self.sf
+            .reset_option
+            .clone()
+            .filter(|_| !self.conn.fast_closed)
     }
     fn on_reset(&mut self, seg: &Segment<'_>) {
         let rst = walk(seg.options).find_map(|o| match o {
@@ -1654,10 +1695,14 @@ impl SegmentHooks for SubflowHooks<'_> {
                         self.sf.ack_now = true;
                     }
                 }
-                // Interim: Tasks 5 and 6 answer a failed checksum with MP_FAIL.
-                Complete::Failed { .. } => {
+                // The subflow is reset with MP_FAIL and its held octets are discarded: they are
+                // not DATA_ACKed, so the peer sends them again elsewhere (RFC 8684 L2369–2394,
+                // M4b spec G11).
+                Complete::Failed { dsn, .. } => {
                     self.sf.reset = true;
-                    self.sf.reset_option = Some(tcprst(0x06, false));
+                    self.sf.reset_option = Some(fail_rst(dsn));
+                    self.sf.hold.drain();
+                    break;
                 }
             }
         }

@@ -105,7 +105,11 @@ impl Join {
             return Reaction::None;
         };
         if now >= *since + r2 {
-            return tcb.abort_with(CloseReason::Timeout, Some(super::tcprst(0x00, true)), now);
+            return tcb.abort_with(
+                CloseReason::Timeout,
+                Some(super::tcprst(0x00, true).to_vec()),
+                now,
+            );
         }
         if now >= *at {
             *interval = (*interval * 2).min(MAX_INTERVAL);
@@ -179,6 +183,7 @@ impl SubflowHooks<'_> {
                 && matches!(j.third_ack, ThirdAck::Due { .. })
             {
                 j.third_ack = ThirdAck::Done;
+                self.conn.infinite_ok = false;
             }
             return;
         }
@@ -213,7 +218,7 @@ impl SubflowHooks<'_> {
             }
             _ => {
                 self.sf.reset = true;
-                self.sf.reset_option = Some(super::tcprst(0x01, false));
+                self.sf.reset_option = Some(super::tcprst(0x01, false).to_vec());
                 self.sf.join_failed = Some(None);
             }
         }
@@ -236,10 +241,11 @@ impl SubflowHooks<'_> {
         if options_ok && joins.count() == 1 && join_ack(seg) == Some(mac[..20].try_into().unwrap())
         {
             j.third_ack = ThirdAck::Done;
+            self.conn.infinite_ok = false;
             self.sf.ack_now = true;
         } else {
             self.sf.reset = true;
-            self.sf.reset_option = Some(super::tcprst(0x01, false));
+            self.sf.reset_option = Some(super::tcprst(0x01, false).to_vec());
         }
     }
 
