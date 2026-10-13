@@ -248,16 +248,17 @@ ip netns exec srv iptables-save -c >"$out/server-rules.txt"
 cat "$out/client.log" "$out/server.log"
 [ -z "$bhpid" ] || cat "$out/blackhole.log"
 [ -z "$rmpid" ] || cat "$out/remove.log"
-[ "$cli_rc" = 0 ] && [ "$srv_rc" = 0 ] && [ "$bh_rc" = 0 ] || { echo "FAIL client=$cli_rc server=$srv_rc blackhole/remove=$bh_rc"; exit 1; }
-if [ -n "$cns" ]; then
-  # The corruption happened exactly once (recorded, as the Linux selftest does).
-  ip netns exec $cns tc -s actions get action pedit index 100 >"$out/pedit.txt"
-  pedit=$(awk '$1 == "Sent" {print $4; exit}' "$out/pedit.txt")
-  [ "$pedit" = 1 ] || { echo "FAIL pedit rewrote ${pedit:-?} packets, want 1"; exit 1; }
-fi
+# Collected before the exit-code gate, so failed runs keep them.
+[ -z "$cns" ] || ip netns exec $cns tc -s actions get action pedit index 100 >"$out/pedit.txt"
 # Linux's MPTCP counters, in the namespace of the Linux end (both ends Linux: the server's).
 lns=srv; [ "$server" = kernel ] || lns=cli
 ip netns exec $lns nstat -asz | grep '^MPTcpExt' >"$out/nstat.txt" || true
+[ "$cli_rc" = 0 ] && [ "$srv_rc" = 0 ] && [ "$bh_rc" = 0 ] || { echo "FAIL client=$cli_rc server=$srv_rc blackhole/remove=$bh_rc"; exit 1; }
+if [ -n "$cns" ]; then
+  # The corruption happened exactly once (recorded, as the Linux selftest does).
+  pedit=$(awk '$1 == "Sent" {print $4; exit}' "$out/pedit.txt")
+  [ "$pedit" = 1 ] || { echo "FAIL pedit rewrote ${pedit:-?} packets, want 1"; exit 1; }
+fi
 mib() { awk -v k="MPTcpExt$1" '$1 == k {print $2}' "$out/nstat.txt"; }
 # csum-fail*: pinned from the first runs (M4b spec section 7 item 2). Which end counts the
 # checksum error, and sends the reset or the infinite mapping, depends on whether Linux receives
