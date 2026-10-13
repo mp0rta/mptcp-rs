@@ -1580,9 +1580,7 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             // A reset connection's data is not readable; otherwise keep it until drained.
             c.detached = !c.reset && !c.half_open && c.hooks.has_unread();
-            if !c.detached
-                && let Some(n) = &c.hooks.negotiation
-            {
+            if let (false, Some(n)) = (c.detached, &c.hooks.negotiation) {
                 tokens.remove(&n.token);
             }
             c.detached
