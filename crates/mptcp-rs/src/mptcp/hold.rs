@@ -188,8 +188,8 @@ impl Hold {
     /// point: octets below it arrived before. An octet at or past `right_edge` is refused, as
     /// `RecvAssembler::accept` refuses it; one below `recv.next` is kept for the checksum (spec
     /// G7). With `cap` octets held, only the mapping covering `frontier` is accepted further,
-    /// and none while a failed mapping is held; with `PIECE_CAP` runs held, only runs touching
-    /// a held one or starting at `frontier`.
+    /// and none while a failed or a refused verified mapping is held; with `PIECE_CAP` runs
+    /// held, only runs touching a held one or starting at `frontier`.
     pub fn insert(
         &mut self,
         ssn: u32,
@@ -199,9 +199,10 @@ impl Hold {
         cap: usize,
     ) -> Vec<Range<usize>> {
         self.prune(frontier);
-        // A failed mapping is held only while MP_FAIL waits (spec G11): then no mapping is
-        // exempt, or the peer could map the same in-window DSNs at each new frontier (G7).
-        let exempt_ok = !self.entries.iter().any(|e| e.failed);
+        // While a complete mapping stays held (failed, as MP_FAIL waits, spec G11, or verified
+        // and refused by `deliver`) no mapping is exempt, or the peer could map the same
+        // in-window DSNs at each new frontier (G7).
+        let exempt_ok = self.refused == 0 && !self.entries.iter().any(|e| e.failed);
         let mut accepted = Vec::new();
         let mut at = 0;
         while at < bytes.len() {

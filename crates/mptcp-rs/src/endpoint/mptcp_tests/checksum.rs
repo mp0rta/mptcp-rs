@@ -1246,6 +1246,44 @@ fn refused_verified_retried_after_other_subflow_input() {
     assert_eq!(read_now(&mut ep, h), data);
 }
 
+/// With the assembler's 64 ranges taken, valid 65,535-octet mappings of one DSN range arrive at
+/// successive frontiers: each verifies and is refused. While one is held so, no mapping is
+/// exempt from the hold cap, and the subflow stays within `recv_buffer + 2 × 65,535` (G7).
+#[test]
+fn refused_verified_ends_frontier_exemption() {
+    let recv_buffer = 1 << 16;
+    let cfg = ConnectConfig {
+        recv_buffer,
+        ..checksums_cfg(true)
+    };
+    let mut c = client_with(cfg, false, false);
+    c.confirm();
+    let dsn = peer_head();
+    let bound = recv_buffer as usize + 2 * 65_535;
+    for k in 0..64u32 {
+        let opt = csum_mapping(1 + k, dsn + 10 + 2 * u64::from(k), b"x", false);
+        c.peer_at(5001 + k, &opt, b"x");
+    }
+    let data = pattern(65_535);
+    let mut ssn = 65;
+    for _ in 0..4 {
+        let opt = csum_mapping(ssn, dsn + 200, &data, false);
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + 4000).min(data.len());
+            let sent = c.peer_at(5000 + ssn + off as u32, &opt, &data[off..end]);
+            assert!(held(&c.ep, c.h) <= bound, "{}", held(&c.ep, c.h));
+            let next = sent.last().expect("an ACK").ack.0 - 5000 - ssn;
+            if (next as usize) < end {
+                return;
+            }
+            off = end;
+        }
+        ssn += data.len() as u32;
+    }
+    unreachable!("past the cap, octets are refused");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The default (M4b G1, G23).
 
