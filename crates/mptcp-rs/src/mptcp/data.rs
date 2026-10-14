@@ -422,7 +422,8 @@ struct Piece {
 ///
 /// With checksums (M4b spec G7), completion credit may raise `right_edge` past the base edge,
 /// at most 65,535 octets plus the scale rounding, and `free` also counts the octets the hold
-/// buffers keep.
+/// buffers keep. On fallback, `replay` stores held octets past `right_edge`; the hold cap, not
+/// the bound above, limits them.
 pub(crate) struct RecvAssembler {
     pub next: u64,
     /// The offered edge, completion credit included.
