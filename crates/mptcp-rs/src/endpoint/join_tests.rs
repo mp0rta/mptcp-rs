@@ -541,7 +541,7 @@ fn add_subflow_errors() {
             ms(0),
             ip("10.0.0.1"),
             "10.0.0.2:80".parse().unwrap(),
-            checksums_cfg(false),
+            ConnectConfig::default(),
         )
         .unwrap();
     assert_eq!(
