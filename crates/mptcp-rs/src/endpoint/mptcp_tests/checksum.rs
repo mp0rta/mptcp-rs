@@ -660,6 +660,32 @@ fn server_third_ack_a_mismatch_falls_back() {
     }
 }
 
+/// After confirmation, an MP_CAPABLE-with-data is a mapping: one whose checksum presence
+/// differs from the decision resets the subflow with MP_TCPRST 0x01, as a DSS would (spec G3);
+/// one invalid otherwise (another key) resets without it.
+#[test]
+fn server_later_capable_presence_mismatch_tcprst() {
+    let rst_of = |checksums: bool, option: &[u8]| {
+        let mut s = server(checksums);
+        s.syn(&syn_cap(1, CAP_H));
+        s.send(65535, &ack_cap(CAP_H | a(checksums), None), &[]);
+        assert_eq!(s.negotiation().state, State::Confirmed);
+        let out = s.send(65535, option, b"hello");
+        let rst = out
+            .iter()
+            .find(|p| packet::parse(p).unwrap().flags.contains(TcpFlags::RST));
+        rst.map(|p| mptcp_of(p))
+    };
+    let tcprst = vec![vec![30, 4, 0x80, 0x01]];
+    assert_eq!(
+        rst_of(true, &ack_cap(CAP_H | CAP_A, Some(5))),
+        Some(tcprst.clone())
+    );
+    assert_eq!(rst_of(false, &cap_csum(CAP_H, b"hello")), Some(tcprst));
+    let other_key = cap(1, CAP_H, Some(CLIENT_KEY), Some(SERVER_KEY ^ 1), Some(5));
+    assert_eq!(rst_of(false, &other_key), Some(vec![]));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Receiving: hold, verify, completion credit (spec G6–G9).
 

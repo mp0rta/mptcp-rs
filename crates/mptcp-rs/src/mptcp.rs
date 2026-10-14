@@ -1692,6 +1692,10 @@ impl SegmentHooks for SubflowHooks<'_> {
                 && c.sender_key == m.peer_key;
             if !valid && (c.data_len.is_some() || m.passive) {
                 self.sf.reset = true;
+                // A mapping whose checksum presence differs from the decision: G3's reset.
+                if c.data_len.is_some() && c.checksum.is_some() != m.csum {
+                    self.sf.reset_option = Some(tcprst(0x01, false).to_vec());
+                }
                 return;
             }
             m.peer_c |= valid && c.flags & CAP_C != 0;
