@@ -1747,8 +1747,20 @@ impl SegmentHooks for SubflowHooks<'_> {
                 }
                 // An MP_CAPABLE mapping always has the handshake's offset (SSN 1, IDSN + 1).
                 // Only checksums use it (G9, A1).
-                self.sf.other_offset |=
+                let other =
                     m.csum && len > 0 && !initial_offset_ok(m.peer_idsn.unwrap(), dsn, mapping.ssn);
+                self.sf.other_offset |= other;
+                // While `Waiting` (on this subflow: no other one carries data, G12), another
+                // offset means the peer reinjected here, so contiguity is gone: the G11
+                // "otherwise" reset, before any of this mapping is delivered.
+                if let MpFail::Waiting { dsn: failed, .. } = self.conn.mp_fail {
+                    if other && !self.sf.joining() {
+                        self.sf.reset = true;
+                        self.sf.reset_option = Some(fail_rst(failed));
+                        self.sf.hold.clear();
+                        return;
+                    }
+                }
                 // With checksums (the check above makes `checksum` present exactly then), a
                 // data mapping is held until it verifies and may earn completion credit; its
                 // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping

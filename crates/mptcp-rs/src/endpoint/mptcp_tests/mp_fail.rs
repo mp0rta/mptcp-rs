@@ -278,6 +278,25 @@ fn waiting_holds_data_ack_at_m() {
     assert_eq!(read_now(&mut c.ep, c.h).len(), 100, "A only");
 }
 
+/// While `Waiting`, a valid copy of M's DSNs at later SSNs (another offset: the peer
+/// reinjected on this subflow) breaks contiguity: the subflow is reset with MP_FAIL(M.dsn) +
+/// MP_TCPRST 0x06 and its hold discarded, before any of the copy is delivered; no DATA_ACK
+/// passes M (spec G10, G11).
+#[test]
+fn waiting_other_offset_mapping_resets() {
+    let Waiting { mut c, m, .. } = waiting();
+    let n = pattern(50);
+    c.peer_at(5111, &csum_mapping(111, m + 10, &n, false), &n);
+    let copy = pattern(10);
+    let sent = c.peer_at(5161, &csum_mapping(161, m, &copy, false), &copy);
+    assert_eq!(rst_reason(&sent), Some(mp_fail_rst(m)));
+    assert!(sent.iter().all(|s| data_ack_of(s).is_none_or(|a| a <= m)));
+    assert_eq!(read_now(&mut c.ep, c.h).len(), 100, "A only");
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(state(&c), MpFail::Idle);
+    assert_eq!(fell_back(&mut c.ep), 0);
+}
+
 /// While `Waiting`, TCP-level retransmission goes on (spec G12): our unacknowledged data is
 /// resent at the RTO, with MP_FAIL(M.dsn).
 #[test]
@@ -496,9 +515,10 @@ fn waiting_ends_at_r2() {
     assert_eq!(deadline(&c), None);
 }
 
-/// While `Waiting`, the peer keeps sending failing mappings of M's in-window DSNs at the next
-/// SSNs, each covering the frontier: the hold buffer stays within `recv_buffer + 2 × 65,535`
-/// (spec G7); past it new octets are refused at the TCP level, and the echo still falls back.
+/// While `Waiting`, the peer keeps sending failing mappings at the next SSNs with the initial
+/// offset (another offset would end `Waiting`), each covering the frontier: the hold buffer
+/// stays within `recv_buffer + 2 × 65,535` (spec G7); past it new octets are refused at the
+/// TCP level, and the echo still falls back.
 #[test]
 fn waiting_further_failures_stay_bounded() {
     let recv_buffer = 1 << 16;
@@ -511,7 +531,7 @@ fn waiting_further_failures_stay_bounded() {
     let data = pattern(4000);
     let (mut ssn, mut refused) = (111, false);
     for _ in 0..200 {
-        let opt = bad_mapping(ssn, m, &data, false);
+        let opt = bad_mapping(ssn, m + u64::from(ssn - 101), &data, false);
         let sent = c.peer_at(5000 + ssn, &opt, &data);
         assert!(held(&c.ep, c.h) <= bound, "{}", held(&c.ep, c.h));
         let next = sent.last().expect("an ACK").ack.0 - 5000;
