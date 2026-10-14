@@ -281,7 +281,8 @@ mib() { awk -v k="MPTcpExt$1" '$1 == k {print $2}' "$out/nstat.txt"; }
 # csum-fail*: pinned from the first runs (M4b spec section 7 item 2). Which end counts the
 # checksum error, and sends the reset or the infinite mapping, depends on whether Linux receives
 # the corrupted direction. MPFail* count MP_FAIL packets Linux processes before its fallback,
-# which in csum-fail1 depends on timing (2 or 9 seen), so only the spec's >= 1 holds there.
+# which in csum-fail1 depends on timing (2 or 9 seen), so only the spec's >= 1 holds there;
+# check.py bounds the MP_FAIL traffic on the wire instead (endpoints.py mp_fail_bounds).
 linux_rx=0
 if [ "$server:$dir" = kernel:c2s ] || [ "$client:$dir" = kernel:s2c ]; then linux_rx=1; fi
 case "$scenario:$linux_rx" in

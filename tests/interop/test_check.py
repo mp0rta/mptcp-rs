@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_bounds, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
 SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "m2-hetero", "csum-fail1", "csum-fail2"]
@@ -67,8 +67,8 @@ class MptcpOptions(unittest.TestCase):
                          [{"subtype": 2, "dsn8": True, "dsn": 7, "dll": 0}, {"subtype": 6, "dsn": 8}, TCPRST6])
 
 
-def pkt(t, src, flow, opts, rst=False, ack=True):
-    return Packet(t, src, flow, rst, ack, opts)
+def pkt(t, src, flow, opts, rst=False, ack=True, **tcp):
+    return Packet(t, src, flow, rst, ack, opts, **tcp)
 
 
 class CsumFail(unittest.TestCase):
@@ -106,6 +106,57 @@ class CsumFail(unittest.TestCase):
                          ([self.RESET, self.ANSWERS[0]._replace(ack=True)], "RST with ACK after the reset")]:
             with self.assertRaises(AssertionError, msg=why):
                 csum_fail_checks("csum-fail2", bad, SRV, "10.0.8.2")
+
+
+class MpFailBounds(unittest.TestCase):
+    """csum-fail1: MP_FAIL traffic bounded per direction by the G13 schedule, and no answer to a
+    peer MP_FAIL after our fallback (G18). Ours: the mptcp-rs client 10.0.9.2; the peer: SRV."""
+    CLI = "10.0.9.2"
+    OURS = {CLI}
+    ECHO = [INFINITE, FAIL]
+
+    def echoer(self):
+        """The peer reports a failure; we echo on a pure ACK, the echo rides our data until
+        retired, the peer answers a late echo, then G13 retries at +1 s and +3 s, each answered."""
+        cli = lambda t, **kw: pkt(t, self.CLI, LEG_A, self.ECHO, **kw)
+        return ([pkt(1.0, SRV, LEG_A, [FAIL]), cli(1.01)] + [cli(1.011 + i / 1000, len=1428) for i in range(20)]
+                + [pkt(1.03, SRV, LEG_A, [FAIL]), cli(2.01), pkt(2.03, SRV, LEG_A, [FAIL]), cli(4.01), pkt(4.03, SRV, LEG_A, [FAIL])])
+
+    E = 1000 + 1428 * 30  # the peer's TCP seq at its echo
+
+    def originator(self):
+        """We report a failure on every ACK of the peer's data; its echo; our ACKs still in flight
+        (all of data sent before the echo); its answer to one of them."""
+        return ([pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * i) for i in range(21)]
+                + [pkt(1.01, SRV, LEG_A, [FAIL], seq=self.E), pkt(1.025, SRV, LEG_A, [FAIL], seq=self.E + 1428 * 10)])
+
+    def test_accepted(self):
+        mp_fail_bounds(self.echoer(), self.OURS)
+        mp_fail_bounds(self.originator(), self.OURS)
+        # The ACK of the last octet before the echo, and the peer's infinite mapping, are fine.
+        mp_fail_bounds(self.originator() + [pkt(1.02, self.CLI, LEG_A, [FAIL], ackno=self.E)], self.OURS)
+
+    def test_storm_rejected(self):
+        # Linux answers every late MP_FAIL, so an answer of ours becomes a loop: alternating
+        # MP_FAILs every millisecond for a second (ours riding data, so only the bound fires).
+        storm = [pkt(1 + i / 1000, SRV if i % 2 == 0 else self.CLI, LEG_A, [FAIL] if i % 2 == 0 else self.ECHO, len=0 if i % 2 == 0 else 1428)
+                 for i in range(1000)]
+        with self.assertRaisesRegex(AssertionError, "lasts"):
+            mp_fail_bounds(storm, self.OURS)
+
+    def test_retries_beyond_the_schedule_rejected(self):
+        # A 7th retry, at +127 s, is past the 120 s G13 cut-off: 8 episodes from us.
+        retries = [pkt(1.01 + (2 ** k - 1), self.CLI, LEG_A, [FAIL]) for k in range(1, 8)]
+        with self.assertRaisesRegex(AssertionError, "episodes"):
+            mp_fail_bounds([pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)] + retries, self.OURS)
+
+    def test_answer_after_fallback_rejected(self):
+        # Echoer: a pure ACK with MP_FAIL right after the peer's answer, not on the G13 schedule.
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(self.echoer() + [pkt(1.031, self.CLI, LEG_A, [FAIL])], self.OURS)
+        # Originator: an MP_FAIL on an ACK of data the peer sent after its echo.
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(self.originator() + [pkt(1.03, self.CLI, LEG_A, [FAIL], ackno=self.E + 1)], self.OURS)
 
 
 class Inversion(unittest.TestCase):

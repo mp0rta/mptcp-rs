@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_bounds, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -94,14 +94,14 @@ def data_fin_acked(side, n):
 def options(flt):
     """The server-side Packets matching `flt`, each MPTCP option read on its own (DSS and MP_FAIL
     share rawdataseqno)."""
-    names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason"]
+    names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason", "tcp.seq_raw", "tcp.len", "tcp.ack_raw"]
     pkts = []
     for name in pcaps:
         cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
         for f in names:
             cmd += ["-e", f]
         for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
-            pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:])))
+            pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:13]), *(int(x or 0) for x in v[13:])))
     return pkts
 if scenario == "m2-hetero":
     # Delivery over time: the receiver's DATA_ACK advances as the server's links see them.
@@ -131,6 +131,7 @@ if scenario.startswith("csum-fail"):
     if scenario == "csum-fail1":
         # The receiver's MP_FAIL names the failed mapping by its first DSN.
         fail = mp_fail_dsn(pkts, receiver)
+        mp_fail_bounds(pkts, {SRV} if args.server == "mptcp-rs" else cips)
         maps = options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}")
         start, dll = failed_mapping(fail, maps, sender, first_dsn(sender))
         check_inversion(inverted, start, dll)

@@ -54,9 +54,9 @@ def mptcp_options(subtypes, m_flags, dsn8_flags, dsns, dlls, reasons):
     return out
 
 
-Packet = namedtuple("Packet", "t src flow rst ack opts")
+Packet = namedtuple("Packet", "t src flow rst ack opts seq len ackno", defaults=(0, 0, 0))
 Packet.__doc__ = """A captured packet: time, source IP, flow ({(IP, port)} pair), RST and ACK flags,
-mptcp_options."""
+mptcp_options, raw TCP seq, payload length, raw TCP ACK number."""
 
 
 def csum_fail_checks(scenario, packets, srv, join):
@@ -85,6 +85,42 @@ def csum_fail_checks(scenario, packets, srv, join):
     for p in rsts:
         assert p is r or (p.flow, p.src) == (r.flow, r.src) and p.t > r.t and not p.ack, f"RST other than the reset's answers to segments in flight: {p}"
     return {r.flow}
+
+
+def mp_fail_bounds(packets, ours):
+    """csum-fail1: the MP_FAIL traffic is bounded (M4b spec G13, G18), over csum_fail_checks's
+    `packets`; `ours`: the mptcp-rs end's IPs. Our MP_FAILs ride our segments until our state
+    ends (the echo's round trip, or the retiring ACK's: tens of ms here), then come only as G13
+    retries on a pure ACK, the interval starting at the RTO (at least 1 s, rtt.rs MIN_RTO) and
+    doubling: +1, +3, +7, +15, +31, +63 s, the next (+127 s) being past the 120 s cut-off. So,
+    split at gaps of 0.5 s or more, each direction has at most 1 + 6 episodes (Linux answers
+    each late MP_FAIL of ours once its timer is clear: at most one episode per one of ours),
+    each shorter than 0.5 s. An answer of ours after our fallback would loop with such a
+    Linux peer and keep an episode going. G18, directly: as the echoer, our later pure-ACK
+    MP_FAILs are retries, 1 s or more apart (0.5 s here, for capture jitter); as the originator, no MP_FAIL of ours ACKs the
+    peer's data sent after its echo or infinite mapping (one in-order path)."""
+    has = lambda p, st: any(o["subtype"] == st for o in p.opts)
+    fails = sorted((p for p in packets if has(p, 6)), key=lambda p: p.t)
+    mine = [p for p in fails if p.src in ours]
+    peer = [p for p in fails if p.src not in ours]
+    for who, ps in [("us", mine), ("the peer", peer)]:
+        episodes = [[ps[0].t]]
+        for a, b in zip(ps, ps[1:]):
+            if b.t - a.t >= 0.5:
+                episodes.append([])
+            episodes[-1].append(b.t)
+        assert len(episodes) <= 7, f"{len(episodes)} MP_FAIL episodes from {who}, want at most 7 (G13)"
+        long = [(e[0], e[-1]) for e in episodes if e[-1] - e[0] >= 0.5]
+        assert not long, f"MP_FAIL from {who} lasts 0.5 s or more: {long}"
+    if peer[0].t < mine[0].t:
+        pure = [p.t for p in mine if p.len == 0]
+        early = [(a, b) for a, b in zip(pure, pure[1:]) if b - a < 0.5]
+        assert not early, f"G18: our pure-ACK MP_FAIL under 0.5 s after the previous one, not a G13 retry: {early}"
+    else:
+        trig = min((p for p in packets if p.src not in ours and p.t > mine[0].t
+                    and (has(p, 6) or any(o["subtype"] == 2 and o.get("dll") == 0 for o in p.opts))), key=lambda p: p.t)
+        late = [p for p in mine if (p.ackno - trig.seq - 1) % (1 << 32) < (1 << 31)]
+        assert not late, f"G18: MP_FAIL from us after our fallback, on an ACK past the peer's seq {trig.seq} at {trig.t}: {late[:3]}"
 
 
 def check_inversion(offsets, start, dll):
