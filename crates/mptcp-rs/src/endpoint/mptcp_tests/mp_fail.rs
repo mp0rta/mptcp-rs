@@ -582,8 +582,9 @@ fn corrupt_first_mapping(c: &mut Client, now: Instant) {
 
 /// While `Waiting` nothing may break contiguity (spec G12): a join in SYN-SENT or
 /// SYN-RECEIVED is reset (the listener's half-open count drops back), a new `add_subflow` is
-/// queued and not started, an incoming join SYN is refused with a RST, a reinjection queued
-/// before the failure is not sent, and a recovery deadline passes without one.
+/// queued and not started, an incoming join SYN is refused with a RST until the subflow we wait
+/// on is reset, a reinjection queued before the failure is not sent, and a recovery deadline
+/// passes without one.
 #[test]
 fn waiting_freezes_joins_and_recovery() {
     let mut s = server(true);
@@ -655,6 +656,14 @@ fn waiting_freezes_joins_and_recovery() {
     assert!(answer[0].flags.contains(TcpFlags::RST));
     assert_eq!(answer[0].options, [30, 4, 0x80, 0x01]);
     assert_eq!(s.ep.conns[&h].subflows.len(), subflows);
+    // The client resets the subflow we wait on: `Waiting` ends, and joins are answered again
+    // within the no-subflow wait (spec G12, G17).
+    let rst = mp_fail_rst(client_idsn() + 1);
+    let seq = s.seq;
+    s.input(TcpFlags::RST | TcpFlags::ACK, seq, 65535, &rst, &[]);
+    assert_eq!(s.ep.conns[&h].hooks.mp_fail, MpFail::Idle);
+    let answer = join_syn_to_server(&mut s, "10.0.1.1:40002");
+    assert_eq!(answer[0].flags, TcpFlags::SYN | TcpFlags::ACK);
 
     // A reinjection queued before the failure is not sent.
     let (mut c, at) = recovery_armed();
