@@ -20,6 +20,7 @@ const ST_DSS: u8 = 0x2;
 const ST_ADD_ADDR: u8 = 0x3;
 const ST_REMOVE_ADDR: u8 = 0x4;
 const ST_PRIO: u8 = 0x5;
+const ST_FAIL: u8 = 0x6;
 const ST_FASTCLOSE: u8 = 0x7;
 const ST_TCPRST: u8 = 0x8;
 
@@ -155,6 +156,10 @@ pub enum MptcpOption {
         transient: bool,
         reason: u8,
     },
+    /// MP_FAIL: the DSN the receiver expected next (RFC 8684 L2380-2390).
+    Fail {
+        dsn: u64,
+    },
     Unknown {
         subtype: u8,
     },
@@ -227,11 +232,45 @@ fn parse_dss(opt: &[u8]) -> Result<Dss, MptcpError> {
     })
 }
 
-/// `opt` is a signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_TCPRST), well-formed or
+/// DSS checksum (RFC 8684 L1402-1430): one's complement of the 16-bit one's-complement sum
+/// over the pseudo-header {DSN, SSN, data-level length, zero} and the data. Chunks are summed
+/// as one byte stream, so a split at an odd offset does not change the result.
+pub fn dss_checksum(dsn: u64, ssn: u32, data_len: u16, data: &[&[u8]]) -> u16 {
+    let mut ph = [0u8; 16];
+    ph[..8].copy_from_slice(&dsn.to_be_bytes());
+    ph[8..12].copy_from_slice(&ssn.to_be_bytes());
+    ph[12..14].copy_from_slice(&data_len.to_be_bytes());
+    let mut sum = 0u32;
+    let mut pending: Option<u8> = None;
+    for &b in ph.iter().chain(data.iter().flat_map(|c| c.iter())) {
+        match pending.take() {
+            Some(hi) => sum += u32::from(u16::from_be_bytes([hi, b])),
+            None => pending = Some(b),
+        }
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    if let Some(hi) = pending {
+        sum += u32::from(hi) << 8;
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// `received` matches the checksum of the mapping (RFC 1624 section 5; 0x0000 and 0xffff
+/// are equivalent).
+pub fn dss_checksum_ok(dsn: u64, ssn: u32, data_len: u16, data: &[&[u8]], received: u16) -> bool {
+    super::packet::valid_checksum(dss_checksum(dsn, ssn, data_len, data), received)
+}
+
+/// `opt` is a signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_FAIL, MP_TCPRST), well-formed or
 /// not: a malformed one is ignored like an unknown option, so the segment's DSS still counts.
 pub(crate) fn is_signal(opt: &[u8]) -> bool {
-    opt.get(2)
-        .is_some_and(|b| matches!(b >> 4, ST_ADD_ADDR | ST_REMOVE_ADDR | ST_PRIO | ST_TCPRST))
+    opt.get(2).is_some_and(|b| {
+        matches!(
+            b >> 4,
+            ST_ADD_ADDR | ST_REMOVE_ADDR | ST_PRIO | ST_FAIL | ST_TCPRST
+        )
+    })
 }
 
 /// `opt` is an MP_JOIN, well-formed or not.
@@ -364,6 +403,14 @@ pub fn parse(opt: &[u8]) -> Result<MptcpOption, MptcpError> {
             Ok(MptcpOption::TcpRst {
                 transient: b2 & TCPRST_T != 0,
                 reason: opt[3],
+            })
+        }
+        ST_FAIL => {
+            if len != 12 {
+                return Err(MptcpError::BadLength);
+            }
+            Ok(MptcpOption::Fail {
+                dsn: u64_at(opt, 4)?,
             })
         }
         subtype => Ok(MptcpOption::Unknown { subtype }),
@@ -528,6 +575,11 @@ pub fn encode(o: &MptcpOption, out: &mut [u8]) -> Result<usize, MptcpError> {
             buf[2] = (ST_TCPRST << 4) | if *transient { TCPRST_T } else { 0 };
             buf[3] = *reason;
             4
+        }
+        MptcpOption::Fail { dsn } => {
+            buf[2] = ST_FAIL << 4;
+            buf[4..12].copy_from_slice(&dsn.to_be_bytes());
+            12
         }
         // Unknown carries no payload, so there is nothing defined to write.
         MptcpOption::Unknown { .. } => return Err(MptcpError::InvalidFields),
@@ -983,10 +1035,83 @@ mod tests {
         assert_eq!(parse(&[30, 5, 0x80, 6, 0]), Err(MptcpError::BadLength));
     }
     #[test]
-    fn mp_fail_stays_unknown() {
+    fn mp_fail_round_trips() {
+        let o = MptcpOption::Fail {
+            dsn: 0x0102_0304_0506_0708,
+        };
+        let b = roundtrip(o);
+        assert_eq!(b, [30, 12, 0x60, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(parse(&b), Ok(o));
+    }
+    #[test]
+    fn mp_fail_reserved_bits_ignored() {
         assert_eq!(
-            parse(&[30, 12, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Ok(MptcpOption::Unknown { subtype: 6 })
+            parse(&[30, 12, 0x6F, 0xFF, 0, 0, 0, 0, 0, 0, 0, 9]),
+            Ok(MptcpOption::Fail { dsn: 9 })
         );
+    }
+    #[test]
+    fn mp_fail_bad_length() {
+        for n in [11usize, 13] {
+            let mut o = vec![0u8; n];
+            o[0] = 30;
+            o[1] = n as u8;
+            o[2] = 0x60;
+            assert_eq!(parse(&o), Err(MptcpError::BadLength));
+            assert!(is_signal(&o));
+        }
+    }
+    fn naive(dsn: u64, ssn: u32, len: u16, data: &[u8]) -> u16 {
+        let mut v = dsn.to_be_bytes().to_vec();
+        v.extend(ssn.to_be_bytes());
+        v.extend(len.to_be_bytes());
+        v.extend([0, 0]);
+        v.extend(data);
+        if v.len() % 2 == 1 {
+            v.push(0);
+        }
+        let mut sum: u32 = v
+            .chunks(2)
+            .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+            .sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+    #[test]
+    fn dss_checksum_split_equals_whole() {
+        let all = [0xffu8, 0x80, 0x01, 0xfe, 0x7f, 0xaa, 0x55];
+        for n in 0..=7 {
+            let d = &all[..n];
+            let want = naive(0xdead_beef_0000_0001, 0x1234_5678, n as u16, d);
+            assert_eq!(
+                dss_checksum(0xdead_beef_0000_0001, 0x1234_5678, n as u16, &[d]),
+                want
+            );
+            for k in 0..=n {
+                let c = dss_checksum(
+                    0xdead_beef_0000_0001,
+                    0x1234_5678,
+                    n as u16,
+                    &[&d[..k], &d[k..]],
+                );
+                assert_eq!(c, want, "n={n} k={k}");
+            }
+        }
+    }
+    #[test]
+    fn dss_checksum_ok_accepts_and_rejects() {
+        let d = [1u8, 2, 3];
+        let c = dss_checksum(5, 6, 3, &[&d]);
+        assert!(dss_checksum_ok(5, 6, 3, &[&d], c));
+        assert!(!dss_checksum_ok(5, 6, 3, &[&[1, 2, 7]], c));
+        // DSN 0xffff sums to 0xffff, so the checksum is 0x0000; 0xffff is equivalent.
+        assert_eq!(dss_checksum(0xffff, 0, 0, &[]), 0);
+        assert!(dss_checksum_ok(0xffff, 0, 0, &[], 0xffff));
+    }
+    #[test]
+    fn dss_checksum_pseudo_header_only() {
+        assert_eq!(dss_checksum(7, 8, 1, &[]), naive(7, 8, 1, &[]));
     }
 }

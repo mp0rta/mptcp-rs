@@ -60,6 +60,9 @@ pub struct ConnectConfig {
     pub r2_syn: Duration,
     /// The congestion controller of every subflow of the connection.
     pub congestion_control: CongestionControlKind,
+    /// Require DSS checksums (A=1). A peer that requires them is honoured either way. Plain
+    /// TCP ignores it. The default is `true`.
+    pub checksums: bool,
 }
 
 /// A congestion controller to run (`ConnectConfig::congestion_control`). MPTCP subflows are
@@ -90,6 +93,7 @@ impl Default for ConnectConfig {
             r2_data: Duration::from_secs(100),
             r2_syn: Duration::from_secs(180),
             congestion_control: CongestionControlKind::Cubic,
+            checksums: true,
         }
     }
 }
@@ -371,8 +375,8 @@ pub struct Tcb {
     /// An ACK only to carry a protocol signal (`request_signal_ack`).
     signal_ack_due: bool,
     /// RST answering an unacceptable ACK, `<SEQ=SEG.ACK><CTL=RST>`, or ending this TCB, with
-    /// the protocol option it carries.
-    rst_due: Option<(SeqNum, Option<[u8; 4]>)>,
+    /// the protocol options it carries.
+    rst_due: Option<(SeqNum, Option<Vec<u8>>)>,
     /// Resend one segment at SND.UNA (RTO, fast retransmit, partial ACK).
     retransmit_due: bool,
     probe_due: bool,
@@ -924,7 +928,7 @@ impl Tcb {
     pub(crate) fn abort_with(
         &mut self,
         reason: CloseReason,
-        rst_option: Option<[u8; 4]>,
+        rst_option: Option<Vec<u8>>,
         now: Instant,
     ) -> Reaction {
         self.rst_due = Some((self.snd_max, rst_option));
@@ -1120,8 +1124,9 @@ impl Tcb {
         if let Some((seq, option)) = self.rst_due.take() {
             let meta = out.start(seq, SeqNum(0), TcpFlags::RST, 0);
             if let Some(o) = option {
-                out.options[..4].copy_from_slice(&o);
-                out.options_len = 4;
+                debug_assert!(o.len() % 4 == 0 && o.len() <= 16);
+                out.options[..o.len()].copy_from_slice(&o);
+                out.options_len = o.len();
             }
             return Some(meta);
         }

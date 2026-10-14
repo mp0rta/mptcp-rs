@@ -2871,7 +2871,7 @@ fn mptcp_receipts_cross_relative_ssn_and_dsn_wrap_with_reordering() {
         ..ConnectConfig::default()
     };
     let mut conn = ConnectionHooks::new(&cfg);
-    conn.negotiation = Some(Negotiation::new(1));
+    conn.negotiation = Some(Negotiation::new(1, false));
     let mut sf = SubflowMp::new();
     let h = SubflowHooks {
         conn: &mut conn,

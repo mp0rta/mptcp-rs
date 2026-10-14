@@ -214,7 +214,7 @@ fn path_calls_validate_connection() {
         Err(AddressError::Closed)
     );
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
-    let cfg = ConnectConfig::default();
+    let cfg = checksums_cfg(false);
     let h = (ep.connect(ms(0), ip("10.0.0.1"), remote(), cfg)).unwrap();
     assert_eq!(ep.set_local_backup(h, s, true), Err(SubflowError::NotMptcp));
     assert_eq!(
@@ -228,7 +228,7 @@ fn path_calls_validate_connection() {
 #[allow(clippy::field_reassign_with_default)]
 #[test]
 fn connect_config_default_then_assign() {
-    let mut cfg = ConnectConfig::default();
+    let mut cfg = checksums_cfg(false);
     cfg.mtu = 1400;
     cfg.recv_buffer = 1 << 16;
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
@@ -651,7 +651,7 @@ fn abort_after_fallback_plain_rst() {
 #[test]
 fn abort_plain_tcp_plain_rst() {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
-    let cfg = ConnectConfig::default();
+    let cfg = checksums_cfg(false);
     let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
     let syn = leak(transmit(&mut ep, ms(0)));
     reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
@@ -753,7 +753,7 @@ fn retained_tuple_not_reallocated_until_expiry() {
     let before = Instant::from_nanos(expiry.as_nanos() - 1);
     let rst = answer(&mut ep, &chal, before).expect("RST");
     assert_eq!(rst.options, &fastclose(PEER_KEY)[..]);
-    let cfg = ConnectConfig::default;
+    let cfg = || checksums_cfg(false);
     let ip = syn.src.ip();
     assert_eq!(
         ep.connect(before, ip, syn.dst, cfg()).err(),
@@ -830,7 +830,7 @@ fn abort_is_idempotent_in_every_state() {
 
     // After `Closed { Reset }` of a plain TCP connection.
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
-    let cfg = ConnectConfig::default();
+    let cfg = checksums_cfg(false);
     let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
     let syn = leak(transmit(&mut ep, ms(0)));
     reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));
@@ -2990,7 +2990,7 @@ fn read_after_abort_is_reset() {
 
     // Plain TCP, closed normally (TIME-WAIT) with 4 octets unread.
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(42));
-    let cfg = ConnectConfig::default();
+    let cfg = checksums_cfg(false);
     let h = (ep.connect(ms(0), "10.0.0.1".parse().unwrap(), remote(), cfg)).unwrap();
     let syn = leak(transmit(&mut ep, ms(0)));
     reply(&mut ep, &syn, &[], syn.seq.wrapping_add(1));

@@ -3,8 +3,11 @@
 receive the pattern (--expect bytes, or until EOF), then send it (--send-bytes, or for --send-secs;
 --bidi: while receiving), then read until EOF. --bytes sets both counts. --abort-after: close
 with SO_LINGER 0 once that many bytes were received and sent in total, and exit 3. A connection
-reset by the client exits 4. Exit 0 means every byte was verified."""
+reset by the client exits 4. Exit 0 means every byte was verified (--invert N: exactly N octets
+inverted, each printed as `inverted at OFF`)."""
 import argparse, os, socket, struct, sys, threading, time
+
+from pattern import BUF, verify_chunk
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--mode", choices=["tcp", "mptcp"], required=True)
@@ -18,15 +21,12 @@ ap.add_argument("--family", choices=["v4", "v6", "dual"], help="listen on the wi
 ap.add_argument("--bidi", action="store_true", help="send and receive concurrently")
 ap.add_argument("--abort-after", type=int, metavar="BYTES")
 ap.add_argument("--verify", choices=["on", "off"], default="on", help="off: count received bytes only (CPU benchmark)")
+ap.add_argument("--invert", type=int, default=0, metavar="N", help="exactly N received octets are the pattern's bitwise inverse")
 a = ap.parse_args()
 if a.bytes is None and (a.expect is None or a.send_bytes is None and not a.send_secs):
     ap.error("give --bytes, or --expect and one of --send-bytes/--send-secs")
 N = a.bytes if a.expect is None else None if a.expect == "any" else int(a.expect)  # None = any
 S = a.bytes if a.send_bytes is None else a.send_bytes
-
-# pattern byte i = (i*31+7) % 251; one repeating buffer, sliced at (offset % 251)
-PAT = bytes((i * 31 + 7) % 251 for i in range(251))
-BUF = memoryview(PAT * (262144 // 251 + 2))  # slices are views: no copy per send
 
 v6 = a.family in ("v6", "dual")
 ls = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_STREAM, 262 if a.mode == "mptcp" else 0)
@@ -76,6 +76,7 @@ if a.bidi:
     sender = threading.Thread(target=send)
     sender.start()
 ok = True
+inverted = []
 first = last = None
 rbuf = bytearray(262144)
 while N is None or got < N:
@@ -85,10 +86,13 @@ while N is None or got < N:
         d = c.recv(262144 if N is None else min(262144, N - got))
     if not d:
         break
-    if a.verify == "on" and d != BUF[got % 251 : got % 251 + len(d)]:
+    seen = len(inverted)
+    if a.verify == "on" and not verify_chunk(got, d, a.invert, inverted):
         ok = False
         print(f"mismatch in chunk at offset {got}", file=sys.stderr)
         break
+    for off in inverted[seen:]:
+        print(f"inverted at {off}", flush=True)
     got += len(d)
     maybe_abort()
     last = time.monotonic()
@@ -97,6 +101,9 @@ while N is None or got < N:
         print(f"read paused at {got} bytes", flush=True)
         time.sleep(a.pause_read_ms / 1000)
         a.pause_read_ms = 0
+if a.verify == "on" and len(inverted) != a.invert:
+    ok = False
+    print(f"{len(inverted)} inverted octets, expected {a.invert}", file=sys.stderr)
 if not ok or (N is not None and got != N):
     print(f"FAIL recv {got}/{N} ok={ok}")
     sys.exit(1)

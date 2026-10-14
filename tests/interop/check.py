@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import endpoints, removed_flow_exempt  # noqa: E402
+from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -38,7 +38,7 @@ for name, got, want in [("c2s", c2s, want_c2s), ("s2c", s2c, want_s2c)]:
 if mode:
     print(f"PASS {scenario} (logs only)")
     sys.exit(0)
-m2 = scenario.startswith("m2-")
+m2 = two_subflows(scenario)
 # M2: the initial subflow on path A and a join from JOIN on path B.
 SRV, cips, JOIN = endpoints(scenario, args.client, args.server)
 fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport"]
@@ -52,10 +52,8 @@ def count(name, flt):
     return len(subprocess.check_output(["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-e", "frame.number"], text=True).split())
 # M2: both legs, as seen by the server (a1, b1), in time order; the mptcp-rs server's own TUN
 # sees every subflow.
-if args.server == "mptcp-rs":
-    rows = capture("server-tun.pcap")
-else:
-    rows = capture("server.pcap") + (capture("server-b.pcap") if m2 else [])
+pcaps = ["server-tun.pcap"] if args.server == "mptcp-rs" else ["server.pcap"] + (["server-b.pcap"] if m2 else [])
+rows = [r for name in pcaps for r in capture(name)]
 rows.sort(key=lambda r: float(r[0]))
 assert rows, "empty pcap"
 flow = lambda r: frozenset([(r[1], r[20]), (r[19], r[21])])
@@ -90,8 +88,43 @@ def data_fin_acked(side, n):
         ]
     assert acked, f"DATA_FIN from {src} not DATA_ACKed"
     return min(acked)
+def options(flt):
+    """The server-side Packets matching `flt`, each MPTCP option read on its own (DSS and MP_FAIL
+    share rawdataseqno)."""
+    names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason"]
+    pkts = []
+    for name in pcaps:
+        cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
+        for f in names:
+            cmd += ["-e", f]
+        for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
+            flag = lambda x: x in ("1", "True")
+            pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:])))
+    return pkts
 rsts = [r for r in rows if r[7] == "1"]
 no_rst, srv_reset, cli_reset = "no RST", set(), set()
+csum_exempt = set()
+if scenario.startswith("csum-fail"):
+    # The data sender, and the receiver whose verifier saw the rewritten octet.
+    sender, receiver = (cips, {SRV}) if want_s2c == "0" else ({SRV}, cips)
+    pkts = options("tcp.flags.reset == 1 || tcp.options.mptcp.subtype == 6 || tcp.options.mptcp.datalvllen == 0")
+    csum_exempt = csum_fail_checks(scenario, pkts, SRV, JOIN)
+    if csum_exempt:
+        n = sum(flow(r) in csum_exempt for r in rsts) - 1
+        no_rst = f"no RST except the MP_FAIL + MP_TCPRST 6 reset on {[sorted(f) for f in csum_exempt]} and its {n} answers to segments in flight"
+    rsts = [r for r in rsts if flow(r) not in csum_exempt]
+    inverted = [int(x) for x in re.findall(r"^inverted at (\d+)$", client + server, re.M)]
+    if scenario == "csum-fail1":
+        # The receiver's MP_FAIL names the failed mapping by its first DSN (RFC 8684 L2372-2375).
+        fail = next(o["dsn"] for p in sorted(pkts, key=lambda p: p.t) if p.src in receiver for o in p.opts if o["subtype"] == 6)
+        dlls = [o["dll"] for p in options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}") if p.src in sender
+                for o in p.opts if o["subtype"] == 2 and "dsn" in o and o["dsn"] == fail % (1 << (64 if o["dsn8"] else 32))]
+        assert dlls, f"no DSS from {sender} maps DSN {fail}"
+        start = (fail - first_dsn(sender)) % (1 << 64)
+        check_inversion(inverted, start, max(dlls))
+        print(f"inverted octet at stream offset {inverted[0]}, in the failed mapping [{start}, {start + max(dlls)})")
+    else:
+        assert not inverted, f"inverted octets at {inverted}"
 # m2-remove: the deleted kernel endpoint's subflow may end with a RST and no FIN.
 removed = {flow(r) for r in rows if removed_flow_exempt(scenario, args.client, flow(r))}
 if any(flow(r) in removed for r in rsts):
@@ -132,7 +165,7 @@ if m2:
     for f in data:
         # A subflow the client reset after close needs no FIN; one the server reset after close
         # (above) needs only the server's FIN.
-        sides = [] if f in cli_reset | removed else [{SRV}] if f in srv_reset else [cips, {SRV}]
+        sides = [] if f in cli_reset | removed | csum_exempt else [{SRV}] if f in srv_reset else [cips, {SRV}]
         for side in sides:
             assert any(flow(r) == f and r[1] in side and r[6] == "1" for r in rows), f"subflow {sorted(f)}: no FIN from {side}"
     join = [r for r in rows if r[9] == "1"]
@@ -160,6 +193,9 @@ else:
         assert sum(r[11] == "0" and r[9] == "2" for r in rows) == 1, "infinite mapping count"
         rules = (out / "server-rules.txt").read_text()
         assert re.search(r"\[[1-9][0-9]*:[0-9]+\].*TCPOPTSTRIP", rules), "strip rule unused"
+    elif scenario == "csum-fail1":
+        # After the fallback there are no DATA_ACKs, so no DATA_FIN check.
+        assert client.count("event: FellBack") + server.count("event: FellBack") == 1, "fallback event count"
     else:
         assert "FellBack" not in client + server
         for side, n in [(cips, c2s), ({SRV}, s2c)]:

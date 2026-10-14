@@ -6,7 +6,7 @@ use crate::endpoint::AddSubflowError;
 use crate::mptcp::State;
 use crate::wire::mptcp::MpJoin;
 
-const JOIN_IP: &str = "10.0.1.1";
+pub(super) const JOIN_IP: &str = "10.0.1.1";
 const PEER_NONCE: u32 = 0xb1b2_b3b4;
 
 /// The initial subflow's remote (`open`).
@@ -67,7 +67,7 @@ fn confirmed() -> Connected {
 }
 
 /// `add_subflow` from `ip` and the MP_JOIN SYN it sends.
-fn join_syn(
+pub(super) fn join_syn(
     ep: &mut Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     now: Instant,
@@ -83,7 +83,7 @@ fn join_syn(
 
 /// The peer's SYN/ACK options: MP_JOIN with the right HMAC-B (unless `hmac` overrides it),
 /// MSS 1460 and window scale `ws`.
-fn synack_opts(
+pub(super) fn synack_opts(
     ep: &Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     jsyn: &Segment,
@@ -122,7 +122,7 @@ fn synack_opts_mss(
     out[..n].to_vec()
 }
 /// The peer's SYN/ACK on the join 4-tuple (ISN 5000, like the initial subflow's peer).
-fn synack(ep: &mut Endpoint<ChaCha20Rng>, jsyn: &Segment, opts: &[u8], now: Instant) {
+pub(super) fn synack(ep: &mut Endpoint<ChaCha20Rng>, jsyn: &Segment, opts: &[u8], now: Instant) {
     let seg = Segment {
         flags: TcpFlags::SYN | TcpFlags::ACK,
         seq: SeqNum(5000),
@@ -159,7 +159,7 @@ fn assert_third_ack(
     );
 }
 /// Opens a subflow from `ip` and completes the four-way join (peer scale `ws`).
-fn joined(
+pub(super) fn joined(
     ep: &mut Endpoint<ChaCha20Rng>,
     h: ConnectionHandle,
     now: Instant,
@@ -541,7 +541,7 @@ fn add_subflow_errors() {
             ms(0),
             ip("10.0.0.1"),
             "10.0.0.2:80".parse().unwrap(),
-            ConnectConfig::default(),
+            checksums_cfg(false),
         )
         .unwrap();
     assert_eq!(
@@ -4685,7 +4685,7 @@ fn bbr_connected() -> Connected {
     let cfg = ConnectConfig {
         recv_buffer: 1 << 20,
         congestion_control: crate::tcp::CongestionControlKind::BbrV3,
-        ..ConnectConfig::default()
+        ..checksums_cfg(false)
     };
     let (mut ep, h, syn, dsn) = connected_cfg("10.0.0.1", "10.0.0.2:80", cfg, None, false);
     open_window(&mut ep, &syn, h);

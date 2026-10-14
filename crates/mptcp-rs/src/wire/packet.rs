@@ -79,7 +79,7 @@ pub struct Segment<'a> {
 
 // RFC 1071 / RFC 1624 section 5: verification includes the received checksum
 // in the one's-complement sum. A zero computed checksum also admits 0xffff.
-fn valid_checksum(computed: u16, received: u16) -> bool {
+pub(crate) fn valid_checksum(computed: u16, received: u16) -> bool {
     let sum = u32::from(!computed) + u32::from(received);
     (sum & 0xffff) + (sum >> 16) == u32::from(u16::MAX)
 }

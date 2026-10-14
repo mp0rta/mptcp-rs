@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use super::ConnectionHooks;
 use super::data::{RxMaps, TxMaps};
+use super::hold::Hold;
 use super::join::Join;
 use crate::SeqNum;
 use crate::tcp::Tcb;
@@ -72,10 +73,13 @@ impl Subflow {
 pub(crate) struct SubflowMp {
     pub tx: TxMaps,
     pub rx: RxMaps,
+    /// With checksums, the octets of mappings not yet verified (M4b spec G7).
+    pub hold: Hold,
     pub unmapped: usize,
     pub reset: bool,
-    /// The MP_TCPRST the RST that `reset` makes due carries (M3 spec §3.4).
-    pub reset_option: Option<[u8; 4]>,
+    /// The options the RST that `reset` makes due carries: MP_TCPRST (M3 spec §3.4), after
+    /// MP_FAIL for a checksum failure (M4b spec G11, G20).
+    pub reset_option: Option<Vec<u8>>,
     pub dss_confirmed: bool,
     pub tcp_acked_dsn: u64,
     pub tcp_acked_ssn: Option<u32>,
@@ -96,6 +100,10 @@ pub(crate) struct SubflowMp {
     /// The highest DSN end of any mapping ever installed on this subflow (fallback data loss).
     pub dsn_end: Option<u64>,
     pub rx_infinite: Option<(u32, u64)>,
+    /// A data mapping installed here ever had a DSN−SSN offset other than the handshake's, or
+    /// the range cap dropped verified octets of one: the peer's side of contiguity is gone for
+    /// good, so no MP_FAIL wait (M4b spec G10, G11).
+    pub other_offset: bool,
     /// Window scale this subflow's SYN/ACK negotiated; scales DATA_ACK windows it carries.
     pub peer_scale: u8,
     /// A scheduling step offered this subflow a nonzero budget and installed no mapping on
@@ -159,6 +167,7 @@ impl SubflowMp {
         Self {
             tx: TxMaps::new(1, 1024),
             rx: RxMaps::new(1024),
+            hold: Hold::default(),
             unmapped: 0,
             reset: false,
             reset_option: None,
@@ -174,6 +183,7 @@ impl SubflowMp {
             infinite: None,
             dsn_end: None,
             rx_infinite: None,
+            other_offset: false,
             peer_scale: 0,
             offered_unused: false,
             join: None,

@@ -473,7 +473,7 @@ mod tests {
             .iter()
             .map(|&n| {
                 let mut tx = TxMaps::new(1, 1024);
-                assert!(send.assign(&mut tx, send.next, n));
+                assert!(send.assign(&mut tx, send.next, n, false));
                 tx
             })
             .collect();
@@ -487,15 +487,15 @@ mod tests {
     fn reinject_head_stops_before_inner_inflight_copy() {
         let (mut send, _) = store(&[1000]); // subflow-ACKed, not DATA_ACKed
         let mut tx = acked();
-        assert!(send.assign(&mut tx, 400, 200)); // an earlier reinjection, still in flight
+        assert!(send.assign(&mut tx, 400, 200, false)); // an earlier reinjection, still in flight
         let mut q = ReinjectQueue::new(0);
         q.insert(0, 1000);
         assert_eq!(q.head([&tx].into_iter(), &send, false), Some((0, 400)));
-        assert!(send.assign(&mut tx, 0, 400));
+        assert!(send.assign(&mut tx, 0, 400, false));
         q.remove(0, 400);
         assert_eq!(q.head([&tx].into_iter(), &send, false), Some((600, 400)));
         assert_eq!(q.total_len(), 400, "the covered middle left the queue");
-        assert!(send.assign(&mut tx, 600, 400));
+        assert!(send.assign(&mut tx, 600, 400, false));
         q.remove(600, 400);
         assert_eq!(q.head([&tx].into_iter(), &send, false), None);
     }
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!((q.first(), q.total_len()), (Some((0, 500)), 500));
         maps[1] = acked(); // V's copy subflow-ACKed without DATA_ACK
         assert_eq!(q.head(maps.iter(), &send, false), Some((0, 500)));
-        assert!(send.assign(&mut maps[0], 0, 500));
+        assert!(send.assign(&mut maps[0], 0, 500, false));
         q.remove(0, 500);
         assert_eq!(q.head(maps.iter(), &send, false), None, "V is not offered");
         // Rule 5 expiry queues the uncovered head run; only then is V reinjected.

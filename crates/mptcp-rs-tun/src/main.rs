@@ -22,7 +22,7 @@ use rand_core::SeedableRng;
 use script::{Action, Ev, Script};
 use tun::Tun;
 
-const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT|--listen IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3] [--verify on|off]";
+const USAGE: &str = "usage: mptcp-rs-tun --mode tcp|mptcp --tun NAME --local IP --remote IP:PORT|--listen IP:PORT --send BYTES|--send-secs S --expect BYTES|any [--pause-read-ms MS] [--script FILE] [--join IP [--join-mtu N]]... [--abort-after-ms MS] [--send-rate MBIT] [--event-log FILE] [--cc cubic|bbr3] [--verify on|off] [--checksums on|off] [--invert N]";
 const CAP: Duration = Duration::from_millis(100);
 
 fn pattern_byte(i: u64) -> u8 {
@@ -34,6 +34,23 @@ fn verify_pattern(offset: u64, data: &[u8]) -> bool {
     data.iter()
         .zip(offset..)
         .all(|(b, i)| *b == pattern_byte(i))
+}
+
+/// `--invert n`: true when every octet of `data` (at stream `offset`) equals the pattern or
+/// its bitwise inverse, and at most `n` inverted octets were seen so far. Adds the stream
+/// offset of each inverted octet to `inverted`; the stream passes if exactly `n` end up there.
+fn verify_chunk(offset: u64, data: &[u8], n: u64, inverted: &mut Vec<u64>) -> bool {
+    if verify_pattern(offset, data) {
+        return true;
+    }
+    for (b, i) in data.iter().zip(offset..) {
+        if *b == !pattern_byte(i) {
+            inverted.push(i);
+        } else if *b != pattern_byte(i) {
+            return false;
+        }
+    }
+    inverted.len() as u64 <= n
 }
 
 /// How the connection starts: `--local IP --remote IP:PORT`, or `--listen IP:PORT`, which
@@ -68,6 +85,11 @@ struct Args {
     cc: CongestionControlKind,
     /// `--verify off`: count received bytes without checking the pattern (CPU benchmark).
     verify: bool,
+    /// `--checksums`: `ConnectConfig::checksums` (default on, as the library).
+    checksums: bool,
+    /// `--invert N`: the received stream holds exactly N octets inverted (a middlebox's
+    /// rewrite delivered after an MP_FAIL fallback).
+    invert: u64,
 }
 
 impl Args {
@@ -101,6 +123,8 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
     let (mut script, mut send_rate, mut event_log) = (None, None, None);
     let mut cc = CongestionControlKind::Cubic;
     let mut verify = true;
+    let mut checksums = ConnectConfig::default().checksums;
+    let mut invert = 0;
     while let Some(flag) = it.next() {
         let v = it.next()?;
         match flag.as_str() {
@@ -138,6 +162,14 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
                     _ => return None,
                 }
             }
+            "--checksums" => {
+                checksums = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return None,
+                }
+            }
+            "--invert" => invert = v.parse().ok()?,
             "--send-secs" => {
                 send_secs = Some(Duration::from_secs(v.parse().ok().filter(|s| *s > 0)?))
             }
@@ -177,6 +209,8 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Option<Args> {
         event_log,
         cc,
         verify,
+        checksums,
+        invert,
     })
 }
 
@@ -200,6 +234,7 @@ fn run(a: Args) -> Result<String, String> {
     };
     let mut cfg = ConnectConfig::default();
     cfg.congestion_control = a.cc;
+    cfg.checksums = a.checksums;
     if !a.pause_read.is_zero() {
         cfg.recv_buffer = 16384;
     }
@@ -344,10 +379,20 @@ fn run(a: Args) -> Result<String, String> {
                 match conn.read(&mut rbuf) {
                     Ok(0) => st.eof = true,
                     Ok(n) => {
+                        let seen = st.inverted.len();
                         if a.expect.is_some_and(|e| st.verified + n as u64 > e)
-                            || (a.verify && !verify_pattern(st.verified, &rbuf[..n]))
+                            || (a.verify
+                                && !verify_chunk(
+                                    st.verified,
+                                    &rbuf[..n],
+                                    a.invert,
+                                    &mut st.inverted,
+                                ))
                         {
                             return Err(format!("verification mismatch at byte {}", st.verified));
+                        }
+                        for off in &st.inverted[seen..] {
+                            eprintln!("inverted at {off}");
                         }
                         st.verified += n as u64;
                         let t = start.elapsed();
@@ -398,6 +443,13 @@ fn run(a: Args) -> Result<String, String> {
         if st.done {
             if !st.eof {
                 return Err("closed before EOF".into());
+            }
+            if a.verify && st.inverted.len() as u64 != a.invert {
+                return Err(format!(
+                    "verification: {} inverted octets, expected {}",
+                    st.inverted.len(),
+                    a.invert
+                ));
             }
             st.unblock(start.elapsed());
             let s = st.stats;
@@ -464,6 +516,8 @@ fn write_packet(tun: &Tun, pkt: &[u8]) -> Result<(), String> {
 struct State {
     sent: u64,
     verified: u64,
+    /// Stream offsets of the inverted octets received (`--invert`).
+    inverted: Vec<u64>,
     connected: bool,
     connected_at: Option<Duration>,
     /// Server mode: the accepted connection's client address.
@@ -781,6 +835,51 @@ mod tests {
         bad[300] ^= 1;
         assert!(!verify_pattern(1000, &bad));
         assert_eq!(pattern_byte(0), 7);
+    }
+
+    #[test]
+    fn invert_verify_accepts_exact_inversions() {
+        let data: Vec<u8> = (1000..1600u64).map(pattern_byte).collect();
+        // `--invert n`: the whole stream, read in two pieces, at stream offset 1000.
+        let check = |d: &[u8], n: u64| {
+            let mut inv = Vec::new();
+            (verify_chunk(1000, &d[..300], n, &mut inv)
+                && verify_chunk(1300, &d[300..], n, &mut inv)
+                && inv.len() as u64 == n)
+                .then_some(inv)
+        };
+        assert_eq!(check(&data, 0), Some(vec![]));
+        let mut two = data.clone();
+        two[10] = !two[10];
+        two[450] = !two[450];
+        assert_eq!(check(&two, 2), Some(vec![1010, 1450]));
+        assert_eq!(check(&two, 1), None, "more inversions than allowed");
+        assert_eq!(check(&two, 3), None, "fewer inversions than required");
+        let mut one = data.clone();
+        one[10] = !one[10];
+        assert_eq!(check(&one, 2), None, "one inverted octet with --invert 2");
+        assert_eq!(check(&one, 1), Some(vec![1010]));
+        let mut changed = data.clone();
+        changed[10] ^= 1;
+        assert_eq!(check(&changed, 1), None, "changed but not inverted");
+        changed[450] = !changed[450];
+        assert_eq!(check(&changed, 2), None, "one inverted, one only changed");
+    }
+
+    #[test]
+    fn checksums_flag_parses() {
+        let base =
+            "--mode mptcp --tun t0 --local 10.0.0.2 --remote 10.0.1.1:80 --send 5 --expect 5";
+        let a = |extra: &str| parse(&format!("{base}{extra}")).map(|a| (a.checksums, a.invert));
+        assert_eq!(a(""), Some((true, 0)), "default: on, as the library");
+        assert_eq!(a(" --checksums on"), Some((true, 0)));
+        assert_eq!(a(" --checksums off"), Some((false, 0)));
+        assert_eq!(a(" --checksums maybe"), None);
+        assert_eq!(a(" --invert 1"), Some((true, 1)));
+        assert_eq!(a(" --invert x"), None);
+        assert!(ConnectConfig::default().checksums);
+        let l = parse(&format!("{LISTEN} --checksums off --invert 2")).unwrap();
+        assert_eq!((l.checksums, l.invert), (false, 2));
     }
 
     #[test]

@@ -16,12 +16,12 @@ mod tests {
             let mut s = SendStore::new(u64::MAX - 1, 4);
             let mut m = TxMaps::new(u32::MAX - 1, 4);
             assert_eq!(s.write(b"abcd"), 4);
-            assert!(s.assign(&mut m, u64::MAX - 1, 4));
+            assert!(s.assign(&mut m, u64::MAX - 1, 4, false));
             assert_eq!(
                 m.peek_with(u32::MAX, 9, |b| b.to_vec()),
                 Some(b"bcd".to_vec())
             );
-            assert!(s.assign(&mut m, u64::MAX - 1, 4)); // reinjection, fresh SSNs
+            assert!(s.assign(&mut m, u64::MAX - 1, 4, false)); // reinjection, fresh SSNs
             if data_first {
                 assert!(s.ack(2));
             } else {
@@ -158,8 +158,9 @@ impl SendStore {
         let len = self.end.wrapping_sub(self.una);
         if off < len { (len - off) as usize } else { 0 }
     }
-    /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection.
-    pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize) -> bool {
+    /// Assigns one contiguous stored run; repeated DSNs use fresh SSNs for reinjection. With
+    /// `csum` the mapping carries its DSS checksum (RFC 8684 L1402–1430).
+    pub fn assign(&mut self, maps: &mut TxMaps, dsn: u64, len: usize, csum: bool) -> bool {
         if len == 0 || len > u16::MAX as usize || maps.is_full() {
             return false;
         }
@@ -191,7 +192,7 @@ impl SendStore {
                 break;
             }
         }
-        maps.maps.push_back(TxMap {
+        let mut map = TxMap {
             ssn: maps.end,
             mapping: crate::wire::mptcp::Mapping {
                 dsn: crate::wire::mptcp::Dsn::Dsn64(dsn),
@@ -204,7 +205,11 @@ impl SendStore {
             dsn,
             len,
             pieces,
-        });
+        };
+        if csum {
+            map.mapping.checksum = Some(map.checksum());
+        }
+        maps.maps.push_back(map);
         maps.end = maps.end.wrapping_add(len as u32);
         if dsn == self.next {
             self.next = self.next.wrapping_add(len as u64);
@@ -243,6 +248,14 @@ struct TxMap {
     pieces: VecDeque<Chunk>,
 }
 impl TxMap {
+    /// The checksum of the whole mapping, before any of it is acknowledged (spec G5).
+    fn checksum(&self) -> u16 {
+        let data: Vec<&[u8]> = (self.pieces.iter())
+            .map(|c| &c.bytes[c.start..c.end])
+            .collect();
+        let m = &self.mapping;
+        crate::wire::mptcp::dss_checksum(self.dsn, m.ssn, m.data_len, &data)
+    }
     fn covers(&self, ssn: u32) -> bool {
         (ssn.wrapping_sub(self.ssn) as usize) < self.len
     }
@@ -303,6 +316,11 @@ impl TxMaps {
         if let Some(m) = self.maps.back_mut() {
             m.data_fin = true;
             m.mapping.data_len += 1;
+            // The Data-Level Length counts the DATA_FIN (RFC 8684 L1402–1430); `install` attaches
+            // it right after `assign`, before the mapping is sent or acknowledged.
+            if m.mapping.checksum.is_some() {
+                m.mapping.checksum = Some(m.checksum());
+            }
         }
     }
     pub fn data_fin(&self, ssn: u32) -> bool {
@@ -401,9 +419,18 @@ struct Piece {
 /// reading and full segments of L octets the overshoot is about `cap · (−L mod 2^scale) / L`
 /// (L 1436: −1436 mod 2^scale is 100 at scale 7 and 9, so about 7 %, 1.1 MiB at the 16 MiB /
 /// scale 9 default); approaching the worst case needs segments shorter than 2^scale.
+///
+/// With checksums (M4b spec G7), completion credit may raise `right_edge` past the base edge,
+/// at most 65,535 octets plus the scale rounding, and `free` also counts the octets the hold
+/// buffers keep.
 pub(crate) struct RecvAssembler {
     pub next: u64,
+    /// The offered edge, completion credit included.
     pub right_edge: u64,
+    /// The base edge while credit has raised `right_edge` past it; `None`: it is `right_edge`.
+    base_edge: Option<u64>,
+    /// Octets the connection's hold buffers keep (`set_held`).
+    held: usize,
     ready: VecDeque<u8>,
     pieces: Vec<Piece>,
     cap: usize,
@@ -417,6 +444,8 @@ impl RecvAssembler {
         Self {
             next: head,
             right_edge: head.wrapping_add(cap as u64),
+            base_edge: None,
+            held: 0,
             ready: VecDeque::new(),
             pieces: Vec::new(),
             cap,
@@ -469,9 +498,40 @@ impl RecvAssembler {
     pub fn window_sent(&mut self, field: u16, scale: u8) {
         self.read_advanced = false;
         let edge = self.next.wrapping_add(u64::from(field) << scale);
+        if let Some(base) = self.base_edge {
+            // The part of the field the base offer covers: free memory or the base edge
+            // itself, rounded (the SWS gate of `window_offer` aside). Credit rounding stays out.
+            let kept = (base.wrapping_sub(self.next) as i64).max(0) as u64;
+            let units = (self.free() as u64 >> scale).max(kept.div_ceil(1 << scale));
+            let b = (self.next).wrapping_add(units.min(u64::from(field)) << scale);
+            if b.wrapping_sub(base) as i64 > 0 {
+                self.base_edge = Some(b);
+            }
+        }
         if edge.wrapping_sub(self.right_edge) as i64 > 0 {
             self.right_edge = edge;
         }
+        if (self.base_edge).is_some_and(|b| b.wrapping_sub(self.right_edge) as i64 >= 0) {
+            self.base_edge = None;
+        }
+    }
+    /// Completion credit (M4b spec G7): a mapping `[start, end)` that starts below the base
+    /// edge and ends past it raises the offered edge to its end, at most base edge + 65,535 (the
+    /// largest Data-Level Length). Anchored to the base edge only, credit never seeds credit;
+    /// raising the edge is allowed, shrinking it is not (RFC 8684 L1639–1641).
+    pub fn credit(&mut self, start: u64, end: u64) {
+        let base = self.base_edge.unwrap_or(self.right_edge);
+        if (start.wrapping_sub(base) as i64) < 0 && (end.wrapping_sub(base) as i64) > 0 {
+            let edge = base.wrapping_add(end.wrapping_sub(base).min(65_535));
+            if edge.wrapping_sub(self.right_edge) as i64 > 0 {
+                self.right_edge = edge;
+                self.base_edge = Some(base);
+            }
+        }
+    }
+    /// The octets all hold buffers of the connection keep: `free` subtracts them.
+    pub fn set_held(&mut self, n: usize) {
+        self.held = n;
     }
     pub fn window_update_due(&self, scale: u8, mss: u16) -> bool {
         let remaining = self.right_edge.wrapping_sub(self.next) as i64;
@@ -483,7 +543,7 @@ impl RecvAssembler {
     }
     pub fn free(&self) -> usize {
         self.cap.saturating_sub(
-            self.ready.len() + self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>(),
+            self.ready.len() + self.pieces.iter().map(|p| p.bytes.len()).sum::<usize>() + self.held,
         )
     }
     pub fn has_unread(&self) -> bool {
@@ -526,6 +586,17 @@ impl RecvAssembler {
         let result = self.accept_inner(dsn, &data[..len], false);
         self.advance_fin();
         result
+    }
+    /// Stores held octets on fallback (M4b spec G15): they are TCP-ACKed and never resent, so
+    /// neither the range cap nor the offered edge may refuse them. The hold cap bounded them
+    /// (`recv_buffer + 65,535` per subflow), and reads deliver them as they make room. Only
+    /// octets past a DATA_FIN are dropped: they belong to no stream.
+    pub fn replay(&mut self, dsn: u64, data: &[u8]) {
+        let (range_cap, edge) = (self.range_cap, self.right_edge);
+        self.range_cap = usize::MAX;
+        self.right_edge = super::later(Some(edge), dsn.wrapping_add(data.len() as u64)).unwrap();
+        self.accept(dsn, data);
+        (self.range_cap, self.right_edge) = (range_cap, edge);
     }
     pub fn accept_tcp(&mut self, dsn: u64, data: &[u8]) -> usize {
         let before = self.next;
@@ -751,6 +822,85 @@ mod pressure_tests {
 }
 
 #[cfg(test)]
+mod credit_tests {
+    use super::*;
+
+    #[test]
+    fn credit_raises_edge_once() {
+        let mut r = RecvAssembler::new(1000, 4096, 64);
+        let base = r.right_edge;
+        r.credit(base - 100, base + 10_000);
+        assert_eq!(r.right_edge, base + 10_000);
+        // A second mapping from inside the credit starts past the base edge: no more credit.
+        r.credit(base + 9_999, base + 30_000);
+        assert_eq!(r.right_edge, base + 10_000);
+        // Nor does one wholly below the base edge, or one far past it reach beyond 65,535.
+        r.credit(base - 500, base);
+        assert_eq!(r.right_edge, base + 10_000);
+        r.credit(base - 1, base + 100_000);
+        assert_eq!(r.right_edge, base + 65_535);
+    }
+
+    #[test]
+    fn credit_never_chains() {
+        for scale in [0u8, 3, 7] {
+            let mut r = RecvAssembler::new(0, 4096, 64);
+            let base = r.right_edge;
+            let bound = base + 65_535 + (1 << scale);
+            r.credit(0, 65_535);
+            for _ in 0..20 {
+                // A 65,535-octet mapping starting at the credited edge.
+                let start = r.right_edge;
+                r.credit(start, start + 65_535);
+                let field = r.window_offer(scale, 1460);
+                r.window_sent(field, scale);
+                assert!(r.right_edge <= bound, "scale {scale}: {}", r.right_edge);
+            }
+            assert!(r.right_edge >= 65_535);
+        }
+    }
+
+    #[test]
+    fn credit_ends_once_the_base_edge_passes() {
+        let mut r = RecvAssembler::new(0, 4096, 64);
+        r.credit(4000, 10_000);
+        assert_eq!(r.right_edge, 10_000);
+        assert_eq!(r.accept(0, &[0; 10_000]), (Outcome::Stored, 10_000));
+        let mut out = vec![0; 10_000];
+        while r.read(&mut out) > 0 {}
+        assert_eq!(r.next, 10_000);
+        let field = r.window_offer(0, 1460);
+        r.window_sent(field, 0);
+        assert_eq!((r.right_edge, r.base_edge), (14_096, None));
+    }
+
+    /// Replayed octets past the offered edge and the range cap are stored; the edge and the
+    /// cap stay as they were (M4b spec G15).
+    #[test]
+    fn replay_ignores_edge_and_range_cap() {
+        let mut r = RecvAssembler::new(0, 100, 1);
+        assert_eq!(r.accept(10, b"a"), (Outcome::Stored, 1));
+        r.replay(150, b"bc");
+        assert_eq!((r.right_edge, r.range_cap), (100, 1));
+        r.replay(0, &[0; 10]);
+        let mut out = [0; 200];
+        assert_eq!(r.read(&mut out), 11);
+        // Delivered `cap` at a time, as reads make room.
+        r.replay(11, &[0; 139]);
+        assert_eq!(r.read(&mut out), 100);
+        assert_eq!(r.read(&mut out), 41);
+        assert_eq!(&out[39..41], b"bc");
+    }
+
+    #[test]
+    fn held_octets_reduce_free() {
+        let mut r = RecvAssembler::new(0, 8000, 64);
+        r.set_held(3000);
+        assert_eq!(r.free(), 5000);
+    }
+}
+
+#[cfg(test)]
 mod bounds_tests {
     use super::*;
     #[test]
@@ -758,12 +908,12 @@ mod bounds_tests {
         let mut s = SendStore::new(100, 70000);
         s.write(&vec![0; 70000]);
         let mut maps = TxMaps::new(1, 1);
-        assert!(!s.assign(&mut maps, 100, 65536));
-        assert!(!s.assign(&mut maps, 101, 1));
-        assert!(s.assign(&mut maps, 100, 10));
-        assert!(!s.assign(&mut maps, 110, 1));
+        assert!(!s.assign(&mut maps, 100, 65536, false));
+        assert!(!s.assign(&mut maps, 101, 1, false));
+        assert!(s.assign(&mut maps, 100, 10, false));
+        assert!(!s.assign(&mut maps, 110, 1, false));
         maps.mark_acked(11);
-        assert!(s.assign(&mut maps, 105, 5));
+        assert!(s.assign(&mut maps, 105, 5, false));
     }
 }
 

@@ -6,6 +6,13 @@ use mptcp_rs::{ConnectConfig, Endpoint, Instant};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
+/// These tests read the A=0 wire layout.
+fn a0() -> ConnectConfig {
+    let mut cfg = ConnectConfig::default();
+    cfg.checksums = false;
+    cfg
+}
+
 #[test]
 fn public_mptcp_api_emits_capable_syn() {
     let mut ep = Endpoint::new(ChaCha20Rng::seed_from_u64(1));
@@ -14,7 +21,7 @@ fn public_mptcp_api_emits_capable_syn() {
         now,
         "10.0.0.1".parse().unwrap(),
         "10.0.0.2:80".parse().unwrap(),
-        ConnectConfig::default(),
+        a0(),
     )
     .unwrap();
     let mut out = [0; 1500];
@@ -63,7 +70,7 @@ fn production_dss_recovery_and_close_wait_for_actual_tcp_close() {
             time,
             "10.0.0.1".parse().unwrap(),
             "10.0.0.2:80".parse().unwrap(),
-            ConnectConfig::default(),
+            a0(),
         )
         .unwrap();
     let bytes = emit(&mut ep, time);
