@@ -95,19 +95,29 @@ def check_inversion(offsets, start, dll):
 
 
 def infinite_mapping_checks(segs):
-    """dataack-strip: one fallback, so one infinite mapping, from the client, over every
-    captured segment in time order as (from the client, payload length, first MPTCP subtype,
-    DLL, DSN), tshark strings. The mapping goes out once on an ACK-only segment and rides every
-    data segment until its first new octet is TCP-ACKed (M4b spec, MP_FAIL state machine;
-    since e0d2c5b), so copies are counted per mapping, not per segment. Retired for good: some
-    later client data goes out as plain TCP, and no copy follows it."""
+    """dataack-strip: one fallback, so one infinite mapping, from the client, over every segment
+    on the client's TUN in time order as (from the client, payload length, first MPTCP subtype,
+    DLL, DSN, SSN, TCP seq, TCP ACK), the MPTCP fields as tshark strings. The mapping goes out
+    once on an ACK-only segment and rides every data segment until an octet that only ever
+    travelled with it is TCP-ACKed (M4b spec, MP_FAIL state machine; since e0d2c5b), so copies
+    are counted per mapping, not per segment; a mapping is its (DSN, SSN) anchor (RFC 8684
+    L1368-1370). Retired for good, and only after that ACK: plain client data follows the last
+    copy, no copy follows it, and an earlier server ACK covers an octet sent only with the
+    mapping. The TUN lists the ACKs as they reached the client, so a correct client always
+    passes; one retiring on an ACK still unread in the TUN queue passes too."""
     inf = [i for i, s in enumerate(segs) if s[2:4] == ("2", "0")]
     assert inf, "no infinite mapping"
     assert all(segs[i][0] for i in inf), "infinite mapping from the server"
-    assert len({segs[i][4] for i in inf}) == 1, f"more than one infinite mapping: DSNs {sorted({segs[i][4] for i in inf})}"
+    anchors = sorted({segs[i][4:6] for i in inf})
+    assert len(anchors) == 1, f"more than one infinite mapping: (DSN, SSN) {anchors}"
     assert sum(segs[i][1] == 0 for i in inf) == 1, "infinite mapping not on exactly one ACK-only segment"
     plain = [i for i, s in enumerate(segs) if s[0] and s[1] > 0 and not s[2] and i > inf[0]]
     assert plain and plain[0] > inf[-1], "infinite mapping not retired: no plain client data after its last copy"
+    octets = lambda s: {(s[6] + k) % (1 << 32) for k in range(s[1])}
+    only = set().union(*(octets(segs[i]) for i in inf))
+    only -= set().union(*(octets(s) for s in segs[:plain[0]] if s[0] and s[2:4] != ("2", "0")))
+    covers = lambda ack: any((ack - x - 1) % (1 << 32) < (1 << 31) for x in only)
+    assert any(not s[0] and covers(s[7]) for s in segs[inf[0]:plain[0]]), "infinite mapping retired before a TCP ACK of an octet sent only with it"
 
 
 def mp_fail_dsn(packets, receiver):

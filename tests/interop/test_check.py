@@ -234,33 +234,51 @@ class Csum(unittest.TestCase):
 
 
 class InfiniteMapping(unittest.TestCase):
-    """dataack-strip: the client's one infinite mapping, as (from the client, payload length,
-    MPTCP subtype, DLL, DSN) in time order."""
-    MPC = (True, 1432, "0", "1432", "")
-    ACK = (False, 0, "", "", "")
-    INF = lambda n: (True, n, "2", "0", "77")
-    PLAIN = (True, 1460, "", "", "")
+    """dataack-strip: the client's one infinite mapping, from the client's TUN, as (from the
+    client, payload length, MPTCP subtype, DLL, DSN, SSN, TCP seq, TCP ACK) in time order."""
 
-    def test_once_on_an_ack_only_segment(self):
-        # Through 0.2.0: one ACK-only copy, then plain TCP.
-        infinite_mapping_checks([self.MPC, self.ACK, InfiniteMapping.INF(0), self.PLAIN, self.ACK, self.PLAIN])
+    @staticmethod
+    def wire(*segs):
+        """Client segments ("mpc"|"inf"|"plain", length[, (DSN, SSN)]) back to back from TCP
+        seq 1; ("ack", n): the server's TCP ACK of the client's first n octets."""
+        out, seq = [], 1
+        for kind, n, *anchor in segs:
+            if kind == "ack":
+                out.append((False, 0, "", "", "", "", 1, 1 + n))
+                continue
+            st, dll, dsn, ssn = {"mpc": ("0", str(n), "", ""), "plain": ("", "", "", ""),
+                                 "inf": ("2", "0", *(anchor[0] if anchor else ("77", "1")))}[kind]
+            out.append((True, n, st, dll, dsn, ssn, seq, 1))
+            seq += n
+        return out
 
     def test_riding_data_until_acknowledged(self):
-        # Since e0d2c5b the copy also rides the data in flight until its first new octet is
-        # TCP-ACKed (the failing run 20261014T213926-RiuFja: one ACK-only copy, two on data).
-        inf = InfiniteMapping.INF
-        infinite_mapping_checks([self.MPC, self.ACK, inf(0), inf(1440), self.ACK, inf(1440), self.ACK, self.PLAIN])
+        # Since e0d2c5b the copy also rides the data until an octet only sent with it is
+        # TCP-ACKed; one more copy may follow that ACK before the client reads it (the TUN of
+        # 20261014T220729-BnmM0J: ACK-only copy, data copy, its ACK, data copy, ACK, plain).
+        infinite_mapping_checks(self.wire(("mpc", 1432), ("ack", 1432), ("inf", 0), ("inf", 1440), ("ack", 2872),
+                                          ("inf", 1440), ("ack", 4312), ("plain", 1460)))
+
+    def test_retired_before_acknowledged_rejected(self):
+        for bad, why in [(self.wire(("mpc", 1432), ("ack", 1432), ("inf", 0), ("plain", 1460)), "ACK-only copy, then plain (through 0.2.0)"),
+                         (self.wire(("mpc", 1432), ("inf", 0), ("inf", 1440), ("inf", 1440), ("plain", 1460)), "no peer ACK"),
+                         (self.wire(("mpc", 1432), ("inf", 0), ("inf", 1440), ("ack", 1432), ("plain", 1460)), "ACK of the pre-switch octets only")]:
+            with self.assertRaisesRegex(AssertionError, "retired before", msg=why):
+                infinite_mapping_checks(bad)
 
     def test_rules(self):
-        inf = InfiniteMapping.INF
-        for bad, why in [([self.MPC, self.PLAIN], "no infinite mapping"),
-                         ([inf(0), (True, 1440, "2", "0", "78"), self.PLAIN], "two infinite mappings"),
-                         ([inf(0), (False, 0, "2", "0", "77"), self.PLAIN], "from the server"),
-                         ([inf(1440), self.PLAIN], "no ACK-only copy"),
-                         ([inf(0), inf(0), self.PLAIN], "two ACK-only copies"),
-                         ([inf(0), inf(1440)], "never retired"),
-                         ([inf(0), self.PLAIN, inf(1440), self.PLAIN], "resumed after plain data")]:
-            with self.assertRaises(AssertionError, msg=why):
+        w = self.wire
+        for bad, err, why in [
+                (w(("mpc", 1432), ("ack", 1432), ("plain", 1460)), "no infinite mapping", "none"),
+                (w(("inf", 0), ("inf", 1440, ("78", "1")), ("ack", 1440), ("plain", 1460)), "more than one", "two DSNs"),
+                (w(("inf", 0), ("inf", 1440, ("77", "2")), ("ack", 1440), ("plain", 1460)), "more than one", "same DSN, two SSNs"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460))[:2] + [(False, 0, "2", "0", "77", "1", 1, 1441)] + w(("plain", 1460)),
+                 "from the server", "server copy"),
+                (w(("inf", 1440), ("ack", 1440), ("plain", 1460)), "ACK-only", "no ACK-only copy"),
+                (w(("inf", 0), ("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460)), "ACK-only", "two ACK-only copies"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440)), "not retired", "never retired"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460), ("inf", 1440), ("plain", 1460)), "not retired", "resumed after plain data")]:
+            with self.assertRaisesRegex(AssertionError, err, msg=why):
                 infinite_mapping_checks(bad)
 
 

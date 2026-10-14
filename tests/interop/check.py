@@ -44,7 +44,7 @@ if mode and scenario != "m2-hetero":
 m2 = two_subflows(scenario)
 # M2: the initial subflow on path A and a join from JOIN on path B.
 SRV, cips, JOIN = endpoints(scenario, args.client, args.server)
-fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport"]
+fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport", "tcp.options.mptcp.subflowseqno"]
 def capture(name):
     cmd = ["tshark", "-r", str(out / name), "-Y", "tcp", "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"]
     for f in fields:
@@ -213,7 +213,8 @@ else:
         print(csum_checks(csum_want(args.csum, args.client, args.server), packets))
     if scenario == "dataack-strip":
         assert client.count("event: FellBack") == 1, "fallback event count"
-        infinite_mapping_checks([(r[1] in cips, int(r[4] or 0), r[9], r[11], r[13]) for r in rows])
+        # The client's TUN: its own sends, and the server's ACKs in the order they reached it.
+        infinite_mapping_checks([(r[1] in cips, int(r[4] or 0), r[9], r[11], r[13], r[22], int(r[2]), int(r[3] or 0)) for r in capture("tun.pcap")])
         rules = (out / "server-rules.txt").read_text()
         assert re.search(r"\[[1-9][0-9]*:[0-9]+\].*TCPOPTSTRIP", rules), "strip rule unused"
     elif scenario == "csum-fail1":
