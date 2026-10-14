@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, failed_mapping, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -22,6 +22,8 @@ for name in ["scenario", "directory", "want_c2s", "want_s2c"]:
 ap.add_argument("mode", nargs="?", choices=["logs-only"])
 ap.add_argument("--client", choices=["kernel", "mptcp-rs"], default="mptcp-rs")
 ap.add_argument("--server", choices=["kernel", "mptcp-rs"], default="kernel")
+# --csum: run.sh's INTEROP_CSUM, when set: check the checksum negotiation on the wire.
+ap.add_argument("--csum", choices=["on:on", "on:off", "off:on", "off:off"])
 args = ap.parse_args()
 scenario, want_c2s, want_s2c, mode = args.scenario, args.want_c2s, args.want_s2c, args.mode
 out = Path(args.directory)
@@ -186,6 +188,17 @@ else:
     else:
         assert "Connected mptcp=true" in client
     assert any(r[10] == "1" for r in rows), "MPTCP v1 missing"
+    if args.csum:
+        flt = "tcp.options.mptcp.subtype == 0 || tcp.options.mptcp.dseqnpresent.flag == 1"
+        names = ["tcp.flags.syn", "tcp.flags.ack", "tcp.option_kind", "tcp.option_len", "tcp.options.mptcp.subtype", "tcp.options.mptcp.checksumreq.flags", "tcp.options.mptcp.dataackpresent.flag", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag"]
+        packets = []
+        for name in pcaps:
+            cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
+            for f in names:
+                cmd += ["-e", f]
+            for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
+                packets.append((flag(v[0]), flag(v[1]), *csum_options(*v[2:])))
+        print(csum_checks(csum_want(args.csum, args.client, args.server), packets))
     if scenario == "dataack-strip":
         assert client.count("event: FellBack") == 1, "fallback event count"
         assert sum(r[11] == "0" and r[9] == "2" for r in rows) == 1, "infinite mapping count"

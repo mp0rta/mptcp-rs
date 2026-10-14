@@ -110,3 +110,54 @@ def failed_mapping(fail, packets, sender, first):
             if o["subtype"] == 2 and "dsn" in o and o["dsn"] == fail % (1 << (64 if o["dsn8"] else 32))]
     assert dlls, f"no DSS from {sender} maps DSN {fail}"
     return (fail - first) % (1 << 64), max(dlls)
+
+
+def csum_options(kinds, lens, subtypes, a_flags, ack_flags, ack8_flags, m_flags, dsn8_flags):
+    """One packet's MP_CAPABLE A bits, and the checksum octets (0 or 2) of each DSS mapping and
+    MP_CAPABLE with data, from tshark's per-option values (occurrence=a). Presence is read from
+    the option length: tshark decodes the checksum field only in some cases. NOP and EOL have no
+    tcp.option_len."""
+    split = lambda v: [x for x in v.split(",") if x]
+    sized = [k for k in split(kinds) if k not in ("0", "1")]
+    lengths = [int(n) for k, n in zip(sized, split(lens)) if k == "30"]
+    a, da, da8, m, d8 = map(iter, map(split, (a_flags, ack_flags, ack8_flags, m_flags, dsn8_flags)))
+    bits, octets = [], []
+    for length, st in zip(lengths, map(int, split(subtypes))):
+        if st == 0:
+            bits.append(flag(next(a)))
+            if length > 20:  # with data: Length 22, or 24 with the checksum (RFC 8684 L834-843)
+                octets.append(length - 22)
+        elif st == 2:
+            ack, ack8, mapping, dsn8 = flag(next(da)), flag(next(da8)), flag(next(m)), flag(next(d8))
+            if mapping:
+                # kind, length, flags (4); DATA_ACK; DSN; SSN (4); Data-Level Length (2).
+                octets.append(length - (4 + (8 if ack8 else 4 if ack else 0) + (8 if dsn8 else 4) + 6))
+    return bits, octets
+
+
+def csum_want(csum, client, server):
+    """run.sh's INTEROP_CSUM (<ours>:<linux>, each on|off) as the M4b spec's G2 decision:
+    (MP_CAPABLE SYN A, SYN/ACK A, checksums used). The SYN carries the client's setting; an
+    mptcp-rs server answers with the decision, a Linux server with its sysctl only; the third
+    ACK carries the decision (either end's setting)."""
+    ours, linux = (v == "on" for v in csum.split(":"))
+    setting = {"mptcp-rs": ours, "kernel": linux}
+    c, s = setting[client], setting[server]
+    return c, (c or s) if server == "mptcp-rs" else s, c or s
+
+
+def csum_checks(want, packets):
+    """INTEROP_CSUM runs: MP_CAPABLE A bits as `want` (csum_want), and a checksum on every DSS
+    mapping exactly when checksums are used (spec G2, G3). `packets`: (SYN, ACK, A bits, checksum
+    octets) per packet, from csum_options. Returns a summary."""
+    syn_a, synack_a, csum = want
+    for what, flags, w in [("SYN", (True, False), syn_a), ("SYN/ACK", (True, True), synack_a),
+                           ("third ACK / with data", (False, True), csum)]:
+        got = {a for s, k, bits, _ in packets if (s, k) == flags for a in bits}
+        assert got == {w}, f"MP_CAPABLE {what} A bits {sorted(got)}, want {w}"
+    octets = [o for *_, os in packets for o in os]
+    want_octets = 2 if csum else 0
+    assert octets, "no DSS mapping"
+    bad = sum(o != want_octets for o in octets)
+    assert not bad, f"{bad} of {len(octets)} mappings without {want_octets} checksum octets"
+    return f"checksums {'on' if csum else 'off'}: A bits SYN={int(syn_a)} SYN/ACK={int(synack_a)} third ACK={int(csum)}, {len(octets)} mappings with {want_octets} checksum octets"

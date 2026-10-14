@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, failed_mapping, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
 SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "csum-fail1", "csum-fail2"]
@@ -163,6 +163,74 @@ class FailedMapping(unittest.TestCase):
                      [pkt(1, SRV, LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1400}])]]:
             with self.assertRaises(AssertionError, msg=maps):
                 failed_mapping(fail, maps, self.CLI, 1000)
+
+
+class CsumOptions(unittest.TestCase):
+    """One packet's MP_CAPABLE A bits and DSS checksum octets, from tshark's per-option fields."""
+
+    def test_dss_lengths(self):
+        # NOP, NOP, timestamps, DSS: DATA_ACK 8 + DSN 8 + SSN + DLL + checksum = 28.
+        self.assertEqual(csum_options("1,1,8,30", "10,28", "2", "", "1", "1", "1", "1"), ([], [2]))
+        # DATA_ACK 4, DSN 4, no checksum: 18; DATA_ACK only: no mapping.
+        self.assertEqual(csum_options("30", "18", "2", "", "1", "0", "1", "0"), ([], [0]))
+        self.assertEqual(csum_options("30", "12", "2", "", "1", "1", "0", "0"), ([], []))
+        # No DATA_ACK, DSN 8, checksum: 20; before it a bare DSS (4) and an ADD_ADDR echo (8).
+        self.assertEqual(csum_options("30,30,30", "4,8,20", "2,3,2", "", "False,False", "False,False", "False,True", "False,True"), ([], [2]))
+
+    def test_mp_capable(self):
+        # SYN (A=1), third ACK (Length 20), MP_CAPABLE with data (22 or 24).
+        self.assertEqual(csum_options("30,2,3,1,4,1,1", "4,4,3,2", "0", "1", "", "", "", ""), ([True], []))
+        self.assertEqual(csum_options("1,1,8,30", "10,20", "0", "0", "", "", "", ""), ([False], []))
+        self.assertEqual(csum_options("30", "24", "0", "True", "", "", "", ""), ([True], [2]))
+        self.assertEqual(csum_options("30", "22", "0", "False", "", "", "", ""), ([False], [0]))
+
+
+SYN, SYNACK, ACK = (True, False), (True, True), (False, True)
+
+
+class Csum(unittest.TestCase):
+    """INTEROP_CSUM runs (spec G2/G3): A bits as negotiated, a checksum on every mapping exactly
+    when negotiated."""
+
+    def wire(self, syn_a, synack_a, csum):
+        o = 2 if csum else 0
+        return [(*SYN, [syn_a], []), (*SYN, [syn_a], []), (*SYNACK, [synack_a], []), (*ACK, [csum], []),
+                (*ACK, [csum], [o]), (*ACK, [], [o, o]), (False, True, [], [])]
+
+    def test_want(self):
+        # (SYN A, SYN/ACK A, checksums): a Linux server answers with its sysctl only; ours with
+        # the decision. Both ours: the Linux sysctl plays no part.
+        for csum, client, server, want in [
+                ("on:off", "mptcp-rs", "kernel", (True, False, True)), ("off:on", "mptcp-rs", "kernel", (False, True, True)),
+                ("off:off", "mptcp-rs", "kernel", (False, False, False)), ("on:on", "mptcp-rs", "kernel", (True, True, True)),
+                ("on:off", "kernel", "mptcp-rs", (False, True, True)), ("off:on", "kernel", "mptcp-rs", (True, True, True)),
+                ("off:off", "kernel", "mptcp-rs", (False, False, False)),
+                ("off:on", "mptcp-rs", "mptcp-rs", (False, False, False)), ("on:off", "mptcp-rs", "mptcp-rs", (True, True, True))]:
+            self.assertEqual(csum_want(csum, client, server), want, (csum, client, server))
+
+    def test_accepted(self):
+        for want in [(True, False, True), (False, True, True), (True, True, True), (False, False, False)]:
+            csum_checks(want, self.wire(*want))
+
+    def test_wrong_presence_rejected(self):
+        for want in [(True, False, True), (False, False, False)]:
+            o = 0 if want[2] else 2
+            for extra in [(*ACK, [], [o]), (*ACK, [], [2 - o, o]), (*ACK, [want[2]], [o])]:
+                with self.assertRaises(AssertionError, msg=(want, extra)):
+                    csum_checks(want, self.wire(*want) + [extra])
+
+    def test_wrong_a_bits_rejected(self):
+        want = (True, False, True)
+        for bad in [(*SYN, [False], []), (*SYNACK, [True], []), (*ACK, [False], [])]:
+            with self.assertRaises(AssertionError, msg=bad):
+                csum_checks(want, self.wire(*want) + [bad])
+
+    def test_missing_evidence_rejected(self):
+        want = (True, False, True)
+        wire = self.wire(*want)
+        for drop in [lambda p: p[:2] == SYN, lambda p: p[:2] == SYNACK, lambda p: p[2] and p[:2] == ACK, lambda p: p[3]]:
+            with self.assertRaises(AssertionError):
+                csum_checks(want, [p for p in wire if not drop(p)])
 
 
 class Invert(unittest.TestCase):

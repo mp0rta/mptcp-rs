@@ -260,6 +260,8 @@ if [ -n "$cns" ]; then
   pedit=$(awk '$1 == "Sent" {print $4; exit}' "$out/pedit.txt")
   [ "$pedit" = 1 ] || { echo "FAIL pedit rewrote ${pedit:-?} packets, want 1"; exit 1; }
 fi
+# INTEROP_CSUM set (the negotiation rows): check.py checks the A bits and checksum presence.
+csum_check=(); [ -z "${INTEROP_CSUM:-}" ] || csum_check=(--csum "$csum")
 mib() { awk -v k="MPTcpExt$1" '$1 == k {print $2}' "$out/nstat.txt"; }
 # csum-fail*: pinned from the first runs (M4b spec section 7 item 2). Which end counts the
 # checksum error, and sends the reset or the infinite mapping, depends on whether Linux receives
@@ -288,7 +290,7 @@ if [ "$server" = mptcp-rs ]; then
       [ "${synack_rx:-0}" -ge 1 ] || { echo "FAIL no join (client)"; exit 1; }
     fi
   fi
-  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" --client "$client" --server "$server" | tee "$out/result.log"
+  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" --client "$client" --server "$server" "${csum_check[@]}" | tee "$out/result.log"
 elif [ -n "$bench" ] || [ "$client" = kernel ]; then
   # Both clients face the same checks: byte counts, and for A+B a completed MP_JOIN.
   if [ -n "$m2" ]; then
@@ -297,5 +299,5 @@ elif [ -n "$bench" ] || [ "$client" = kernel ]; then
   fi
   python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" logs-only | tee "$out/result.log"
 else
-  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" | tee "$out/result.log"
+  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" "${csum_check[@]}" | tee "$out/result.log"
 fi
