@@ -108,9 +108,9 @@ pub(crate) enum MpFail {
         retry_at: Instant,
         interval: Duration,
     },
-    /// We echoed the peer's MP_FAIL and fell back: the echo rides every segment while our
-    /// infinite mapping is due, and a pure ACK with it is forced at `retry_at` until then or
-    /// 120 s after `since` (G13).
+    /// We echoed the peer's MP_FAIL and fell back: the echo, carrying `recv.next` at each send,
+    /// rides every segment while our infinite mapping is due, and a pure ACK with it is forced
+    /// at `retry_at` until then or 120 s after `since` (G13).
     Echo {
         since: Instant,
         retry_at: Instant,
@@ -415,7 +415,7 @@ impl Connection {
         }
         self.hooks.mp_fail = MpFail::Idle;
         if let Some(sf) = sf {
-            sf.mp.hold.drain();
+            sf.mp.hold.clear();
         }
         if let Some(d) = self.hooks.data.as_mut() {
             d.recv
@@ -644,7 +644,7 @@ impl Connection {
         // or failed, can never complete, nor are they DATA_ACKed, so the peer sends them again
         // elsewhere (RFC 8684 L2392–2394). Kept, they would hold `free` down, for good on the
         // retained initial subflow, and escape the connection's bound (M4b spec G7).
-        if self.subflows[i].ended() && !self.subflows[i].mp.hold.drain().is_empty() {
+        if self.subflows[i].ended() && self.subflows[i].mp.hold.clear() {
             let held = self.subflows.iter().map(|s| s.mp.hold.held()).sum();
             d.recv.set_held(held);
         }
@@ -1286,6 +1286,7 @@ impl SubflowHooks<'_> {
 impl SubflowHooks<'_> {
     /// The DSN of the MP_FAIL this subflow's segments carry now (M4b spec G11, G13): ours on
     /// the subflow we wait on, or our echo, `recv.next`, while our infinite mapping is due.
+    /// `signal_clock` names this subflow: `prepare_send` sets it before the subflow sends.
     fn fail_due(&self) -> Option<u64> {
         let d = self.conn.data.as_ref()?;
         match self.conn.mp_fail {
@@ -1505,6 +1506,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                         Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
                             fastclose = Some(receiver_key)
                         }
+                        // Repeated signal options: the last MP_PRIO or MP_FAIL counts.
                         Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
                         Ok(MptcpOption::Fail { dsn }) => fail = Some(dsn),
                         Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
@@ -1981,7 +1983,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 Complete::Failed { dsn, .. } => {
                     self.sf.reset = true;
                     self.sf.reset_option = Some(fail_rst(dsn));
-                    self.sf.hold.drain();
+                    self.sf.hold.clear();
                     break;
                 }
             }
