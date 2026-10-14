@@ -63,10 +63,11 @@ fn two_subflows_corrupt_joined_subflow_each_direction() {
             let end = if dir == Dir::AtoB { s.src } else { s.dst };
             end.ip() == ip("10.0.2.1")
         };
-        let (first, done) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(false)));
+        // The corrupted mapping's DSN, once corrupted.
+        let (first, done) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
         let corrupted = done.clone();
         n.rewrite(dir, move |s| {
-            if !joined(s) || s.payload.is_empty() || done.get() {
+            if !joined(s) || s.payload.is_empty() || done.get().is_some() {
                 return true;
             }
             let dsn = mapping_dsn(s);
@@ -74,7 +75,7 @@ fn two_subflows_corrupt_joined_subflow_each_direction() {
                 first.set(dsn);
             } else if dsn != first.get() {
                 s.payload[0] ^= 0xff;
-                done.set(true);
+                done.set(dsn);
             }
             true
         });
@@ -83,7 +84,7 @@ fn two_subflows_corrupt_joined_subflow_each_direction() {
             App::new(true, None, 1 << 20, 1),
         ];
         run_apps_with_rst(&mut n, &mut apps, SECS);
-        assert!(corrupted.get(), "{dir:?}: a segment was corrupted");
+        let bad = corrupted.get().expect("a segment was corrupted");
         let back = if dir == Dir::AtoB {
             Dir::BtoA
         } else {
@@ -100,10 +101,7 @@ fn two_subflows_corrupt_joined_subflow_each_direction() {
         let on_joined = [rst.src, rst.dst].iter().any(|a| a.ip() == ip("10.0.2.1"));
         assert!(on_joined, "{dir:?}: on the joined subflow");
         let opts = mptcp_opts(rst);
-        assert!(
-            matches!(opts[0], MptcpOption::Fail { .. }),
-            "{dir:?}: {opts:?}"
-        );
+        assert_eq!(opts[0], MptcpOption::Fail { dsn: bad }, "{dir:?}");
         let tcprst = MptcpOption::TcpRst {
             transient: false,
             reason: 6,

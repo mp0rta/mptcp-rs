@@ -314,10 +314,11 @@ impl TxMaps {
 
     pub fn attach_fin(&mut self) {
         if let Some(m) = self.maps.back_mut() {
-            m.data_fin = true;
-            m.mapping.data_len += 1;
             // The Data-Level Length counts the DATA_FIN (RFC 8684 L1402–1430); `install` attaches
             // it right after `assign`, before the mapping is sent or acknowledged.
+            debug_assert!(m.ssn == m.mapping.ssn && m.len == usize::from(m.mapping.data_len));
+            m.data_fin = true;
+            m.mapping.data_len += 1;
             if m.mapping.checksum.is_some() {
                 m.mapping.checksum = Some(m.checksum());
             }
@@ -422,7 +423,8 @@ struct Piece {
 ///
 /// With checksums (M4b spec G7), completion credit may raise `right_edge` past the base edge,
 /// at most 65,535 octets plus the scale rounding, and `free` also counts the octets the hold
-/// buffers keep.
+/// buffers keep. On fallback, `replay` stores held octets past `right_edge`; the hold cap, not
+/// the bound above, limits them.
 pub(crate) struct RecvAssembler {
     pub next: u64,
     /// The offered edge, completion credit included.
@@ -857,6 +859,31 @@ mod credit_tests {
                 assert!(r.right_edge <= bound, "scale {scale}: {}", r.right_edge);
             }
             assert!(r.right_edge >= 65_535);
+        }
+    }
+
+    /// The base edge moves under the credit as the application reads; a mapping from just
+    /// below the credited edge (above the base edge) still gets no credit.
+    #[test]
+    fn credit_never_chains_as_the_base_edge_moves() {
+        for scale in [0u8, 3, 7] {
+            let mut r = RecvAssembler::new(0, 4096, 64);
+            r.credit(0, 65_535);
+            let mut out = [0; 1000];
+            for _ in 0..20 {
+                let start = r.right_edge - 1;
+                r.credit(start, start + 65_535);
+                let next = r.next;
+                assert_eq!(r.accept(next, &[0; 1000]), (Outcome::Stored, 1000));
+                assert_eq!(r.read(&mut out), 1000);
+                let field = r.window_offer(scale, 1460);
+                r.window_sent(field, scale);
+                // The base edge is at most `next + cap`, rounded up; credit and its rounding
+                // add at most 65,535 + 2^scale.
+                let bound = r.next + 4096 + 65_535 + (2 << scale);
+                assert!(r.right_edge <= bound, "scale {scale}: {}", r.right_edge);
+            }
+            assert!(r.base_edge.is_some_and(|b| b > 4096), "the base edge moved");
         }
     }
 

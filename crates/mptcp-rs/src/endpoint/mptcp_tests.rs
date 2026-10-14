@@ -3613,7 +3613,7 @@ fn app_limited_marked_before_write() {
             Instant::from_nanos(0),
             "10.0.0.1".parse().unwrap(),
             "10.0.0.2:80".parse().unwrap(),
-            checksums_cfg(false),
+            ConnectConfig::default(),
         )
         .unwrap();
     let bytes = transmit(&mut ep, Instant::from_nanos(0));
