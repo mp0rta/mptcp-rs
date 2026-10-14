@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -37,7 +37,8 @@ assert m, server
 assert (int(m[1]), int(m[2])) == (c2s, s2c), f"sender/receiver byte counts differ: client sent {c2s} server got {m[1]}, server sent {m[2]} client got {s2c}"
 for name, got, want in [("c2s", c2s, want_c2s), ("s2c", s2c, want_s2c)]:
     assert got > 0 if want == "any" else got == int(want), f"{name}: {got} bytes, expected {want}"
-if mode:
+# m2-hetero still reads its pcaps in logs-only mode (the kernel-to-kernel baseline).
+if mode and scenario != "m2-hetero":
     print(f"PASS {scenario} (logs only)")
     sys.exit(0)
 m2 = two_subflows(scenario)
@@ -102,6 +103,17 @@ def options(flt):
         for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
             pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:])))
     return pkts
+if scenario == "m2-hetero":
+    # Delivery over time: the receiver's DATA_ACK advances as the server's links see them.
+    rx, tx = (cips, {SRV}) if want_c2s == "0" else ({SRV}, cips)
+    adv = data_ack_advances([(float(r[0]), int(r[14]), r[15] == "1") for r in rows if r[1] in rx and r[14]], first_dsn(tx))
+    gap, series = delivery_summary(adv)
+    print(f"hetero: longest_dataack_gap_s={gap:.3f} mbps_per_s={series}")
+    # A stall: 2 s or more with no delivered data (mptcp_net-next#635).
+    assert gap < 2.0, f"delivery stalled {gap:.3f} s"
+if mode:
+    print(f"PASS {scenario} (logs only)")
+    sys.exit(0)
 rsts = [r for r in rows if r[7] == "1"]
 no_rst, srv_reset, cli_reset = "no RST", set(), set()
 csum_exempt = set()

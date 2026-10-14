@@ -177,3 +177,28 @@ def csum_checks(want, packets):
     bad = sum(o != want_octets for o in octets)
     assert not bad, f"{bad} of {len(octets)} mappings without {want_octets} checksum octets"
     return f"checksums {'on' if csum else 'off'}: A bits SYN={int(syn_a)} SYN/ACK={int(synack_a)} third ACK={int(csum)}, {len(octets)} mappings with {want_octets} checksum octets"
+
+
+def data_ack_advances(acks, base):
+    """The receiver's cumulative DATA_ACK advances [(time, offset)], from its (time, raw DATA_ACK,
+    64-bit) in time order. Offsets are from the sender's IDSN + 1 (`base`); a 32-bit DATA_ACK is
+    promoted to the offset nearest the current one."""
+    out, cur = [], 0
+    for t, v, ack64 in acks:
+        a = (v - base) % (1 << 64) if ack64 else cur + ((v - base - cur + (1 << 31)) % (1 << 32) - (1 << 31))
+        if a > cur:
+            out.append((t, a))
+            cur = a
+    return out
+
+
+def delivery_summary(advances):
+    """(longest gap in s between DATA_ACK advances, Mbit/s per one-second bin after the first)."""
+    if not advances:
+        return 0.0, []
+    t0 = advances[0][0]
+    bins = [0] * (int(advances[-1][0] - t0) + 1)
+    for (_, a0), (t1, a1) in zip(advances, advances[1:]):
+        bins[int(t1 - t0)] += a1 - a0
+    gap = max((t1 - t0 for (t0, _), (t1, _) in zip(advances, advances[1:])), default=0.0)
+    return gap, [round(b * 8 / 1e6, 1) for b in bins]

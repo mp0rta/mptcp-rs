@@ -4,10 +4,10 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
-SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "csum-fail1", "csum-fail2"]
+SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "m2-hetero", "csum-fail1", "csum-fail2"]
 
 
 class Endpoints(unittest.TestCase):
@@ -28,7 +28,7 @@ class Endpoints(unittest.TestCase):
             self.assertEqual(endpoints("base-a", "kernel", server), (srv, {"10.0.1.1"}, None))
             self.assertEqual(endpoints("base-b", "kernel", server), (srv, {"10.0.2.1"}, None))
             self.assertEqual(endpoints("csum-fail1", "kernel", server), (srv, {"10.0.1.1"}, None))
-            for s in ["m2-goodput", "m2-lossy", "m2-remove", "csum-fail2"]:
+            for s in ["m2-goodput", "m2-lossy", "m2-remove", "m2-hetero", "csum-fail2"]:
                 self.assertEqual(endpoints(s, "kernel", server), (srv, {"10.0.1.1", "10.0.2.1"}, "10.0.2.1"), s)
 
 
@@ -305,6 +305,31 @@ class Invert(unittest.TestCase):
         self.assertEqual(verify_chunk(1000, changed, 2, []), 1010, "the changed octet")
         self.assertEqual(verify_chunk(0, bytes([BUF[0] ^ 1]), 0, []), 0, "offset 0 is an error too")
         self.assertIsNone(verify_chunk(1000, self.DATA, 0, []))
+
+
+class Delivery(unittest.TestCase):
+    """m2-hetero: the receiver's cumulative DATA_ACK over time (offsets from the sender's IDSN + 1)."""
+    BASE = (1 << 64) - 1000  # the 64-bit offsets wrap
+
+    def test_advances_only(self):
+        acks = [(0.0, self.BASE, True), (1.0, (self.BASE + 500) % (1 << 64), True), (1.5, (self.BASE + 400) % (1 << 64), True),
+                (2.0, (self.BASE + 500) % (1 << 64), True), (3.0, (self.BASE + 2000) % (1 << 64), True)]
+        self.assertEqual(data_ack_advances(acks, self.BASE), [(1.0, 500), (3.0, 2000)])
+
+    def test_32_bit_acks_promoted(self):
+        base = (1 << 32) - 100
+        acks = [(1.0, base + 50, True), (2.0, (base + 300) % (1 << 32), False), (3.0, (base + 200) % (1 << 32), False),
+                (4.0, (base + 1000000) % (1 << 32), False)]
+        self.assertEqual(data_ack_advances(acks, base), [(1.0, 50), (2.0, 300), (4.0, 1000000)])
+
+    def test_summary(self):
+        # Longest gap between advances, and Mbit/s per one-second bin after the first advance.
+        gap, series = delivery_summary([(10.0, 125000), (10.5, 250000), (13.0, 500000), (13.2, 625000)])
+        self.assertAlmostEqual(gap, 2.5)
+        self.assertEqual(series, [1.0, 0.0, 0.0, 3.0])
+
+    def test_summary_no_advance(self):
+        self.assertEqual(delivery_summary([]), (0.0, []))
 
 
 if __name__ == "__main__":

@@ -8,9 +8,9 @@ if [ "${1:-}" != --inner ]; then
     m0:|m1:|syn-strip:|dataack-strip:|zero-server:|zero-client:|m2-mtu:) ;;
     base-a:c2s|base-a:s2c|base-b:c2s|base-b:s2c|base-unshaped:c2s|base-unshaped:s2c) ;;
     m2-goodput:c2s|m2-goodput:s2c|m2-blackhole-a:c2s|m2-blackhole-a:s2c|m2-blackhole-b:c2s|m2-blackhole-b:s2c|m2-lossy:c2s|m2-lossy:s2c) ;;
-    m2-unshaped:c2s|m2-unshaped:s2c|m2-remove:c2s|m2-remove:s2c) ;;
+    m2-unshaped:c2s|m2-unshaped:s2c|m2-remove:c2s|m2-remove:s2c|m2-hetero:c2s|m2-hetero:s2c) ;;
     csum-fail1:c2s|csum-fail1:s2c|csum-fail2:c2s|csum-fail2:s2c) ;;
-    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-lossy|m2-unshaped|m2-remove|m2-blackhole-a|m2-blackhole-b|csum-fail1|csum-fail2 c2s|s2c" >&2; exit 2;;
+    *) echo "usage: $0 m0|m1|syn-strip|dataack-strip|zero-server|zero-client|m2-mtu | $0 base-a|base-b|base-unshaped|m2-goodput|m2-lossy|m2-unshaped|m2-remove|m2-hetero|m2-blackhole-a|m2-blackhole-b|csum-fail1|csum-fail2 c2s|s2c" >&2; exit 2;;
   esac
   docker build -t mptcp-rs-m1-test:local tests/interop
   exec docker run --rm --init --network none --privileged -e MPTCP_RS_CC -e INTEROP_CLIENT -e INTEROP_SERVER -e INTEROP_BENCH -e INTEROP_CSUM -v "$PWD":/w -w /w mptcp-rs-m1-test:local bash tests/interop/run.sh --inner "$1" "${2:-}"
@@ -21,13 +21,13 @@ scenario=$2; dir=${3:-}; cc=${MPTCP_RS_CC:-cubic}
 client=${INTEROP_CLIENT:-mptcp-rs}; bench=${INTEROP_BENCH:-}
 case "$client:$scenario" in
   mptcp-rs:m2-remove) echo "INTEROP_CLIENT=$client: unsupported for $scenario" >&2; exit 2;;
-  mptcp-rs:*|kernel:base-a|kernel:base-b|kernel:m2-goodput|kernel:m2-lossy|kernel:m2-unshaped|kernel:m2-remove|kernel:csum-fail1|kernel:csum-fail2) ;;
+  mptcp-rs:*|kernel:base-a|kernel:base-b|kernel:m2-goodput|kernel:m2-lossy|kernel:m2-unshaped|kernel:m2-remove|kernel:m2-hetero|kernel:csum-fail1|kernel:csum-fail2) ;;
   *) echo "INTEROP_CLIENT=$client: unsupported for $scenario" >&2; exit 2;;
 esac
 # INTEROP_SERVER=mptcp-rs: mptcp-rs-tun --listen on a TUN in srv as 10.0.7.2, instead of server.py.
 server=${INTEROP_SERVER:-kernel}
 case "$server:$scenario" in
-  kernel:*|mptcp-rs:base-a|mptcp-rs:m1|mptcp-rs:m2-goodput|mptcp-rs:m2-lossy|mptcp-rs:m2-remove|mptcp-rs:csum-fail1|mptcp-rs:csum-fail2) ;;
+  kernel:*|mptcp-rs:base-a|mptcp-rs:m1|mptcp-rs:m2-goodput|mptcp-rs:m2-lossy|mptcp-rs:m2-remove|mptcp-rs:m2-hetero|mptcp-rs:csum-fail1|mptcp-rs:csum-fail2) ;;
   *) echo "INTEROP_SERVER=$server: unsupported for $scenario" >&2; exit 2;;
 esac
 # csum-fail*: one end mptcp-rs, the other Linux, whose counters run.sh checks.
@@ -76,6 +76,16 @@ case "$scenario" in base-a|base-b|m2-goodput|m2-lossy|m2-remove|m2-blackhole-*|c
     [ -z "$bench" ] || { ip netns exec "$1" ethtool -K "$2" tso off gso off gro off; ip -n "$1" link set "$2" gso_max_segs 1; }
   done;;
 esac
+# m2-hetero (mptcp_net-next#635): legs so unlike that the receiver holds heavy out-of-order data.
+# A 100 Mbit x 10 ms RTT (BDP 125000 B = 83 pkts -> limit 170); B 10 Mbit x 300 ms RTT with 10 ms
+# jitter, 0.5 % loss and 1 % of packets reordered ahead (BDP 375000 B = 250 pkts -> 500). Data
+# mapped on B lands >= 145 ms after data sent with it on A, while A delivers ~1.8 MB of later
+# DSNs, and B keeps up to ~250 segments in flight interleaved with A's: many disjoint
+# out-of-order ranges (more than RecvAssembler's 64) and B's losses hold the left edge for RTOs.
+[ "$scenario" != m2-hetero ] || for x in "cli a0 5ms rate 100mbit limit 170" "srv a1 5ms rate 100mbit limit 170" \
+    "cli b0 150ms 10ms rate 10mbit limit 500 loss 0.5% reorder 1%" "srv b1 150ms 10ms rate 10mbit limit 500 loss 0.5% reorder 1%"; do
+  set -- $x; ip netns exec "$1" tc qdisc add dev "$2" root netem delay "${@:3}"
+done
 echo "$client" >"$out/client.txt"; echo "$server" >"$out/server.txt"; echo "$csum" >"$out/csum.txt"
 # Two subflows: the initial one on path A and one join on path B.
 m2=; [[ "$scenario" != m2-* && "$scenario" != csum-fail2 ]] || m2=1
@@ -184,11 +194,12 @@ fi
 trap 'kill ${tdpid:-} ${tdcli:-} ${tdb:-} ${tdtun:-} ${tdstun:-} ${bhpid:-} ${cpupid:-} ${rmpid:-} 2>/dev/null || true' EXIT
 # Fixed cases: N bytes each way. Timed cases: 30 s in $dir, the other direction idle.
 # Blackhole cases: 1 GiB in $dir, the other direction idle (outlasts the 15 s blackhole).
+# m2-hetero: 1 GiB too, a bulk transfer of ~80 s at the 110 Mbit/s aggregate.
 sargs=(--bytes "$N"); cargs=(--send "$N" --expect "$N"); want_c2s=$N; want_s2c=$N
 B=1073741824
 case "$scenario:$dir" in
-  m2-blackhole-*:c2s) sargs=(--expect "$B" --send-bytes 0); cargs=(--send "$B" --expect 0); want_c2s=$B; want_s2c=0;;
-  m2-blackhole-*:s2c) sargs=(--expect 0 --send-bytes "$B"); cargs=(--send 0 --expect "$B"); want_c2s=0; want_s2c=$B;;
+  m2-blackhole-*:c2s|m2-hetero:c2s) sargs=(--expect "$B" --send-bytes 0); cargs=(--send "$B" --expect 0); want_c2s=$B; want_s2c=0;;
+  m2-blackhole-*:s2c|m2-hetero:s2c) sargs=(--expect 0 --send-bytes "$B"); cargs=(--send 0 --expect "$B"); want_c2s=0; want_s2c=$B;;
   *:c2s) sargs=(--expect any --send-bytes 0); cargs=(--send-secs 30 --expect 0); want_c2s=any; want_s2c=0;;
   *:s2c) sargs=(--expect 0 --send-secs 30); cargs=(--send 0 --expect any); want_c2s=0; want_s2c=any;;
 esac
@@ -198,9 +209,11 @@ sinv=(); cinv=()
 [ "$scenario" != csum-fail1 ] || if [ "$dir" = c2s ]; then sinv=(--invert 1); else cinv=(--invert 1); fi
 if [ "$server" = mptcp-rs ]; then
   # server.py's counts in mptcp-rs-tun's flags (no blackhole case here).
-  case "$dir" in
-    c2s) targs=(--send 0 --expect any);;
-    s2c) targs=(--send-secs 30 --expect 0);;
+  case "$scenario:$dir" in
+    m2-hetero:c2s) targs=(--send 0 --expect "$B");;
+    m2-hetero:s2c) targs=(--send "$B" --expect 0);;
+    *:c2s) targs=(--send 0 --expect any);;
+    *:s2c) targs=(--send-secs 30 --expect 0);;
     *) targs=(--send "$N" --expect "$N");;
   esac
   ip netns exec srv timeout 910 target/release/mptcp-rs-tun --mode "$mode" --tun mtun0 --listen "$srvip:5201" "${targs[@]}" --pause-read-ms "$server_pause" --cc "$cc" --checksums "$csum_ours" "${verify[@]}" "${sinv[@]}" >"$out/server.log" 2>&1 &
