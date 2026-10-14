@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Linux kernel MPTCP client for the kernel comparison bench, printing mptcp-rs-tun's lines.
-c2s (--send-secs S --expect 0): send the pattern for S seconds, shut down writes, read to EOF.
+c2s (--send-secs S --expect 0): send the pattern for S seconds, shut down writes, read to EOF;
+--send N (N > 0): send N octets of it instead.
 s2c (--send 0 --expect any): read to the server's EOF, then close. An early SHUT_WR would take
 the MPTCP socket out of ESTABLISHED, and Linux then never adds the leg-B subflow.
 The kernel path manager adds subflows (run.sh configures the endpoints).
@@ -13,13 +14,13 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--local", required=True)
 ap.add_argument("--remote", required=True, help="IP:PORT")
 ap.add_argument("--send-secs", type=float)
-ap.add_argument("--send", type=int, choices=[0])
+ap.add_argument("--send", type=int, help="octets")
 ap.add_argument("--expect", required=True, help="0 or 'any'")
 ap.add_argument("--verify", choices=["on", "off"], default="on")
 ap.add_argument("--invert", type=int, default=0, metavar="N")
 a = ap.parse_args()
 if (a.send_secs is None) == (a.send is None):
-    ap.error("give one of --send-secs or --send 0")
+    ap.error("give one of --send-secs or --send")
 
 CHUNK = len(BUF) - 251
 
@@ -29,11 +30,12 @@ s.bind((a.local, 0))
 s.connect((host, int(port)))
 
 sent = 0
-if a.send_secs:
-    deadline = time.monotonic() + a.send_secs
-    while time.monotonic() < deadline:
-        s.sendall(BUF[sent % 251 : sent % 251 + CHUNK])
-        sent += CHUNK
+if a.send_secs or a.send:
+    deadline = time.monotonic() + (a.send_secs or float("inf"))
+    while time.monotonic() < deadline and sent != a.send:
+        n = CHUNK if a.send_secs else min(CHUNK, a.send - sent)
+        s.sendall(BUF[sent % 251 : sent % 251 + n])
+        sent += n
     s.shutdown(socket.SHUT_WR)
 
 got = 0

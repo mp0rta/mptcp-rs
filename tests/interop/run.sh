@@ -312,7 +312,7 @@ elif [ -n "$bench" ] || [ "$client" = kernel ]; then
     joins_rx=$(ip netns exec srv nstat -asz MPTcpExtMPJoinAckRx | awk '$1 == "MPTcpExtMPJoinAckRx" {print $2}')
     [ "${joins_rx:-0}" -ge 1 ] || { echo "FAIL no join"; exit 1; }
   fi
-  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" logs-only | tee "$out/result.log"
+  python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" logs-only --client "$client" --server "$server" | tee "$out/result.log"
 else
   python3 tests/interop/check.py "$scenario" "$out" "$want_c2s" "$want_s2c" "${csum_check[@]}" | tee "$out/result.log"
 fi
