@@ -277,6 +277,12 @@ fn active_maps(subflows: &[Subflow]) -> impl Iterator<Item = &TxMaps> + Clone {
         .map(|s| &s.mp.tx)
 }
 
+/// The DSN of `ssn` under a received infinite mapping's translation `(anchor SSN, anchor
+/// DSN)`. The offset is signed: the anchor may lie ahead of `ssn`.
+fn infinite_dsn((anchor_ssn, anchor_dsn): (u32, u64), ssn: u32) -> u64 {
+    anchor_dsn.wrapping_add_signed(ssn.wrapping_sub(anchor_ssn) as i32 as i64)
+}
+
 /// The later of two DSNs (`end` if there is no `old`).
 pub(crate) fn later(old: Option<u64>, end: u64) -> Option<u64> {
     Some(
@@ -1866,9 +1872,8 @@ impl SegmentHooks for SubflowHooks<'_> {
     }
     fn receipt_advanced(&mut self, ssn: u32) {
         if self.conn.data.is_some() {
-            if let Some((base, dsn)) = &mut self.sf.rx_infinite {
-                *dsn = dsn.wrapping_add_signed(ssn.wrapping_sub(*base) as i32 as i64);
-                *base = ssn;
+            if let Some(anchor) = &mut self.sf.rx_infinite {
+                *anchor = (ssn, infinite_dsn(*anchor, ssn));
             }
             self.sf.rx.ack(ssn);
             // Complete mappings were taken in `receive_data`, before the receipt advanced. Only
@@ -1895,12 +1900,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         while at < bytes.len() {
             let pos = ssn.wrapping_add(at as u32);
             let translated = if d.fallback {
-                self.sf.rx_infinite.map(|(ssn, dsn)| {
-                    (
-                        dsn.wrapping_add_signed(pos.wrapping_sub(ssn) as i32 as i64),
-                        bytes.len() - at,
-                    )
-                })
+                (self.sf.rx_infinite).map(|a| (infinite_dsn(a, pos), bytes.len() - at))
             } else {
                 self.sf.rx.translate(pos)
             };
@@ -2051,14 +2051,12 @@ impl DataState {
         // the handshake's constant DSN−SSN offset.
         let next = self.recv.next;
         let peer_idsn = m.peer_idsn.unwrap();
-        let (ssn_r, dsn_r) =
-            *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
+        let anchor = *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
         // Held octets go on as plain TCP through the new translation (spec G15). What free
         // memory cannot take is carried by `RecvAssembler`'s promised data above it, past the
         // range cap and the offered edge if need be (`replay`), and delivered as reads make room.
         for (ssn, run) in sf.hold.drain() {
-            let dsn = dsn_r.wrapping_add_signed(ssn.wrapping_sub(ssn_r) as i32 as i64);
-            self.recv.replay(dsn, &run);
+            self.recv.replay(infinite_dsn(anchor, ssn), &run);
         }
         let una = self.send.una;
         let (ssn, dsn) = if joined_ever {
