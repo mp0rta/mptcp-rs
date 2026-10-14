@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, failed_mapping, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -98,7 +98,6 @@ def options(flt):
         for f in names:
             cmd += ["-e", f]
         for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
-            flag = lambda x: x in ("1", "True")
             pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:])))
     return pkts
 rsts = [r for r in rows if r[7] == "1"]
@@ -110,19 +109,18 @@ if scenario.startswith("csum-fail"):
     pkts = options("tcp.flags.reset == 1 || tcp.options.mptcp.subtype == 6 || tcp.options.mptcp.datalvllen == 0")
     csum_exempt = csum_fail_checks(scenario, pkts, SRV, JOIN)
     if csum_exempt:
-        n = sum(flow(r) in csum_exempt for r in rsts) - 1
+        # The answers: csum_fail_checks's bare RSTs after the reset.
+        n = sum(p.rst and not p.opts and p.flow in csum_exempt for p in pkts)
         no_rst = f"no RST except the MP_FAIL + MP_TCPRST 6 reset on {[sorted(f) for f in csum_exempt]} and its {n} answers to segments in flight"
     rsts = [r for r in rsts if flow(r) not in csum_exempt]
     inverted = [int(x) for x in re.findall(r"^inverted at (\d+)$", client + server, re.M)]
     if scenario == "csum-fail1":
-        # The receiver's MP_FAIL names the failed mapping by its first DSN (RFC 8684 L2372-2375).
-        fail = next(o["dsn"] for p in sorted(pkts, key=lambda p: p.t) if p.src in receiver for o in p.opts if o["subtype"] == 6)
-        dlls = [o["dll"] for p in options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}") if p.src in sender
-                for o in p.opts if o["subtype"] == 2 and "dsn" in o and o["dsn"] == fail % (1 << (64 if o["dsn8"] else 32))]
-        assert dlls, f"no DSS from {sender} maps DSN {fail}"
-        start = (fail - first_dsn(sender)) % (1 << 64)
-        check_inversion(inverted, start, max(dlls))
-        print(f"inverted octet at stream offset {inverted[0]}, in the failed mapping [{start}, {start + max(dlls)})")
+        # The receiver's MP_FAIL names the failed mapping by its first DSN.
+        fail = mp_fail_dsn(pkts, receiver)
+        maps = options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}")
+        start, dll = failed_mapping(fail, maps, sender, first_dsn(sender))
+        check_inversion(inverted, start, dll)
+        print(f"inverted octet at stream offset {inverted[0]}, in the failed mapping [{start}, {start + dll})")
     else:
         assert not inverted, f"inverted octets at {inverted}"
 # m2-remove: the deleted kernel endpoint's subflow may end with a RST and no FIN.

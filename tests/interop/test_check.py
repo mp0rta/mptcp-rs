@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, failed_mapping, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
 SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "csum-fail1", "csum-fail2"]
@@ -124,6 +124,45 @@ class Inversion(unittest.TestCase):
         for offs in [[], [1000, 1001]]:
             with self.assertRaises(AssertionError, msg=offs):
                 check_inversion(offs, 1000, 1400)
+
+
+class FailedMapping(unittest.TestCase):
+    """csum-fail1: the receiver's first MP_FAIL DSN, and the sender's mapping it names as stream
+    offsets from the sender's IDSN + 1."""
+    CLI = {"10.0.9.2"}
+    FIRST = (1 << 64) - 100  # the sender's IDSN + 1, near the wrap
+
+    def test_first_mp_fail_from_the_receiver(self):
+        pkts = [pkt(3, SRV, LEG_A, [{"subtype": 6, "dsn": 7}]), pkt(1, "10.0.9.2", LEG_A, [{"subtype": 6, "dsn": 5}]),
+                pkt(2, SRV, LEG_A, [DSS, {"subtype": 6, "dsn": 6}])]
+        self.assertEqual(mp_fail_dsn(pkts, {SRV}), 6)
+        self.assertEqual(mp_fail_dsn(pkts, self.CLI), 5)
+        with self.assertRaises(AssertionError):
+            mp_fail_dsn(pkts[:1], self.CLI)
+
+    def test_64_bit_dsn_and_offset_across_the_wrap(self):
+        fail = (self.FIRST + 5000) % (1 << 64)
+        maps = [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1400}]),
+                # Linux re-declares its last mapping with DLL + 1 (DATA_FIN): the larger one counts.
+                pkt(2, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1401}]),
+                pkt(3, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail + 1, "dll": 9999}]),
+                pkt(4, SRV, LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 9999}])]
+        self.assertEqual(failed_mapping(fail, maps, self.CLI, self.FIRST), (5000, 1401))
+
+    def test_32_bit_dss_matches_the_low_bits(self):
+        fail = (5 << 32) + 1234
+        maps = [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": False, "dsn": 1234, "dll": 1400}]),
+                # A 64-bit DSN must match in full.
+                pkt(2, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": 1234, "dll": 9999}])]
+        self.assertEqual(failed_mapping(fail, maps, self.CLI, 1000), ((5 << 32) + 234, 1400))
+
+    def test_no_mapping_rejected(self):
+        fail = (5 << 32) + 1234
+        for maps in [[], [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": 1234, "dll": 1400}])],
+                     [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": False}, {"subtype": 6, "dsn": fail}])],
+                     [pkt(1, SRV, LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1400}])]]:
+            with self.assertRaises(AssertionError, msg=maps):
+                failed_mapping(fail, maps, self.CLI, 1000)
 
 
 class Invert(unittest.TestCase):

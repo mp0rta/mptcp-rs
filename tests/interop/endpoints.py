@@ -27,13 +27,17 @@ def removed_flow_exempt(scenario, client, flow):
     return scenario == "m2-remove" and client == "kernel" and any(ip == "10.0.2.1" for ip, _ in flow)
 
 
+def flag(v):
+    """A tshark boolean field: "1"/"True" (its spelling varies by field)."""
+    return v in ("1", "True")
+
+
 def mptcp_options(subtypes, m_flags, dsn8_flags, dsns, dlls, reasons):
     """One packet's MPTCP options in option order, from tshark's comma-separated per-option
     values (occurrence=a). DSS (with a mapping) and MP_FAIL both decode to rawdataseqno, so it is
     consumed in option order. Only for packets without an MP_CAPABLE carrying data, whose
     Data-Level Length would shift `dlls`."""
     split = lambda v: [x for x in v.split(",") if x]
-    flag = lambda v: v in ("1", "True")
     m, d8, dsn, dll, why = map(iter, map(split, (m_flags, dsn8_flags, dsns, dlls, reasons)))
     out = []
     for st in map(int, split(subtypes)):
@@ -88,3 +92,21 @@ def check_inversion(offsets, start, dll):
     mapping that the receiver's MP_FAIL names: [start, start + dll) in stream offsets."""
     assert len(offsets) == 1, f"inverted octets at {offsets}, want exactly one"
     assert start <= offsets[0] < start + dll, f"inverted octet at {offsets[0]}, outside the failed mapping [{start}, {start + dll})"
+
+
+def mp_fail_dsn(packets, receiver):
+    """csum-fail1: the DSN of the first MP_FAIL from `receiver` (a set of IPs)."""
+    fails = [o["dsn"] for p in sorted(packets, key=lambda p: p.t) if p.src in receiver for o in p.opts if o["subtype"] == 6]
+    assert fails, f"no MP_FAIL from {receiver}"
+    return fails[0]
+
+
+def failed_mapping(fail, packets, sender, first):
+    """csum-fail1: the mapping that an MP_FAIL names by its first DSN `fail` (RFC 8684
+    L2372-2375), as (start, Data-Level Length) in stream offsets from `first`, the sender's IDSN
+    + 1. A DSS from `sender` with a 32-bit DSN matches on the low 32 bits. The largest length
+    wins: Linux re-declares its last mapping with the DATA_FIN added."""
+    dlls = [o["dll"] for p in packets if p.src in sender for o in p.opts
+            if o["subtype"] == 2 and "dsn" in o and o["dsn"] == fail % (1 << (64 if o["dsn8"] else 32))]
+    assert dlls, f"no DSS from {sender} maps DSN {fail}"
+    return (fail - first) % (1 << 64), max(dlls)
