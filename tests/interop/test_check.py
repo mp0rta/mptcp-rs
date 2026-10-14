@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
 SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "csum-fail1", "csum-fail2"]
@@ -231,6 +231,37 @@ class Csum(unittest.TestCase):
         for drop in [lambda p: p[:2] == SYN, lambda p: p[:2] == SYNACK, lambda p: p[2] and p[:2] == ACK, lambda p: p[3]]:
             with self.assertRaises(AssertionError):
                 csum_checks(want, [p for p in wire if not drop(p)])
+
+
+class InfiniteMapping(unittest.TestCase):
+    """dataack-strip: the client's one infinite mapping, as (from the client, payload length,
+    MPTCP subtype, DLL, DSN) in time order."""
+    MPC = (True, 1432, "0", "1432", "")
+    ACK = (False, 0, "", "", "")
+    INF = lambda n: (True, n, "2", "0", "77")
+    PLAIN = (True, 1460, "", "", "")
+
+    def test_once_on_an_ack_only_segment(self):
+        # Through 0.2.0: one ACK-only copy, then plain TCP.
+        infinite_mapping_checks([self.MPC, self.ACK, InfiniteMapping.INF(0), self.PLAIN, self.ACK, self.PLAIN])
+
+    def test_riding_data_until_acknowledged(self):
+        # Since e0d2c5b the copy also rides the data in flight until its first new octet is
+        # TCP-ACKed (the failing run 20261014T213926-RiuFja: one ACK-only copy, two on data).
+        inf = InfiniteMapping.INF
+        infinite_mapping_checks([self.MPC, self.ACK, inf(0), inf(1440), self.ACK, inf(1440), self.ACK, self.PLAIN])
+
+    def test_rules(self):
+        inf = InfiniteMapping.INF
+        for bad, why in [([self.MPC, self.PLAIN], "no infinite mapping"),
+                         ([inf(0), (True, 1440, "2", "0", "78"), self.PLAIN], "two infinite mappings"),
+                         ([inf(0), (False, 0, "2", "0", "77"), self.PLAIN], "from the server"),
+                         ([inf(1440), self.PLAIN], "no ACK-only copy"),
+                         ([inf(0), inf(0), self.PLAIN], "two ACK-only copies"),
+                         ([inf(0), inf(1440)], "never retired"),
+                         ([inf(0), self.PLAIN, inf(1440), self.PLAIN], "resumed after plain data")]:
+            with self.assertRaises(AssertionError, msg=why):
+                infinite_mapping_checks(bad)
 
 
 class Invert(unittest.TestCase):

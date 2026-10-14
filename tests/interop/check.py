@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -201,7 +201,7 @@ else:
         print(csum_checks(csum_want(args.csum, args.client, args.server), packets))
     if scenario == "dataack-strip":
         assert client.count("event: FellBack") == 1, "fallback event count"
-        assert sum(r[11] == "0" and r[9] == "2" for r in rows) == 1, "infinite mapping count"
+        infinite_mapping_checks([(r[1] in cips, int(r[4] or 0), r[9], r[11], r[13]) for r in rows])
         rules = (out / "server-rules.txt").read_text()
         assert re.search(r"\[[1-9][0-9]*:[0-9]+\].*TCPOPTSTRIP", rules), "strip rule unused"
     elif scenario == "csum-fail1":

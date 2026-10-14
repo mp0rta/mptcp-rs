@@ -94,6 +94,22 @@ def check_inversion(offsets, start, dll):
     assert start <= offsets[0] < start + dll, f"inverted octet at {offsets[0]}, outside the failed mapping [{start}, {start + dll})"
 
 
+def infinite_mapping_checks(segs):
+    """dataack-strip: one fallback, so one infinite mapping, from the client, over every
+    captured segment in time order as (from the client, payload length, first MPTCP subtype,
+    DLL, DSN), tshark strings. The mapping goes out once on an ACK-only segment and rides every
+    data segment until its first new octet is TCP-ACKed (M4b spec, MP_FAIL state machine;
+    since e0d2c5b), so copies are counted per mapping, not per segment. Retired for good: some
+    later client data goes out as plain TCP, and no copy follows it."""
+    inf = [i for i, s in enumerate(segs) if s[2:4] == ("2", "0")]
+    assert inf, "no infinite mapping"
+    assert all(segs[i][0] for i in inf), "infinite mapping from the server"
+    assert len({segs[i][4] for i in inf}) == 1, f"more than one infinite mapping: DSNs {sorted({segs[i][4] for i in inf})}"
+    assert sum(segs[i][1] == 0 for i in inf) == 1, "infinite mapping not on exactly one ACK-only segment"
+    plain = [i for i, s in enumerate(segs) if s[0] and s[1] > 0 and not s[2] and i > inf[0]]
+    assert plain and plain[0] > inf[-1], "infinite mapping not retired: no plain client data after its last copy"
+
+
 def mp_fail_dsn(packets, receiver):
     """csum-fail1: the DSN of the first MP_FAIL from `receiver` (a set of IPs)."""
     fails = [o["dsn"] for p in sorted(packets, key=lambda p: p.t) if p.src in receiver for o in p.opts if o["subtype"] == 6]
