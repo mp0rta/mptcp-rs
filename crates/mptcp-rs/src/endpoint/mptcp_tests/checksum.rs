@@ -373,8 +373,9 @@ fn tx_mapping_checksum_verifies() {
     assert_eq!(p.c.connection(p.h).unwrap().write(&data), Ok(3000));
     p.pump();
     assert_eq!(p.server_read(), data);
-    // Each mapping, its octets, and how many segments carried it.
-    let mut maps: Vec<(Mapping, Vec<Option<u8>>, usize)> = Vec::new();
+    // Each mapping, its octets, and the distinct sequence numbers that carried it (a
+    // retransmission is not a second segment).
+    let mut maps: Vec<(Mapping, Vec<Option<u8>>, Vec<u32>)> = Vec::new();
     for seg in p.client_sent.iter().filter(|s| !s.payload.is_empty()) {
         let Some((m, fin)) = seg_mapping(seg) else {
             continue;
@@ -383,7 +384,7 @@ fn tx_mapping_checksum_verifies() {
             Some(i) => i,
             None => {
                 let len = usize::from(m.data_len) - usize::from(fin);
-                maps.push((m, vec![None; len], 0));
+                maps.push((m, vec![None; len], Vec::new()));
                 maps.len() - 1
             }
         };
@@ -393,11 +394,13 @@ fn tx_mapping_checksum_verifies() {
             .iter_mut()
             .zip(seg.payload)
             .for_each(|(b, v)| *b = Some(*v));
-        *segs += 1;
+        if !segs.contains(&seg.seq.0) {
+            segs.push(seg.seq.0);
+        }
     }
     assert!(!maps.is_empty());
     assert!(
-        maps.iter().any(|(.., segs)| *segs > 1),
+        maps.iter().any(|(.., segs)| segs.len() > 1),
         "a mapping spans segments"
     );
     for (m, bytes, _) in &maps {
@@ -624,16 +627,19 @@ fn server_csum_from_config() {
     assert_eq!(mptcp_of(&synack), [want]);
 }
 
-/// A confirming option whose A differs from the decision, or MP_CAPABLE-with-data of length 22
-/// when `csum` or 24 when not, is invalid: the G2b fallback of M4a.
+/// A confirming option whose A differs from the decision (each form, the length right or
+/// wrong), or MP_CAPABLE-with-data of length 22 when `csum` or 24 when not, is invalid: the G2b
+/// fallback of M4a.
 #[test]
 fn server_third_ack_a_mismatch_falls_back() {
     for (checksums, peer_a) in BOTH {
         let csum = checksums || peer_a;
         let wrong = CAP_H | a(!csum);
-        let cases: [(Vec<u8>, &[u8]); 3] = [
+        let cases: [(Vec<u8>, &[u8]); 4] = [
             (ack_cap(wrong, None), b""),
             (ack_cap(wrong, Some(5)), b"hello"),
+            // With `csum`, only A is wrong: the length 24 matches.
+            (cap_csum(wrong, b"hello"), b"hello"),
             if csum {
                 (ack_cap(CAP_H | CAP_A, Some(5)), b"hello")
             } else {
