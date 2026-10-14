@@ -170,6 +170,17 @@ if [ "$server" = mptcp-rs ]; then
   ip netns exec srv tcpdump -Z root -i mtun0 -U -s 160 -w "$out/server-tun.pcap" >"$out/server-tun-capture.log" 2>&1 &
   tdstun=$!
 fi
+if [ "$client" = mptcp-rs ]; then
+  # The client's TUN, addressed and captured before the client starts: its first SYN must not
+  # leave a TUN that has no addresses yet (it was lost, and m2-lossy could then fall back).
+  ip netns exec cli ip tuntap add dev mtun0 mode tun
+  ip -n cli addr add 10.0.9.1/24 dev mtun0; ip -n cli addr add 10.0.8.1/24 dev mtun0
+  ip -n cli link set mtun0 up
+  if [ -n "$cap" ] && [ -z "$bench" ]; then
+    ip netns exec cli tcpdump -Z root -i mtun0 -U -s 160 -w "$out/tun.pcap" >"$out/tun-capture.log" 2>&1 &
+    tdtun=$!
+  fi
+fi
 trap 'kill ${tdpid:-} ${tdcli:-} ${tdb:-} ${tdtun:-} ${tdstun:-} ${bhpid:-} ${cpupid:-} ${rmpid:-} 2>/dev/null || true' EXIT
 # Fixed cases: N bytes each way. Timed cases: 30 s in $dir, the other direction idle.
 # Blackhole cases: 1 GiB in $dir, the other direction idle (outlasts the 15 s blackhole).
@@ -224,16 +235,6 @@ case "$scenario" in
   m2-blackhole-a) bash tests/interop/blackhole.sh "$out/client.log" a0 >"$out/blackhole.log" 2>&1 & bhpid=$!;;
   m2-blackhole-b) bash tests/interop/blackhole.sh "$out/client.log" b0 >"$out/blackhole.log" 2>&1 & bhpid=$!;;
 esac
-if [ "$client" = mptcp-rs ]; then
-  for _ in $(seq 50); do ip -n cli link show mtun0 >/dev/null 2>&1 && break; sleep 0.1; done
-  ip -n cli link set mtun0 up
-  if [ -n "$cap" ] && [ -z "$bench" ]; then
-    ip netns exec cli tcpdump -Z root -i mtun0 -U -s 160 -w "$out/tun.pcap" >"$out/tun-capture.log" 2>&1 &
-    tdtun=$!
-  fi
-  sleep 1
-  ip -n cli addr add 10.0.9.1/24 dev mtun0; ip -n cli addr add 10.0.8.1/24 dev mtun0
-fi
 cli_rc=0; wait "$clipid" || cli_rc=$?
 srv_rc=0; wait "$srvpid" || srv_rc=$?
 bh_rc=0; [ -z "$bhpid" ] || wait "$bhpid" || bh_rc=$?
