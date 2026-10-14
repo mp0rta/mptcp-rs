@@ -262,8 +262,9 @@ pub fn dss_checksum_ok(dsn: u64, ssn: u32, data_len: u16, data: &[&[u8]], receiv
     super::packet::valid_checksum(dss_checksum(dsn, ssn, data_len, data), received)
 }
 
-/// `opt` is a signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_FAIL, MP_TCPRST), well-formed or
-/// not: a malformed one is ignored like an unknown option, so the segment's DSS still counts.
+/// `opt` is a signal-only option (ADD_ADDR, REMOVE_ADDR, MP_PRIO, MP_FAIL, MP_TCPRST),
+/// well-formed or not: a malformed one is ignored like an unknown option, so the segment's DSS
+/// still counts.
 pub(crate) fn is_signal(opt: &[u8]) -> bool {
     opt.get(2).is_some_and(|b| {
         matches!(
@@ -1082,21 +1083,21 @@ mod tests {
     #[test]
     fn dss_checksum_split_equals_whole() {
         let all = [0xffu8, 0x80, 0x01, 0xfe, 0x7f, 0xaa, 0x55];
-        for n in 0..=7 {
-            let d = &all[..n];
-            let want = naive(0xdead_beef_0000_0001, 0x1234_5678, n as u16, d);
-            assert_eq!(
-                dss_checksum(0xdead_beef_0000_0001, 0x1234_5678, n as u16, &[d]),
-                want
-            );
-            for k in 0..=n {
-                let c = dss_checksum(
-                    0xdead_beef_0000_0001,
-                    0x1234_5678,
-                    n as u16,
-                    &[&d[..k], &d[k..]],
-                );
-                assert_eq!(c, want, "n={n} k={k}");
+        // All-ones and zero pseudo-headers too, so the end-around carry is exercised.
+        for (dsn, ssn) in [
+            (0xdead_beef_0000_0001, 0x1234_5678),
+            (u64::MAX, u32::MAX),
+            (0, 0),
+            (0x0123_4567_89ab_cdef, 0xfedc_ba98),
+        ] {
+            for n in 0..=7 {
+                let d = &all[..n];
+                let want = naive(dsn, ssn, n as u16, d);
+                assert_eq!(dss_checksum(dsn, ssn, n as u16, &[d]), want);
+                for k in 0..=n {
+                    let c = dss_checksum(dsn, ssn, n as u16, &[&d[..k], &d[k..]]);
+                    assert_eq!(c, want, "dsn={dsn:#x} n={n} k={k}");
+                }
             }
         }
     }
