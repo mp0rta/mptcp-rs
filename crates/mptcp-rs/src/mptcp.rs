@@ -1604,19 +1604,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 RecvAssembler::new(m.peer_idsn.unwrap().wrapping_add(1), self.conn.recv_cap, 64);
             // The edge our SYN or SYN/ACK advertised, unscaled.
             recv.right_edge = recv.next.wrapping_add(self.conn.recv_cap.min(65535) as u64);
-            self.conn.data = Some(DataState {
-                recv,
-                send,
-                close: close::Close::default(),
-                sanity_failures: 0,
-                recovery_head: None,
-                recovery_at: None,
-                recovery_interval: Duration::from_secs(1),
-                reinject: ReinjectQueue::new(m.local_idsn.wrapping_add(1)),
-                fallback: false,
-                settling: false,
-                dropped_end: None,
-            });
+            self.conn.data = Some(DataState::new(recv, send));
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
             // Our ISS: the SYN/ACK's ACK (initiator) or the final ACK's (listener) is ISS + 1.
             self.sf.local_isn = seg.ack.wrapping_add(u32::MAX);
@@ -2013,6 +2001,22 @@ impl SegmentHooks for SubflowHooks<'_> {
 }
 
 impl DataState {
+    /// The state at MP_CAPABLE completion: nothing sent or reinjected yet.
+    fn new(recv: RecvAssembler, send: SendStore) -> Self {
+        Self {
+            reinject: ReinjectQueue::new(send.una),
+            recv,
+            send,
+            close: close::Close::default(),
+            sanity_failures: 0,
+            recovery_head: None,
+            recovery_at: None,
+            recovery_interval: Duration::from_secs(1),
+            fallback: false,
+            settling: false,
+            dropped_end: None,
+        }
+    }
     /// Every DATA_ACK release: frees the store, then prunes the reinjection queue below
     /// the new `send.una`.
     fn release(&mut self, ack: u64) -> bool {
@@ -2406,19 +2410,10 @@ mod tests {
         m.peer_idsn = Some(0xfff0_0000_0000_0010);
         let peer_head = m.peer_idsn.unwrap().wrapping_add(1 + past);
         let local_una = m.local_idsn.wrapping_add(1 + past);
-        let mut d = DataState {
-            recv: RecvAssembler::new(peer_head, 65_536, 64),
-            send: SendStore::new(local_una, 65_536),
-            close: close::Close::default(),
-            sanity_failures: 0,
-            recovery_head: None,
-            recovery_at: None,
-            recovery_interval: Duration::from_secs(1),
-            reinject: ReinjectQueue::new(local_una),
-            fallback: false,
-            settling: false,
-            dropped_end: None,
-        };
+        let mut d = DataState::new(
+            RecvAssembler::new(peer_head, 65_536, 64),
+            SendStore::new(local_una, 65_536),
+        );
         let mut sf = SubflowMp::new();
         d.fall_back(&mut sf, &mut m, false);
         let ssn = (1 + past) as u32;
