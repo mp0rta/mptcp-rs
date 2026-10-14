@@ -266,6 +266,32 @@ fn waiting_sends_mp_fail_on_acks_and_retries() {
     }
 }
 
+/// While `Waiting`, a later mapping N that verifies leaves the DATA_ACK at M, with
+/// MP_FAIL(M.dsn) on our ACK, and N unread (spec G11).
+#[test]
+fn waiting_holds_data_ack_at_m() {
+    let Waiting { mut c, m, .. } = waiting();
+    let n = pattern(50);
+    let sent = c.peer_at(5111, &csum_mapping(111, m + 10, &n, false), &n);
+    let ack = sent.last().expect("an ACK");
+    assert_eq!((fail_of(ack), data_ack_of(ack)), (Some(m), Some(m)));
+    assert_eq!(read_now(&mut c.ep, c.h).len(), 100, "A only");
+}
+
+/// While `Waiting`, TCP-level retransmission goes on (spec G12): our unacknowledged data is
+/// resent at the RTO, with MP_FAIL(M.dsn).
+#[test]
+fn waiting_keeps_tcp_retransmission() {
+    let Waiting { mut c, m, .. } = waiting();
+    c.ep.connection(c.h).unwrap().write(b"reply").unwrap();
+    assert!(c.sent(t(2)).iter().any(|s| s.payload == b"reply"));
+    let at = c.ep.poll_timeout().unwrap();
+    c.ep.handle_timeout(at);
+    let out = c.sent(at);
+    let again = out.iter().find(|s| s.payload == b"reply");
+    assert_eq!(again.map(fail_of), Some(Some(m)), "the retransmission");
+}
+
 /// The peer's echo: we fall back at once, M's octets (the corrupt one included) are readable,
 /// and our next data segment carries the infinite mapping `(SSN of send.una, send.una)`, without
 /// an MP_FAIL of ours (spec G10a, G13, G15).
@@ -450,6 +476,26 @@ fn waiting_times_out_at_120s() {
     assert_eq!(state(&c), MpFail::Idle);
 }
 
+/// The subflow we wait on reaches R2 before the 120 s: `Waiting` ends with it, its held octets
+/// dropped, and no MP_FAIL timer is left (spec G12, G17).
+#[test]
+fn waiting_ends_at_r2() {
+    let Waiting { mut c, .. } = waiting();
+    let sf = &mut c.ep.conns.get_mut(&c.h).unwrap().subflows[0];
+    sf.tcb.set_r2_data(Duration::from_secs(5));
+    c.ep.connection(c.h).unwrap().write(b"reply").unwrap();
+    c.sent(t(2));
+    while c.ep.conns[&c.h].subflows[0].tcb.state() != TcpState::Closed {
+        let at = c.ep.poll_timeout().unwrap();
+        assert!(at < t(2) + MP_FAIL_WAIT);
+        c.ep.handle_timeout(at);
+        c.sent(at);
+    }
+    assert_eq!(state(&c), MpFail::Idle);
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(deadline(&c), None);
+}
+
 /// While `Waiting`, the peer keeps sending failing mappings of M's in-window DSNs at the next
 /// SSNs, each covering the frontier: the hold buffer stays within `recv_buffer + 2 × 65,535`
 /// (spec G7); past it new octets are refused at the TCP level, and the echo still falls back.
@@ -593,6 +639,8 @@ fn waiting_freezes_joins_and_recovery() {
     let c = &s.ep.conns[&h];
     assert!(matches!(c.hooks.mp_fail, MpFail::Waiting { .. }));
     assert!(c.hooks.infinite_ok);
+    // After its RST the answered join is gone.
+    assert!(c.subflows.iter().all(|sf| sf.remote != rst[0].dst));
     // A new join is queued, not started; an incoming one is refused.
     s.ep.add_subflow(s.now, h, local, other, 1500, false)
         .unwrap();
