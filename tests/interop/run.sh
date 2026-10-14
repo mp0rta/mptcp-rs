@@ -260,8 +260,10 @@ if [ -n "$cns" ]; then
   pedit=$(awk '$1 == "Sent" {print $4; exit}' "$out/pedit.txt")
   [ "$pedit" = 1 ] || { echo "FAIL pedit rewrote ${pedit:-?} packets, want 1"; exit 1; }
 fi
-# INTEROP_CSUM set (the negotiation rows): check.py checks the A bits and checksum presence.
-csum_check=(); [ -z "${INTEROP_CSUM:-}" ] || csum_check=(--csum "$csum")
+# check.py checks the A bits and checksum presence: always with INTEROP_CSUM set (the
+# negotiation rows); by default (on:off) whenever a Linux end takes part.
+csum_check=()
+if [ -n "${INTEROP_CSUM:-}" ] || [ "$client" = kernel ] || [ "$server" = kernel ]; then csum_check=(--csum "$csum"); fi
 mib() { awk -v k="MPTcpExt$1" '$1 == k {print $2}' "$out/nstat.txt"; }
 # csum-fail*: pinned from the first runs (M4b spec section 7 item 2). Which end counts the
 # checksum error, and sends the reset or the infinite mapping, depends on whether Linux receives
