@@ -1764,7 +1764,8 @@ impl SegmentHooks for SubflowHooks<'_> {
                 // With checksums (the check above makes `checksum` present exactly then), a
                 // data mapping is held until it verifies and may earn completion credit; its
                 // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping
-                // only if its checksum does (spec G6–G8, RFC 8684 L1402–1430).
+                // only if its checksum does or it is at `recv.next` (spec G6–G8, RFC 8684
+                // L1402–1430).
                 let fin = if let Some(checksum) = mapping.checksum {
                     if len > 0 {
                         let map = HoldMap {
@@ -1781,7 +1782,16 @@ impl SegmentHooks for SubflowHooks<'_> {
                         let end = dsn.wrapping_add(u64::from(mapping.data_len));
                         d.recv.credit(dsn, end);
                     }
-                    v.data_fin && len == 0 && dss_checksum_ok(dsn, mapping.ssn, 1, &[], checksum)
+                    // A DATA_FIN-only mapping at `recv.next` is taken whatever its checksum: all
+                    // data up to it has arrived, so it agrees with our state. Linux kernels with
+                    // cfcceb7a39fc ("tcp: shrink per-packet memset in __tcp_transmit_skb()") but
+                    // not b110f1dd6cb6 ("mptcp: options: fix uninit-value in
+                    // mptcp_write_data_fin") send it with an uninitialised checksum, and Linux
+                    // never verifies it; ignored, the close would never complete.
+                    v.data_fin
+                        && len == 0
+                        && (dsn == d.recv.next
+                            || dss_checksum_ok(dsn, mapping.ssn, 1, &[], checksum))
                 } else {
                     v.data_fin
                 };

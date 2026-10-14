@@ -954,18 +954,34 @@ fn rx_free_subtracts_held() {
     assert_eq!(edge, dsn + 8000);
 }
 
-/// A DATA_FIN-only mapping whose checksum fails changes nothing (no RST either); a correct
-/// one sets the DATA_FIN (spec G8).
+/// A DATA_FIN-only mapping whose checksum fails changes nothing (no RST either) unless its
+/// DSN is `recv.next`: then it is taken, as some Linux kernels send it with an uninitialised
+/// checksum. A correct one sets the DATA_FIN at any in-window DSN (spec G8).
 #[test]
 fn rx_data_fin_only_bad_checksum_ignored() {
+    let head = peer_head();
+    let fin_only = |dsn: u64, good: bool| {
+        let ck = dss_checksum(dsn, 0, 1, &[]);
+        dss_mapping(true, 0, dsn, 1, Some(if good { ck } else { ck ^ 1 }))
+    };
+    // Bad checksum past `recv.next`: ignored.
     let mut c = client(true, false);
     c.confirm();
-    let dsn = peer_head();
-    let ck = dss_checksum(dsn, 0, 1, &[]);
-    let sent = c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck ^ 1)), &[]);
+    let sent = c.peer(&fin_only(head + 5, false), &[]);
     assert!(!recv(&c.ep, c.h).has_fin());
     assert_eq!(rst_reason(&sent), None);
-    c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck)), &[]);
+    // Bad checksum at `recv.next`, after all the data: the DATA_FIN applies.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer_at(5001, &csum_mapping(1, head, b"hello", false), b"hello");
+    let sent = c.peer_at(5006, &fin_only(head + 5, false), &[]);
+    assert!(recv(&c.ep, c.h).has_fin());
+    assert_eq!(rst_reason(&sent), None);
+    assert_eq!(data_ack_of(sent.last().unwrap()), Some(head + 6));
+    // A correct checksum, past `recv.next`: the DATA_FIN applies, as before.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer(&fin_only(head + 5, true), &[]);
     assert!(recv(&c.ep, c.h).has_fin());
 }
 
