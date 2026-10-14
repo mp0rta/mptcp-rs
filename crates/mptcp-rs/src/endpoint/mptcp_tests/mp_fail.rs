@@ -375,6 +375,22 @@ fn mp_fail_with_infinite_mapping_checked_and_anchored() {
     }
 }
 
+/// A received infinite mapping without an MP_FAIL keeps its own anchor too: SSN 151 at DSN
+/// `head + 100`, where the handshake offset would put it at `head + 150` (spec G15).
+#[test]
+fn infinite_mapping_alone_keeps_its_anchor() {
+    let head = peer_head();
+    let mut c = client(true, false);
+    c.confirm();
+    let a = pattern(100);
+    c.peer_at(5001, &csum_mapping(1, head, &a, false), &a);
+    assert_eq!(read_now(&mut c.ep, c.h), a);
+    c.peer_at(5101, &dss_mapping(false, 151, head + 100, 0, Some(0)), &[]);
+    assert_eq!(fell_back(&mut c.ep), 1);
+    c.peer_at(5151, &[], b"later");
+    assert_eq!(read_now(&mut c.ep, c.h), b"later");
+}
+
 /// Review Focus 1: the peer sends one request whose only mapping fails, then only ACKs. After
 /// its echo the request is readable with no peer data, and our response goes out as plain TCP
 /// (spec G15).

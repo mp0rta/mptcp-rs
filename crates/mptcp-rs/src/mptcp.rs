@@ -2386,6 +2386,16 @@ impl Negotiation {
 mod tests {
     use super::*;
 
+    /// The received infinite-mapping translation across the SSN wrap, with the anchor behind
+    /// or ahead of the SSN (a replayed held run may precede a received anchor).
+    #[test]
+    fn infinite_dsn_across_ssn_wrap() {
+        let anchor = (u32::MAX - 9, 1_000);
+        assert_eq!(infinite_dsn(anchor, 5), 1_015);
+        assert_eq!(infinite_dsn(anchor, u32::MAX - 19), 990);
+        assert_eq!(infinite_dsn((5, 1_000), u32::MAX - 4), 990);
+    }
+
     /// Review Focus 3 (spec G10a): a connection that has moved `past` octets each way past its
     /// IDSNs falls back with no join. Plain data at the matching SSN lands at `recv.next`, and
     /// our infinite mapping is `(SSN of send.una, send.una)`.
