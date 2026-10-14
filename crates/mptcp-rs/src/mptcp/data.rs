@@ -862,6 +862,31 @@ mod credit_tests {
         }
     }
 
+    /// The base edge moves under the credit as the application reads; a mapping from just
+    /// below the credited edge (above the base edge) still gets no credit.
+    #[test]
+    fn credit_never_chains_as_the_base_edge_moves() {
+        for scale in [0u8, 3, 7] {
+            let mut r = RecvAssembler::new(0, 4096, 64);
+            r.credit(0, 65_535);
+            let mut out = [0; 1000];
+            for _ in 0..20 {
+                let start = r.right_edge - 1;
+                r.credit(start, start + 65_535);
+                let next = r.next;
+                assert_eq!(r.accept(next, &[0; 1000]), (Outcome::Stored, 1000));
+                assert_eq!(r.read(&mut out), 1000);
+                let field = r.window_offer(scale, 1460);
+                r.window_sent(field, scale);
+                // The base edge is at most `next + cap`, rounded up; credit and its rounding
+                // add at most 65,535 + 2^scale.
+                let bound = r.next + 4096 + 65_535 + (2 << scale);
+                assert!(r.right_edge <= bound, "scale {scale}: {}", r.right_edge);
+            }
+            assert!(r.base_edge.is_some_and(|b| b > 4096), "the base edge moved");
+        }
+    }
+
     #[test]
     fn credit_ends_once_the_base_edge_passes() {
         let mut r = RecvAssembler::new(0, 4096, 64);
