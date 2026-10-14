@@ -239,7 +239,7 @@ class Invert(unittest.TestCase):
 
     def check(self, data, n):
         inv = []
-        ok = verify_chunk(1000, data[:300], n, inv) and verify_chunk(1300, data[300:], n, inv)
+        ok = verify_chunk(1000, data[:300], n, inv) is None and verify_chunk(1300, data[300:], n, inv) is None
         return inv if ok and len(inv) == n else None
 
     def test_exact_inversions(self):
@@ -262,6 +262,18 @@ class Invert(unittest.TestCase):
         self.assertIsNone(self.check(changed, 1))
         changed[450] ^= 0xFF
         self.assertIsNone(self.check(changed, 2))
+
+    def test_offending_octet(self):
+        # The stream offset of the first octet breaking the rule, as mptcp-rs-tun's error.
+        two = bytearray(self.DATA)
+        two[10] ^= 0xFF
+        two[450] ^= 0xFF
+        self.assertEqual(verify_chunk(1000, two, 1, []), 1450, "the extra inversion")
+        changed = bytearray(self.DATA)
+        changed[10] ^= 1
+        self.assertEqual(verify_chunk(1000, changed, 2, []), 1010, "the changed octet")
+        self.assertEqual(verify_chunk(0, bytes([BUF[0] ^ 1]), 0, []), 0, "offset 0 is an error too")
+        self.assertIsNone(verify_chunk(1000, self.DATA, 0, []))
 
 
 if __name__ == "__main__":

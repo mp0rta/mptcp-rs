@@ -87,9 +87,9 @@ while N is None or got < N:
     if not d:
         break
     seen = len(inverted)
-    if a.verify == "on" and not verify_chunk(got, d, a.invert, inverted):
+    if a.verify == "on" and (at := verify_chunk(got, d, a.invert, inverted)) is not None:
         ok = False
-        print(f"mismatch in chunk at offset {got}", file=sys.stderr)
+        print(f"verification mismatch at byte {at}", file=sys.stderr)
         break
     for off in inverted[seen:]:
         print(f"inverted at {off}", flush=True)

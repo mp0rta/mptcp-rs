@@ -5,16 +5,17 @@ BUF = memoryview(PAT * (262144 // 251 + 2))  # slices are views: no copy per sen
 
 
 def verify_chunk(offset, data, n, inverted):
-    """`--invert n`: True when every octet of `data` (at stream `offset`, at most 256 KiB) equals
-    the pattern or its bitwise inverse, and at most `n` inverted octets were seen so far. Appends
-    the stream offset of each inverted octet to `inverted`; the stream passes if exactly `n` end
-    up there."""
+    """`--invert n`: None when every octet of `data` (at stream `offset`, at most 256 KiB) equals
+    the pattern or its bitwise inverse, and at most `n` inverted octets were seen so far; else
+    the stream offset of the first octet that breaks this (as mptcp-rs-tun's). Appends the
+    stream offset of each allowed inverted octet to `inverted`; the stream passes if exactly `n`
+    end up there."""
     want = BUF[offset % 251 : offset % 251 + len(data)]
     if data == want:
-        return True
+        return None
     for i, (b, w) in enumerate(zip(data, want)):
-        if b == w ^ 0xFF:
+        if b == w ^ 0xFF and len(inverted) < n:
             inverted.append(offset + i)
         elif b != w:
-            return False
-    return len(inverted) <= n
+            return offset + i
+    return None

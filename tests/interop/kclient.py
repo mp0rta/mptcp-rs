@@ -45,8 +45,8 @@ while True:
     if not n:
         break
     seen = len(inverted)
-    if a.verify == "on" and not verify_chunk(got, rbuf[:n], a.invert, inverted):
-        print(f"verification mismatch at byte {got}", file=sys.stderr)
+    if a.verify == "on" and (at := verify_chunk(got, rbuf[:n], a.invert, inverted)) is not None:
+        print(f"verification mismatch at byte {at}", file=sys.stderr)
         sys.exit(1)
     for off in inverted[seen:]:
         print(f"inverted at {off}", flush=True)
