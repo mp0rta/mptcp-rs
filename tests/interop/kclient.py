@@ -4,6 +4,8 @@ c2s (--send-secs S --expect 0): send the pattern for S seconds, shut down writes
 --send N (N > 0): send N octets of it instead.
 s2c (--send 0 --expect any): read to the server's EOF, then close. An early SHUT_WR would take
 the MPTCP socket out of ESTABLISHED, and Linux then never adds the leg-B subflow.
+s2c (--send 0 --expect N): shut down writes once N octets are in (server.py's fixed-size sender
+waits for that EOF before its own), then read to EOF.
 The kernel path manager adds subflows (run.sh configures the endpoints).
 --invert N: exactly N received octets are inverted, each printed as `inverted at OFF`."""
 import argparse, socket, sys, time
@@ -58,6 +60,8 @@ while True:
     if a.expect != "any" and got > int(a.expect):
         print(f"received {got} bytes, expected {a.expect}", file=sys.stderr)
         sys.exit(1)
+    if not a.send and a.expect not in ("any", "0") and got == int(a.expect):
+        s.shutdown(socket.SHUT_WR)
 s.close()
 if a.verify == "on" and len(inverted) != a.invert:
     print(f"{len(inverted)} inverted octets, expected {a.invert}", file=sys.stderr)
