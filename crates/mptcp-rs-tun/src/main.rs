@@ -36,21 +36,22 @@ fn verify_pattern(offset: u64, data: &[u8]) -> bool {
         .all(|(b, i)| *b == pattern_byte(i))
 }
 
-/// `--invert n`: true when every octet of `data` (at stream `offset`) equals the pattern or
-/// its bitwise inverse, and at most `n` inverted octets were seen so far. Adds the stream
-/// offset of each inverted octet to `inverted`; the stream passes if exactly `n` end up there.
-fn verify_chunk(offset: u64, data: &[u8], n: u64, inverted: &mut Vec<u64>) -> bool {
+/// `--invert n`: Ok when every octet of `data` (at stream `offset`) equals the pattern or
+/// its bitwise inverse, and at most `n` inverted octets were seen so far; else Err with the
+/// stream offset of the first octet that breaks this. Adds the stream offset of each inverted
+/// octet to `inverted`; the stream passes if exactly `n` end up there.
+fn verify_chunk(offset: u64, data: &[u8], n: u64, inverted: &mut Vec<u64>) -> Result<(), u64> {
     if verify_pattern(offset, data) {
-        return true;
+        return Ok(());
     }
     for (b, i) in data.iter().zip(offset..) {
-        if *b == !pattern_byte(i) {
+        if *b == !pattern_byte(i) && (inverted.len() as u64) < n {
             inverted.push(i);
         } else if *b != pattern_byte(i) {
-            return false;
+            return Err(i);
         }
     }
-    inverted.len() as u64 <= n
+    Ok(())
 }
 
 /// How the connection starts: `--local IP --remote IP:PORT`, or `--listen IP:PORT`, which
@@ -380,16 +381,15 @@ fn run(a: Args) -> Result<String, String> {
                     Ok(0) => st.eof = true,
                     Ok(n) => {
                         let seen = st.inverted.len();
-                        if a.expect.is_some_and(|e| st.verified + n as u64 > e)
-                            || (a.verify
-                                && !verify_chunk(
-                                    st.verified,
-                                    &rbuf[..n],
-                                    a.invert,
-                                    &mut st.inverted,
-                                ))
-                        {
+                        if a.expect.is_some_and(|e| st.verified + n as u64 > e) {
                             return Err(format!("verification mismatch at byte {}", st.verified));
+                        }
+                        if a.verify {
+                            if let Err(at) =
+                                verify_chunk(st.verified, &rbuf[..n], a.invert, &mut st.inverted)
+                            {
+                                return Err(format!("verification mismatch at byte {at}"));
+                            }
                         }
                         for off in &st.inverted[seen..] {
                             eprintln!("inverted at {off}");
@@ -843,8 +843,8 @@ mod tests {
         // `--invert n`: the whole stream, read in two pieces, at stream offset 1000.
         let check = |d: &[u8], n: u64| {
             let mut inv = Vec::new();
-            (verify_chunk(1000, &d[..300], n, &mut inv)
-                && verify_chunk(1300, &d[300..], n, &mut inv)
+            (verify_chunk(1000, &d[..300], n, &mut inv).is_ok()
+                && verify_chunk(1300, &d[300..], n, &mut inv).is_ok()
                 && inv.len() as u64 == n)
                 .then_some(inv)
         };
@@ -864,6 +864,17 @@ mod tests {
         assert_eq!(check(&changed, 1), None, "changed but not inverted");
         changed[450] = !changed[450];
         assert_eq!(check(&changed, 2), None, "one inverted, one only changed");
+        // The error names the offending octet, not the chunk start.
+        assert_eq!(
+            verify_chunk(1000, &two, 1, &mut Vec::new()),
+            Err(1450),
+            "the extra inversion"
+        );
+        assert_eq!(
+            verify_chunk(1000, &changed, 2, &mut Vec::new()),
+            Err(1010),
+            "the changed octet"
+        );
     }
 
     #[test]
