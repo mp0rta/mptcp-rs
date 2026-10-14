@@ -314,10 +314,11 @@ impl TxMaps {
 
     pub fn attach_fin(&mut self) {
         if let Some(m) = self.maps.back_mut() {
-            m.data_fin = true;
-            m.mapping.data_len += 1;
             // The Data-Level Length counts the DATA_FIN (RFC 8684 L1402–1430); `install` attaches
             // it right after `assign`, before the mapping is sent or acknowledged.
+            debug_assert!(m.ssn == m.mapping.ssn && m.len == usize::from(m.mapping.data_len));
+            m.data_fin = true;
+            m.mapping.data_len += 1;
             if m.mapping.checksum.is_some() {
                 m.mapping.checksum = Some(m.checksum());
             }
