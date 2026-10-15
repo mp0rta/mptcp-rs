@@ -238,13 +238,16 @@ def data_ack_advances(acks, base):
     return out
 
 
-def delivery_summary(advances):
-    """(longest gap in s between DATA_ACK advances, Mbit/s per one-second bin after the first)."""
-    if not advances:
-        return 0.0, []
-    t0 = advances[0][0]
-    bins = [0] * (int(advances[-1][0] - t0) + 1)
-    for (_, a0), (t1, a1) in zip(advances, advances[1:]):
-        bins[int(t1 - t0)] += a1 - a0
-    gap = max((t1 - t0 for (t0, _), (t1, _) in zip(advances, advances[1:])), default=0.0)
+def delivery_summary(advances, start, n):
+    """(longest gap in s without a DATA_ACK advance, Mbit/s per one-second bin), from `start`, the
+    sender's first payload, until the advance that covers all `n` octets: a stall before the
+    first advance counts, and missing evidence fails."""
+    assert advances, "no DATA_ACK advance"
+    done = next((i for i, (_, a) in enumerate(advances) if a >= n), None)
+    assert done is not None, f"DATA_ACK stops at {advances[-1][1]}, short of {n}"
+    pts = [(start, 0)] + advances[:done + 1]
+    bins = [0] * (int(pts[-1][0] - start) + 1)
+    for (_, a0), (t1, a1) in zip(pts, pts[1:]):
+        bins[int(t1 - start)] += a1 - a0
+    gap = max(t1 - t0 for (t0, _), (t1, _) in zip(pts, pts[1:]))
     return gap, [round(b * 8 / 1e6, 1) for b in bins]

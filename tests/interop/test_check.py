@@ -392,13 +392,27 @@ class Delivery(unittest.TestCase):
         self.assertEqual(data_ack_advances(acks, base), [(1.0, 50), (2.0, 300), (4.0, 1000000)])
 
     def test_summary(self):
-        # Longest gap between advances, and Mbit/s per one-second bin after the first advance.
-        gap, series = delivery_summary([(10.0, 125000), (10.5, 250000), (13.0, 500000), (13.2, 625000)])
+        # Longest gap from the first payload (9.8 s) to the advance reaching the byte count
+        # (1000000), and Mbit/s per one-second bin from the first payload.
+        gap, series = delivery_summary([(10.0, 125000), (10.5, 250000), (13.0, 500000), (13.2, 1000000)], 9.8, 1000000)
         self.assertAlmostEqual(gap, 2.5)
-        self.assertEqual(series, [1.0, 0.0, 0.0, 3.0])
+        self.assertEqual(series, [2.0, 0.0, 0.0, 6.0])
 
-    def test_summary_no_advance(self):
-        self.assertEqual(delivery_summary([]), (0.0, []))
+    def test_initial_stall_counted(self):
+        # No advance until 5 s after the first payload, then two quick ones: a 5 s stall.
+        gap, _ = delivery_summary([(5.0, 500000), (5.1, 1000000)], 0.0, 1000000)
+        self.assertAlmostEqual(gap, 5.0)
+
+    def test_gaps_after_completion_ignored(self):
+        # The DATA_FIN's advance (byte count + 1) may come later: delivery was complete.
+        gap, _ = delivery_summary([(1.0, 1000000), (9.0, 1000001)], 0.5, 1000000)
+        self.assertAlmostEqual(gap, 0.5)
+
+    def test_missing_evidence_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "no DATA_ACK advance"):
+            delivery_summary([], 0.0, 1000000)
+        with self.assertRaisesRegex(AssertionError, "short of"):
+            delivery_summary([(1.0, 500000), (1.1, 999999)], 0.5, 1000000)
 
 
 if __name__ == "__main__":

@@ -107,7 +107,12 @@ if scenario == "m2-hetero":
     # Delivery over time: the receiver's DATA_ACK advances as the server's links see them.
     rx, tx = (cips, {SRV}) if want_c2s == "0" else ({SRV}, cips)
     adv = data_ack_advances([(float(r[0]), int(r[14]), r[15] == "1") for r in rows if r[1] in rx and r[14]], first_dsn(tx))
-    gap, series = delivery_summary(adv)
+    n = int(want_s2c if want_c2s == "0" else want_c2s)
+    # From the sender's first payload: a stall before the first advance counts too.
+    pay = [float(r[0]) for r in rows if r[1] in tx and int(r[4] or 0) > 0]
+    assert pay, "no payload from the sender"
+    start = min(pay)
+    gap, series = delivery_summary(adv, start, n)
     print(f"hetero: longest_dataack_gap_s={gap:.3f} mbps_per_s={series}")
     # A stall: 2 s or more with no delivered data (mptcp_net-next#635).
     assert gap < 2.0, f"delivery stalled {gap:.3f} s"
