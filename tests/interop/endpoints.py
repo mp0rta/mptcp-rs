@@ -102,16 +102,15 @@ def mp_fail_bounds(packets, ours):
     rtt.rs MIN_RTO) and doubling: +1, +3, +7, +15, +31, +63 s, none later than 120 s after our
     first (mptcp.rs mp_fail_deadline). Split at gaps of 0.5 s or more, each direction has at
     most 1 + 6 episodes (Linux answers each late MP_FAIL of ours once its timer is clear: at
-    most one episode per one of ours), each shorter than 0.5 s; our episodes after the first
-    are retries, checked against that schedule (50 ms allowed for timers and capture). An
-    answer of ours after our fallback would loop with such a Linux peer and keep an episode
+    most one episode per one of ours), each shorter than 0.5 s; our timer retries (see below)
+    are no earlier than that schedule, handling delays making them only later. An answer of ours after our fallback would loop with such a Linux peer and keep an episode
     going. G18, directly: as the echoer, our later pure-ACK MP_FAILs are retries, 1 s or more
-    apart (0.5 s here, for capture jitter), and none of ours follows the retirement of our
-    echo, once the peer TCP-ACKs an octet sent only with our infinite mapping (the dataack-strip
-    rule), except a run we wrote before reading that ACK: within 5 ms of it and before our first
-    segment without MP_FAIL (0.4 ms seen); as the originator, no MP_FAIL of ours ACKs the peer's
-    data sent after the first echo or infinite mapping of the peer that reached us (one in-order
-    path)."""
+    apart (0.5 s here, for capture jitter), and once the peer TCP-ACKs an octet sent only with
+    our infinite mapping (the dataack-strip rule), retiring our echo, none of ours follows our
+    first segment without MP_FAIL on that subflow (the run before it was built before we read
+    that ACK: 0.4 ms seen, longer if the process pauses mid-drain); as the originator, no
+    MP_FAIL of ours ACKs the peer's data sent after the first echo or infinite mapping of the
+    peer that reached us (one in-order path)."""
     has = lambda p, st: any(o["subtype"] == st for o in p.opts)
     infinite = lambda p: any(o["subtype"] == 2 and o.get("dll") == 0 for o in p.opts)
     packets = sorted(packets, key=lambda p: p.t)
@@ -127,12 +126,22 @@ def mp_fail_bounds(packets, ours):
         assert len(episodes) <= 7, f"{len(episodes)} MP_FAIL episodes from {who}, want at most 7 (G13)"
         long = [(e[0], e[-1]) for e in episodes if e[-1] - e[0] >= 0.5]
         assert not long, f"MP_FAIL from {who} lasts 0.5 s or more: {long}"
-        if who == "us":
-            gaps = [b[0] - a[0] for a, b in zip(episodes, episodes[1:])]
-            assert all(g >= 0.95 for g in gaps[:1]), f"G13: first MP_FAIL retry {gaps[0]:.3f} s after our first MP_FAIL, under MIN_RTO (1 s)"
-            short = [(a, b) for a, b in zip(gaps, gaps[1:]) if b < 2 * a - 0.05]
-            assert not short, f"G13: MP_FAIL retry intervals not doubling: {short}"
-            assert mine[-1].t - mine[0].t <= 120, f"G13: MP_FAIL from us {mine[-1].t - mine[0].t:.3f} s after our first, past 120 s"
+    assert mine[-1].t - mine[0].t <= 120, f"G13: MP_FAIL from us {mine[-1].t - mine[0].t:.3f} s after our first, past 120 s"
+    # Timer retries: pure-ACK MP_FAILs of ours answering no new peer payload and starting an
+    # episode (window updates and ACKs inside one are not). Late handling only delays them, so
+    # the k-th is at or after the nominal first + (2^k - 1) MIN_RTO (50 ms for capture jitter).
+    retries, fresh, last = [], False, None
+    for p in packets:
+        if p.src not in ours:
+            fresh |= p.len > 0
+            continue
+        if has(p, 6):
+            if last is not None and p.len == 0 and not fresh and p.t - last >= 0.5:
+                retries.append(p.t)
+            last = p.t
+        fresh = False
+    early = [(k, round(t - mine[0].t, 3)) for k, t in enumerate(retries, 1) if t - mine[0].t < (2 ** k - 1) - 0.05]
+    assert not early, f"G13: MP_FAIL retries (k, s after our first) ahead of the schedule from MIN_RTO (1 s) doubling: {early}"
     if peer and peer[0].t < mine[0].t:
         pure = [p.t for p in mine if p.len == 0]
         early = [(a, b) for a, b in zip(pure, pure[1:]) if b - a < 0.5]
@@ -152,8 +161,8 @@ def mp_fail_bounds(packets, ours):
         retire = next((p for p in packets if p.src not in ours and t0 <= p.t < plain[0].t and first is not None
                        and (p.ackno - first - 1) % (1 << 32) < (1 << 31)), None)
         assert retire, "infinite mapping retired before a TCP ACK of an octet sent only with it"
-        clean = next((p.t for p in packets if p.src in ours and p.t > retire.t and not has(p, 6)), float("inf"))
-        late = [p for p in mine if p.t > retire.t and (p.t > clean or p.t - retire.t > 0.005)]
+        clean = next((p.t for p in packets if p.src in ours and p.flow == retire.flow and p.t > retire.t and not has(p, 6)), float("inf"))
+        late = [p for p in mine if p.t > clean]
         assert not late, f"G18: MP_FAIL from us after our echo retired (TCP ACK at {retire.t}): {late[:3]}"
     else:
         trig = min((p for p in packets if p.src not in ours and p.t > mine[0].t and (has(p, 6) or infinite(p))),

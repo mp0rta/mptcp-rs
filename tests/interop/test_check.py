@@ -165,11 +165,24 @@ class MpFailBounds(unittest.TestCase):
         # sent later than 120 s after our first MP_FAIL.
         start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
         retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
-        for retries, err in [([retry(0.7)], "MIN_RTO"), ([retry(1), retry(2)], "doubl"), ([retry(1), retry(3), retry(4.5)], "doubl"),
+        for retries, err in [([retry(0.7)], "schedule"), ([retry(1), retry(2)], "schedule"), ([retry(1), retry(3), retry(4.5)], "schedule"),
                              ([retry(121)], "120 s"), ([retry(41), retry(123)], "120 s")]:
             with self.assertRaisesRegex(AssertionError, err, msg=[round(p.t - 1.01, 3) for p in retries]):
                 mp_fail_bounds(start + retries, self.OURS)
         mp_fail_bounds(start + [retry(1), retry(3), retry(7), retry(15), retry(31), retry(63)], self.OURS)
+
+    def test_late_timers_accepted(self):
+        # Paused mid-drain: copies we built before reading the retiring ACK reach the TUN 20 ms
+        # after it, still before our first segment without MP_FAIL.
+        r = self.retired()
+        paused = [p._replace(t=p.t + 0.02) if p.t > 1.031 else p for p in r]
+        mp_fail_bounds(paused, self.OURS)
+        # A 1 s retry serviced 100 ms late: the next is scheduled 2 s from then (mptcp.rs
+        # mp_fail_timeout doubles the stored interval from the handling time).
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        mp_fail_bounds(start + [pkt(2.11, self.CLI, LEG_A, [FAIL]), pkt(4.11, self.CLI, LEG_A, [FAIL])], self.OURS)
+        # Infinite-mapped payload sent 0.7 s after the echo carries it: data-driven, no retry.
+        mp_fail_bounds(start + [pkt(1.71, self.CLI, LEG_A, self.ECHO, len=1428)], self.OURS)
 
     def test_originator_lost_echo(self):
         # From our side's capture: the peer's echo never reached us, so we kept MP_FAIL on ACKs
