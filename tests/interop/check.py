@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_bounds, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_bounds, mp_fail_dsn, mptcp_options, own_capture, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -91,12 +91,12 @@ def data_fin_acked(side, n):
         ]
     assert acked, f"DATA_FIN from {src} not DATA_ACKed"
     return min(acked)
-def options(flt):
-    """The server-side Packets matching `flt`, each MPTCP option read on its own (DSS and MP_FAIL
-    share rawdataseqno)."""
+def options(flt, files=pcaps):
+    """The Packets of `files` (the server-side captures) matching `flt`, each MPTCP option read
+    on its own (DSS and MP_FAIL share rawdataseqno)."""
     names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason", "tcp.seq_raw", "tcp.len", "tcp.ack_raw"]
     pkts = []
-    for name in pcaps:
+    for name in files:
         cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
         for f in names:
             cmd += ["-e", f]
@@ -136,7 +136,12 @@ if scenario.startswith("csum-fail"):
     if scenario == "csum-fail1":
         # The receiver's MP_FAIL names the failed mapping by its first DSN.
         fail = mp_fail_dsn(pkts, receiver)
-        mp_fail_bounds(pkts, {SRV} if args.server == "mptcp-rs" else cips)
+        # Over our end's own capture (only what reached us counts), every packet from 1 s
+        # before the MP_FAIL traffic to 1 s after it: the TCP ACKs too, for the retirement.
+        t0, t1 = min(p.t for p in pkts) - 1, max(p.t for p in pkts) + 1
+        flt = "tcp.flags.reset == 1 || tcp.options.mptcp.subtype == 6 || tcp.options.mptcp.datalvllen == 0"
+        mp_fail_bounds(options(f"{flt} || (frame.time_epoch >= {t0:.6f} && frame.time_epoch <= {t1:.6f})", [own_capture(args.client, args.server)]),
+                       {SRV} if args.server == "mptcp-rs" else cips)
         maps = options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}")
         start, dll = failed_mapping(fail, maps, sender, first_dsn(sender))
         check_inversion(inverted, start, dll)

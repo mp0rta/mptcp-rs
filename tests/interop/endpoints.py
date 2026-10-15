@@ -87,24 +87,39 @@ def csum_fail_checks(scenario, packets, srv, join):
     return {r.flow}
 
 
+def own_capture(client, server):
+    """The mptcp-rs end's own TUN capture (csum-fail1 has exactly one): the packets that reached
+    it, in the order it read them."""
+    return "server-tun.pcap" if server == "mptcp-rs" else "tun.pcap"
+
+
 def mp_fail_bounds(packets, ours):
-    """csum-fail1: the MP_FAIL traffic is bounded (M4b spec G13, G18), over csum_fail_checks's
-    `packets`; `ours`: the mptcp-rs end's IPs. Our MP_FAILs ride our segments until our state
-    ends (the echo's round trip, or the retiring ACK's: tens of ms here), then come only as G13
-    retries on a pure ACK, the interval starting at the RTO (at least 1 s, rtt.rs MIN_RTO) and
-    doubling: +1, +3, +7, +15, +31, +63 s, the next (+127 s) being past the 120 s cut-off. So,
-    split at gaps of 0.5 s or more, each direction has at most 1 + 6 episodes (Linux answers
-    each late MP_FAIL of ours once its timer is clear: at most one episode per one of ours),
-    each shorter than 0.5 s. An answer of ours after our fallback would loop with such a
-    Linux peer and keep an episode going. G18, directly: as the echoer, our later pure-ACK
-    MP_FAILs are retries, 1 s or more apart (0.5 s here, for capture jitter); as the originator, no MP_FAIL of ours ACKs the
-    peer's data sent after its echo or infinite mapping (one in-order path)."""
+    """csum-fail1: the MP_FAIL traffic is bounded (M4b spec G13, G18), over `packets`, every
+    packet around the MP_FAIL traffic in the capture of our end (`ours`: the mptcp-rs end's
+    IPs; own_capture), so that only what reached us counts. Our MP_FAILs ride our segments
+    until our state ends (the echo's round trip, or the retiring ACK's: tens of ms here), then
+    come only as G13 retries on a pure ACK, the interval starting at the RTO (at least 1 s,
+    rtt.rs MIN_RTO) and doubling: +1, +3, +7, +15, +31, +63 s, none later than 120 s after our
+    first (mptcp.rs mp_fail_deadline). Split at gaps of 0.5 s or more, each direction has at
+    most 1 + 6 episodes (Linux answers each late MP_FAIL of ours once its timer is clear: at
+    most one episode per one of ours), each shorter than 0.5 s; our episodes after the first
+    are retries, checked against that schedule (50 ms allowed for timers and capture). An
+    answer of ours after our fallback would loop with such a Linux peer and keep an episode
+    going. G18, directly: as the echoer, our later pure-ACK MP_FAILs are retries, 1 s or more
+    apart (0.5 s here, for capture jitter), and none of ours follows the retirement of our
+    echo, once the peer TCP-ACKs an octet sent only with our infinite mapping (the dataack-strip
+    rule), except a run we wrote before reading that ACK: within 5 ms of it and before our first
+    segment without MP_FAIL (0.4 ms seen); as the originator, no MP_FAIL of ours ACKs the peer's
+    data sent after the first echo or infinite mapping of the peer that reached us (one in-order
+    path)."""
     has = lambda p, st: any(o["subtype"] == st for o in p.opts)
-    fails = sorted((p for p in packets if has(p, 6)), key=lambda p: p.t)
+    infinite = lambda p: any(o["subtype"] == 2 and o.get("dll") == 0 for o in p.opts)
+    packets = sorted(packets, key=lambda p: p.t)
+    fails = [p for p in packets if has(p, 6)]
     mine = [p for p in fails if p.src in ours]
     peer = [p for p in fails if p.src not in ours]
     for who, ps in [("us", mine), ("the peer", peer)]:
-        episodes = [[ps[0].t]]
+        episodes = [[p.t] for p in ps[:1]]
         for a, b in zip(ps, ps[1:]):
             if b.t - a.t >= 0.5:
                 episodes.append([])
@@ -112,13 +127,38 @@ def mp_fail_bounds(packets, ours):
         assert len(episodes) <= 7, f"{len(episodes)} MP_FAIL episodes from {who}, want at most 7 (G13)"
         long = [(e[0], e[-1]) for e in episodes if e[-1] - e[0] >= 0.5]
         assert not long, f"MP_FAIL from {who} lasts 0.5 s or more: {long}"
-    if peer[0].t < mine[0].t:
+        if who == "us":
+            gaps = [b[0] - a[0] for a, b in zip(episodes, episodes[1:])]
+            assert all(g >= 0.95 for g in gaps[:1]), f"G13: first MP_FAIL retry {gaps[0]:.3f} s after our first MP_FAIL, under MIN_RTO (1 s)"
+            short = [(a, b) for a, b in zip(gaps, gaps[1:]) if b < 2 * a - 0.05]
+            assert not short, f"G13: MP_FAIL retry intervals not doubling: {short}"
+            assert mine[-1].t - mine[0].t <= 120, f"G13: MP_FAIL from us {mine[-1].t - mine[0].t:.3f} s after our first, past 120 s"
+    if peer and peer[0].t < mine[0].t:
         pure = [p.t for p in mine if p.len == 0]
         early = [(a, b) for a, b in zip(pure, pure[1:]) if b - a < 0.5]
         assert not early, f"G18: our pure-ACK MP_FAIL under 0.5 s after the previous one, not a G13 retry: {early}"
+        # Retirement: the octets of our infinite-mapping copies before our first plain data,
+        # less those also sent without it; a peer ACK covering one retires the echo.
+        t0 = min((p.t for p in packets if p.src in ours and infinite(p)), default=None)
+        assert t0, "no infinite mapping from us, the echoer"
+        plain = [p for p in packets if p.src in ours and p.len > 0 and p.t > t0 and not any("dll" in o for o in p.opts)]
+        if not plain:
+            return
+        octets = lambda p: {(p.seq + k) % (1 << 32) for k in range(p.len)}
+        sent = [p for p in packets if p.src in ours and p.len > 0 and p.t < plain[0].t]
+        only = set().union(*(octets(p) for p in sent if infinite(p))) - set().union(*(octets(p) for p in sent if not infinite(p)))
+        # A cumulative ACK covers one of them once it is past the first, in sequence order.
+        first = min(only, key=lambda x: (x - sent[0].seq) % (1 << 32), default=None)
+        retire = next((p for p in packets if p.src not in ours and t0 <= p.t < plain[0].t and first is not None
+                       and (p.ackno - first - 1) % (1 << 32) < (1 << 31)), None)
+        assert retire, "infinite mapping retired before a TCP ACK of an octet sent only with it"
+        clean = next((p.t for p in packets if p.src in ours and p.t > retire.t and not has(p, 6)), float("inf"))
+        late = [p for p in mine if p.t > retire.t and (p.t > clean or p.t - retire.t > 0.005)]
+        assert not late, f"G18: MP_FAIL from us after our echo retired (TCP ACK at {retire.t}): {late[:3]}"
     else:
-        trig = min((p for p in packets if p.src not in ours and p.t > mine[0].t
-                    and (has(p, 6) or any(o["subtype"] == 2 and o.get("dll") == 0 for o in p.opts))), key=lambda p: p.t)
+        trig = min((p for p in packets if p.src not in ours and p.t > mine[0].t and (has(p, 6) or infinite(p))),
+                   key=lambda p: p.t, default=None)
+        assert trig, "no echo or infinite mapping from the peer reached us"
         late = [p for p in mine if (p.ackno - trig.seq - 1) % (1 << 32) < (1 << 31)]
         assert not late, f"G18: MP_FAIL from us after our fallback, on an ACK past the peer's seq {trig.seq} at {trig.t}: {late[:3]}"
 

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_bounds, mp_fail_dsn, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_bounds, mp_fail_dsn, mptcp_options, own_capture, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
 SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "m2-hetero", "csum-fail1", "csum-fail2"]
@@ -122,6 +122,18 @@ class MpFailBounds(unittest.TestCase):
         return ([pkt(1.0, SRV, LEG_A, [FAIL]), cli(1.01)] + [cli(1.011 + i / 1000, len=1428) for i in range(20)]
                 + [pkt(1.03, SRV, LEG_A, [FAIL]), cli(2.01), pkt(2.03, SRV, LEG_A, [FAIL]), cli(4.01), pkt(4.03, SRV, LEG_A, [FAIL])])
 
+    S = 5000  # our TCP seq at the echo
+
+    def retired(self):
+        """As the echoer, from our side's capture: the echo, 20 copies riding data, the peer's
+        TCP ACK of the first copy's octets (sent only with the infinite mapping), two copies we
+        wrote before reading that ACK (0.4 ms seen, csum-fail1-s2c 20261013T185639-dDLsVJ), then
+        plain data."""
+        cli = lambda t, i, opts=self.ECHO: pkt(t, self.CLI, LEG_A, opts, seq=self.S + 1428 * i, len=1428)
+        return ([pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO, seq=self.S)]
+                + [cli(1.011 + i / 1000, i) for i in range(20)] + [pkt(1.031, SRV, LEG_A, [], ackno=self.S + 1428)]
+                + [cli(1.0312, 20), cli(1.0314, 21), cli(1.032, 22, []), cli(1.033, 23, [])])
+
     E = 1000 + 1428 * 30  # the peer's TCP seq at its echo
 
     def originator(self):
@@ -135,6 +147,47 @@ class MpFailBounds(unittest.TestCase):
         mp_fail_bounds(self.originator(), self.OURS)
         # The ACK of the last octet before the echo, and the peer's infinite mapping, are fine.
         mp_fail_bounds(self.originator() + [pkt(1.02, self.CLI, LEG_A, [FAIL], ackno=self.E)], self.OURS)
+
+    def test_retired_echo_accepted(self):
+        mp_fail_bounds(self.retired(), self.OURS)
+
+    def test_mp_fail_after_retirement_rejected(self):
+        # Ten data-bearing MP_FAILs in a burst well under 0.5 s; one riding data right after
+        # plain data; a pure-ACK retry once the echo is retired.
+        burst = [pkt(1.05 + i / 100, self.CLI, LEG_A, [FAIL], seq=self.S + 1428 * (24 + i), len=1428) for i in range(10)]
+        for bad, why in [(burst, "burst"), ([pkt(1.0325, self.CLI, LEG_A, self.ECHO, seq=self.S + 1428 * 23, len=1428)], "after plain data"),
+                         ([pkt(2.01, self.CLI, LEG_A, [FAIL])], "retry")]:
+            with self.assertRaisesRegex(AssertionError, "retired", msg=why):
+                mp_fail_bounds(self.retired() + bad, self.OURS)
+
+    def test_retry_schedule_rejected(self):
+        # Retries (episodes of ours after the first) start at MIN_RTO (1 s) and double; none is
+        # sent later than 120 s after our first MP_FAIL.
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
+        for retries, err in [([retry(0.7)], "MIN_RTO"), ([retry(1), retry(2)], "doubl"), ([retry(1), retry(3), retry(4.5)], "doubl"),
+                             ([retry(121)], "120 s"), ([retry(41), retry(123)], "120 s")]:
+            with self.assertRaisesRegex(AssertionError, err, msg=[round(p.t - 1.01, 3) for p in retries]):
+                mp_fail_bounds(start + retries, self.OURS)
+        mp_fail_bounds(start + [retry(1), retry(3), retry(7), retry(15), retry(31), retry(63)], self.OURS)
+
+    def test_originator_lost_echo(self):
+        # From our side's capture: the peer's echo never reached us, so we kept MP_FAIL on ACKs
+        # of its later data until its infinite mapping arrived.
+        lost = [pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * i) for i in range(21)]
+        lost += [pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=self.E + 1428 * (i - 21)) for i in range(21, 30)]
+        inf = pkt(1.03, SRV, LEG_A, [INFINITE], seq=self.E + 1428 * 9, len=1428)
+        mp_fail_bounds(lost + [inf], self.OURS)
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(lost + [inf, pkt(1.031, self.CLI, LEG_A, [FAIL], ackno=self.E + 1428 * 10)], self.OURS)
+        with self.assertRaisesRegex(AssertionError, "no echo"):
+            mp_fail_bounds(lost, self.OURS)
+
+    def test_own_capture(self):
+        # The mptcp-rs end's own TUN: what reached it, in the order it read them. The peer's
+        # echo, captured at the peer's end, can still be lost on the way.
+        self.assertEqual(own_capture("mptcp-rs", "kernel"), "tun.pcap")
+        self.assertEqual(own_capture("kernel", "mptcp-rs"), "server-tun.pcap")
 
     def test_storm_rejected(self):
         # Linux answers every late MP_FAIL, so an answer of ours becomes a loop: alternating
