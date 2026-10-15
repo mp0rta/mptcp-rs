@@ -104,10 +104,11 @@ def mp_fail_bounds(packets, ours):
     most 1 + 6 episodes (Linux answers each late MP_FAIL of ours once its timer is clear: at
     most one episode per one of ours), each shorter than 0.5 s, and nothing of ours comes later
     than 120 s after our first (the spacing itself: see the comment below). An answer of ours
-    after our fallback would loop with such a Linux peer and keep an episode going. G18, directly: as the echoer, our later pure-ACK MP_FAILs are retries, 1 s or more
-    apart (0.5 s here, for capture jitter), and once the peer TCP-ACKs an octet sent only with
-    our infinite mapping (the dataack-strip rule), retiring our echo, none of ours follows our
-    first segment without MP_FAIL on that subflow (the run before it was built before we read
+    after our fallback would loop with such a Linux peer and keep an episode going. G18,
+    directly: as the echoer (our echo rides every segment while our infinite mapping is due,
+    ACKs and window updates too: mptcp.rs fail_due), once the peer TCP-ACKs an octet sent only
+    with our infinite mapping (the dataack-strip rule), retiring our echo, none of ours follows
+    our first segment without MP_FAIL on that subflow (the run before it was built before we read
     that ACK: 0.4 ms seen, longer if the process pauses mid-drain); as the originator, no
     MP_FAIL of ours ACKs the peer's data sent after the first echo or infinite mapping of the
     peer that reached us (one in-order path)."""
@@ -133,9 +134,6 @@ def mp_fail_bounds(packets, ours):
     # (RTO, 2 RTO), echoer_idle_retries_bounded, waiting_times_out_at_120s and
     # after_fallback_mp_fail_triggers_nothing.
     if peer and peer[0].t < mine[0].t:
-        pure = [p.t for p in mine if p.len == 0]
-        early = [(a, b) for a, b in zip(pure, pure[1:]) if b - a < 0.5]
-        assert not early, f"G18: our pure-ACK MP_FAIL under 0.5 s after the previous one, not a G13 retry: {early}"
         # Retirement: the octets of our infinite-mapping copies before our first plain data,
         # less those also sent without it; a peer ACK covering one retires the echo.
         t0 = min((p.t for p in packets if p.src in ours and infinite(p)), default=None)

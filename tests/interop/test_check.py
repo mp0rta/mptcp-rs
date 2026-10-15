@@ -195,6 +195,11 @@ class MpFailBounds(unittest.TestCase):
         # Infinite-mapped payload sent 0.7 s after the echo carries it: data-driven, no retry.
         mp_fail_bounds(start + [pkt(1.71, self.CLI, LEG_A, self.ECHO, len=1428)], self.OURS)
 
+    def test_echo_state_window_update_accepted(self):
+        # Codex r5: while our infinite mapping is due, every segment carries the echo, an
+        # ordinary payload-free ACK (a window update) too (mptcp.rs fail_due).
+        mp_fail_bounds(self.retired() + [pkt(1.015, self.CLI, LEG_A, [FAIL])], self.OURS)
+
     def test_originator_lost_echo(self):
         # From our side's capture: the peer's echo never reached us, so we kept MP_FAIL on ACKs
         # of its later data until its infinite mapping arrived.
@@ -228,9 +233,10 @@ class MpFailBounds(unittest.TestCase):
             mp_fail_bounds([pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)] + retries, self.OURS)
 
     def test_answer_after_fallback_rejected(self):
-        # Echoer: a pure ACK with MP_FAIL right after the peer's answer, not on the G13 schedule.
+        # Echoer: a pure ACK with MP_FAIL answering the peer after our echo retired (after our
+        # first segment without MP_FAIL).
         with self.assertRaisesRegex(AssertionError, "G18"):
-            mp_fail_bounds(self.echoer() + [pkt(1.031, self.CLI, LEG_A, [FAIL])], self.OURS)
+            mp_fail_bounds(self.retired() + [pkt(1.0335, self.CLI, LEG_A, [FAIL])], self.OURS)
         # Originator: an MP_FAIL on an ACK of data the peer sent after its echo.
         with self.assertRaisesRegex(AssertionError, "G18"):
             mp_fail_bounds(self.originator() + [pkt(1.03, self.CLI, LEG_A, [FAIL], ackno=self.E + 1)], self.OURS)
