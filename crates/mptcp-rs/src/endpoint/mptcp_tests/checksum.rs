@@ -373,8 +373,9 @@ fn tx_mapping_checksum_verifies() {
     assert_eq!(p.c.connection(p.h).unwrap().write(&data), Ok(3000));
     p.pump();
     assert_eq!(p.server_read(), data);
-    // Each mapping, its octets, and how many segments carried it.
-    let mut maps: Vec<(Mapping, Vec<Option<u8>>, usize)> = Vec::new();
+    // Each mapping, its octets, and the distinct sequence numbers that carried it (a
+    // retransmission is not a second segment).
+    let mut maps: Vec<(Mapping, Vec<Option<u8>>, Vec<u32>)> = Vec::new();
     for seg in p.client_sent.iter().filter(|s| !s.payload.is_empty()) {
         let Some((m, fin)) = seg_mapping(seg) else {
             continue;
@@ -383,7 +384,7 @@ fn tx_mapping_checksum_verifies() {
             Some(i) => i,
             None => {
                 let len = usize::from(m.data_len) - usize::from(fin);
-                maps.push((m, vec![None; len], 0));
+                maps.push((m, vec![None; len], Vec::new()));
                 maps.len() - 1
             }
         };
@@ -393,11 +394,13 @@ fn tx_mapping_checksum_verifies() {
             .iter_mut()
             .zip(seg.payload)
             .for_each(|(b, v)| *b = Some(*v));
-        *segs += 1;
+        if !segs.contains(&seg.seq.0) {
+            segs.push(seg.seq.0);
+        }
     }
     assert!(!maps.is_empty());
     assert!(
-        maps.iter().any(|(.., segs)| *segs > 1),
+        maps.iter().any(|(.., segs)| segs.len() > 1),
         "a mapping spans segments"
     );
     for (m, bytes, _) in &maps {
@@ -624,16 +627,19 @@ fn server_csum_from_config() {
     assert_eq!(mptcp_of(&synack), [want]);
 }
 
-/// A confirming option whose A differs from the decision, or MP_CAPABLE-with-data of length 22
-/// when `csum` or 24 when not, is invalid: the G2b fallback of M4a.
+/// A confirming option whose A differs from the decision (each form, the length right or
+/// wrong), or MP_CAPABLE-with-data of length 22 when `csum` or 24 when not, is invalid: the G2b
+/// fallback of M4a.
 #[test]
 fn server_third_ack_a_mismatch_falls_back() {
     for (checksums, peer_a) in BOTH {
         let csum = checksums || peer_a;
         let wrong = CAP_H | a(!csum);
-        let cases: [(Vec<u8>, &[u8]); 3] = [
+        let cases: [(Vec<u8>, &[u8]); 4] = [
             (ack_cap(wrong, None), b""),
             (ack_cap(wrong, Some(5)), b"hello"),
+            // With `csum`, only A is wrong: the length 24 matches.
+            (cap_csum(wrong, b"hello"), b"hello"),
             if csum {
                 (ack_cap(CAP_H | CAP_A, Some(5)), b"hello")
             } else {
@@ -652,6 +658,32 @@ fn server_third_ack_a_mismatch_falls_back() {
             s.assert_plain_after();
         }
     }
+}
+
+/// After confirmation, an MP_CAPABLE-with-data is a mapping: one whose checksum presence
+/// differs from the decision resets the subflow with MP_TCPRST 0x01, as a DSS would (spec G3);
+/// one invalid otherwise (another key) resets without it.
+#[test]
+fn server_later_capable_presence_mismatch_tcprst() {
+    let rst_of = |checksums: bool, option: &[u8]| {
+        let mut s = server(checksums);
+        s.syn(&syn_cap(1, CAP_H));
+        s.send(65535, &ack_cap(CAP_H | a(checksums), None), &[]);
+        assert_eq!(s.negotiation().state, State::Confirmed);
+        let out = s.send(65535, option, b"hello");
+        let rst = out
+            .iter()
+            .find(|p| packet::parse(p).unwrap().flags.contains(TcpFlags::RST));
+        rst.map(|p| mptcp_of(p))
+    };
+    let tcprst = vec![vec![30, 4, 0x80, 0x01]];
+    assert_eq!(
+        rst_of(true, &ack_cap(CAP_H | CAP_A, Some(5))),
+        Some(tcprst.clone())
+    );
+    assert_eq!(rst_of(false, &cap_csum(CAP_H, b"hello")), Some(tcprst));
+    let other_key = cap(1, CAP_H, Some(CLIENT_KEY), Some(SERVER_KEY ^ 1), Some(5));
+    assert_eq!(rst_of(false, &other_key), Some(vec![]));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -922,18 +954,34 @@ fn rx_free_subtracts_held() {
     assert_eq!(edge, dsn + 8000);
 }
 
-/// A DATA_FIN-only mapping whose checksum fails changes nothing (no RST either); a correct
-/// one sets the DATA_FIN (spec G8).
+/// A DATA_FIN-only mapping whose checksum fails changes nothing (no RST either) unless its
+/// DSN is `recv.next`: then it is taken, as some Linux kernels send it with an uninitialised
+/// checksum. A correct one sets the DATA_FIN at any in-window DSN (spec G8).
 #[test]
 fn rx_data_fin_only_bad_checksum_ignored() {
+    let head = peer_head();
+    let fin_only = |dsn: u64, good: bool| {
+        let ck = dss_checksum(dsn, 0, 1, &[]);
+        dss_mapping(true, 0, dsn, 1, Some(if good { ck } else { ck ^ 1 }))
+    };
+    // Bad checksum past `recv.next`: ignored.
     let mut c = client(true, false);
     c.confirm();
-    let dsn = peer_head();
-    let ck = dss_checksum(dsn, 0, 1, &[]);
-    let sent = c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck ^ 1)), &[]);
+    let sent = c.peer(&fin_only(head + 5, false), &[]);
     assert!(!recv(&c.ep, c.h).has_fin());
     assert_eq!(rst_reason(&sent), None);
-    c.peer(&dss_mapping(true, 0, dsn, 1, Some(ck)), &[]);
+    // Bad checksum at `recv.next`, after all the data: the DATA_FIN applies.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer_at(5001, &csum_mapping(1, head, b"hello", false), b"hello");
+    let sent = c.peer_at(5006, &fin_only(head + 5, false), &[]);
+    assert!(recv(&c.ep, c.h).has_fin());
+    assert_eq!(rst_reason(&sent), None);
+    assert_eq!(data_ack_of(sent.last().unwrap()), Some(head + 6));
+    // A correct checksum, past `recv.next`: the DATA_FIN applies, as before.
+    let mut c = client(true, false);
+    c.confirm();
+    c.peer(&fin_only(head + 5, true), &[]);
     assert!(recv(&c.ep, c.h).has_fin());
 }
 

@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, flag, mp_fail_bounds, mp_fail_dsn, mptcp_options, own_capture, removed_flow_exempt, two_subflows  # noqa: E402
 
 # c2s/s2c: expected byte count for that direction, or "any" (timed cases; the logs say how many).
 # logs-only (the kernel comparison bench): the byte counts below, no wire checks.
@@ -22,6 +22,8 @@ for name in ["scenario", "directory", "want_c2s", "want_s2c"]:
 ap.add_argument("mode", nargs="?", choices=["logs-only"])
 ap.add_argument("--client", choices=["kernel", "mptcp-rs"], default="mptcp-rs")
 ap.add_argument("--server", choices=["kernel", "mptcp-rs"], default="kernel")
+# --csum: run.sh's INTEROP_CSUM, when set: check the checksum negotiation on the wire.
+ap.add_argument("--csum", choices=["on:on", "on:off", "off:on", "off:off"])
 args = ap.parse_args()
 scenario, want_c2s, want_s2c, mode = args.scenario, args.want_c2s, args.want_s2c, args.mode
 out = Path(args.directory)
@@ -35,13 +37,14 @@ assert m, server
 assert (int(m[1]), int(m[2])) == (c2s, s2c), f"sender/receiver byte counts differ: client sent {c2s} server got {m[1]}, server sent {m[2]} client got {s2c}"
 for name, got, want in [("c2s", c2s, want_c2s), ("s2c", s2c, want_s2c)]:
     assert got > 0 if want == "any" else got == int(want), f"{name}: {got} bytes, expected {want}"
-if mode:
+# m2-hetero still reads its pcaps in logs-only mode (the kernel-to-kernel baseline).
+if mode and scenario != "m2-hetero":
     print(f"PASS {scenario} (logs only)")
     sys.exit(0)
 m2 = two_subflows(scenario)
 # M2: the initial subflow on path A and a join from JOIN on path B.
 SRV, cips, JOIN = endpoints(scenario, args.client, args.server)
-fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport"]
+fields = ["frame.time_epoch", "ip.src", "tcp.seq_raw", "tcp.ack_raw", "tcp.len", "tcp.flags.syn", "tcp.flags.fin", "tcp.flags.reset", "tcp.window_size_value", "tcp.options.mptcp.subtype", "tcp.options.mptcp.version", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.datafin.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.rawdataack", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.sendkey", "tcp.flags.ack", "ip.dst", "tcp.srcport", "tcp.dstport", "tcp.options.mptcp.subflowseqno"]
 def capture(name):
     cmd = ["tshark", "-r", str(out / name), "-Y", "tcp", "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"]
     for f in fields:
@@ -88,19 +91,34 @@ def data_fin_acked(side, n):
         ]
     assert acked, f"DATA_FIN from {src} not DATA_ACKed"
     return min(acked)
-def options(flt):
-    """The server-side Packets matching `flt`, each MPTCP option read on its own (DSS and MP_FAIL
-    share rawdataseqno)."""
-    names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason"]
+def options(flt, files=pcaps):
+    """The Packets of `files` (the server-side captures) matching `flt`, each MPTCP option read
+    on its own (DSS and MP_FAIL share rawdataseqno)."""
+    names = ["frame.time_epoch", "tcp.flags.ack", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport", "tcp.flags.reset", "tcp.options.mptcp.subtype", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag", "tcp.options.mptcp.rawdataseqno", "tcp.options.mptcp.datalvllen", "tcp.options.mptcp.rst_reason", "tcp.seq_raw", "tcp.len", "tcp.ack_raw"]
     pkts = []
-    for name in pcaps:
+    for name in files:
         cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
         for f in names:
             cmd += ["-e", f]
         for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
-            flag = lambda x: x in ("1", "True")
-            pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:])))
+            pkts.append(Packet(float(v[0]), v[2], frozenset([(v[2], v[3]), (v[4], v[5])]), flag(v[6]), flag(v[1]), mptcp_options(*v[7:13]), *(int(x or 0) for x in v[13:])))
     return pkts
+if scenario == "m2-hetero":
+    # Delivery over time: the receiver's DATA_ACK advances as the server's links see them.
+    rx, tx = (cips, {SRV}) if want_c2s == "0" else ({SRV}, cips)
+    adv = data_ack_advances([(float(r[0]), int(r[14]), r[15] == "1") for r in rows if r[1] in rx and r[14]], first_dsn(tx))
+    n = int(want_s2c if want_c2s == "0" else want_c2s)
+    # From the sender's first payload: a stall before the first advance counts too.
+    pay = [float(r[0]) for r in rows if r[1] in tx and int(r[4] or 0) > 0]
+    assert pay, "no payload from the sender"
+    start = min(pay)
+    gap, series = delivery_summary(adv, start, n)
+    print(f"hetero: longest_dataack_gap_s={gap:.3f} mbps_per_s={series}")
+    # A stall: 2 s or more with no delivered data (mptcp_net-next#635).
+    assert gap < 2.0, f"delivery stalled {gap:.3f} s"
+if mode:
+    print(f"PASS {scenario} (logs only)")
+    sys.exit(0)
 rsts = [r for r in rows if r[7] == "1"]
 no_rst, srv_reset, cli_reset = "no RST", set(), set()
 csum_exempt = set()
@@ -110,19 +128,24 @@ if scenario.startswith("csum-fail"):
     pkts = options("tcp.flags.reset == 1 || tcp.options.mptcp.subtype == 6 || tcp.options.mptcp.datalvllen == 0")
     csum_exempt = csum_fail_checks(scenario, pkts, SRV, JOIN)
     if csum_exempt:
-        n = sum(flow(r) in csum_exempt for r in rsts) - 1
+        # The answers: csum_fail_checks's bare RSTs after the reset.
+        n = sum(p.rst and not p.opts and p.flow in csum_exempt for p in pkts)
         no_rst = f"no RST except the MP_FAIL + MP_TCPRST 6 reset on {[sorted(f) for f in csum_exempt]} and its {n} answers to segments in flight"
     rsts = [r for r in rsts if flow(r) not in csum_exempt]
     inverted = [int(x) for x in re.findall(r"^inverted at (\d+)$", client + server, re.M)]
     if scenario == "csum-fail1":
-        # The receiver's MP_FAIL names the failed mapping by its first DSN (RFC 8684 L2372-2375).
-        fail = next(o["dsn"] for p in sorted(pkts, key=lambda p: p.t) if p.src in receiver for o in p.opts if o["subtype"] == 6)
-        dlls = [o["dll"] for p in options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}") if p.src in sender
-                for o in p.opts if o["subtype"] == 2 and "dsn" in o and o["dsn"] == fail % (1 << (64 if o["dsn8"] else 32))]
-        assert dlls, f"no DSS from {sender} maps DSN {fail}"
-        start = (fail - first_dsn(sender)) % (1 << 64)
-        check_inversion(inverted, start, max(dlls))
-        print(f"inverted octet at stream offset {inverted[0]}, in the failed mapping [{start}, {start + max(dlls)})")
+        # The receiver's MP_FAIL names the failed mapping by its first DSN.
+        fail = mp_fail_dsn(pkts, receiver)
+        # Over our end's own capture (only what reached us counts), every packet from 1 s
+        # before the MP_FAIL traffic to 1 s after it: the TCP ACKs too, for the retirement.
+        t0, t1 = min(p.t for p in pkts) - 1, max(p.t for p in pkts) + 1
+        flt = "tcp.flags.reset == 1 || tcp.options.mptcp.subtype == 6 || tcp.options.mptcp.datalvllen == 0"
+        mp_fail_bounds(options(f"{flt} || (frame.time_epoch >= {t0:.6f} && frame.time_epoch <= {t1:.6f})", [own_capture(args.client, args.server)]),
+                       {SRV} if args.server == "mptcp-rs" else cips)
+        maps = options(f"tcp.options.mptcp.rawdataseqno == {fail} || tcp.options.mptcp.rawdataseqno == {fail % (1 << 32)}")
+        start, dll = failed_mapping(fail, maps, sender, first_dsn(sender))
+        check_inversion(inverted, start, dll)
+        print(f"inverted octet at stream offset {inverted[0]}, in the failed mapping [{start}, {start + dll})")
     else:
         assert not inverted, f"inverted octets at {inverted}"
 # m2-remove: the deleted kernel endpoint's subflow may end with a RST and no FIN.
@@ -188,9 +211,21 @@ else:
     else:
         assert "Connected mptcp=true" in client
     assert any(r[10] == "1" for r in rows), "MPTCP v1 missing"
+    if args.csum:
+        flt = "tcp.options.mptcp.subtype == 0 || tcp.options.mptcp.dseqnpresent.flag == 1"
+        names = ["tcp.flags.syn", "tcp.flags.ack", "tcp.option_kind", "tcp.option_len", "tcp.options.mptcp.subtype", "tcp.options.mptcp.checksumreq.flags", "tcp.options.mptcp.dataackpresent.flag", "tcp.options.mptcp.dataack8.flag", "tcp.options.mptcp.dseqnpresent.flag", "tcp.options.mptcp.dseqn8.flag"]
+        packets = []
+        for name in pcaps:
+            cmd = ["tshark", "-r", str(out / name), "-Y", flt, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
+            for f in names:
+                cmd += ["-e", f]
+            for v in csv.reader(io.StringIO(subprocess.check_output(cmd, text=True)), delimiter="\t"):
+                packets.append((flag(v[0]), flag(v[1]), *csum_options(*v[2:])))
+        print(csum_checks(csum_want(args.csum, args.client, args.server), packets))
     if scenario == "dataack-strip":
         assert client.count("event: FellBack") == 1, "fallback event count"
-        assert sum(r[11] == "0" and r[9] == "2" for r in rows) == 1, "infinite mapping count"
+        # The client's TUN: its own sends, and the server's ACKs in the order they reached it.
+        infinite_mapping_checks([(r[1] in cips, int(r[4] or 0), r[9], r[11], r[13], r[22], int(r[2]), int(r[3] or 0)) for r in capture("tun.pcap")])
         rules = (out / "server-rules.txt").read_text()
         assert re.search(r"\[[1-9][0-9]*:[0-9]+\].*TCPOPTSTRIP", rules), "strip rule unused"
     elif scenario == "csum-fail1":

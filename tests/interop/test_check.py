@@ -4,10 +4,10 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from endpoints import Packet, check_inversion, csum_fail_checks, endpoints, mptcp_options, removed_flow_exempt, two_subflows  # noqa: E402
+from endpoints import Packet, check_inversion, csum_checks, csum_fail_checks, csum_options, csum_want, data_ack_advances, delivery_summary, endpoints, failed_mapping, infinite_mapping_checks, mp_fail_bounds, mp_fail_dsn, mptcp_options, own_capture, removed_flow_exempt, two_subflows  # noqa: E402
 from pattern import BUF, verify_chunk  # noqa: E402
 
-SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "csum-fail1", "csum-fail2"]
+SCENARIOS = ["m0", "m1", "syn-strip", "m2-mtu", "base-a", "base-b", "m2-goodput", "m2-lossy", "m2-blackhole-a", "m2-remove", "m2-hetero", "csum-fail1", "csum-fail2"]
 
 
 class Endpoints(unittest.TestCase):
@@ -28,7 +28,7 @@ class Endpoints(unittest.TestCase):
             self.assertEqual(endpoints("base-a", "kernel", server), (srv, {"10.0.1.1"}, None))
             self.assertEqual(endpoints("base-b", "kernel", server), (srv, {"10.0.2.1"}, None))
             self.assertEqual(endpoints("csum-fail1", "kernel", server), (srv, {"10.0.1.1"}, None))
-            for s in ["m2-goodput", "m2-lossy", "m2-remove", "csum-fail2"]:
+            for s in ["m2-goodput", "m2-lossy", "m2-remove", "m2-hetero", "csum-fail2"]:
                 self.assertEqual(endpoints(s, "kernel", server), (srv, {"10.0.1.1", "10.0.2.1"}, "10.0.2.1"), s)
 
 
@@ -67,8 +67,8 @@ class MptcpOptions(unittest.TestCase):
                          [{"subtype": 2, "dsn8": True, "dsn": 7, "dll": 0}, {"subtype": 6, "dsn": 8}, TCPRST6])
 
 
-def pkt(t, src, flow, opts, rst=False, ack=True):
-    return Packet(t, src, flow, rst, ack, opts)
+def pkt(t, src, flow, opts, rst=False, ack=True, **tcp):
+    return Packet(t, src, flow, rst, ack, opts, **tcp)
 
 
 class CsumFail(unittest.TestCase):
@@ -108,6 +108,140 @@ class CsumFail(unittest.TestCase):
                 csum_fail_checks("csum-fail2", bad, SRV, "10.0.8.2")
 
 
+class MpFailBounds(unittest.TestCase):
+    """csum-fail1: MP_FAIL traffic bounded per direction by the G13 schedule, and no answer to a
+    peer MP_FAIL after our fallback (G18). Ours: the mptcp-rs client 10.0.9.2; the peer: SRV."""
+    CLI = "10.0.9.2"
+    OURS = {CLI}
+    ECHO = [INFINITE, FAIL]
+
+    def echoer(self):
+        """The peer reports a failure; we echo on a pure ACK, the echo rides our data until
+        retired, the peer answers a late echo, then G13 retries at +1 s and +3 s, each answered."""
+        cli = lambda t, **kw: pkt(t, self.CLI, LEG_A, self.ECHO, **kw)
+        return ([pkt(1.0, SRV, LEG_A, [FAIL]), cli(1.01)] + [cli(1.011 + i / 1000, len=1428) for i in range(20)]
+                + [pkt(1.03, SRV, LEG_A, [FAIL]), cli(2.01), pkt(2.03, SRV, LEG_A, [FAIL]), cli(4.01), pkt(4.03, SRV, LEG_A, [FAIL])])
+
+    S = 5000  # our TCP seq at the echo
+
+    def retired(self):
+        """As the echoer, from our side's capture: the echo, 20 copies riding data, the peer's
+        TCP ACK of the first copy's octets (sent only with the infinite mapping), two copies we
+        wrote before reading that ACK (0.4 ms seen, csum-fail1-s2c 20261013T185639-dDLsVJ), then
+        plain data."""
+        cli = lambda t, i, opts=self.ECHO: pkt(t, self.CLI, LEG_A, opts, seq=self.S + 1428 * i, len=1428)
+        return ([pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO, seq=self.S)]
+                + [cli(1.011 + i / 1000, i) for i in range(20)] + [pkt(1.031, SRV, LEG_A, [], ackno=self.S + 1428)]
+                + [cli(1.0312, 20), cli(1.0314, 21), cli(1.032, 22, []), cli(1.033, 23, [])])
+
+    E = 1000 + 1428 * 30  # the peer's TCP seq at its echo
+
+    def originator(self):
+        """We report a failure on every ACK of the peer's data; its echo; our ACKs still in flight
+        (all of data sent before the echo); its answer to one of them."""
+        return ([pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * i) for i in range(21)]
+                + [pkt(1.01, SRV, LEG_A, [FAIL], seq=self.E), pkt(1.025, SRV, LEG_A, [FAIL], seq=self.E + 1428 * 10)])
+
+    def test_accepted(self):
+        mp_fail_bounds(self.echoer(), self.OURS)
+        mp_fail_bounds(self.originator(), self.OURS)
+        # The ACK of the last octet before the echo, and the peer's infinite mapping, are fine.
+        mp_fail_bounds(self.originator() + [pkt(1.02, self.CLI, LEG_A, [FAIL], ackno=self.E)], self.OURS)
+
+    def test_retired_echo_accepted(self):
+        mp_fail_bounds(self.retired(), self.OURS)
+
+    def test_mp_fail_after_retirement_rejected(self):
+        # Ten data-bearing MP_FAILs in a burst well under 0.5 s; one riding data right after
+        # plain data; a pure-ACK retry once the echo is retired.
+        burst = [pkt(1.05 + i / 100, self.CLI, LEG_A, [FAIL], seq=self.S + 1428 * (24 + i), len=1428) for i in range(10)]
+        for bad, why in [(burst, "burst"), ([pkt(1.0325, self.CLI, LEG_A, self.ECHO, seq=self.S + 1428 * 23, len=1428)], "after plain data"),
+                         ([pkt(2.01, self.CLI, LEG_A, [FAIL])], "retry")]:
+            with self.assertRaisesRegex(AssertionError, "retired", msg=why):
+                mp_fail_bounds(self.retired() + bad, self.OURS)
+
+    def test_deadline_rejected(self):
+        # None of ours later than 120 s after our first MP_FAIL (G13, G16).
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
+        for retries in [[retry(121)], [retry(41), retry(123)]]:
+            with self.assertRaisesRegex(AssertionError, "120 s", msg=[round(p.t - 1.01, 3) for p in retries]):
+                mp_fail_bounds(start + retries, self.OURS)
+
+    def test_retry_spacing_not_checked(self):
+        # Timer emissions cannot be told apart on the wire (a data-driven MP_FAIL can hide one,
+        # a delayed window update looks like one), so the spacing is left to the library's unit
+        # tests; within the episode and 120 s bounds these pass.
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
+        for retries in [[retry(0.7)], [retry(1), retry(2)], [retry(1), retry(3), retry(4.5)],
+                        [retry(1), retry(3), retry(7), retry(15), retry(31), retry(63)]]:
+            mp_fail_bounds(start + retries, self.OURS)
+        # Codex r4: infinite-mapped payload at +0.7 s, then retries at +1 s and +2 s.
+        mp_fail_bounds(start + [pkt(1.71, self.CLI, LEG_A, self.ECHO, len=1428), retry(1), retry(2)], self.OURS)
+        # Codex r4: a window update while Waiting, 0.6 s after our MP_FAIL, with no new peer data.
+        mp_fail_bounds(self.originator() + [pkt(1.62, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * 20)], self.OURS)
+
+    def test_late_timers_accepted(self):
+        # Paused mid-drain: copies we built before reading the retiring ACK reach the TUN 20 ms
+        # after it, still before our first segment without MP_FAIL.
+        r = self.retired()
+        paused = [p._replace(t=p.t + 0.02) if p.t > 1.031 else p for p in r]
+        mp_fail_bounds(paused, self.OURS)
+        # A 1 s retry serviced 100 ms late: the next is scheduled 2 s from then (mptcp.rs
+        # mp_fail_timeout doubles the stored interval from the handling time).
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        mp_fail_bounds(start + [pkt(2.11, self.CLI, LEG_A, [FAIL]), pkt(4.11, self.CLI, LEG_A, [FAIL])], self.OURS)
+        # Infinite-mapped payload sent 0.7 s after the echo carries it: data-driven, no retry.
+        mp_fail_bounds(start + [pkt(1.71, self.CLI, LEG_A, self.ECHO, len=1428)], self.OURS)
+
+    def test_echo_state_window_update_accepted(self):
+        # Codex r5: while our infinite mapping is due, every segment carries the echo, an
+        # ordinary payload-free ACK (a window update) too (mptcp.rs fail_due).
+        mp_fail_bounds(self.retired() + [pkt(1.015, self.CLI, LEG_A, [FAIL])], self.OURS)
+
+    def test_originator_lost_echo(self):
+        # From our side's capture: the peer's echo never reached us, so we kept MP_FAIL on ACKs
+        # of its later data until its infinite mapping arrived.
+        lost = [pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * i) for i in range(21)]
+        lost += [pkt(1.0 + i / 1000, self.CLI, LEG_A, [FAIL], ackno=self.E + 1428 * (i - 21)) for i in range(21, 30)]
+        inf = pkt(1.03, SRV, LEG_A, [INFINITE], seq=self.E + 1428 * 9, len=1428)
+        mp_fail_bounds(lost + [inf], self.OURS)
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(lost + [inf, pkt(1.031, self.CLI, LEG_A, [FAIL], ackno=self.E + 1428 * 10)], self.OURS)
+        with self.assertRaisesRegex(AssertionError, "no echo"):
+            mp_fail_bounds(lost, self.OURS)
+
+    def test_own_capture(self):
+        # The mptcp-rs end's own TUN: what reached it, in the order it read them. The peer's
+        # echo, captured at the peer's end, can still be lost on the way.
+        self.assertEqual(own_capture("mptcp-rs", "kernel"), "tun.pcap")
+        self.assertEqual(own_capture("kernel", "mptcp-rs"), "server-tun.pcap")
+
+    def test_storm_rejected(self):
+        # Linux answers every late MP_FAIL, so an answer of ours becomes a loop: alternating
+        # MP_FAILs every millisecond for a second (ours riding data, so only the bound fires).
+        storm = [pkt(1 + i / 1000, SRV if i % 2 == 0 else self.CLI, LEG_A, [FAIL] if i % 2 == 0 else self.ECHO, len=0 if i % 2 == 0 else 1428)
+                 for i in range(1000)]
+        with self.assertRaisesRegex(AssertionError, "lasts"):
+            mp_fail_bounds(storm, self.OURS)
+
+    def test_retries_beyond_the_schedule_rejected(self):
+        # A 7th retry, at +127 s, is past the 120 s G13 cut-off: 8 episodes from us.
+        retries = [pkt(1.01 + (2 ** k - 1), self.CLI, LEG_A, [FAIL]) for k in range(1, 8)]
+        with self.assertRaisesRegex(AssertionError, "episodes"):
+            mp_fail_bounds([pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)] + retries, self.OURS)
+
+    def test_answer_after_fallback_rejected(self):
+        # Echoer: a pure ACK with MP_FAIL answering the peer after our echo retired (after our
+        # first segment without MP_FAIL).
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(self.retired() + [pkt(1.0335, self.CLI, LEG_A, [FAIL])], self.OURS)
+        # Originator: an MP_FAIL on an ACK of data the peer sent after its echo.
+        with self.assertRaisesRegex(AssertionError, "G18"):
+            mp_fail_bounds(self.originator() + [pkt(1.03, self.CLI, LEG_A, [FAIL], ackno=self.E + 1)], self.OURS)
+
+
 class Inversion(unittest.TestCase):
     """csum-fail1: one inverted octet, inside the mapping the MP_FAIL names (stream offsets)."""
 
@@ -126,13 +260,169 @@ class Inversion(unittest.TestCase):
                 check_inversion(offs, 1000, 1400)
 
 
+class FailedMapping(unittest.TestCase):
+    """csum-fail1: the receiver's first MP_FAIL DSN, and the sender's mapping it names as stream
+    offsets from the sender's IDSN + 1."""
+    CLI = {"10.0.9.2"}
+    FIRST = (1 << 64) - 100  # the sender's IDSN + 1, near the wrap
+
+    def test_first_mp_fail_from_the_receiver(self):
+        pkts = [pkt(3, SRV, LEG_A, [{"subtype": 6, "dsn": 7}]), pkt(1, "10.0.9.2", LEG_A, [{"subtype": 6, "dsn": 5}]),
+                pkt(2, SRV, LEG_A, [DSS, {"subtype": 6, "dsn": 6}])]
+        self.assertEqual(mp_fail_dsn(pkts, {SRV}), 6)
+        self.assertEqual(mp_fail_dsn(pkts, self.CLI), 5)
+        with self.assertRaises(AssertionError):
+            mp_fail_dsn(pkts[:1], self.CLI)
+
+    def test_64_bit_dsn_and_offset_across_the_wrap(self):
+        fail = (self.FIRST + 5000) % (1 << 64)
+        maps = [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1400}]),
+                # Linux re-declares its last mapping with DLL + 1 (DATA_FIN): the larger one counts.
+                pkt(2, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1401}]),
+                pkt(3, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail + 1, "dll": 9999}]),
+                pkt(4, SRV, LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 9999}])]
+        self.assertEqual(failed_mapping(fail, maps, self.CLI, self.FIRST), (5000, 1401))
+
+    def test_32_bit_dss_matches_the_low_bits(self):
+        fail = (5 << 32) + 1234
+        maps = [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": False, "dsn": 1234, "dll": 1400}]),
+                # A 64-bit DSN must match in full.
+                pkt(2, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": 1234, "dll": 9999}])]
+        self.assertEqual(failed_mapping(fail, maps, self.CLI, 1000), ((5 << 32) + 234, 1400))
+
+    def test_no_mapping_rejected(self):
+        fail = (5 << 32) + 1234
+        for maps in [[], [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": True, "dsn": 1234, "dll": 1400}])],
+                     [pkt(1, "10.0.9.2", LEG_A, [{"subtype": 2, "dsn8": False}, {"subtype": 6, "dsn": fail}])],
+                     [pkt(1, SRV, LEG_A, [{"subtype": 2, "dsn8": True, "dsn": fail, "dll": 1400}])]]:
+            with self.assertRaises(AssertionError, msg=maps):
+                failed_mapping(fail, maps, self.CLI, 1000)
+
+
+class CsumOptions(unittest.TestCase):
+    """One packet's MP_CAPABLE A bits and DSS checksum octets, from tshark's per-option fields."""
+
+    def test_dss_lengths(self):
+        # NOP, NOP, timestamps, DSS: DATA_ACK 8 + DSN 8 + SSN + DLL + checksum = 28.
+        self.assertEqual(csum_options("1,1,8,30", "10,28", "2", "", "1", "1", "1", "1"), ([], [2]))
+        # DATA_ACK 4, DSN 4, no checksum: 18; DATA_ACK only: no mapping.
+        self.assertEqual(csum_options("30", "18", "2", "", "1", "0", "1", "0"), ([], [0]))
+        self.assertEqual(csum_options("30", "12", "2", "", "1", "1", "0", "0"), ([], []))
+        # No DATA_ACK, DSN 8, checksum: 20; before it a bare DSS (4) and an ADD_ADDR echo (8).
+        self.assertEqual(csum_options("30,30,30", "4,8,20", "2,3,2", "", "False,False", "False,False", "False,True", "False,True"), ([], [2]))
+
+    def test_mp_capable(self):
+        # SYN (A=1), third ACK (Length 20), MP_CAPABLE with data (22 or 24).
+        self.assertEqual(csum_options("30,2,3,1,4,1,1", "4,4,3,2", "0", "1", "", "", "", ""), ([True], []))
+        self.assertEqual(csum_options("1,1,8,30", "10,20", "0", "0", "", "", "", ""), ([False], []))
+        self.assertEqual(csum_options("30", "24", "0", "True", "", "", "", ""), ([True], [2]))
+        self.assertEqual(csum_options("30", "22", "0", "False", "", "", "", ""), ([False], [0]))
+
+
+SYN, SYNACK, ACK = (True, False), (True, True), (False, True)
+
+
+class Csum(unittest.TestCase):
+    """INTEROP_CSUM runs (spec G2/G3): A bits as negotiated, a checksum on every mapping exactly
+    when negotiated."""
+
+    def wire(self, syn_a, synack_a, csum):
+        o = 2 if csum else 0
+        return [(*SYN, [syn_a], []), (*SYN, [syn_a], []), (*SYNACK, [synack_a], []), (*ACK, [csum], []),
+                (*ACK, [csum], [o]), (*ACK, [], [o, o]), (False, True, [], [])]
+
+    def test_want(self):
+        # (SYN A, SYN/ACK A, checksums): a Linux server answers with its sysctl only; ours with
+        # the decision. Both ours: the Linux sysctl plays no part.
+        for csum, client, server, want in [
+                ("on:off", "mptcp-rs", "kernel", (True, False, True)), ("off:on", "mptcp-rs", "kernel", (False, True, True)),
+                ("off:off", "mptcp-rs", "kernel", (False, False, False)), ("on:on", "mptcp-rs", "kernel", (True, True, True)),
+                ("on:off", "kernel", "mptcp-rs", (False, True, True)), ("off:on", "kernel", "mptcp-rs", (True, True, True)),
+                ("off:off", "kernel", "mptcp-rs", (False, False, False)),
+                ("off:on", "mptcp-rs", "mptcp-rs", (False, False, False)), ("on:off", "mptcp-rs", "mptcp-rs", (True, True, True))]:
+            self.assertEqual(csum_want(csum, client, server), want, (csum, client, server))
+
+    def test_accepted(self):
+        for want in [(True, False, True), (False, True, True), (True, True, True), (False, False, False)]:
+            csum_checks(want, self.wire(*want))
+
+    def test_wrong_presence_rejected(self):
+        for want in [(True, False, True), (False, False, False)]:
+            o = 0 if want[2] else 2
+            for extra in [(*ACK, [], [o]), (*ACK, [], [2 - o, o]), (*ACK, [want[2]], [o])]:
+                with self.assertRaises(AssertionError, msg=(want, extra)):
+                    csum_checks(want, self.wire(*want) + [extra])
+
+    def test_wrong_a_bits_rejected(self):
+        want = (True, False, True)
+        for bad in [(*SYN, [False], []), (*SYNACK, [True], []), (*ACK, [False], [])]:
+            with self.assertRaises(AssertionError, msg=bad):
+                csum_checks(want, self.wire(*want) + [bad])
+
+    def test_missing_evidence_rejected(self):
+        want = (True, False, True)
+        wire = self.wire(*want)
+        for drop in [lambda p: p[:2] == SYN, lambda p: p[:2] == SYNACK, lambda p: p[2] and p[:2] == ACK, lambda p: p[3]]:
+            with self.assertRaises(AssertionError):
+                csum_checks(want, [p for p in wire if not drop(p)])
+
+
+class InfiniteMapping(unittest.TestCase):
+    """dataack-strip: the client's one infinite mapping, from the client's TUN, as (from the
+    client, payload length, MPTCP subtype, DLL, DSN, SSN, TCP seq, TCP ACK) in time order."""
+
+    @staticmethod
+    def wire(*segs):
+        """Client segments ("mpc"|"inf"|"plain", length[, (DSN, SSN)]) back to back from TCP
+        seq 1; ("ack", n): the server's TCP ACK of the client's first n octets."""
+        out, seq = [], 1
+        for kind, n, *anchor in segs:
+            if kind == "ack":
+                out.append((False, 0, "", "", "", "", 1, 1 + n))
+                continue
+            st, dll, dsn, ssn = {"mpc": ("0", str(n), "", ""), "plain": ("", "", "", ""),
+                                 "inf": ("2", "0", *(anchor[0] if anchor else ("77", "1")))}[kind]
+            out.append((True, n, st, dll, dsn, ssn, seq, 1))
+            seq += n
+        return out
+
+    def test_riding_data_until_acknowledged(self):
+        # Since e0d2c5b the copy also rides the data until an octet only sent with it is
+        # TCP-ACKed; one more copy may follow that ACK before the client reads it (the TUN of
+        # 20261014T220729-BnmM0J: ACK-only copy, data copy, its ACK, data copy, ACK, plain).
+        infinite_mapping_checks(self.wire(("mpc", 1432), ("ack", 1432), ("inf", 0), ("inf", 1440), ("ack", 2872),
+                                          ("inf", 1440), ("ack", 4312), ("plain", 1460)))
+
+    def test_retired_before_acknowledged_rejected(self):
+        for bad, why in [(self.wire(("mpc", 1432), ("ack", 1432), ("inf", 0), ("plain", 1460)), "ACK-only copy, then plain (through 0.2.0)"),
+                         (self.wire(("mpc", 1432), ("inf", 0), ("inf", 1440), ("inf", 1440), ("plain", 1460)), "no peer ACK"),
+                         (self.wire(("mpc", 1432), ("inf", 0), ("inf", 1440), ("ack", 1432), ("plain", 1460)), "ACK of the pre-switch octets only")]:
+            with self.assertRaisesRegex(AssertionError, "retired before", msg=why):
+                infinite_mapping_checks(bad)
+
+    def test_rules(self):
+        w = self.wire
+        for bad, err, why in [
+                (w(("mpc", 1432), ("ack", 1432), ("plain", 1460)), "no infinite mapping", "none"),
+                (w(("inf", 0), ("inf", 1440, ("78", "1")), ("ack", 1440), ("plain", 1460)), "more than one", "two DSNs"),
+                (w(("inf", 0), ("inf", 1440, ("77", "2")), ("ack", 1440), ("plain", 1460)), "more than one", "same DSN, two SSNs"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460))[:2] + [(False, 0, "2", "0", "77", "1", 1, 1441)] + w(("plain", 1460)),
+                 "from the server", "server copy"),
+                (w(("inf", 1440), ("ack", 1440), ("plain", 1460)), "ACK-only", "no ACK-only copy"),
+                (w(("inf", 0), ("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460)), "ACK-only", "two ACK-only copies"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440)), "not retired", "never retired"),
+                (w(("inf", 0), ("inf", 1440), ("ack", 1440), ("plain", 1460), ("inf", 1440), ("plain", 1460)), "not retired", "resumed after plain data")]:
+            with self.assertRaisesRegex(AssertionError, err, msg=why):
+                infinite_mapping_checks(bad)
+
+
 class Invert(unittest.TestCase):
     """server.py's and kclient.py's `--invert N`, as mptcp-rs-tun's."""
     DATA = bytes(BUF[1000 % 251 : 1000 % 251 + 600])  # stream offsets 1000..1600
 
     def check(self, data, n):
         inv = []
-        ok = verify_chunk(1000, data[:300], n, inv) and verify_chunk(1300, data[300:], n, inv)
+        ok = verify_chunk(1000, data[:300], n, inv) is None and verify_chunk(1300, data[300:], n, inv) is None
         return inv if ok and len(inv) == n else None
 
     def test_exact_inversions(self):
@@ -155,6 +445,57 @@ class Invert(unittest.TestCase):
         self.assertIsNone(self.check(changed, 1))
         changed[450] ^= 0xFF
         self.assertIsNone(self.check(changed, 2))
+
+    def test_offending_octet(self):
+        # The stream offset of the first octet breaking the rule, as mptcp-rs-tun's error.
+        two = bytearray(self.DATA)
+        two[10] ^= 0xFF
+        two[450] ^= 0xFF
+        self.assertEqual(verify_chunk(1000, two, 1, []), 1450, "the extra inversion")
+        changed = bytearray(self.DATA)
+        changed[10] ^= 1
+        self.assertEqual(verify_chunk(1000, changed, 2, []), 1010, "the changed octet")
+        self.assertEqual(verify_chunk(0, bytes([BUF[0] ^ 1]), 0, []), 0, "offset 0 is an error too")
+        self.assertIsNone(verify_chunk(1000, self.DATA, 0, []))
+
+
+class Delivery(unittest.TestCase):
+    """m2-hetero: the receiver's cumulative DATA_ACK over time (offsets from the sender's IDSN + 1)."""
+    BASE = (1 << 64) - 1000  # the 64-bit offsets wrap
+
+    def test_advances_only(self):
+        acks = [(0.0, self.BASE, True), (1.0, (self.BASE + 500) % (1 << 64), True), (1.5, (self.BASE + 400) % (1 << 64), True),
+                (2.0, (self.BASE + 500) % (1 << 64), True), (3.0, (self.BASE + 2000) % (1 << 64), True)]
+        self.assertEqual(data_ack_advances(acks, self.BASE), [(1.0, 500), (3.0, 2000)])
+
+    def test_32_bit_acks_promoted(self):
+        base = (1 << 32) - 100
+        acks = [(1.0, base + 50, True), (2.0, (base + 300) % (1 << 32), False), (3.0, (base + 200) % (1 << 32), False),
+                (4.0, (base + 1000000) % (1 << 32), False)]
+        self.assertEqual(data_ack_advances(acks, base), [(1.0, 50), (2.0, 300), (4.0, 1000000)])
+
+    def test_summary(self):
+        # Longest gap from the first payload (9.8 s) to the advance reaching the byte count
+        # (1000000), and Mbit/s per one-second bin from the first payload.
+        gap, series = delivery_summary([(10.0, 125000), (10.5, 250000), (13.0, 500000), (13.2, 1000000)], 9.8, 1000000)
+        self.assertAlmostEqual(gap, 2.5)
+        self.assertEqual(series, [2.0, 0.0, 0.0, 6.0])
+
+    def test_initial_stall_counted(self):
+        # No advance until 5 s after the first payload, then two quick ones: a 5 s stall.
+        gap, _ = delivery_summary([(5.0, 500000), (5.1, 1000000)], 0.0, 1000000)
+        self.assertAlmostEqual(gap, 5.0)
+
+    def test_gaps_after_completion_ignored(self):
+        # The DATA_FIN's advance (byte count + 1) may come later: delivery was complete.
+        gap, _ = delivery_summary([(1.0, 1000000), (9.0, 1000001)], 0.5, 1000000)
+        self.assertAlmostEqual(gap, 0.5)
+
+    def test_missing_evidence_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "no DATA_ACK advance"):
+            delivery_summary([], 0.0, 1000000)
+        with self.assertRaisesRegex(AssertionError, "short of"):
+            delivery_summary([(1.0, 500000), (1.1, 999999)], 0.5, 1000000)
 
 
 if __name__ == "__main__":

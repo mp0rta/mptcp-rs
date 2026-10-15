@@ -35,10 +35,7 @@ fn half_open_hidden_until_established() {
         now,
         "10.0.0.1".parse().unwrap(),
         remote,
-        ConnectConfig {
-            checksums: false,
-            ..ConnectConfig::default()
-        },
+        ConnectConfig::default(),
     )
     .unwrap();
     assert_eq!(shuttle(&mut a, &mut b, now), 1, "the SYN");
@@ -75,10 +72,7 @@ fn open_mptcp(ep: &mut Endpoint<ChaCha20Rng>, now: Instant) -> ConnectionHandle 
         now,
         "10.0.0.1".parse().unwrap(),
         "10.0.0.2:80".parse().unwrap(),
-        ConnectConfig {
-            checksums: false,
-            ..ConnectConfig::default()
-        },
+        no_checksums(),
     )
     .unwrap()
 }
@@ -367,10 +361,7 @@ fn token_collision_client_server() {
             now,
             "10.0.0.2".parse().unwrap(),
             "10.0.0.3:80".parse().unwrap(),
-            ConnectConfig {
-                checksums: false,
-                ..ConnectConfig::default()
-            },
+            no_checksums(),
         )
         .unwrap();
     let seg = Segment {

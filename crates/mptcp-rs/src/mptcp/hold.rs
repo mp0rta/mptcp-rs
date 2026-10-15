@@ -289,6 +289,15 @@ impl Hold {
         out
     }
 
+    /// Discards every held run (the frontier stays); returns whether any octet was held.
+    pub fn clear(&mut self) -> bool {
+        let had = self.held > 0;
+        self.entries.clear();
+        self.held = 0;
+        self.pieces = 0;
+        had
+    }
+
     /// Empties the buffer: every held run with its SSN, in SSN order.
     pub fn drain(&mut self) -> Vec<(u32, Vec<u8>)> {
         self.held = 0;

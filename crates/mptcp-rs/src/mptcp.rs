@@ -108,9 +108,9 @@ pub(crate) enum MpFail {
         retry_at: Instant,
         interval: Duration,
     },
-    /// We echoed the peer's MP_FAIL and fell back: the echo rides every segment while our
-    /// infinite mapping is due, and a pure ACK with it is forced at `retry_at` until then or
-    /// 120 s after `since` (G13).
+    /// We echoed the peer's MP_FAIL and fell back: the echo, carrying `recv.next` at each send,
+    /// rides every segment while our infinite mapping is due, and a pure ACK with it is forced
+    /// at `retry_at` until then or 120 s after `since` (G13).
     Echo {
         since: Instant,
         retry_at: Instant,
@@ -277,6 +277,12 @@ fn active_maps(subflows: &[Subflow]) -> impl Iterator<Item = &TxMaps> + Clone {
         .map(|s| &s.mp.tx)
 }
 
+/// The DSN of `ssn` under a received infinite mapping's translation `(anchor SSN, anchor
+/// DSN)`. The offset is signed: the anchor may lie ahead of `ssn`.
+fn infinite_dsn((anchor_ssn, anchor_dsn): (u32, u64), ssn: u32) -> u64 {
+    anchor_dsn.wrapping_add_signed(ssn.wrapping_sub(anchor_ssn) as i32 as i64)
+}
+
 /// The later of two DSNs (`end` if there is no `old`).
 pub(crate) fn later(old: Option<u64>, end: u64) -> Option<u64> {
     Some(
@@ -409,7 +415,7 @@ impl Connection {
         }
         self.hooks.mp_fail = MpFail::Idle;
         if let Some(sf) = sf {
-            sf.mp.hold.drain();
+            sf.mp.hold.clear();
         }
         if let Some(d) = self.hooks.data.as_mut() {
             d.recv
@@ -638,7 +644,7 @@ impl Connection {
         // or failed, can never complete, nor are they DATA_ACKed, so the peer sends them again
         // elsewhere (RFC 8684 L2392–2394). Kept, they would hold `free` down, for good on the
         // retained initial subflow, and escape the connection's bound (M4b spec G7).
-        if self.subflows[i].ended() && !self.subflows[i].mp.hold.drain().is_empty() {
+        if self.subflows[i].ended() && self.subflows[i].mp.hold.clear() {
             let held = self.subflows.iter().map(|s| s.mp.hold.held()).sum();
             d.recv.set_held(held);
         }
@@ -1280,6 +1286,7 @@ impl SubflowHooks<'_> {
 impl SubflowHooks<'_> {
     /// The DSN of the MP_FAIL this subflow's segments carry now (M4b spec G11, G13): ours on
     /// the subflow we wait on, or our echo, `recv.next`, while our infinite mapping is due.
+    /// `signal_clock` names this subflow: `prepare_send` sets it before the subflow sends.
     fn fail_due(&self) -> Option<u64> {
         let d = self.conn.data.as_ref()?;
         match self.conn.mp_fail {
@@ -1499,6 +1506,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                         Ok(MptcpOption::FastClose { receiver_key }) if fastclose.is_none() => {
                             fastclose = Some(receiver_key)
                         }
+                        // Repeated signal options: the last MP_PRIO or MP_FAIL counts.
                         Ok(MptcpOption::Prio { backup }) => prio = Some(backup),
                         Ok(MptcpOption::Fail { dsn }) => fail = Some(dsn),
                         Ok(MptcpOption::RemoveAddr { ids }) => removed.extend(ids.iter()),
@@ -1598,19 +1606,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 RecvAssembler::new(m.peer_idsn.unwrap().wrapping_add(1), self.conn.recv_cap, 64);
             // The edge our SYN or SYN/ACK advertised, unscaled.
             recv.right_edge = recv.next.wrapping_add(self.conn.recv_cap.min(65535) as u64);
-            self.conn.data = Some(DataState {
-                recv,
-                send,
-                close: close::Close::default(),
-                sanity_failures: 0,
-                recovery_head: None,
-                recovery_at: None,
-                recovery_interval: Duration::from_secs(1),
-                reinject: ReinjectQueue::new(m.local_idsn.wrapping_add(1)),
-                fallback: false,
-                settling: false,
-                dropped_end: None,
-            });
+            self.conn.data = Some(DataState::new(recv, send));
             self.sf.tcp_acked_dsn = m.local_idsn.wrapping_add(1);
             // Our ISS: the SYN/ACK's ACK (initiator) or the final ACK's (listener) is ISS + 1.
             self.sf.local_isn = seg.ack.wrapping_add(u32::MAX);
@@ -1692,6 +1688,10 @@ impl SegmentHooks for SubflowHooks<'_> {
                 && c.sender_key == m.peer_key;
             if !valid && (c.data_len.is_some() || m.passive) {
                 self.sf.reset = true;
+                // A mapping whose checksum presence differs from the decision: G3's reset.
+                if c.data_len.is_some() && c.checksum.is_some() != m.csum {
+                    self.sf.reset_option = Some(tcprst(0x01, false).to_vec());
+                }
                 return;
             }
             m.peer_c |= valid && c.flags & CAP_C != 0;
@@ -1747,12 +1747,25 @@ impl SegmentHooks for SubflowHooks<'_> {
                 }
                 // An MP_CAPABLE mapping always has the handshake's offset (SSN 1, IDSN + 1).
                 // Only checksums use it (G9, A1).
-                self.sf.other_offset |=
+                let other =
                     m.csum && len > 0 && !initial_offset_ok(m.peer_idsn.unwrap(), dsn, mapping.ssn);
+                self.sf.other_offset |= other;
+                // While `Waiting` (on this subflow: no other one carries data, G12), another
+                // offset means the peer reinjected here, so contiguity is gone: the G11
+                // "otherwise" reset, before any of this mapping is delivered.
+                if let MpFail::Waiting { dsn: failed, .. } = self.conn.mp_fail {
+                    if other && !self.sf.joining() {
+                        self.sf.reset = true;
+                        self.sf.reset_option = Some(fail_rst(failed));
+                        self.sf.hold.clear();
+                        return;
+                    }
+                }
                 // With checksums (the check above makes `checksum` present exactly then), a
                 // data mapping is held until it verifies and may earn completion credit; its
                 // folded DATA_FIN applies only once it verifies, and a DATA_FIN-only mapping
-                // only if its checksum does (spec G6–G8, RFC 8684 L1402–1430).
+                // only if its checksum does or it is at `recv.next` (spec G6–G8, RFC 8684
+                // L1402–1430).
                 let fin = if let Some(checksum) = mapping.checksum {
                     if len > 0 {
                         let map = HoldMap {
@@ -1769,7 +1782,16 @@ impl SegmentHooks for SubflowHooks<'_> {
                         let end = dsn.wrapping_add(u64::from(mapping.data_len));
                         d.recv.credit(dsn, end);
                     }
-                    v.data_fin && len == 0 && dss_checksum_ok(dsn, mapping.ssn, 1, &[], checksum)
+                    // A DATA_FIN-only mapping at `recv.next` is taken whatever its checksum: all
+                    // data up to it has arrived, so it agrees with our state. Linux kernels with
+                    // cfcceb7a39fc ("tcp: shrink per-packet memset in __tcp_transmit_skb()") but
+                    // not b110f1dd6cb6 ("mptcp: options: fix uninit-value in
+                    // mptcp_write_data_fin") send it with an uninitialised checksum, and Linux
+                    // never verifies it; ignored, the close would never complete.
+                    v.data_fin
+                        && len == 0
+                        && (dsn == d.recv.next
+                            || dss_checksum_ok(dsn, mapping.ssn, 1, &[], checksum))
                 } else {
                     v.data_fin
                 };
@@ -1862,9 +1884,8 @@ impl SegmentHooks for SubflowHooks<'_> {
     }
     fn receipt_advanced(&mut self, ssn: u32) {
         if self.conn.data.is_some() {
-            if let Some((base, dsn)) = &mut self.sf.rx_infinite {
-                *dsn = dsn.wrapping_add_signed(ssn.wrapping_sub(*base) as i32 as i64);
-                *base = ssn;
+            if let Some(anchor) = &mut self.sf.rx_infinite {
+                *anchor = (ssn, infinite_dsn(*anchor, ssn));
             }
             self.sf.rx.ack(ssn);
             // Complete mappings were taken in `receive_data`, before the receipt advanced. Only
@@ -1891,12 +1912,7 @@ impl SegmentHooks for SubflowHooks<'_> {
         while at < bytes.len() {
             let pos = ssn.wrapping_add(at as u32);
             let translated = if d.fallback {
-                self.sf.rx_infinite.map(|(ssn, dsn)| {
-                    (
-                        dsn.wrapping_add_signed(pos.wrapping_sub(ssn) as i32 as i64),
-                        bytes.len() - at,
-                    )
-                })
+                (self.sf.rx_infinite).map(|a| (infinite_dsn(a, pos), bytes.len() - at))
             } else {
                 self.sf.rx.translate(pos)
             };
@@ -1989,7 +2005,7 @@ impl SegmentHooks for SubflowHooks<'_> {
                 Complete::Failed { dsn, .. } => {
                     self.sf.reset = true;
                     self.sf.reset_option = Some(fail_rst(dsn));
-                    self.sf.hold.drain();
+                    self.sf.hold.clear();
                     break;
                 }
             }
@@ -2009,6 +2025,22 @@ impl SegmentHooks for SubflowHooks<'_> {
 }
 
 impl DataState {
+    /// The state at MP_CAPABLE completion: nothing sent or reinjected yet.
+    fn new(recv: RecvAssembler, send: SendStore) -> Self {
+        Self {
+            reinject: ReinjectQueue::new(send.una),
+            recv,
+            send,
+            close: close::Close::default(),
+            sanity_failures: 0,
+            recovery_head: None,
+            recovery_at: None,
+            recovery_interval: Duration::from_secs(1),
+            fallback: false,
+            settling: false,
+            dropped_end: None,
+        }
+    }
     /// Every DATA_ACK release: frees the store, then prunes the reinjection queue below
     /// the new `send.una`.
     fn release(&mut self, ack: u64) -> bool {
@@ -2047,14 +2079,12 @@ impl DataState {
         // the handshake's constant DSN−SSN offset.
         let next = self.recv.next;
         let peer_idsn = m.peer_idsn.unwrap();
-        let (ssn_r, dsn_r) =
-            *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
+        let anchor = *(sf.rx_infinite).get_or_insert((next.wrapping_sub(peer_idsn) as u32, next));
         // Held octets go on as plain TCP through the new translation (spec G15). What free
         // memory cannot take is carried by `RecvAssembler`'s promised data above it, past the
         // range cap and the offered edge if need be (`replay`), and delivered as reads make room.
         for (ssn, run) in sf.hold.drain() {
-            let dsn = dsn_r.wrapping_add_signed(ssn.wrapping_sub(ssn_r) as i32 as i64);
-            self.recv.replay(dsn, &run);
+            self.recv.replay(infinite_dsn(anchor, ssn), &run);
         }
         let una = self.send.una;
         let (ssn, dsn) = if joined_ever {
@@ -2384,6 +2414,16 @@ impl Negotiation {
 mod tests {
     use super::*;
 
+    /// The received infinite-mapping translation across the SSN wrap, with the anchor behind
+    /// or ahead of the SSN (a replayed held run may precede a received anchor).
+    #[test]
+    fn infinite_dsn_across_ssn_wrap() {
+        let anchor = (u32::MAX - 9, 1_000);
+        assert_eq!(infinite_dsn(anchor, 5), 1_015);
+        assert_eq!(infinite_dsn(anchor, u32::MAX - 19), 990);
+        assert_eq!(infinite_dsn((5, 1_000), u32::MAX - 4), 990);
+    }
+
     /// Review Focus 3 (spec G10a): a connection that has moved `past` octets each way past its
     /// IDSNs falls back with no join. Plain data at the matching SSN lands at `recv.next`, and
     /// our infinite mapping is `(SSN of send.una, send.una)`.
@@ -2394,19 +2434,10 @@ mod tests {
         m.peer_idsn = Some(0xfff0_0000_0000_0010);
         let peer_head = m.peer_idsn.unwrap().wrapping_add(1 + past);
         let local_una = m.local_idsn.wrapping_add(1 + past);
-        let mut d = DataState {
-            recv: RecvAssembler::new(peer_head, 65_536, 64),
-            send: SendStore::new(local_una, 65_536),
-            close: close::Close::default(),
-            sanity_failures: 0,
-            recovery_head: None,
-            recovery_at: None,
-            recovery_interval: Duration::from_secs(1),
-            reinject: ReinjectQueue::new(local_una),
-            fallback: false,
-            settling: false,
-            dropped_end: None,
-        };
+        let mut d = DataState::new(
+            RecvAssembler::new(peer_head, 65_536, 64),
+            SendStore::new(local_una, 65_536),
+        );
         let mut sf = SubflowMp::new();
         d.fall_back(&mut sf, &mut m, false);
         let ssn = (1 + past) as u32;

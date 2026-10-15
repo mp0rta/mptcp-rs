@@ -1526,7 +1526,7 @@ impl<R: CryptoRng> Endpoint<R> {
                 let syn_sent = sf.tcb.state() == TcpState::SynSent;
                 if Some(sf.id) == mp_fail_expired {
                     // No answer to our MP_FAIL in 120 s (M4b spec G16); held octets go too.
-                    hk.sf.hold.drain();
+                    hk.sf.hold.clear();
                 }
                 if Some(sf.id) == mp_fail_expired && sf.tcb.state() != TcpState::Closed {
                     let rst = Some(tcprst(0x06, false).to_vec());

@@ -266,6 +266,51 @@ fn waiting_sends_mp_fail_on_acks_and_retries() {
     }
 }
 
+/// While `Waiting`, a later mapping N that verifies leaves the DATA_ACK at M, with
+/// MP_FAIL(M.dsn) on our ACK, and N unread (spec G11).
+#[test]
+fn waiting_holds_data_ack_at_m() {
+    let Waiting { mut c, m, .. } = waiting();
+    let n = pattern(50);
+    let sent = c.peer_at(5111, &csum_mapping(111, m + 10, &n, false), &n);
+    let ack = sent.last().expect("an ACK");
+    assert_eq!((fail_of(ack), data_ack_of(ack)), (Some(m), Some(m)));
+    assert_eq!(read_now(&mut c.ep, c.h).len(), 100, "A only");
+}
+
+/// While `Waiting`, a valid copy of M's DSNs at later SSNs (another offset: the peer
+/// reinjected on this subflow) breaks contiguity: the subflow is reset with MP_FAIL(M.dsn) +
+/// MP_TCPRST 0x06 and its hold discarded, before any of the copy is delivered; no DATA_ACK
+/// passes M (spec G10, G11).
+#[test]
+fn waiting_other_offset_mapping_resets() {
+    let Waiting { mut c, m, .. } = waiting();
+    let n = pattern(50);
+    c.peer_at(5111, &csum_mapping(111, m + 10, &n, false), &n);
+    let copy = pattern(10);
+    let sent = c.peer_at(5161, &csum_mapping(161, m, &copy, false), &copy);
+    assert_eq!(rst_reason(&sent), Some(mp_fail_rst(m)));
+    assert!(sent.iter().all(|s| data_ack_of(s).is_none_or(|a| a <= m)));
+    assert_eq!(read_now(&mut c.ep, c.h).len(), 100, "A only");
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(state(&c), MpFail::Idle);
+    assert_eq!(fell_back(&mut c.ep), 0);
+}
+
+/// While `Waiting`, TCP-level retransmission goes on (spec G12): our unacknowledged data is
+/// resent at the RTO, with MP_FAIL(M.dsn).
+#[test]
+fn waiting_keeps_tcp_retransmission() {
+    let Waiting { mut c, m, .. } = waiting();
+    c.ep.connection(c.h).unwrap().write(b"reply").unwrap();
+    assert!(c.sent(t(2)).iter().any(|s| s.payload == b"reply"));
+    let at = c.ep.poll_timeout().unwrap();
+    c.ep.handle_timeout(at);
+    let out = c.sent(at);
+    let again = out.iter().find(|s| s.payload == b"reply");
+    assert_eq!(again.map(fail_of), Some(Some(m)), "the retransmission");
+}
+
 /// The peer's echo: we fall back at once, M's octets (the corrupt one included) are readable,
 /// and our next data segment carries the infinite mapping `(SSN of send.una, send.una)`, without
 /// an MP_FAIL of ours (spec G10a, G13, G15).
@@ -375,6 +420,22 @@ fn mp_fail_with_infinite_mapping_checked_and_anchored() {
     }
 }
 
+/// A received infinite mapping without an MP_FAIL keeps its own anchor too: SSN 151 at DSN
+/// `head + 100`, where the handshake offset would put it at `head + 150` (spec G15).
+#[test]
+fn infinite_mapping_alone_keeps_its_anchor() {
+    let head = peer_head();
+    let mut c = client(true, false);
+    c.confirm();
+    let a = pattern(100);
+    c.peer_at(5001, &csum_mapping(1, head, &a, false), &a);
+    assert_eq!(read_now(&mut c.ep, c.h), a);
+    c.peer_at(5101, &dss_mapping(false, 151, head + 100, 0, Some(0)), &[]);
+    assert_eq!(fell_back(&mut c.ep), 1);
+    c.peer_at(5151, &[], b"later");
+    assert_eq!(read_now(&mut c.ep, c.h), b"later");
+}
+
 /// Review Focus 1: the peer sends one request whose only mapping fails, then only ACKs. After
 /// its echo the request is readable with no peer data, and our response goes out as plain TCP
 /// (spec G15).
@@ -434,9 +495,30 @@ fn waiting_times_out_at_120s() {
     assert_eq!(state(&c), MpFail::Idle);
 }
 
-/// While `Waiting`, the peer keeps sending failing mappings of M's in-window DSNs at the next
-/// SSNs, each covering the frontier: the hold buffer stays within `recv_buffer + 2 × 65,535`
-/// (spec G7); past it new octets are refused at the TCP level, and the echo still falls back.
+/// The subflow we wait on reaches R2 before the 120 s: `Waiting` ends with it, its held octets
+/// dropped, and no MP_FAIL timer is left (spec G12, G17).
+#[test]
+fn waiting_ends_at_r2() {
+    let Waiting { mut c, .. } = waiting();
+    let sf = &mut c.ep.conns.get_mut(&c.h).unwrap().subflows[0];
+    sf.tcb.set_r2_data(Duration::from_secs(5));
+    c.ep.connection(c.h).unwrap().write(b"reply").unwrap();
+    c.sent(t(2));
+    while c.ep.conns[&c.h].subflows[0].tcb.state() != TcpState::Closed {
+        let at = c.ep.poll_timeout().unwrap();
+        assert!(at < t(2) + MP_FAIL_WAIT);
+        c.ep.handle_timeout(at);
+        c.sent(at);
+    }
+    assert_eq!(state(&c), MpFail::Idle);
+    assert_eq!(held(&c.ep, c.h), 0);
+    assert_eq!(deadline(&c), None);
+}
+
+/// While `Waiting`, the peer keeps sending failing mappings at the next SSNs with the initial
+/// offset (another offset would end `Waiting`), each covering the frontier: the hold buffer
+/// stays within `recv_buffer + 2 × 65,535` (spec G7); past it new octets are refused at the
+/// TCP level, and the echo still falls back.
 #[test]
 fn waiting_further_failures_stay_bounded() {
     let recv_buffer = 1 << 16;
@@ -449,7 +531,7 @@ fn waiting_further_failures_stay_bounded() {
     let data = pattern(4000);
     let (mut ssn, mut refused) = (111, false);
     for _ in 0..200 {
-        let opt = bad_mapping(ssn, m, &data, false);
+        let opt = bad_mapping(ssn, m + u64::from(ssn - 101), &data, false);
         let sent = c.peer_at(5000 + ssn, &opt, &data);
         assert!(held(&c.ep, c.h) <= bound, "{}", held(&c.ep, c.h));
         let next = sent.last().expect("an ACK").ack.0 - 5000;
@@ -520,8 +602,9 @@ fn corrupt_first_mapping(c: &mut Client, now: Instant) {
 
 /// While `Waiting` nothing may break contiguity (spec G12): a join in SYN-SENT or
 /// SYN-RECEIVED is reset (the listener's half-open count drops back), a new `add_subflow` is
-/// queued and not started, an incoming join SYN is refused with a RST, a reinjection queued
-/// before the failure is not sent, and a recovery deadline passes without one.
+/// queued and not started, an incoming join SYN is refused with a RST until the subflow we wait
+/// on is reset, a reinjection queued before the failure is not sent, and a recovery deadline
+/// passes without one.
 #[test]
 fn waiting_freezes_joins_and_recovery() {
     let mut s = server(true);
@@ -577,6 +660,8 @@ fn waiting_freezes_joins_and_recovery() {
     let c = &s.ep.conns[&h];
     assert!(matches!(c.hooks.mp_fail, MpFail::Waiting { .. }));
     assert!(c.hooks.infinite_ok);
+    // After its RST the answered join is gone.
+    assert!(c.subflows.iter().all(|sf| sf.remote != rst[0].dst));
     // A new join is queued, not started; an incoming one is refused.
     s.ep.add_subflow(s.now, h, local, other, 1500, false)
         .unwrap();
@@ -591,6 +676,14 @@ fn waiting_freezes_joins_and_recovery() {
     assert!(answer[0].flags.contains(TcpFlags::RST));
     assert_eq!(answer[0].options, [30, 4, 0x80, 0x01]);
     assert_eq!(s.ep.conns[&h].subflows.len(), subflows);
+    // The client resets the subflow we wait on: `Waiting` ends, and joins are answered again
+    // within the no-subflow wait (spec G12, G17).
+    let rst = mp_fail_rst(client_idsn() + 1);
+    let seq = s.seq;
+    s.input(TcpFlags::RST | TcpFlags::ACK, seq, 65535, &rst, &[]);
+    assert_eq!(s.ep.conns[&h].hooks.mp_fail, MpFail::Idle);
+    let answer = join_syn_to_server(&mut s, "10.0.1.1:40002");
+    assert_eq!(answer[0].flags, TcpFlags::SYN | TcpFlags::ACK);
 
     // A reinjection queued before the failure is not sent.
     let (mut c, at) = recovery_armed();

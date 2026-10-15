@@ -58,7 +58,7 @@ transfer in one direction, and both clients open the first subflow on A and join
 
 Paths A (10 ms one-way, 300 Mbit/s) and B (30 ms, 80 Mbit/s) are netem on veth on one host; CUBIC, median of 5 runs, one segment per packet at netem; the dashed line is each client's ceiling after header overhead. Measured with checksums off (A=0).
 
-Without netem the CPU is the limit, and the kernel is far ahead (same paths A+B, offloads at their defaults, median of 5 runs):
+Without netem the CPU is the limit, and the kernel is far ahead (same paths A+B, offloads at their defaults, median of 5 runs, checksums off (A=0)):
 
 | direction | client | goodput | host CPU per GB |
 |---|---|---|---|

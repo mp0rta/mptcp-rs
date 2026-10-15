@@ -541,7 +541,7 @@ fn add_subflow_errors() {
             ms(0),
             ip("10.0.0.1"),
             "10.0.0.2:80".parse().unwrap(),
-            checksums_cfg(false),
+            ConnectConfig::default(),
         )
         .unwrap();
     assert_eq!(
@@ -4863,6 +4863,36 @@ fn responder_synack_hmac_matches_rfc_vector() {
         };
         assert_eq!(s.events(), if round == 0 { vec![up] } else { vec![] });
     }
+}
+
+/// The responder's third ACK completes the join and clears `infinite_ok` (M4b spec G10); an
+/// MP_FAIL on it arrived before the join completed and is ignored (G18): no RST.
+#[test]
+fn responder_join_clears_infinite_ok_and_ignores_mp_fail() {
+    let mut s = responder();
+    s.ep.nonces.push_back(RB);
+    let synack = responder_syn(&mut s, false);
+    let h = ConnectionHandle(0);
+    assert!(s.ep.conns[&h].hooks.infinite_ok);
+    let hmac160: [u8; 20] = join_hmac(KA, KB, RA, RB)[..20].try_into().unwrap();
+    let fail = MptcpOption::Fail { dsn: 7 };
+    let mut opts = [0; 36];
+    let n = mptcp::encode(&MptcpOption::Join(MpJoin::Ack { hmac160 }), &mut opts).unwrap();
+    let n = n + mptcp::encode(&fail, &mut opts[n..]).unwrap();
+    let third = Segment {
+        seq: SeqNum(7001),
+        ack: synack.seq.wrapping_add(1),
+        flags: TcpFlags::ACK,
+        options: &opts[..n],
+        ..synack.clone()
+    };
+    let out = join_input(&mut s, third);
+    assert!(out.iter().all(|p| !p.flags.contains(TcpFlags::RST)));
+    let up = Event::SubflowUp {
+        subflow: SubflowId(1),
+    };
+    assert_eq!(s.events(), [up]);
+    assert!(!s.ep.conns[&h].hooks.infinite_ok);
 }
 
 /// Spec G3c: the SYN's B bit is the peer's backup request (RFC 8684 L1101–1109); its window
