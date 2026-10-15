@@ -102,9 +102,9 @@ def mp_fail_bounds(packets, ours):
     rtt.rs MIN_RTO) and doubling: +1, +3, +7, +15, +31, +63 s, none later than 120 s after our
     first (mptcp.rs mp_fail_deadline). Split at gaps of 0.5 s or more, each direction has at
     most 1 + 6 episodes (Linux answers each late MP_FAIL of ours once its timer is clear: at
-    most one episode per one of ours), each shorter than 0.5 s; our timer retries (see below)
-    are no earlier than that schedule, handling delays making them only later. An answer of ours after our fallback would loop with such a Linux peer and keep an episode
-    going. G18, directly: as the echoer, our later pure-ACK MP_FAILs are retries, 1 s or more
+    most one episode per one of ours), each shorter than 0.5 s, and nothing of ours comes later
+    than 120 s after our first (the spacing itself: see the comment below). An answer of ours
+    after our fallback would loop with such a Linux peer and keep an episode going. G18, directly: as the echoer, our later pure-ACK MP_FAILs are retries, 1 s or more
     apart (0.5 s here, for capture jitter), and once the peer TCP-ACKs an octet sent only with
     our infinite mapping (the dataack-strip rule), retiring our echo, none of ours follows our
     first segment without MP_FAIL on that subflow (the run before it was built before we read
@@ -127,21 +127,11 @@ def mp_fail_bounds(packets, ours):
         long = [(e[0], e[-1]) for e in episodes if e[-1] - e[0] >= 0.5]
         assert not long, f"MP_FAIL from {who} lasts 0.5 s or more: {long}"
     assert mine[-1].t - mine[0].t <= 120, f"G13: MP_FAIL from us {mine[-1].t - mine[0].t:.3f} s after our first, past 120 s"
-    # Timer retries: pure-ACK MP_FAILs of ours answering no new peer payload and starting an
-    # episode (window updates and ACKs inside one are not). Late handling only delays them, so
-    # the k-th is at or after the nominal first + (2^k - 1) MIN_RTO (50 ms for capture jitter).
-    retries, fresh, last = [], False, None
-    for p in packets:
-        if p.src not in ours:
-            fresh |= p.len > 0
-            continue
-        if has(p, 6):
-            if last is not None and p.len == 0 and not fresh and p.t - last >= 0.5:
-                retries.append(p.t)
-            last = p.t
-        fresh = False
-    early = [(k, round(t - mine[0].t, 3)) for k, t in enumerate(retries, 1) if t - mine[0].t < (2 ** k - 1) - 0.05]
-    assert not early, f"G13: MP_FAIL retries (k, s after our first) ahead of the schedule from MIN_RTO (1 s) doubling: {early}"
+    # The retry spacing (RTO, then doubling) is not checked here: timer emissions cannot be
+    # told apart on the wire. Unit tests with injected time cover it, in
+    # crates/mptcp-rs/src/endpoint/mptcp_tests/mp_fail.rs: waiting_sends_mp_fail_on_acks_and_retries
+    # (RTO, 2 RTO), echoer_idle_retries_bounded, waiting_times_out_at_120s and
+    # after_fallback_mp_fail_triggers_nothing.
     if peer and peer[0].t < mine[0].t:
         pure = [p.t for p in mine if p.len == 0]
         early = [(a, b) for a, b in zip(pure, pure[1:]) if b - a < 0.5]

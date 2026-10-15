@@ -160,16 +160,27 @@ class MpFailBounds(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "retired", msg=why):
                 mp_fail_bounds(self.retired() + bad, self.OURS)
 
-    def test_retry_schedule_rejected(self):
-        # Retries (episodes of ours after the first) start at MIN_RTO (1 s) and double; none is
-        # sent later than 120 s after our first MP_FAIL.
+    def test_deadline_rejected(self):
+        # None of ours later than 120 s after our first MP_FAIL (G13, G16).
         start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
         retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
-        for retries, err in [([retry(0.7)], "schedule"), ([retry(1), retry(2)], "schedule"), ([retry(1), retry(3), retry(4.5)], "schedule"),
-                             ([retry(121)], "120 s"), ([retry(41), retry(123)], "120 s")]:
-            with self.assertRaisesRegex(AssertionError, err, msg=[round(p.t - 1.01, 3) for p in retries]):
+        for retries in [[retry(121)], [retry(41), retry(123)]]:
+            with self.assertRaisesRegex(AssertionError, "120 s", msg=[round(p.t - 1.01, 3) for p in retries]):
                 mp_fail_bounds(start + retries, self.OURS)
-        mp_fail_bounds(start + [retry(1), retry(3), retry(7), retry(15), retry(31), retry(63)], self.OURS)
+
+    def test_retry_spacing_not_checked(self):
+        # Timer emissions cannot be told apart on the wire (a data-driven MP_FAIL can hide one,
+        # a delayed window update looks like one), so the spacing is left to the library's unit
+        # tests; within the episode and 120 s bounds these pass.
+        start = [pkt(1.0, SRV, LEG_A, [FAIL]), pkt(1.01, self.CLI, LEG_A, self.ECHO)]
+        retry = lambda t: pkt(1.01 + t, self.CLI, LEG_A, [FAIL])
+        for retries in [[retry(0.7)], [retry(1), retry(2)], [retry(1), retry(3), retry(4.5)],
+                        [retry(1), retry(3), retry(7), retry(15), retry(31), retry(63)]]:
+            mp_fail_bounds(start + retries, self.OURS)
+        # Codex r4: infinite-mapped payload at +0.7 s, then retries at +1 s and +2 s.
+        mp_fail_bounds(start + [pkt(1.71, self.CLI, LEG_A, self.ECHO, len=1428), retry(1), retry(2)], self.OURS)
+        # Codex r4: a window update while Waiting, 0.6 s after our MP_FAIL, with no new peer data.
+        mp_fail_bounds(self.originator() + [pkt(1.62, self.CLI, LEG_A, [FAIL], ackno=1000 + 1428 * 20)], self.OURS)
 
     def test_late_timers_accepted(self):
         # Paused mid-drain: copies we built before reading the retiring ACK reach the TUN 20 ms
