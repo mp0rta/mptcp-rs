@@ -2789,6 +2789,17 @@ impl Scheduler for Probe {
     }
 }
 type Rogues = Arc<Mutex<Option<Rogue>>>;
+/// Sets the probe's plan. `poll_transmit` consults the scheduler of a ready connection only,
+/// and a plan changed from outside reaches the connection through no endpoint call: mark it.
+fn set_rogue(
+    ep: &mut Endpoint<ChaCha20Rng>,
+    h: ConnectionHandle,
+    rogue: &Rogues,
+    r: Option<Rogue>,
+) {
+    *rogue.lock().unwrap() = r;
+    ep.conns.touch(h);
+}
 fn install_probe(ep: &mut Endpoint<ChaCha20Rng>, h: ConnectionHandle) -> (Arc<Mutex<Log>>, Rogues) {
     let (log, rogue) = (Arc::default(), Arc::default());
     ep.conns.get_mut(&h).unwrap().hooks.scheduler = Box::new(Probe {
@@ -2919,7 +2930,7 @@ fn rogue_scheduler_plan_rejected() {
         Rogue::NoSuchSubflow,
         Rogue::ForeignReinject(head, 1),
     ] {
-        *rogue.lock().unwrap() = Some(r);
+        set_rogue(&mut ep, h, &rogue, Some(r));
         assert!(
             drain(&mut ep, now).is_empty(),
             "nothing is sent for a rejected plan"
@@ -2928,7 +2939,7 @@ fn rogue_scheduler_plan_rejected() {
     assert_eq!(log.lock().unwrap().plans.len(), 3);
     assert_eq!(ep.conns[&h].hooks.rejected_plans, 3);
     // A Joining subflow: with no Active subflow `plan` is not even called ...
-    *rogue.lock().unwrap() = Some(Rogue::FirstSubflow);
+    set_rogue(&mut ep, h, &rogue, Some(Rogue::FirstSubflow));
     ep.conns.get_mut(&h).unwrap().subflows[0].state = SubflowState::Joining;
     assert!(drain(&mut ep, now).is_empty());
     assert_eq!(log.lock().unwrap().plans.len(), 3);
@@ -2958,7 +2969,7 @@ fn rogue_scheduler_plan_rejected() {
         "no on_assigned for a rejected plan"
     );
     // Valid plans: one on_assigned per installed mapping, with its byte count.
-    *rogue.lock().unwrap() = None;
+    set_rogue(&mut ep, h, &rogue, None);
     let mut mappings = Vec::new();
     let mut received = vec![None; data.len()];
     while una(&ep, h) != head + data.len() as u64 {
@@ -3282,7 +3293,7 @@ fn rogue_reinject_outside_head_rejected() {
     let assigned = log.lock().unwrap().assigned.len();
     // Queued but not the head, beyond the queue, and longer than the head candidate.
     for (dsn, len) in [(head + 1, 1), (head + 5000, 1), (head, 2865)] {
-        *rogue.lock().unwrap() = Some(Rogue::ForeignReinject(dsn, len));
+        set_rogue(&mut ep, h, &rogue, Some(Rogue::ForeignReinject(dsn, len)));
         let before = ep.conns[&h].hooks.rejected_plans;
         assert!(
             drain(&mut ep, deadline).is_empty(),
@@ -3316,7 +3327,7 @@ fn rogue_reinject_outside_head_rejected() {
     );
     assert!(crate::mptcp::accept_plan(reinject(2864), &[wide], candidate, None).is_some());
     // MinRTT restored: the head itself is reinjected.
-    *rogue.lock().unwrap() = None;
+    set_rogue(&mut ep, h, &rogue, None);
     let out = drain(&mut ep, deadline);
     let seg = packet::parse(&out[0]).unwrap();
     assert_eq!(dsn_of(&seg, syn.seq), Some((head, 2864)));
