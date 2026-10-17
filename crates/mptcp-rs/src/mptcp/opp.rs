@@ -45,7 +45,7 @@ pub struct DebugStats {
 
 /// The copy of the head a later repair judges (§2.7): the subflow that installed it, its DSN
 /// range and its exclusive SSN end there.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Pin {
     pub target: SubflowId,
     pub start: u64,
@@ -54,7 +54,7 @@ pub(crate) struct Pin {
 }
 
 /// One bounded lookahead over S's holes (§2.7 H2).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Lookahead {
     pub s: SubflowId,
     /// Exclusive: the greatest end of S's mappings when it started.
@@ -65,7 +65,7 @@ pub(crate) struct Lookahead {
 }
 
 /// Head repair (§2.7 H1) and the bounded lookahead (H2).
-#[derive(Default)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Repair {
     /// The DATA_ACK (`send.una`) the state below is about.
     head: u64,

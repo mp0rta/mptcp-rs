@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 
 use rand_core::CryptoRng;
 
@@ -18,8 +19,11 @@ use crate::tcp::{CloseReason, ConnectConfig, Reaction, SegmentWriter, Tcb, TcpSt
 use crate::wire::mptcp::{self, MpJoin, MptcpOption, is_join};
 use crate::wire::packet::{self, Segment, TcpFlags};
 use crate::wire::tcp_options::{TcpOpt, walk};
+use conns::Conns;
+pub(crate) use conns::Slot;
 
 mod aborted;
+mod conns;
 
 /// Queued RSTs for segments without a TCB; beyond this they are dropped.
 const MAX_PENDING_RST: usize = 64;
@@ -245,7 +249,7 @@ struct PendingRst {
 pub struct Endpoint<R: CryptoRng> {
     rng: R,
     isn: IsnGenerator,
-    conns: BTreeMap<ConnectionHandle, Connection>,
+    conns: Conns,
     /// (local, remote) → (handle, subflow) (a BTreeMap: no OS-seeded hasher in the core). Closed and TIME-WAIT TCBs stay until `handle_timeout`.
     demux: BTreeMap<(SocketAddr, SocketAddr), (ConnectionHandle, SubflowId)>,
     next_handle: u64,
@@ -272,6 +276,13 @@ pub struct Endpoint<R: CryptoRng> {
     /// Congestion controller for new connections; `None` is the default (CUBIC).
     #[cfg(test)]
     pub(crate) cc: Option<fn() -> Box<dyn crate::tcp::cc::CongestionControl>>,
+    /// Connections `handle_timeout` has processed.
+    #[cfg(test)]
+    pub(crate) timeouts: u64,
+    /// Test-only oracle: `poll_timeout` and `handle_timeout` look at every connection, as
+    /// before the deadline heap (`diff_tests`).
+    #[cfg(test)]
+    pub(crate) full_scan: bool,
 }
 
 impl<R: CryptoRng> Endpoint<R> {
@@ -281,7 +292,7 @@ impl<R: CryptoRng> Endpoint<R> {
         Self {
             rng,
             isn: IsnGenerator::new(secret),
-            conns: BTreeMap::new(),
+            conns: Conns::default(),
             demux: BTreeMap::new(),
             next_handle: 0,
             cursor: 0,
@@ -299,6 +310,10 @@ impl<R: CryptoRng> Endpoint<R> {
             nonces: VecDeque::new(),
             #[cfg(test)]
             cc: None,
+            #[cfg(test)]
+            timeouts: 0,
+            #[cfg(test)]
+            full_scan: false,
         }
     }
 
@@ -423,14 +438,19 @@ impl<R: CryptoRng> Endpoint<R> {
         // Its pending joins are reset at the next `handle_timeout`, which `poll_timeout` makes
         // due at once (as `Connection::abort`), or by their next segment. A join holds its
         // listener's slot only while it is open (`free_ended`), so only these can.
-        for c in self.conns.values_mut() {
+        let mut changed = Vec::new();
+        for (&h, c) in self.conns.iter_untracked_mut() {
             for sf in &mut c.subflows {
                 if sf.mp.join.is_some() && sf.pending_via == Some(key) {
                     sf.pending_via = None;
                     sf.mp.reset = true;
                     sf.mp.reset_option = Some(tcprst(0x01, false).to_vec());
+                    changed.push(h);
                 }
             }
+        }
+        for h in changed {
+            self.conns.touch(h);
         }
         let pending = |(_, c): &(&ConnectionHandle, &Connection)| {
             c.half_open && c.subflows[0].pending_via == Some(key)
@@ -932,7 +952,7 @@ impl<R: CryptoRng> Endpoint<R> {
     /// connection with unread data stays reachable, without its port, until the data is read
     /// and `handle_timeout` runs.
     pub fn connection(&mut self, h: ConnectionHandle) -> Option<&mut Connection> {
-        self.conns.get_mut(&h).filter(|c| !c.half_open)
+        self.conns.lend(&h).filter(|c| !c.half_open)
     }
 
     pub fn poll_event(&mut self) -> Option<(ConnectionHandle, Event)> {
@@ -1271,7 +1291,9 @@ impl<R: CryptoRng> Endpoint<R> {
     /// deleted, each synchronized one (TIME-WAIT included) with a RST at SND.MAX, with
     /// MP_FASTCLOSE and a retained 4-tuple when MPTCP is in use.
     fn apply_aborts(&mut self, now: Instant) {
-        for (&h, c) in &mut self.conns {
+        // Only the application's `abort` sets `aborting`, through `connection`.
+        for h in self.conns.aborting() {
+            let c = self.conns.untracked_mut(&h).unwrap();
             if !std::mem::take(&mut c.aborting) || ended(c) {
                 continue;
             }
@@ -1375,93 +1397,140 @@ impl<R: CryptoRng> Endpoint<R> {
         }
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let cursor = ConnectionHandle(self.cursor);
-        // Round robin from the cursor, then wrap around; no allocation.
+        // Round robin from the cursor, then wrap around.
+        let mut out = Out {
+            scratch: &mut self.scratch,
+            ip_id: &mut self.ip_id,
+            events: &mut self.events,
+            demux: &mut self.demux,
+            listeners: &mut self.listeners,
+        };
         for bounds in [(Included(cursor), Unbounded), (Unbounded, Excluded(cursor))] {
-            for (h, c) in self.conns.range_mut(bounds) {
-                c.update_recovery(now);
-                c.select_control();
-                // Step 1 (spec §3.1): each subflow's own traffic — ACKs, TCP retransmissions,
-                // assigned data, control items — never through the scheduler.
-                let mut sent = None;
-                for (i, sf) in c.subflows.iter_mut().enumerate() {
-                    let mut hk = SubflowHooks {
-                        conn: &mut c.hooks,
-                        sf: &mut sf.mp,
-                    };
-                    // Whatever is due (a third ACK, data) stays due until `buf` can hold it.
-                    if buf.len() < sf.tcb.mtu() {
-                        continue;
-                    }
-                    hk.prepare_send(&mut sf.tcb, now, sf.id);
-                    if c.closed_by_app && !hk.conn.close() {
-                        sf.tcb.close();
-                    }
-                    if sf.tcb.poll_send(now, &mut hk, &mut self.scratch).is_some() {
-                        sent = Some(i);
-                        break;
-                    }
-                }
-                // Steps 2–3: plan one mapping, install it, send it on its subflow.
-                if sent.is_none() {
-                    if let Some(i) = c.schedule(now, buf.len()) {
-                        let sf = &mut c.subflows[i];
-                        let mut hk = SubflowHooks {
-                            conn: &mut c.hooks,
-                            sf: &mut sf.mp,
-                        };
-                        if sf.tcb.poll_send(now, &mut hk, &mut self.scratch).is_some() {
-                            sent = Some(i);
-                        }
-                    }
-                }
-                let Some(i) = sent else {
-                    continue;
+            let flow = self.conns.scan(bounds, |h, c| {
+                let (r, quiet) = Self::visit(h, c, now, buf, &mut out);
+                let Visit::Sent(n) = r else {
+                    return ControlFlow::Continue(matches!(r, Visit::Idle).then_some(quiet));
                 };
+                self.cursor = h.0 + 1;
+                match n {
+                    Some(_) => ControlFlow::Break(n),
+                    None => ControlFlow::Continue(None),
+                }
+            });
+            if let ControlFlow::Break(n) = flow {
+                self.conns.refresh_if_many();
+                return n;
+            }
+        }
+        self.conns.refresh();
+        None
+    }
+
+    /// One connection's turn in `poll_transmit`, and whether it was quiet: idle, before its
+    /// wake time, so that the turn changes nothing (`Slot::idle`).
+    fn visit(
+        h: ConnectionHandle,
+        c: &mut Connection,
+        now: Instant,
+        buf: &mut [u8],
+        out: &mut Out<'_>,
+    ) -> (Visit, bool) {
+        let quiet = c.slot.idle && c.slot.wake.is_none_or(|w| now < w);
+        // A quiet turn changes nothing: no need to look for what it changed.
+        let states = (!quiet).then(|| tcb_states(c));
+        c.update_recovery(now);
+        c.select_control();
+        // Step 1 (spec §3.1): each subflow's own traffic — ACKs, TCP retransmissions,
+        // assigned data, control items — never through the scheduler.
+        let mut sent = None;
+        let mut busy = false;
+        for (i, sf) in c.subflows.iter_mut().enumerate() {
+            let mut hk = SubflowHooks {
+                conn: &mut c.hooks,
+                sf: &mut sf.mp,
+            };
+            // Whatever is due (a third ACK, data) stays due until `buf` can hold it.
+            if buf.len() < sf.tcb.mtu() {
+                busy = true;
+                continue;
+            }
+            hk.prepare_send(&mut sf.tcb, now, sf.id);
+            if c.closed_by_app && !hk.conn.close() {
+                sf.tcb.close();
+            }
+            if sf.tcb.poll_send(now, &mut hk, out.scratch).is_some() {
+                sent = Some(i);
+                break;
+            }
+        }
+        // Steps 2–3: plan one mapping, install it, send it on its subflow.
+        if sent.is_none() {
+            // A step that trims the reinjection head or moves the repair state leaves the next
+            // turn something else to do (its roles and demand differ), as does a mapping the
+            // `Tcb` holds back (SWS).
+            let before = (!quiet).then(|| scheduled(c));
+            if let Some(i) = c.schedule(now, buf.len()) {
+                busy = true;
                 let sf = &mut c.subflows[i];
                 let mut hk = SubflowHooks {
                     conn: &mut c.hooks,
                     sf: &mut sf.mp,
                 };
-                self.cursor = h.0 + 1;
-                let w = &self.scratch;
-                let seg = Segment {
-                    src: sf.local,
-                    dst: sf.remote,
-                    seq: w.seq,
-                    ack: w.ack,
-                    flags: w.flags,
-                    wnd: w.wnd,
-                    options: w.options(),
-                    payload: &w.payload,
-                };
-                if let Some(n) = Self::build(&mut self.ip_id, &seg, buf) {
-                    let rto = sf.tcb.retransmission_timeout();
-                    hk.on_transmitted(&seg, now, rto);
-                    hk.sf.keepalive_sent(sf.tcb.keepalive_pending(), now, rto);
-                    if let Some(j) = hk
-                        .sf
-                        .join
-                        .as_ref()
-                        .filter(|_| w.flags.contains(TcpFlags::SYN))
-                    {
-                        c.local_addrs.sent(j.addr_id);
-                    }
-                    if let Some(mptcp) = hk
-                        .conn
-                        .negotiation
-                        .as_mut()
-                        .and_then(|m| m.on_transmitted(w.flags))
-                    {
-                        self.events.push_back((*h, Event::Connected { mptcp }));
-                    }
-                    if w.flags.contains(TcpFlags::RST) {
-                        Self::free_ended(&mut self.demux, &mut self.listeners, *h, c);
-                    }
-                    return Some(n);
+                if sf.tcb.poll_send(now, &mut hk, out.scratch).is_some() {
+                    sent = Some(i);
                 }
+            } else {
+                busy |= before.is_some_and(|b| scheduled(c) != b);
             }
         }
-        None
+        let Some(i) = sent else {
+            // A subflow closed without a segment (a join in SYN-SENT once our DATA_FIN is
+            // acknowledged) changes what the next turn's recovery update does.
+            busy |= states.is_some_and(|s| tcb_states(c) != s);
+            return (if busy { Visit::Busy } else { Visit::Idle }, quiet);
+        };
+        let sf = &mut c.subflows[i];
+        let mut hk = SubflowHooks {
+            conn: &mut c.hooks,
+            sf: &mut sf.mp,
+        };
+        let w = &*out.scratch;
+        let seg = Segment {
+            src: sf.local,
+            dst: sf.remote,
+            seq: w.seq,
+            ack: w.ack,
+            flags: w.flags,
+            wnd: w.wnd,
+            options: w.options(),
+            payload: &w.payload,
+        };
+        let Some(n) = Self::build(out.ip_id, &seg, buf) else {
+            return (Visit::Sent(None), quiet);
+        };
+        let rto = sf.tcb.retransmission_timeout();
+        hk.on_transmitted(&seg, now, rto);
+        hk.sf.keepalive_sent(sf.tcb.keepalive_pending(), now, rto);
+        if let Some(j) = hk
+            .sf
+            .join
+            .as_ref()
+            .filter(|_| w.flags.contains(TcpFlags::SYN))
+        {
+            c.local_addrs.sent(j.addr_id);
+        }
+        if let Some(mptcp) = hk
+            .conn
+            .negotiation
+            .as_mut()
+            .and_then(|m| m.on_transmitted(w.flags))
+        {
+            out.events.push_back((h, Event::Connected { mptcp }));
+        }
+        if w.flags.contains(TcpFlags::RST) {
+            Self::free_ended(out.demux, out.listeners, h, c);
+        }
+        (Visit::Sent(Some(n)), quiet)
     }
 
     fn build(ip_id: &mut u16, seg: &Segment, buf: &mut [u8]) -> Option<usize> {
@@ -1473,34 +1542,12 @@ impl<R: CryptoRng> Endpoint<R> {
     /// Earliest `poll_send_at` over all connections. Driver contract: after any `read`,
     /// `write` or `close` call `poll_transmit` (they can make a packet due), then re-read this.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.conns
-            .values()
-            .filter(|c| !c.detached)
-            .filter_map(|c| {
-                // A Closed TCB's deadline frees the connection, which waits for TIME-WAIT.
-                let free = !(c.hooks.retained() || time_wait(c));
-                c.subflows
-                    .iter()
-                    .flat_map(|sf| {
-                        let open = sf.tcb.state() != TcpState::Closed;
-                        let tcb = sf.tcb.poll_send_at().filter(|_| free || open);
-                        let join = (sf.mp.join.as_ref().filter(|_| open))
-                            .and_then(|j| j.deadline(c.cfg.r2_data));
-                        let strand = sf.mp.strand_at.filter(|_| open);
-                        let keepalive = sf.mp.keepalive.and_then(|k| k.deadline);
-                        let keepalive = keepalive.filter(|_| open);
-                        let unlisten = (sf.tcb.state() == TcpState::SynReceived && sf.mp.reset)
-                            .then_some(Instant::from_nanos(0));
-                        let tcb = tcb.into_iter().chain(join).chain(strand).chain(keepalive);
-                        tcb.chain(unlisten)
-                    })
-                    .chain(c.hooks.recovery_deadline())
-                    .chain(c.mp_fail_deadline())
-                    .chain(c.opp_deadline())
-                    .chain(c.hooks.signals.next_wake())
-                    .chain(c.aborting.then_some(Instant::from_nanos(0)))
-                    .min()
-            })
+        #[cfg(test)]
+        if self.full_scan {
+            let all = self.conns.iter().filter_map(|(_, c)| next_deadline(c));
+            return all.chain(self.aborted.next_expiry()).min();
+        }
+        (self.conns.next_timer().into_iter())
             .chain(self.aborted.next_expiry())
             .min()
     }
@@ -1511,7 +1558,24 @@ impl<R: CryptoRng> Endpoint<R> {
     pub fn handle_timeout(&mut self, now: Instant) {
         self.apply_aborts(now);
         self.aborted.expire(now);
-        for (&h, c) in self.conns.iter_mut().filter(|(_, c)| !c.detached) {
+        self.conns.refresh();
+        // The connections with a deadline at or before `now`, and those changed since their
+        // last pass here: any other would change nothing.
+        let due = self.conns.due(now);
+        #[cfg(test)]
+        let due = match self.full_scan {
+            true => self.conns.iter().map(|(&h, _)| h).collect(),
+            false => due,
+        };
+        for &h in &due {
+            let c = self.conns.untracked_mut(&h).unwrap();
+            if c.detached {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.timeouts += 1;
+            }
             let mark = self.events.len();
             c.update_recovery(now);
             let mp_fail_expired = c.mp_fail_timeout(now);
@@ -1589,10 +1653,11 @@ impl<R: CryptoRng> Endpoint<R> {
                 self.events.truncate(mark);
             }
             Self::free_ended(&mut self.demux, &mut self.listeners, h, c);
+            self.conns.passed(h);
         }
         let (demux, events) = (&mut self.demux, &mut self.events);
         let (listeners, tokens) = (&mut self.listeners, &mut self.tokens);
-        self.conns.retain(|&h, c| {
+        self.conns.retain_some(&due, |&h, c| {
             // A half-open connection is never retained nor detached: no application holds it
             // (spec G10), and keeping it would bypass `max_half_open` (spec G9).
             let retained = !c.half_open && c.hooks.retained();
@@ -1622,6 +1687,7 @@ impl<R: CryptoRng> Endpoint<R> {
             }
             c.detached
         });
+        self.conns.refresh();
     }
 }
 
@@ -1663,6 +1729,82 @@ fn others_open(subflows: &[Subflow], i: usize) -> bool {
     (subflows.iter().enumerate()).any(|(j, s)| j != i && !s.ended())
 }
 
+/// The endpoint state a connection's turn in `poll_transmit` writes, beside the connection.
+struct Out<'a> {
+    scratch: &'a mut SegmentWriter,
+    ip_id: &'a mut u16,
+    events: &'a mut VecDeque<(ConnectionHandle, Event)>,
+    demux: &'a mut BTreeMap<(SocketAddr, SocketAddr), (ConnectionHandle, SubflowId)>,
+    listeners: &'a mut BTreeMap<SocketAddr, Listener>,
+}
+
+/// What `poll_transmit` made of a connection's turn.
+enum Visit {
+    /// A segment, and its packet unless `buf` could not hold it.
+    Sent(Option<usize>),
+    /// Nothing to send, and nothing changed that a later turn would act on.
+    Idle,
+    /// Nothing sent, but the next turn may send or change more: a subflow's MTU exceeds
+    /// `buf` (what it has due waits for a larger one), a mapping was installed and held, the
+    /// reinjection head or repair state moved, or a subflow's TCP state changed.
+    Busy,
+}
+
+/// The earliest deadline of `c` (`poll_timeout`); `None` once it is detached.
+fn next_deadline(c: &Connection) -> Option<Instant> {
+    if c.detached {
+        return None;
+    }
+    // A Closed TCB's deadline frees the connection, which waits for TIME-WAIT.
+    let free = !(c.hooks.retained() || time_wait(c));
+    c.subflows
+        .iter()
+        .flat_map(|sf| {
+            let open = sf.tcb.state() != TcpState::Closed;
+            let tcb = sf.tcb.poll_send_at().filter(|_| free || open);
+            let join =
+                (sf.mp.join.as_ref().filter(|_| open)).and_then(|j| j.deadline(c.cfg.r2_data));
+            let strand = sf.mp.strand_at.filter(|_| open);
+            let keepalive = sf.mp.keepalive.and_then(|k| k.deadline);
+            let keepalive = keepalive.filter(|_| open);
+            let unlisten = (sf.tcb.state() == TcpState::SynReceived && sf.mp.reset)
+                .then_some(Instant::from_nanos(0));
+            let tcb = tcb.into_iter().chain(join).chain(strand).chain(keepalive);
+            tcb.chain(unlisten)
+        })
+        .chain(c.hooks.recovery_deadline())
+        .chain(c.mp_fail_deadline())
+        .chain(c.opp_deadline())
+        .chain(c.hooks.signals.next_wake())
+        .chain(c.aborting.then_some(Instant::from_nanos(0)))
+        .min()
+}
+
+/// The state a scheduling step may change for the next one: the reinjection head and repair.
+fn scheduled(c: &Connection) -> (Option<(u64, u64)>, crate::mptcp::Repair) {
+    (
+        c.hooks.data.as_ref().and_then(|d| d.reinject.first()),
+        c.repair,
+    )
+}
+
+/// When the passing of time alone may give `c` something to send: its deadline (`deadline`,
+/// from `next_deadline`), or a pacing release, which the deadline leaves out when nothing it
+/// knows of waits for it.
+fn wake_at(c: &Connection, deadline: Option<Instant>) -> Option<Instant> {
+    let release = (c.subflows.iter())
+        .filter_map(|sf| sf.tcb.release_at())
+        .min();
+    deadline.into_iter().chain(release).min()
+}
+
+/// The TCP states of `c`'s subflows, packed: changes when one changes or one is freed.
+fn tcb_states(c: &Connection) -> u64 {
+    (c.subflows.iter()).fold(c.subflows.len() as u64, |k, sf| {
+        k << 4 | sf.tcb.state() as u64
+    })
+}
+
 /// Some subflow of `c` is in TIME-WAIT.
 fn time_wait(c: &Connection) -> bool {
     (c.subflows.iter()).any(|sf| sf.tcb.state() == TcpState::TimeWait)
@@ -1685,6 +1827,10 @@ fn closed(c: &Connection) -> bool {
 }
 
 #[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
 mod mptcp_tests;
+#[cfg(test)]
+mod scale_tests;
 #[cfg(test)]
 mod server_tests;

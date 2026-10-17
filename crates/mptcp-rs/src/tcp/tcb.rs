@@ -1293,6 +1293,12 @@ impl Tcb {
         }
     }
 
+    /// The pacing release, if one is set: data and FINs held back for it may go once it
+    /// passes, also those `poll_send_at` leaves it out for (a go-back's lone FIN).
+    pub(crate) fn release_at(&self) -> Option<Instant> {
+        self.next_send_at
+    }
+
     /// Preserve NewReno's nominal timer (only the first partial ACK restarts it), while
     /// preventing a timer-based retry less than one RTO after the last retransmission.
     fn rto_deadline(&self) -> Option<Instant> {

@@ -660,7 +660,7 @@ fn join_rogue_plan_naming_joining_subflow_rejected() {
     assert_eq!(from(&drain(&mut ep, ms(20)), JOIN_IP).len(), 1, "third ACK");
     // Established at TCP level, still Joining: it must get no data.
     let (log, rogue) = install_probe(&mut ep, h);
-    *rogue.lock().unwrap() = Some(Rogue::Named(id));
+    set_rogue(&mut ep, h, &rogue, Some(Rogue::Named(id)));
     ep.connection(h).unwrap().write(&[1; 5000]).unwrap();
     assert!(
         drain(&mut ep, ms(30)).is_empty(),
@@ -671,7 +671,7 @@ fn join_rogue_plan_naming_joining_subflow_rejected() {
     let snapshot = ep.conns[&h].snapshots()[1];
     assert_eq!(snapshot.state, SubflowState::Joining);
     assert_eq!(snapshot.new_budget.bytes(), 0, "not usable");
-    *rogue.lock().unwrap() = None;
+    set_rogue(&mut ep, h, &rogue, None);
     let out = drain(&mut ep, ms(30));
     assert!(!out.is_empty());
     assert!(

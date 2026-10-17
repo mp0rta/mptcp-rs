@@ -29,8 +29,10 @@ A peer that requires them is honoured even when ours is off. Not yet supported (
 sending 32-bit DSNs.
 
 Server limits: the server sends no ADD_ADDR; there are no SYN cookies, so SYNs beyond the
-`max_half_open` cap are dropped; and the timer and transmit paths scan every connection of
-the endpoint, so they are not meant for very many connections yet.
+`max_half_open` cap are dropped; and the transmit path (`poll_transmit`) visits every
+connection of the endpoint, so it is not meant for very many connections yet. `poll_timeout`
+and `handle_timeout` look only at the connections that an endpoint call reached or whose
+deadline passed.
 
 ## Interoperability
 
