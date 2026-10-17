@@ -54,6 +54,8 @@ pub struct Connection {
     pub(crate) repair: Repair,
     /// Accepted by a listener and not yet `Accepted`: hidden from the application (spec G10).
     pub(crate) half_open: bool,
+    /// The endpoint's bookkeeping (issue #12).
+    pub(crate) slot: crate::endpoint::Slot,
 }
 
 /// An `add_subflow` made before the connection was Confirmed.
@@ -89,6 +91,7 @@ impl Connection {
             opp: None,
             repair: Default::default(),
             half_open: false,
+            slot: Default::default(),
         }
     }
 
